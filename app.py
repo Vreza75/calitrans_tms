@@ -28,6 +28,7 @@ st.set_page_config(
 LOAD_STATUS_FLOW = [
     "New",
     "Hold/Need Info",
+    "Awaiting Appointment",
     "Ready to Dispatch",
     "Assigned",
     "En Route to Pickup",
@@ -259,6 +260,7 @@ def show_header() -> None:
 STATUS_COLORS = {
     "New": "#f8fafc",
     "Hold/Need Info": "#fecaca",
+    "Awaiting Appointment": "#fdba74",
     "Ready to Dispatch": "#bbf7d0",
     "Assigned": "#dcfce7",
     "En Route to Pickup": "#bef264",
@@ -278,6 +280,7 @@ STATUS_COLORS = {
 STATUS_MEANINGS = {
     "New": "New confirmed load, not dispatched yet",
     "Hold/Need Info": "Issue or missing information; dispatcher action required",
+    "Awaiting Appointment": "Booking confirmed but waiting for pickup or delivery appointment",
     "Ready to Dispatch": "Ready/green light to assign driver and truck",
     "Assigned": "Driver and truck assigned",
     "En Route to Pickup": "Driver moving toward pickup or terminal",
@@ -299,7 +302,7 @@ STATUS_LEGEND_GROUPS = {
     "Ready / Active": ["Ready to Dispatch", "Assigned", "En Route to Pickup", "En Route To Delivery", "Ready for ProfitTools"],
     "Pickup / Loading": ["At Pickup", "Loaded"],
     "Delivered / Return": ["Delivered", "Returning Empty", "POD Received"],
-    "Issues / Stops": ["Hold/Need Info", "Cancelled"],
+    "Issues / Stops": ["Hold/Need Info", "Awaiting Appointment", "Cancelled"],
     "Billing / Closed": ["Exported to ProfitTools", "Invoiced", "Closed", "New"],
 }
 
@@ -313,6 +316,7 @@ def _get_status_border_color(status: str) -> str:
     border_colors = {
         "New": "#94a3b8",
         "Hold/Need Info": "#dc2626",
+        "Awaiting Appointment": "#ea580c",
         "Ready to Dispatch": "#16a34a",
         "Assigned": "#22c55e",
         "En Route to Pickup": "#65a30d",
@@ -510,11 +514,230 @@ def render_dashboard(df: pd.DataFrame) -> None:
                 hide_index=True,
             )
 
+
+BOOKING_VERIFICATION_REQUIRED_FIELDS = [
+    "TYPE",
+    "Booking Number",
+    "Customer",
+    "Container Number",
+    "Port",
+    "Warehouse",
+    "Delivery Need Date",
+    "LFD",
+]
+
+
+def _is_blank_value(value) -> bool:
+    value_str = str(value or "").strip()
+    return value_str == "" or value_str.lower() in {"nan", "none", "nat", "-", "null"}
+
+
+def _booking_readiness(row) -> tuple[int, list[str]]:
+    missing = []
+
+    for field in BOOKING_VERIFICATION_REQUIRED_FIELDS:
+        if field not in row.index or _is_blank_value(row.get(field, "")):
+            missing.append(field)
+
+    completed = len(BOOKING_VERIFICATION_REQUIRED_FIELDS) - len(missing)
+    score = int(round((completed / len(BOOKING_VERIFICATION_REQUIRED_FIELDS)) * 100))
+
+    return score, missing
+
+
+def _add_booking_verification_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    scores = []
+    missing_values = []
+    readiness_labels = []
+
+    for _, row in df.iterrows():
+        score, missing = _booking_readiness(row)
+        scores.append(score)
+        missing_values.append(", ".join(missing) if missing else "")
+
+        if score == 100:
+            readiness_labels.append("Ready")
+        elif score >= 75:
+            readiness_labels.append("Needs Minor Info")
+        elif score >= 50:
+            readiness_labels.append("Needs Review")
+        else:
+            readiness_labels.append("Missing Critical Info")
+
+    df["Readiness %"] = scores
+    df["Missing Fields"] = missing_values
+    df["Verification Result"] = readiness_labels
+
+    return df
+
+
+def _render_booking_verification_table(table_df: pd.DataFrame, title: str) -> None:
+    st.markdown(f"#### {title}")
+    st.caption(f"{len(table_df)} booking(s)")
+
+    if table_df.empty:
+        st.success("No bookings in this queue.")
+        return
+
+    columns = [
+        "_row_id",
+        "TYPE",
+        "Booking Number",
+        "Customer",
+        "Container Number",
+        "Port",
+        "Warehouse",
+        "Delivery Need Date",
+        "LFD",
+        "Status",
+        "Readiness %",
+        "Verification Result",
+        "Missing Fields",
+        "Dispatcher Notes",
+    ]
+
+    display_cols = [c for c in columns if c in table_df.columns]
+    styled = (
+        table_df.sort_values(["Readiness %", "_row_id"], ascending=[True, False])[display_cols]
+        .style
+        .apply(_status_row_style, axis=1)
+    )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+def _render_booking_verification_actions(verification_df: pd.DataFrame) -> None:
+    if verification_df.empty:
+        return
+
+    st.divider()
+    st.markdown("### Booking Final Check / Move to Dispatch")
+    st.caption("Use this section as the last office check before the booking becomes Ready to Dispatch.")
+
+    labels = [
+        f"{row['Booking Number']} | {row.get('Customer', '')} | {row.get('Readiness %', 0)}% ready | row {int(row['_row_id'])}"
+        for _, row in verification_df.sort_values("_row_id", ascending=False).iterrows()
+    ]
+
+    selected = st.selectbox("Select booking to review", labels, key="booking_verification_selected")
+    selected_row_id = int(selected.split("row ")[-1])
+    selected_df = verification_df[verification_df["_row_id"].astype(int).eq(selected_row_id)]
+
+    if selected_df.empty:
+        st.warning("Selected booking was not found.")
+        return
+
+    selected_load = selected_df.iloc[0]
+    readiness_score = int(selected_load.get("Readiness %", 0))
+    missing_fields = str(selected_load.get("Missing Fields", "") or "")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Booking", str(selected_load.get("Booking Number", "") or "-"))
+    c2.metric("Customer", str(selected_load.get("Customer", "") or "-"))
+    c3.metric("Readiness", f"{readiness_score}%")
+    c4.metric("Status", str(selected_load.get("Status", "") or "-"))
+
+    if missing_fields:
+        st.warning(f"Missing fields: {missing_fields}")
+    else:
+        st.success("This booking has all required dispatch-readiness fields.")
+
+    with st.expander("Review selected booking details", expanded=True):
+        details = {
+            "Type": selected_load.get("TYPE", ""),
+            "Booking Number": selected_load.get("Booking Number", ""),
+            "Load ID": selected_load.get("Load ID", ""),
+            "Customer": selected_load.get("Customer", ""),
+            "Container Number": selected_load.get("Container Number", ""),
+            "Port / Pickup": selected_load.get("Port", ""),
+            "Warehouse / Delivery": selected_load.get("Warehouse", ""),
+            "Delivery Need Date": selected_load.get("Delivery Need Date", ""),
+            "LFD": selected_load.get("LFD", ""),
+            "Status": selected_load.get("Status", ""),
+            "Dispatcher Notes": selected_load.get("Dispatcher Notes", ""),
+        }
+        st.dataframe(
+            pd.DataFrame([{"Field": k, "Value": v} for k, v in details.items()]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    action_note = st.text_area(
+        "Verification Note",
+        value=str(selected_load.get("Dispatcher Notes", "") or ""),
+        height=100,
+        key=f"booking_verification_note_{selected_row_id}",
+    )
+
+    a1, a2, a3, a4 = st.columns(4)
+
+    with a1:
+        if st.button("Mark Missing Info", key=f"mark_missing_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {
+                    "Status": "Hold/Need Info",
+                    "Dispatcher Notes": action_note or f"Missing fields: {missing_fields}",
+                },
+            )
+            refresh_data()
+            st.success("Booking marked Hold/Need Info.")
+            st.rerun()
+
+    with a2:
+        if st.button("Awaiting Appointment", key=f"mark_appt_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {
+                    "Status": "Awaiting Appointment",
+                    "Dispatcher Notes": action_note or "Waiting for appointment confirmation.",
+                },
+            )
+            refresh_data()
+            st.success("Booking marked Awaiting Appointment.")
+            st.rerun()
+
+    with a3:
+        if st.button("Save Verification Note", key=f"save_verify_note_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {"Dispatcher Notes": action_note},
+            )
+            refresh_data()
+            st.success("Verification note saved.")
+            st.rerun()
+
+    with a4:
+        disabled = readiness_score < 100
+        if st.button(
+            "Move to Dispatch",
+            key=f"move_to_dispatch_{selected_row_id}",
+            use_container_width=True,
+            disabled=disabled,
+            help="Requires 100% readiness. Sets status to Ready to Dispatch.",
+        ):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {
+                    "Status": "Ready to Dispatch",
+                    "Dispatcher Notes": action_note or "Booking verified and moved to dispatch.",
+                },
+            )
+            refresh_data()
+            st.success("Booking moved to Dispatch Board as Ready to Dispatch.")
+            st.rerun()
+
+    if readiness_score < 100:
+        st.info("Move to Dispatch is disabled until all required booking fields are complete.")
+
+
 def render_orders(df: pd.DataFrame) -> None:
     st.subheader("Orders")
 
     intake_tab, confirm_tab, active_tab = st.tabs(
-        ["1. Intake Queue", "2. Confirm Orders", "3. Active Loads"]
+        ["1. Intake Queue", "2. Confirm Orders", "3. Booking Verification"]
     )
 
     with intake_tab:
@@ -783,38 +1006,47 @@ def render_orders(df: pd.DataFrame) -> None:
                     st.rerun()
 
     with active_tab:
-        st.markdown("### Active Loads")
-        st.caption("Only confirmed loads should appear here. Dispatch details are handled on the Dispatch Board.")
+        st.markdown("### Booking Verification")
+        st.caption(
+            "This is the final office check after order confirmation. "
+            "Bookings stay here while they are New, missing minor information, or awaiting appointment confirmation. "
+            "Once moved to Ready to Dispatch, they leave this tab and appear on the Dispatch Board."
+        )
 
-        col1, col2, col3 = st.columns([3, 2, 2])
-        search = col1.text_input("Search active loads", placeholder="Booking, customer, container, driver...")
-        status = col2.selectbox("Status", ["All"] + LOAD_STATUS_FLOW)
-        load_type = col3.selectbox("Type", ["All"] + sorted([x for x in df["TYPE"].dropna().unique() if x]))
+        verification_statuses = ["New", "Hold/Need Info", "Awaiting Appointment"]
+        verification_df = df[df["Status"].isin(verification_statuses)].copy()
+        verification_df = _add_booking_verification_columns(verification_df)
 
-        filtered = filter_loads(df, search, status, load_type)
+        ready_to_dispatch_count = int(df["Status"].eq("Ready to Dispatch").sum())
 
-        active_columns = [
-            "_row_id",
-            "TYPE",
-            "Booking Number",
-            "Load ID",
-            "Customer",
-            "Container Number",
-            "Warehouse",
-            "Delivery Need Date",
-            "Status",
-            "Driver Name",
-            "Truck Assigned",
-            "Chassis",
-            "LFD",
-            "Dispatcher Notes",
-        ]
-        active_columns = [c for c in active_columns if c in filtered.columns]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Bookings Awaiting Review", int(verification_df["Status"].eq("New").sum()) if not verification_df.empty else 0)
+        k2.metric("Missing Information", int(verification_df["Status"].eq("Hold/Need Info").sum()) if not verification_df.empty else 0)
+        k3.metric("Awaiting Appointment", int(verification_df["Status"].eq("Awaiting Appointment").sum()) if not verification_df.empty else 0)
+        k4.metric("Moved to Dispatch", ready_to_dispatch_count)
 
-        st.dataframe(filtered[active_columns], use_container_width=True, hide_index=True)
+        st.markdown("#### Booking Verification Queues")
+        q1, q2, q3, q4 = st.tabs(["Needs Review", "Missing Info", "Awaiting Appointment", "All Verification"])
 
-        with st.expander("Create active load manually", expanded=False):
-            st.caption("Use this only when the order is already confirmed and ready to become an active load.")
+        with q1:
+            needs_review = verification_df[verification_df["Status"].eq("New")].copy()
+            _render_booking_verification_table(needs_review, "Needs Review / New Bookings")
+
+        with q2:
+            missing_info = verification_df[verification_df["Status"].eq("Hold/Need Info")].copy()
+            _render_booking_verification_table(missing_info, "Missing Information")
+
+        with q3:
+            awaiting_appt = verification_df[verification_df["Status"].eq("Awaiting Appointment")].copy()
+            _render_booking_verification_table(awaiting_appt, "Awaiting Appointment")
+
+        with q4:
+            _render_booking_verification_table(verification_df, "All Bookings in Verification")
+
+        _render_booking_verification_actions(verification_df)
+
+        with st.expander("Create confirmed booking manually", expanded=False):
+            st.caption("Use this only after the order is confirmed but before it is ready for dispatch.")
 
             with st.form("new_load_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
@@ -824,14 +1056,19 @@ def render_orders(df: pd.DataFrame) -> None:
                     customer = st.text_input("Customer")
                     container = st.text_input("Container Number")
                     reference = st.text_input("Reference Number")
+                    try:
+                        size_options = _dropdown_options(_load_master_options().get("sizes", []), "")
+                    except Exception:
+                        size_options = ["", "20", "40", "40HC", "40ST", "20FR", "40FR", "20 STRF", "40STRF"]
+                    size_value = st.selectbox("Size", size_options, key="manual_create_size_verification")
                 with c2:
                     port = st.text_input("Port / Terminal")
                     warehouse = st.text_input("Warehouse")
                     address = st.text_input("Address")
                     delivery_need = st.date_input("Delivery Need Date", value=None)
                     lfd = st.date_input("LFD", value=None)
-                notes = st.text_area("Dispatcher Notes")
-                submitted = st.form_submit_button("Create Active Load")
+                notes = st.text_area("Verification Notes")
+                submitted = st.form_submit_button("Create Booking for Verification")
 
             if submitted:
                 if not booking.strip():
@@ -843,6 +1080,7 @@ def render_orders(df: pd.DataFrame) -> None:
                         "Customer": customer,
                         "Container Number": container,
                         "Reference Number": reference,
+                        "Size": size_value,
                         "Port": port,
                         "Warehouse": warehouse,
                         "Address": address,
@@ -853,7 +1091,7 @@ def render_orders(df: pd.DataFrame) -> None:
                     }
                     created = DispatchDatabaseClient().add_row(row)
                     refresh_data()
-                    st.success(f"Created active load ID {created.id}")
+                    st.success(f"Created booking ID {created.id} for verification.")
                     st.rerun()
 
 def _get_selected_dispatch_load(df: pd.DataFrame):
