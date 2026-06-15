@@ -4,11 +4,6 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote, unquote
 import base64
-import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.message import EmailMessage
 
 import pandas as pd
 import streamlit as st
@@ -173,25 +168,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.astype(str).str.strip()
 
-    for col in SUMMARY_COLUMNS + [
-        "Reference Number",
-        "Address",
-        "Billing Notes",
-        "Ready for ProfitTools",
-        "Rate",
-        "Customer Email",
-        "Contact Email",
-        "Public Notes",
-        "current_location",
-        "eta",
-        "live_load_status",
-        "live_unload_status",
-        "last_driver_update",
-        "pickup_appointment",
-        "delivery_appointment",
-        "terminal",
-        "empty_return_location",
-    ]:
+    for col in SUMMARY_COLUMNS + ["Reference Number", "Address", "Billing Notes", "Ready for ProfitTools", "Rate", "current_location", "eta", "live_load_status", "live_unload_status", "last_driver_update"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -1217,202 +1194,6 @@ def _insert_dispatch_message(load_id: int, message_type: str, direction: str, re
 
 
 
-def _get_app_setting(name: str, default=None):
-    """Read from Streamlit secrets first, then environment variables."""
-    try:
-        value = st.secrets.get(name)
-        if value not in [None, ""]:
-            return value
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-
-def _first_present(load, keys: list[str], fallback: str = "") -> str:
-    for key in keys:
-        try:
-            value = load.get(key, "")
-        except Exception:
-            value = ""
-        value_str = str(value or "").strip()
-        if value_str and value_str.lower() not in {"nan", "none", "nat", "null", "-"}:
-            return value_str
-    return fallback
-
-
-def _customer_email_for_load(load) -> str:
-    return _first_present(
-        load,
-        ["Customer Email", "Contact Email", "customer_email", "contact_email", "Email", "email"],
-        "",
-    )
-
-
-def _next_status_goal(new_status: str) -> str:
-    flow = LOAD_STATUS_FLOW
-    if new_status in flow:
-        idx = flow.index(new_status)
-        if idx + 1 < len(flow):
-            return flow[idx + 1]
-    return "Next dispatch milestone"
-
-
-def _eta_to_next_goal(load, new_status: str) -> str:
-    eta_value = _first_present(load, ["eta", "ETA"], "")
-    if eta_value:
-        return eta_value
-
-    if new_status in ["Assigned", "En Route to Pickup", "At Pickup"]:
-        eta_value = _first_present(load, ["pickup_appointment", "Pickup Appointment", "Delivery Need Date"], "")
-        if eta_value:
-            return eta_value
-
-    if new_status in ["Loaded", "En Route To Delivery", "Delivered"]:
-        eta_value = _first_present(load, ["delivery_appointment", "Delivery Appointment", "Delivery Need Date"], "")
-        if eta_value:
-            return eta_value
-
-    if new_status == "Returning Empty":
-        eta_value = _first_present(load, ["empty_return_date", "Empty Return Date", "LFD"], "")
-        if eta_value:
-            return eta_value
-
-    return "ETA pending dispatch update"
-
-
-def _build_customer_status_email(load, old_status: str, new_status: str, note: str = "") -> tuple[str, str]:
-    company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
-    booking = _first_present(load, ["Booking Number", "booking_number"], "-")
-    load_ref = _first_present(load, ["Load ID", "id", "_row_id"], "-")
-    customer = _first_present(load, ["Customer", "customer"], "Customer")
-    container = _first_present(load, ["Container Number", "container_number", "Reference Number"], "-")
-    move_type = _first_present(load, ["TYPE", "type"], "-")
-    pickup = _first_present(load, ["Port", "terminal", "pickup_location"], "-")
-    delivery = _first_present(load, ["Warehouse", "Address", "delivery_location"], "-")
-    driver = _first_present(load, ["Driver Name", "driver_name"], "Pending")
-    truck = _first_present(load, ["Truck Assigned", "truck_assigned"], "Pending")
-    chassis = _first_present(load, ["Chassis", "chassis"], "-")
-    lfd = _first_present(load, ["LFD", "lfd"], "-")
-    current_location = _first_present(load, ["current_location", "Current Location"], "-")
-    public_notes = _first_present(load, ["Public Notes", "public_notes"], "")
-    dispatcher_notes = note or public_notes
-    next_goal = _next_status_goal(new_status)
-    eta = _eta_to_next_goal(load, new_status)
-
-    subject = f"{company_name} Load Update | {booking} | {new_status}"
-
-    body = f"""
-Hello {customer},
-
-Your load status has been updated.
-
-STATUS UPDATE
-Previous Status: {old_status or '-'}
-Current Status: {new_status}
-Next Goal: {next_goal}
-ETA to Next Goal: {eta}
-
-LOAD DETAILS
-Load ID: {load_ref}
-Move Type: {move_type}
-Booking Number: {booking}
-Container / Reference: {container}
-LFD: {lfd}
-
-ROUTE
-Pickup / Port: {pickup}
-Delivery / Warehouse: {delivery}
-Current Location: {current_location}
-
-DISPATCH DETAILS
-Driver: {driver}
-Truck: {truck}
-Chassis: {chassis}
-
-NOTES
-{dispatcher_notes if dispatcher_notes else 'No additional notes at this time.'}
-
-Thank you,
-{company_name} Dispatch
-""".strip()
-    return subject, body
-
-
-def _log_customer_email_notification(load_id: int, old_status: str, new_status: str, recipient: str, subject: str, body: str, status: str, error_message: str = "") -> None:
-    """Log customer status emails. Safe no-op if the table has not been created yet."""
-    try:
-        execute(
-            """
-            insert into email_notifications
-                (load_id, old_status, new_status, sent_to, subject, body, status, error_message, sent_at)
-            values
-                (:load_id, :old_status, :new_status, :sent_to, :subject, :body, :status, :error_message,
-                 case when :status = 'sent' then now() else null end)
-            """,
-            {
-                "load_id": load_id,
-                "old_status": old_status,
-                "new_status": new_status,
-                "sent_to": recipient or None,
-                "subject": subject,
-                "body": body,
-                "status": status,
-                "error_message": error_message or None,
-            },
-        )
-    except Exception:
-        pass
-
-
-def _send_smtp_email(to_email: str, subject: str, body: str) -> None:
-    smtp_host = _get_app_setting("SMTP_HOST")
-    smtp_port = int(_get_app_setting("SMTP_PORT", 587))
-    smtp_user = _get_app_setting("SMTP_USER")
-    smtp_password = _get_app_setting("SMTP_PASSWORD")
-    dispatch_email = _get_app_setting("DISPATCH_EMAIL", smtp_user)
-
-    if not to_email:
-        raise ValueError("Missing customer email address on this load.")
-    if not smtp_host or not smtp_user or not smtp_password:
-        raise ValueError("Missing SMTP settings. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and DISPATCH_EMAIL.")
-
-    msg = MIMEMultipart()
-    msg["From"] = dispatch_email
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
-
-
-def _send_customer_status_update_email(load_id: int, original_load, old_status: str, new_status: str, note: str = "") -> tuple[bool, str]:
-    """Send a customer email only when status actually changes."""
-    if old_status == new_status:
-        return True, "Status unchanged; no customer email needed."
-
-    updated_load = original_load.copy()
-    updated_load["Status"] = new_status
-    if note:
-        updated_load["Dispatcher Notes"] = note
-
-    recipient = _customer_email_for_load(updated_load)
-    st.write("Customer Email:", recipient)
-    subject, body = _build_customer_status_email(updated_load, old_status, new_status, note)
-   
-    try:
-        _send_smtp_email(recipient, subject, body)
-        _log_customer_email_notification(load_id, old_status, new_status, recipient, subject, body, "sent")
-        _insert_dispatch_message(load_id, "customer_status_email", "outbound", recipient, body)
-        return True, f"Customer email sent to {recipient}."
-    except Exception as exc:
-        _log_customer_email_notification(load_id, old_status, new_status, recipient, subject, body, "failed", str(exc))
-        return False, str(exc)
-
-
-
 def _clean_display_value(value, fallback: str = "-") -> str:
     value_str = str(value or "").strip()
     if value_str.lower() in {"nan", "none", "nat", ""}:
@@ -1457,9 +1238,7 @@ Instructions:
     return message.strip()
 
 
-def _save_status_quick_update(load_id: int, selected_load, new_status: str, note: str) -> tuple[bool, str]:
-    old_status = str(selected_load.get("Status", "") or "")
-
+def _save_status_quick_update(load_id: int, new_status: str, note: str) -> None:
     DispatchDatabaseClient().update_row_fields(
         load_id,
         {
@@ -1475,18 +1254,7 @@ def _save_status_quick_update(load_id: int, selected_load, new_status: str, note
         f"Quick status update: {new_status}. {note}",
     )
 
-    return _send_customer_status_update_email(load_id, selected_load, old_status, new_status, note)
 
-if st.button("Test Email"):
-    try:
-        _send_smtp_email(
-            "YOURPERSONALEMAIL@gmail.com",
-            "CaliTrans Test Email",
-            "This is a test email from CaliTrans TMS."
-        )
-        st.success("Test email sent.")
-    except Exception as e:
-        st.error(f"Test email failed: {e}")
 
 def render_dispatch_workspace(selected_load) -> None:
     load_id = int(selected_load["_row_id"])
@@ -1565,11 +1333,6 @@ def render_dispatch_workspace(selected_load) -> None:
         driver = c2.text_input("Driver Name", value=str(selected_load.get("Driver Name", "") or ""))
         truck = c3.text_input("Truck Assigned", value=str(selected_load.get("Truck Assigned", "") or ""))
         chassis = c4.text_input("Chassis", value=str(selected_load.get("Chassis", "") or ""))
-        customer_email = st.text_input(
-            "Customer Email",
-            value=str(selected_load.get("Customer Email", "") or ""),
-            key=f"customer_email_{load_id}",
-    )
 
         note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120)
 
@@ -1585,28 +1348,10 @@ def render_dispatch_workspace(selected_load) -> None:
                 updates["Chassis"] = chassis.strip()
             if note.strip() != str(selected_load.get("Dispatcher Notes", "") or "").strip():
                 updates["Dispatcher Notes"] = note.strip()
-           
 
             if updates:
                 DispatchDatabaseClient().update_row_fields(load_id, updates)
-
-                if "Status" in updates:
-                    email_sent, email_msg = _send_customer_status_update_email(
-                        load_id,
-                        selected_load,
-                        current_status,
-                        new_status,
-                        note.strip(),
-                        customer_email.strip(),
-                    )
-
-                    if email_sent:
-                        st.success(f"Status updated. {email_msg}")
-                    else:
-                        st.warning(f"Status updated, but customer email was not sent: {email_msg}")
-                else:
-                    st.success("Load details updated.")
-
+                st.success("Status updated.")
                 refresh_data()
                 st.rerun()
             else:
@@ -1715,12 +1460,9 @@ def render_dispatch_workspace(selected_load) -> None:
         for idx, (status_label, default_note) in enumerate(quick_statuses):
             with quick_cols[idx % 4]:
                 if st.button(status_label, key=f"quick_status_{load_id}_{status_label}", use_container_width=True):
-                    email_sent, email_msg = _save_status_quick_update(load_id, selected_load, status_label, default_note)
+                    _save_status_quick_update(load_id, status_label, default_note)
                     refresh_data()
-                    if email_sent:
-                        st.success(f"Updated to {status_label}. {email_msg}")
-                    else:
-                        st.warning(f"Updated to {status_label}, but customer email was not sent: {email_msg}")
+                    st.success(f"Updated to {status_label}")
                     st.rerun()
 
         st.markdown("#### Manual Driver Note / Message")
@@ -1831,100 +1573,34 @@ def render_dispatch_workspace(selected_load) -> None:
             st.warning("This load is not ready for billing yet.")
 
         if st.button("Mark Ready for ProfitTools", key=f"mark_billing_{load_id}"):
-            old_status = str(selected_load.get("Status", "") or "")
-            new_status = "Ready for ProfitTools"
-            DispatchDatabaseClient().update_row_fields(load_id, {"Status": new_status})
-            email_sent, email_msg = _send_customer_status_update_email(
-                load_id,
-                selected_load,
-                old_status,
-                new_status,
-                "Load is ready for billing/export review.",
-            )
-            if email_sent:
-                st.success(f"Marked Ready for ProfitTools. {email_msg}")
-            else:
-                st.warning(f"Marked Ready for ProfitTools, but customer email was not sent: {email_msg}")
+            DispatchDatabaseClient().update_row_fields(load_id, {"Status": "Ready for ProfitTools"})
+            st.success("Marked Ready for ProfitTools.")
             refresh_data()
             st.rerun()
-def _send_customer_status_update_email(
-    load_id: int,
-    original_load,
-    old_status: str,
-    new_status: str,
-    note: str = "",
-    recipient_override: str = "",
-) -> tuple[bool, str]:
-    """Send a customer email only when status actually changes."""
-    if old_status == new_status:
-        return True, "Status unchanged; no customer email needed."
 
-    updated_load = original_load.copy()
-    updated_load["Status"] = new_status
-    if note:
-        updated_load["Dispatcher Notes"] = note
 
-    recipient = recipient_override.strip() or _customer_email_for_load(updated_load)
-
-    subject, body = _build_customer_status_email(updated_load, old_status, new_status, note)
-
-    try:
-        _send_smtp_email(recipient, subject, body)
-        _log_customer_email_notification(load_id, old_status, new_status, recipient, subject, body, "sent")
-        _insert_dispatch_message(load_id, "customer_status_email", "outbound", recipient, body)
-        return True, f"Customer email sent to {recipient}."
-    except Exception as exc:
-        _log_customer_email_notification(load_id, old_status, new_status, recipient, subject, body, "failed", str(exc))
-        return False, str(exc)
 def render_dispatch_board(df: pd.DataFrame) -> None:
     st.subheader("Dispatch Board")
     st.caption("Click a load card to open the dispatcher workspace below.")
 
     board_df = df[df["Status"].isin(DISPATCH_BOARD_STATUSES)].copy()
+    status_cols = st.columns(len(DISPATCH_BOARD_STATUSES))
 
-    type_tabs = st.tabs(["OTR Import", "OTR Export", "OTR Local Import"])
-
-    type_map = {
-        "OTR Import": "OTR Import",
-        "OTR Export": "OTR Export",
-        "OTR Local Import": "OTR Local Import",
-    }
-
-    for tab, (tab_name, type_value) in zip(type_tabs, type_map.items()):
-        with tab:
-            type_df = board_df[
-                board_df["TYPE"].astype(str).str.strip().eq(type_value)
-            ].copy()
-
-            st.markdown(f"### {tab_name}")
-            st.caption(f"{len(type_df)} active dispatch load(s)")
-
-            if type_df.empty:
-                st.success(f"No active {tab_name} loads on the Dispatch Board.")
-                continue
-
-            status_cols = st.columns(len(DISPATCH_BOARD_STATUSES))
-
-            for idx, status in enumerate(DISPATCH_BOARD_STATUSES):
-                with status_cols[idx]:
-                    st.markdown(f"**{status}**")
-
-                    status_df = type_df[
-                        type_df["Status"].astype(str).str.strip().eq(status)
-                    ].head(20)
-
-                    if status_df.empty:
-                        st.caption("No loads")
-
-                    for _, row in status_df.iterrows():
-                        render_load_card(row)
+    for idx, status in enumerate(DISPATCH_BOARD_STATUSES):
+        with status_cols[idx]:
+            st.markdown(f"**{status}**")
+            status_df = board_df[board_df["Status"] == status].head(20)
+            if status_df.empty:
+                st.caption("No loads")
+            for _, row in status_df.iterrows():
+                render_load_card(row)
 
     selected_load = _get_selected_dispatch_load(df)
-
     if selected_load is not None:
         render_dispatch_workspace(selected_load)
     else:
         st.info("Select a load card above to open the dispatcher workspace.")
+
 def render_containers(df: pd.DataFrame) -> None:
     st.subheader("Container Tracking")
 
@@ -2078,14 +1754,6 @@ def render_booking_detail(df: pd.DataFrame, booking: str) -> None:
                     updates[col] = edited.iloc[i][col]
             if updates:
                 DispatchDatabaseClient().update_row_fields(row_id, updates)
-                if "Status" in updates:
-                    _send_customer_status_update_email(
-                        row_id,
-                        booking_df.iloc[i],
-                        str(booking_df.iloc[i].get("Status", "") or ""),
-                        str(updates["Status"] or ""),
-                        str(updates.get("Dispatcher Notes", booking_df.iloc[i].get("Dispatcher Notes", "")) or ""),
-                    )
         refresh_data()
         st.success("Booking updated.")
         st.rerun()

@@ -275,6 +275,7 @@ def render_email_intake_panel() -> None:
         return
 
     for idx, item in enumerate(emails):
+        gmail_message_id = item.get("id", "")
         subject = item.get("subject", "")
         sender = item.get("from", "")
         body = item.get("body", "") or item.get("snippet", "") or ""
@@ -343,6 +344,19 @@ def render_email_intake_panel() -> None:
                 })
 
             st.markdown("#### Accuracy Check")
+            existing_import = read_df(
+                """
+                select gmail_message_id
+                from email_imports
+                where gmail_message_id = :gmail_message_id
+                """,
+                {"gmail_message_id": gmail_message_id},
+            )
+
+            already_imported = not existing_import.empty
+
+            if already_imported:
+                st.success("Already imported previously")
             c1, c2, c3 = st.columns(3)
             c1.metric("Estimated Load Count", 1)
             c2.metric("Email Body Fields Found", sum(1 for v in body_parsed.values() if str(v).strip()))
@@ -355,7 +369,8 @@ def render_email_intake_panel() -> None:
 
             col1, col2, col3 = st.columns(3)
 
-            if col1.button("Add Body Only to Queue", key=f"add_body_only_{idx}"):
+            
+            if col1.button("Add Body Only to Queue", key=f"add_body_only_{idx}", disabled=already_imported):
                 create_intake_record(
                     source="email_body",
                     source_subject=subject,
@@ -366,11 +381,33 @@ def render_email_intake_panel() -> None:
                     raw_text=body,
                     action_required=action_required,
                 )
+                execute(
+                    """
+                    insert into email_imports (
+                        gmail_message_id,
+                        subject,
+                        sender,
+                        parsed_status
+                    )
+                    values (
+                        :gmail_message_id,
+                        :subject,
+                        :sender,
+                        'intake_created'
+                    )
+                    """,
+                    {
+                        "gmail_message_id": gmail_message_id,
+                        "subject": subject,
+                        "sender": sender,
+                    },
+                )
                 st.success("Email body added to Action Queue.")
                 st.cache_data.clear()
                 st.rerun()
 
-            if col2.button("Add PDF Only to Queue", key=f"add_pdf_only_{idx}", disabled=selected_pdf is None):
+            
+            if col2.button("Add PDF Only to Queue", key=f"add_pdf_only_{idx}", disabled=(selected_pdf is None or already_imported)):    
                 if selected_pdf is not None:
                     from io import BytesIO
                     pdf_file = BytesIO(selected_pdf["content"])
@@ -386,11 +423,36 @@ def render_email_intake_panel() -> None:
                         raw_text=pdf_text,
                         action_required=action_required,
                     )
+                    execute(
+                        """
+                        insert into email_imports (
+                            gmail_message_id,
+                            subject,
+                            sender,
+                            parsed_status
+                        )
+                        values (
+                            :gmail_message_id,
+                            :subject,
+                            :sender,
+                            'intake_created'
+                        )
+                        """,
+                        {
+                            "gmail_message_id": gmail_message_id,
+                            "subject": subject,
+                            "sender": sender,
+                        },
+                    )
                     st.success("Email PDF added to Action Queue.")
                     st.cache_data.clear()
                     st.rerun()
 
-            if col3.button("Add Combined Review to Queue", key=f"add_combined_{idx}"):
+            if col3.button(
+                "Add Combined Review to Queue",
+                key=f"add_combined_{idx}",
+                disabled=already_imported
+                ):
                 file_path = None
                 filename = None
                 if selected_pdf is not None:
@@ -410,10 +472,31 @@ def render_email_intake_panel() -> None:
                     raw_text=f"EMAIL BODY:\n{body}\n\nPDF TEXT:\n{pdf_text}",
                     action_required=action_required,
                 )
+                execute(
+                    """
+                    insert into email_imports (
+                        gmail_message_id,
+                        subject,
+                        sender,
+                        parsed_status
+                    )
+                    values (
+                        :gmail_message_id,
+                        :subject,
+                        :sender,
+                        'intake_created'
+                    )
+                    """,
+                    {
+                        "gmail_message_id": gmail_message_id,
+                        "subject": subject,
+                        "sender": sender,
+                    },
+                )
                 st.success("Combined email review added to Action Queue.")
                 st.cache_data.clear()
                 st.rerun()
-
+    st.write(item)
 def render_action_queue_panel() -> None:
     st.markdown("### Order Action Queue")
 
