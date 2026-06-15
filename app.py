@@ -60,6 +60,7 @@ DISPATCH_BOARD_STATUSES = [
     "Delivered",
     "Returning Empty",
 ]
+LOAD_TYPE_TABS = ["Export", "Import", "Export Local", "Import Local"]
 
 SUMMARY_COLUMNS = [
     "_row_id",
@@ -446,7 +447,6 @@ def render_load_card(row) -> None:
     )
 
 
-
 def render_dashboard(df: pd.DataFrame) -> None:
     show_kpis(df)
 
@@ -485,14 +485,6 @@ def render_dashboard(df: pd.DataFrame) -> None:
     st.markdown(f"### Operations Snapshot — {selected_filter}")
     st.caption(f"Showing {len(filtered_df)} affected load(s). Rows are color-coded by load status.")
 
-    type_tabs = st.tabs(["OTR Import", "OTR Export", "OTR Local Import"])
-
-    type_map = {
-        "OTR Import": "OTR Import",
-        "OTR Export": "OTR Export",
-        "OTR Local Import": "OTR Local Import",
-    }
-
     columns = [
         "_row_id",
         "TYPE",
@@ -511,20 +503,23 @@ def render_dashboard(df: pd.DataFrame) -> None:
         "Dispatcher Notes",
     ]
 
-    for tab, (tab_name, type_value) in zip(type_tabs, type_map.items()):
+    type_tabs = st.tabs(LOAD_TYPE_TABS)
+
+    for tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
         with tab:
             type_df = filtered_df[
                 filtered_df["TYPE"].astype(str).str.strip().eq(type_value)
             ].copy()
 
-            st.markdown(f"#### {tab_name}")
+            st.markdown(f"#### {type_value}")
             st.caption(f"{len(type_df)} load(s)")
 
             if type_df.empty:
-                st.success(f"No {tab_name} loads found for this filter.")
+                st.success(f"No {type_value} loads found for this filter.")
                 continue
 
             display_cols = [c for c in columns if c in type_df.columns]
+
             styled = (
                 type_df.sort_values("_row_id", ascending=False)[display_cols]
                 .style
@@ -536,7 +531,6 @@ def render_dashboard(df: pd.DataFrame) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-
 
 BOOKING_VERIFICATION_REQUIRED_FIELDS = [
     "TYPE",
@@ -821,7 +815,7 @@ def render_orders(df: pd.DataFrame) -> None:
                         container = st.text_input("Container #")
 
                     with col2:
-                        order_type = st.selectbox("Order Type", ["OTR Import", "OTR Export", "OTR Local Import", "Unknown"])
+                        order_type = st.selectbox("Order Type", LOAD_TYPE_TABS + ["Unknown"])
                         pickup_or_port = st.text_input("Pickup / Port / Terminal")
                         delivery_location = st.text_input("Delivery Location / Warehouse")
                         requested_date = st.date_input("Requested Date", value=None)
@@ -939,7 +933,7 @@ def render_orders(df: pd.DataFrame) -> None:
                 with col1:
                     type_val = st.selectbox(
                         "Order Type",
-                        ["OTR Import", "OTR Export", "OTR Local Import"],
+                        ["Export", "Import", "Export Local", "Import Local"],
                         index=0,
                     )
                     booking = st.text_input("Booking Number *", value=str(parsed.get("Booking Number", "") or ""))
@@ -1074,15 +1068,12 @@ def render_orders(df: pd.DataFrame) -> None:
             with st.form("new_load_form", clear_on_submit=True):
                 c1, c2 = st.columns(2)
                 with c1:
-                    type_val = st.selectbox("TYPE", ["OTR Import", "OTR Export", "OTR Local Import"])
+                    type_val = st.selectbox("TYPE", LOAD_TYPE_TABS)
                     booking = st.text_input("Booking Number *")
                     customer = st.text_input("Customer")
                     container = st.text_input("Container Number")
                     reference = st.text_input("Reference Number")
-                    try:
-                        size_options = _dropdown_options(_load_master_options().get("sizes", []), "")
-                    except Exception:
-                        size_options = ["", "20", "40", "40HC", "40ST", "20FR", "40FR", "20 STRF", "40STRF"]
+                    size_options = ["", "20", "40", "40HC", "40ST", "20FR", "40FR", "20 STRF", "40STRF"]
                     size_value = st.selectbox("Size", size_options, key="manual_create_size_verification")
                 with c2:
                     port = st.text_input("Port / Terminal")
@@ -1876,31 +1867,26 @@ def _send_customer_status_update_email(
     except Exception as exc:
         _log_customer_email_notification(load_id, old_status, new_status, recipient, subject, body, "failed", str(exc))
         return False, str(exc)
+    
 def render_dispatch_board(df: pd.DataFrame) -> None:
     st.subheader("Dispatch Board")
     st.caption("Click a load card to open the dispatcher workspace below.")
 
     board_df = df[df["Status"].isin(DISPATCH_BOARD_STATUSES)].copy()
 
-    type_tabs = st.tabs(["OTR Import", "OTR Export", "OTR Local Import"])
+    type_tabs = st.tabs(LOAD_TYPE_TABS)
 
-    type_map = {
-        "OTR Import": "OTR Import",
-        "OTR Export": "OTR Export",
-        "OTR Local Import": "OTR Local Import",
-    }
-
-    for tab, (tab_name, type_value) in zip(type_tabs, type_map.items()):
+    for tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
         with tab:
             type_df = board_df[
                 board_df["TYPE"].astype(str).str.strip().eq(type_value)
             ].copy()
 
-            st.markdown(f"### {tab_name}")
+            st.markdown(f"### {type_value}")
             st.caption(f"{len(type_df)} active dispatch load(s)")
 
             if type_df.empty:
-                st.success(f"No active {tab_name} loads on the Dispatch Board.")
+                st.success(f"No active {type_value} loads on the Dispatch Board.")
                 continue
 
             status_cols = st.columns(len(DISPATCH_BOARD_STATUSES))
@@ -1925,47 +1911,15 @@ def render_dispatch_board(df: pd.DataFrame) -> None:
         render_dispatch_workspace(selected_load)
     else:
         st.info("Select a load card above to open the dispatcher workspace.")
-def render_containers(df: pd.DataFrame) -> None:
-    st.subheader("Container Tracking")
+    def render_billing(df: pd.DataFrame) -> None:
+        st.subheader("Billing / ProfitTools")
 
-    c1, c2, c3 = st.columns(3)
-    search = c1.text_input("Search container / booking")
-    status = c2.selectbox("Container Status", ["All"] + LOAD_STATUS_FLOW)
-    risk_only = c3.checkbox("Show LFD risk only")
-
-    filtered = filter_loads(df, search, status, "All")
-
-    if risk_only:
-        lfd = pd.to_datetime(filtered["LFD"], errors="coerce")
-        filtered = filtered[(lfd.notna()) & (lfd <= pd.Timestamp(date.today()) + pd.Timedelta(days=1))]
-
-    columns = [
-        "Booking Number",
-        "Container Number",
-        "TYPE",
-        "Customer",
-        "Port",
-        "Warehouse",
-        "Delivery Need Date",
-        "LFD",
-        "Status",
-        "Driver Name",
-        "Truck Assigned",
-        "Chassis",
-    ]
-    columns = [c for c in columns if c in filtered.columns]
-    st.dataframe(filtered[columns], use_container_width=True, hide_index=True)
-
-
-def render_billing(df: pd.DataFrame) -> None:
-    st.subheader("Billing / ProfitTools")
-
-    ready = df[df["Status"].isin(["POD Received", "Ready for ProfitTools", "Exported to ProfitTools", "Invoiced"])]
-    st.dataframe(
-        ready[[c for c in ["Booking Number", "Customer", "Container Number", "Status", "Billing Notes", "Rate"] if c in ready.columns]],
-        use_container_width=True,
-        hide_index=True,
-    )
+        ready = df[df["Status"].isin(["POD Received", "Ready for ProfitTools", "Exported to ProfitTools", "Invoiced"])]
+        st.dataframe(
+            ready[[c for c in ["Booking Number", "Customer", "Container Number", "Status", "Billing Notes", "Rate"] if c in ready.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if st.button("Generate ProfitTools Ready CSV"):
         path = export_ready_loads(df)
@@ -2136,7 +2090,7 @@ def render_pdf_intake() -> None:
         if st.button("Create Load From Parsed PDF"):
             created = DispatchDatabaseClient().add_row(
                 {
-                    "TYPE": parsed.get("TYPE", "OTR Import"),
+                    "TYPE": parsed.get("TYPE", "Import"),
                     "Booking Number": parsed.get("Booking Number", ""),
                     "Reference Number": parsed.get("Reference Number", ""),
                     "Customer": parsed.get("Customer", ""),
