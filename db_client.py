@@ -181,14 +181,17 @@ class DispatchDatabaseClient:
         return CreatedRow(int(new_id))
 
     def update_row_fields(self, row_id: int, updates: dict[str, Any]) -> None:
-        invalid = [column for column in updates if column not in EDITABLE_COLUMNS]
-        if invalid:
-            raise ValueError(f"Columns not allowed to update from app: {invalid}")
+        db_updates: dict[str, Any] = {}
 
-        db_updates = {
-            SM_TO_DB_COLUMNS[column]: _clean_value(SM_TO_DB_COLUMNS[column], value)
-            for column, value in updates.items()
-        }
+        for column, value in updates.items():
+            if column in SM_TO_DB_COLUMNS:
+                db_col = SM_TO_DB_COLUMNS[column]
+            elif column in EDITABLE_COLUMNS:
+                db_col = column
+            else:
+                raise ValueError(f"Columns not allowed to update from app: [{column}]")
+
+            db_updates[db_col] = _clean_value(db_col, value)
 
         if not db_updates:
             return
@@ -219,7 +222,6 @@ class DispatchDatabaseClient:
                     "created_by": "streamlit",
                 },
             )
-
     def attach_file_to_row(self, row_id: int, uploaded_file, source: str = "streamlit") -> None:
         storage_dir = Path(DOCUMENT_STORAGE_DIR)
         storage_dir.mkdir(parents=True, exist_ok=True)

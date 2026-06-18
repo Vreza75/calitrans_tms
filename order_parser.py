@@ -38,7 +38,7 @@ def parse_order_text(text):
 
     if is_gmt:
         parsed.update({
-            "TYPE": "OTR Export",
+            "TYPE": "Export",
             "Customer": "Global Marine Transportation",
             "Booking Number": find_pattern(text, [
                 r"SS Line Booking No\.:\s*([^\n]+)",
@@ -69,7 +69,7 @@ def parse_order_text(text):
 
     if is_flat_world:
         parsed.update({
-            "TYPE": "OTR Import",
+            "TYPE": "Import",
             "Customer": "Flat World Global Logistics",
             "Booking Number": find_pattern(text, [
                 r"Load #:\s*([^\n]+)",
