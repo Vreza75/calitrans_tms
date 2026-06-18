@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
+from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import quote, unquote
 import base64
@@ -16,6 +18,8 @@ import streamlit as st
 from admin_pages import render_master_data_admin
 from config import ACTIVE_STATUSES, APP_NAME, EDITABLE_COLUMNS
 from db_client import DispatchDatabaseClient, execute, read_df
+from email_client import fetch_recent_operations_emails
+from email_parser import parse_email_text
 from order_parser import extract_text_from_pdf, parse_order_text
 from profittools_export import export_ready_loads
 from validators import validate_dispatch_rows
@@ -924,10 +928,19 @@ REQUEST_TYPES = [
     "Booking Update",
     "Appointment Update",
     "Quote Request",
+    "Missing Information",
     "Cancellation",
     "Customer Request",
     "POD Request",
     "Other",
+]
+
+INBOX_TERMINAL_REVIEW_STATUSES = [
+    "Order Created",
+    "Attached",
+    "Quote Created",
+    "Order Cancelled",
+    "Closed",
 ]
 
 
@@ -950,6 +963,9 @@ def classify_customer_request(subject: str, body: str) -> str:
 
     if any(x in text for x in ["quote", "rate", "price", "pricing", "cost"]):
         return "Quote Request"
+
+    if any(x in text for x in ["missing info", "missing information", "need info", "need information", "incomplete"]):
+        return "Missing Information"
 
     if any(x in text for x in ["cancel", "cancelled", "canceled"]):
         return "Cancellation"
@@ -1036,7 +1052,7 @@ def update_intake_classification(intake_id: int, request_type: str, conversation
     )
 
 
-def save_load_communication(load_id, intake_id, conversation_key, request_type, subject, sender, body) -> None:
+def save_load_communication(load_id, intake_id, conversation_key, request_type, subject, sender, body, direction: str = "inbound") -> None:
     execute(
         """
         insert into load_communications (
@@ -1054,7 +1070,7 @@ def save_load_communication(load_id, intake_id, conversation_key, request_type, 
             :intake_id,
             :conversation_key,
             :communication_type,
-            'inbound',
+            :direction,
             :subject,
             :sender,
             :message_body
@@ -1065,6 +1081,7 @@ def save_load_communication(load_id, intake_id, conversation_key, request_type, 
             "intake_id": intake_id,
             "conversation_key": conversation_key,
             "communication_type": request_type,
+            "direction": direction,
             "subject": subject,
             "sender": sender,
             "message_body": body,
@@ -1107,6 +1124,261 @@ def create_quote_request_from_intake(intake_id: int, parsed: dict, notes: str = 
         },
     )
 
+
+def _coerce_json_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, dict) else {}
+        except Exception:
+            return {}
+
+    return {}
+
+
+def _json_dump(data: dict) -> str:
+    return json.dumps(data or {}, default=str)
+
+
+def _extract_email_address(value: str) -> str:
+    parsed = parseaddr(str(value or ""))
+    return parsed[1] or str(value or "").strip()
+
+
+def _inbox_review_where_clause() -> str:
+    terminal = ", ".join([f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES])
+    return f"where coalesce(review_status, 'Open') not in ({terminal})"
+
+
+def _operations_email_already_imported(message_id: str, subject: str, sender: str) -> bool:
+    if message_id:
+        existing = read_df(
+            """
+            select id
+            from order_intake
+            where source_message_id = :message_id
+            limit 1
+            """,
+            {"message_id": message_id},
+        )
+        if not existing.empty:
+            return True
+
+    fallback = read_df(
+        """
+        select id
+        from order_intake
+        where source in ('operations_email', 'email_body', 'email_combined')
+          and coalesce(source_subject, '') = :subject
+          and coalesce(source_sender, '') = :sender
+        limit 1
+        """,
+        {"subject": subject or "", "sender": sender or ""},
+    )
+    return not fallback.empty
+
+
+def _action_required_for_request(request_type: str, parsed: dict, body: str) -> str:
+    missing = []
+    for field in ["Booking Number", "Customer", "Container Number", "Warehouse"]:
+        if not _safe_str(parsed.get(field, "")):
+            missing.append(field)
+
+    if request_type == "Quote Request":
+        return "Quote requested; review lane, date, container type, and reply with rate."
+    if request_type == "Missing Information":
+        return "Customer needs missing information; reply or attach to the matching order."
+    if request_type == "Cancellation":
+        return "Customer requested cancellation; verify matching order before cancelling."
+    if request_type == "Appointment Update":
+        return "Appointment update received; attach to matching order and update schedule."
+    if missing:
+        return "Missing: " + ", ".join(missing)
+    if body:
+        return "Review message and choose the next action."
+    return "Review imported email."
+
+
+def import_recent_operations_emails(limit: int = 25) -> tuple[int, int]:
+    emails = fetch_recent_operations_emails(limit=limit)
+    imported = 0
+    skipped = 0
+
+    for item in emails:
+        subject = str(item.get("subject", "") or "")
+        sender = str(item.get("from", "") or "")
+        body = str(item.get("body", "") or "")
+        message_id = str(item.get("message_id", "") or item.get("id", "") or "")
+
+        if _operations_email_already_imported(message_id, subject, sender):
+            skipped += 1
+            continue
+
+        try:
+            parsed = parse_email_text(subject, body)
+        except Exception:
+            parsed = {}
+
+        detected_type = classify_customer_request(subject, body)
+        tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+        matched_load_id, confidence = find_matching_load(tokens)
+        conversation_key = (
+            tokens.get("booking_number")
+            or tokens.get("container_number")
+            or tokens.get("reference_number")
+            or message_id
+            or f"email-{imported + 1}"
+        )
+
+        execute(
+            """
+            insert into order_intake (
+                source,
+                source_subject,
+                source_sender,
+                source_received_at,
+                source_message_id,
+                parsed_data,
+                raw_text,
+                intake_status,
+                review_status,
+                request_type,
+                conversation_key,
+                matched_load_id,
+                confidence_score,
+                action_required
+            )
+            values (
+                'operations_email',
+                :source_subject,
+                :source_sender,
+                :source_received_at,
+                :source_message_id,
+                cast(:parsed_data as jsonb),
+                :raw_text,
+                'Needs Review',
+                'Open',
+                :request_type,
+                :conversation_key,
+                :matched_load_id,
+                :confidence_score,
+                :action_required
+            )
+            """,
+            {
+                "source_subject": subject,
+                "source_sender": sender,
+                "source_received_at": item.get("received_at"),
+                "source_message_id": message_id or None,
+                "parsed_data": _json_dump(parsed),
+                "raw_text": body,
+                "request_type": detected_type,
+                "conversation_key": conversation_key,
+                "matched_load_id": matched_load_id,
+                "confidence_score": confidence,
+                "action_required": _action_required_for_request(detected_type, parsed, body),
+            },
+        )
+        imported += 1
+
+    return imported, skipped
+
+
+def _default_operations_reply_subject(subject: str, request_type: str) -> str:
+    clean_subject = str(subject or "").strip()
+    if clean_subject.lower().startswith("re:"):
+        return clean_subject
+    if clean_subject:
+        return f"Re: {clean_subject}"
+    return f"Re: {request_type}"
+
+
+def _default_operations_reply_body(request_type: str, parsed: dict, matched_load_id) -> str:
+    company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
+    booking = _safe_str(parsed.get("Booking Number", ""))
+    container = _safe_str(parsed.get("Container Number", ""))
+    reference = booking or container or (f"load {matched_load_id}" if matched_load_id else "your request")
+
+    if request_type == "Quote Request":
+        return (
+            "Hello,\n\n"
+            f"We received your quote request for {reference}. We are reviewing the lane, timing, and equipment details now "
+            "and will follow up with pricing shortly.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Missing Information":
+        return (
+            "Hello,\n\n"
+            f"We received your message for {reference}. We are checking the missing information now and will send the update "
+            "as soon as it is confirmed.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Cancellation":
+        return (
+            "Hello,\n\n"
+            f"We received your cancellation request for {reference}. We are verifying the order details and will confirm once "
+            "the change is complete.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    return (
+        "Hello,\n\n"
+        f"We received your update for {reference}. Our dispatch team is reviewing it now and will follow up shortly.\n\n"
+        f"Thank you,\n{company_name} Dispatch"
+    )
+
+
+def save_operations_email_reply(
+    *,
+    intake_id: int,
+    load_id,
+    recipient: str,
+    subject: str,
+    body: str,
+    status: str,
+    error_message: str = "",
+) -> None:
+    execute(
+        """
+        insert into operations_email_replies (
+            intake_id,
+            load_id,
+            recipient,
+            subject,
+            body,
+            status,
+            error_message,
+            sent_at,
+            sent_by
+        )
+        values (
+            :intake_id,
+            :load_id,
+            :recipient,
+            :subject,
+            :body,
+            :status,
+            :error_message,
+            case when :status = 'sent' then now() else null end,
+            'dispatcher'
+        )
+        """,
+        {
+            "intake_id": intake_id,
+            "load_id": load_id,
+            "recipient": recipient,
+            "subject": subject,
+            "body": body,
+            "status": status,
+            "error_message": error_message or None,
+        },
+    )
+
 def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
     for _, row in inbox_df.iterrows():
         current_type = str(row.get("request_type", "") or "").strip()
@@ -1117,7 +1389,7 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
         intake_id = int(row["id"])
         subject = str(row.get("source_subject", "") or "")
         body = str(row.get("raw_text", "") or "")
-        parsed = row.get("parsed_data") or {}
+        parsed = _coerce_json_dict(row.get("parsed_data"))
 
         detected_type = classify_customer_request(subject, body)
         tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
@@ -1140,8 +1412,8 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
         
 def render_operations_inbox() -> None:
     st.subheader("Operations Inbox")
-    st.caption("Classify customer emails, match updates to existing loads, create bookings, or create quote requests.")
-    c1, c2 = st.columns([1, 4])
+    st.caption("Classify customer emails, match updates to existing loads, create bookings, create quote requests, or send replies.")
+    c1, c2, c3 = st.columns([1, 1, 3])
 
     with c1:
         if st.button("Refresh Inbox", use_container_width=True):
@@ -1149,14 +1421,26 @@ def render_operations_inbox() -> None:
             st.rerun()
 
     with c2:
-        st.info("Inbox auto-classifies open items when this page loads. Live email polling can be added next with FastAPI or a scheduled background job.")
+        if st.button("Check Client Email", use_container_width=True):
+            try:
+                imported, skipped = import_recent_operations_emails(limit=25)
+                refresh_data()
+                st.success(f"Imported {imported} email(s). Skipped {skipped} already in the inbox.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not import client emails: {exc}")
+
+    with c3:
+        st.info("Open items are classified automatically. Replies can be sent from the request review panel.")
             
     try:
+        where_clause = _inbox_review_where_clause()
         inbox_df = read_df(
-            """
+            f"""
             select
                 id,
                 created_at,
+                source_received_at,
                 source,
                 source_subject,
                 source_sender,
@@ -1168,14 +1452,16 @@ def render_operations_inbox() -> None:
                 conversation_key,
                 matched_load_id,
                 confidence_score,
-                action_required
+                action_required,
+                review_status
             from order_intake
-            where coalesce(review_status, 'Open') = 'Open'
+            {where_clause}
             order by created_at desc
             """
         )
     except Exception as exc:
         st.error(f"Could not load Operations Inbox: {exc}")
+        st.info("If this is the first time using Operations Inbox email, run database/operations_email_workflow_migration.sql in Supabase.")
         return
 
     if inbox_df.empty:
@@ -1185,10 +1471,11 @@ def render_operations_inbox() -> None:
     auto_classify_open_inbox_items(inbox_df)
 
     inbox_df = read_df(
-        """
+        f"""
         select
             id,
             created_at,
+            source_received_at,
             source,
             source_subject,
             source_sender,
@@ -1200,9 +1487,10 @@ def render_operations_inbox() -> None:
             conversation_key,
             matched_load_id,
             confidence_score,
-            action_required
+            action_required,
+            review_status
         from order_intake
-        where coalesce(review_status, 'Open') = 'Open'
+        {where_clause}
         order by created_at desc
         """
         )
@@ -1212,6 +1500,18 @@ def render_operations_inbox() -> None:
                 .astype(str)
                 .str.strip()
         )
+    inbox_df["review_status_clean"] = (
+        inbox_df["review_status"]
+                .fillna("Open")
+                .astype(str)
+                .str.strip()
+        )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Open Requests", len(inbox_df))
+    m2.metric("Quotes", int(inbox_df["request_type_clean"].eq("Quote Request").sum()))
+    m3.metric("Missing Info", int(inbox_df["request_type_clean"].eq("Missing Information").sum()))
+    m4.metric("Waiting", int(inbox_df["review_status_clean"].eq("Waiting on Customer").sum()))
 
     tab_labels = [
         "All",
@@ -1219,8 +1519,10 @@ def render_operations_inbox() -> None:
         "Booking Updates",
         "Appointments",
         "Quote Requests",
+        "Missing Info",
         "Customer Requests",
         "Cancellations",
+        "Waiting",
         "Needs Review",
     ]
 
@@ -1232,10 +1534,12 @@ def render_operations_inbox() -> None:
         "Booking Updates": inbox_df[inbox_df["request_type_clean"].eq("Booking Update")],
         "Appointments": inbox_df[inbox_df["request_type_clean"].eq("Appointment Update")],
         "Quote Requests": inbox_df[inbox_df["request_type_clean"].eq("Quote Request")],
+        "Missing Info": inbox_df[inbox_df["request_type_clean"].eq("Missing Information")],
         "Customer Requests": inbox_df[
             inbox_df["request_type_clean"].isin(["Customer Request", "POD Request"])
         ],
         "Cancellations": inbox_df[inbox_df["request_type_clean"].eq("Cancellation")],
+        "Waiting": inbox_df[inbox_df["review_status_clean"].eq("Waiting on Customer")],
         "Needs Review": inbox_df[
             inbox_df["request_type_clean"].isin(["Needs Classification", "Other"])
             | inbox_df["confidence_score"].fillna(0).lt(70)
@@ -1246,6 +1550,7 @@ def render_operations_inbox() -> None:
         "id",
         "created_at",
         "request_type",
+        "review_status",
         "source_sender",
         "source_subject",
         "matched_load_id",
@@ -1315,9 +1620,7 @@ def render_operations_inbox() -> None:
     st.divider()
 
     record = record_df.iloc[0]
-    parsed = record.get("parsed_data") or {}
-    if not isinstance(parsed, dict):
-        parsed = {}
+    parsed = _coerce_json_dict(record.get("parsed_data"))
 
     subject = str(record.get("source_subject", "") or "")
     sender = str(record.get("source_sender", "") or "")
@@ -1364,6 +1667,89 @@ def render_operations_inbox() -> None:
         )
         st.success("Classification saved.")
         st.rerun()
+
+    st.markdown("### Customer Email Reply")
+    with st.form(f"operations_email_reply_{selected_id}"):
+        reply_to = st.text_input(
+            "To",
+            value=_extract_email_address(sender),
+            key=f"operations_reply_to_{selected_id}",
+        )
+        reply_subject = st.text_input(
+            "Subject",
+            value=_default_operations_reply_subject(subject, request_type),
+            key=f"operations_reply_subject_{selected_id}",
+        )
+        reply_body = st.text_area(
+            "Message",
+            value=_default_operations_reply_body(request_type, parsed, matched_load_id),
+            height=220,
+            key=f"operations_reply_body_{selected_id}",
+        )
+        mark_waiting = st.checkbox(
+            "Mark waiting on customer after sending",
+            value=True,
+            key=f"operations_reply_waiting_{selected_id}",
+        )
+        send_reply = st.form_submit_button("Send Email Reply")
+
+    if send_reply:
+        if not reply_to.strip():
+            st.error("Reply recipient is required.")
+        elif not reply_subject.strip() or not reply_body.strip():
+            st.error("Subject and message are required.")
+        else:
+            try:
+                _send_smtp_email(reply_to.strip(), reply_subject.strip(), reply_body.strip())
+                save_operations_email_reply(
+                    intake_id=int(selected_id),
+                    load_id=matched_load_id,
+                    recipient=reply_to.strip(),
+                    subject=reply_subject.strip(),
+                    body=reply_body.strip(),
+                    status="sent",
+                )
+
+                if matched_load_id is not None:
+                    save_load_communication(
+                        matched_load_id,
+                        int(selected_id),
+                        conversation_key,
+                        request_type,
+                        reply_subject.strip(),
+                        reply_to.strip(),
+                        reply_body.strip(),
+                        direction="outbound",
+                    )
+
+                if mark_waiting:
+                    execute(
+                        """
+                        update order_intake
+                        set review_status = 'Waiting on Customer',
+                            action_required = 'Reply sent; waiting on customer response.'
+                        where id = :intake_id
+                        """,
+                        {"intake_id": int(selected_id)},
+                    )
+
+                st.success(f"Email sent to {reply_to.strip()}.")
+                refresh_data()
+                st.rerun()
+            except Exception as exc:
+                try:
+                    save_operations_email_reply(
+                        intake_id=int(selected_id),
+                        load_id=matched_load_id,
+                        recipient=reply_to.strip(),
+                        subject=reply_subject.strip(),
+                        body=reply_body.strip(),
+                        status="failed",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+                st.error(f"Email was not sent: {exc}")
 
     st.markdown("### Operations Actions")
 
@@ -2062,17 +2448,6 @@ def _save_status_quick_update(load_id: int, selected_load, new_status: str, note
 
     return _send_customer_status_update_email(load_id, selected_load, old_status, new_status, note)
 
-if st.button("Test Email"):
-    try:
-        _send_smtp_email(
-            "YOURPERSONALEMAIL@gmail.com",
-            "CaliTrans Test Email",
-            "This is a test email from CaliTrans TMS."
-        )
-        st.success("Test email sent.")
-    except Exception as e:
-        st.error(f"Test email failed: {e}")
-
 def render_dispatch_workspace(selected_load) -> None:
     load_id = int(selected_load["_row_id"])
     booking = str(selected_load.get("Booking Number", "") or "")
@@ -2641,6 +3016,154 @@ def render_dispatch_board(df: pd.DataFrame) -> None:
 
         if selected_load is not None:
             open_load_workspace_dialog(selected_load)
+
+
+def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
+    selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
+
+    if selected_df.empty:
+        st.warning("Selected order was not found.")
+        return
+
+    selected_load = selected_df.iloc[0]
+    safe_context = re.sub(r"[^A-Za-z0-9_]+", "_", context_key)
+    form_key = f"order_detail_editor_{safe_context}_{selected_row_id}"
+
+    header_cols = st.columns([4, 1])
+    with header_cols[0]:
+        st.markdown("### Order Detail Editor")
+        st.caption(
+            f"Editing: {selected_load.get('Booking Number', '')} | "
+            f"{selected_load.get('Customer', '')} | row {selected_row_id}"
+        )
+    with header_cols[1]:
+        if st.button("Clear Editor", key=f"clear_order_editor_{safe_context}_{selected_row_id}", use_container_width=True):
+            st.session_state.pop("orders_management_selected_row_id", None)
+            st.session_state.pop("orders_management_selected_context", None)
+            st.rerun()
+
+    with st.form(form_key):
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            type_val = st.selectbox(
+                "TYPE",
+                LOAD_TYPE_TABS,
+                index=LOAD_TYPE_TABS.index(_safe_str(selected_load.get("TYPE", "")))
+                if _safe_str(selected_load.get("TYPE", "")) in LOAD_TYPE_TABS else 0,
+                key=f"{form_key}_type",
+            )
+            booking = st.text_input("Booking Number", value=_safe_str(selected_load.get("Booking Number", "")), key=f"{form_key}_booking")
+            load_id = st.text_input("Load ID", value=_safe_str(selected_load.get("Load ID", "")), key=f"{form_key}_load_id")
+            reference = st.text_input("Reference Number", value=_safe_str(selected_load.get("Reference Number", "")), key=f"{form_key}_reference")
+            customer = st.text_input("Customer", value=_safe_str(selected_load.get("Customer", "")), key=f"{form_key}_customer")
+            container = st.text_input("Container Number", value=_safe_str(selected_load.get("Container Number", "")), key=f"{form_key}_container")
+
+        with c2:
+            port = st.text_input("Port / Pickup", value=_safe_str(selected_load.get("Port", "")), key=f"{form_key}_port")
+            warehouse = st.text_input("Warehouse / Delivery", value=_safe_str(selected_load.get("Warehouse", "")), key=f"{form_key}_warehouse")
+            address = st.text_input("Address", value=_safe_str(selected_load.get("Address", "")), key=f"{form_key}_address")
+            delivery_need = st.date_input(
+                "Delivery Need Date",
+                value=_parse_date_or_none(selected_load.get("Delivery Need Date", "")),
+                key=f"{form_key}_delivery_need",
+            )
+            lfd = st.date_input(
+                "LFD",
+                value=_parse_date_or_none(selected_load.get("LFD", "")),
+                key=f"{form_key}_lfd",
+            )
+
+        with c3:
+            status = st.selectbox(
+                "Status",
+                LOAD_STATUS_FLOW,
+                index=LOAD_STATUS_FLOW.index(_safe_str(selected_load.get("Status", "New")))
+                if _safe_str(selected_load.get("Status", "New")) in LOAD_STATUS_FLOW else 0,
+                key=f"{form_key}_status",
+            )
+            driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")), key=f"{form_key}_driver")
+            truck = st.text_input("Truck Assigned", value=_safe_str(selected_load.get("Truck Assigned", "")), key=f"{form_key}_truck")
+            chassis = st.text_input("Chassis", value=_safe_str(selected_load.get("Chassis", "")), key=f"{form_key}_chassis")
+            notes = st.text_area(
+                "Dispatcher Notes",
+                value=_safe_str(selected_load.get("Dispatcher Notes", "")),
+                height=135,
+                key=f"{form_key}_notes",
+            )
+
+        save_order = st.form_submit_button("Save Order Updates")
+
+    if save_order:
+        updates = {
+            "type": type_val,
+            "booking_number": booking.strip(),
+            "load_id": load_id.strip(),
+            "reference_number": reference.strip(),
+            "customer": customer.strip(),
+            "container_number": container.strip(),
+            "port": port.strip(),
+            "warehouse": warehouse.strip(),
+            "address": address.strip(),
+            "delivery_need_date": delivery_need,
+            "lfd": lfd,
+            "status": status,
+            "driver_name": driver.strip(),
+            "truck_assigned": truck.strip(),
+            "chassis": chassis.strip(),
+            "dispatcher_notes": notes.strip(),
+        }
+
+        DispatchDatabaseClient().update_row_fields(selected_row_id, updates)
+        st.session_state.pop("orders_management_selected_row_id", None)
+        st.session_state.pop("orders_management_selected_context", None)
+        refresh_data()
+        st.success("Order updated successfully.")
+        st.rerun()
+
+    st.markdown("#### Quick Actions")
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        if st.button("Mark Missing Info", key=f"quick_missing_info_{safe_context}_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {
+                    "Status": "Hold/Need Info",
+                    "Dispatcher Notes": notes.strip() or "Missing information requested from customer.",
+                },
+            )
+            st.session_state.pop("orders_management_selected_row_id", None)
+            st.session_state.pop("orders_management_selected_context", None)
+            refresh_data()
+            st.warning("Order marked Hold/Need Info.")
+            st.rerun()
+    with q2:
+        if st.button("Move To Dispatch", key=f"quick_ready_dispatch_{safe_context}_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {
+                    "Status": "Ready to Dispatch",
+                    "Dispatcher Notes": notes.strip() or "Order reviewed and moved to dispatch.",
+                },
+            )
+            st.session_state.pop("orders_management_selected_row_id", None)
+            st.session_state.pop("orders_management_selected_context", None)
+            refresh_data()
+            st.success("Order moved to Dispatch Board.")
+            st.rerun()
+    with q3:
+        if st.button("Cancel Order", key=f"quick_cancel_order_{safe_context}_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {"Status": "Cancelled"},
+            )
+            st.session_state.pop("orders_management_selected_row_id", None)
+            st.session_state.pop("orders_management_selected_context", None)
+            refresh_data()
+            st.error("Order cancelled.")
+            st.rerun()
+
+
 def render_orders_management(df: pd.DataFrame) -> None:
     st.subheader("Orders / Load Management")
     st.caption("Manage orders after they are created from Operations Inbox.")
@@ -2676,6 +3199,10 @@ def render_orders_management(df: pd.DataFrame) -> None:
         "Chassis", "Dispatcher Notes",
     ]
 
+    def clear_order_editor() -> None:
+        st.session_state.pop("orders_management_selected_row_id", None)
+        st.session_state.pop("orders_management_selected_context", None)
+
     def render_clickable_order_table(table_df: pd.DataFrame, title: str):
         st.markdown(f"### {title}")
         st.caption(f"{len(table_df)} order(s)")
@@ -2684,164 +3211,74 @@ def render_orders_management(df: pd.DataFrame) -> None:
             st.info(f"No {title.lower()} orders.")
             return
 
-        type_tabs = st.tabs(LOAD_TYPE_TABS)
+        type_key = f"orders_management_type_{re.sub(r'[^A-Za-z0-9_]+', '_', title)}"
+        type_value = st.radio("Load Type", LOAD_TYPE_TABS, horizontal=True, key=type_key)
+        last_type_key = f"{type_key}_last"
+        if st.session_state.get(last_type_key) != type_value:
+            st.session_state[last_type_key] = type_value
+            clear_order_editor()
 
-        for type_tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
-            with type_tab:
-                type_df = table_df[
-                    table_df["TYPE"].astype(str).str.strip().eq(type_value)
-                ].copy()
+        type_df = table_df[
+            table_df["TYPE"].astype(str).str.strip().eq(type_value)
+        ].copy()
 
-                st.markdown(f"#### {type_value}")
-                st.caption(f"{len(type_df)} order(s)")
+        st.markdown(f"#### {type_value}")
+        st.caption(f"{len(type_df)} order(s)")
 
-                if type_df.empty:
-                    st.info(f"No {type_value} orders.")
-                    continue
+        if type_df.empty:
+            st.info(f"No {type_value} orders.")
+            return
 
-                display_cols = [c for c in columns if c in type_df.columns]
+        display_cols = [c for c in columns if c in type_df.columns]
+        sorted_type_df = type_df.sort_values("_row_id", ascending=False)
+        context_key = f"{title}_{type_value}"
 
-                event = st.dataframe(
-                    type_df.sort_values("_row_id", ascending=False)[display_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key=f"orders_table_{title}_{type_value}",
-                )
+        event = st.dataframe(
+            sorted_type_df[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key=f"orders_table_{title}_{type_value}",
+        )
 
-                selected_rows = event.selection.rows
+        selected_rows = event.selection.rows
 
-                if selected_rows:
-                    selected_row_id = int(
-                        type_df.sort_values("_row_id", ascending=False)
-                        .iloc[selected_rows[0]]["_row_id"]
-                    )
+        if selected_rows:
+            selected_row_id = int(sorted_type_df.iloc[selected_rows[0]]["_row_id"])
+            st.session_state["orders_management_selected_row_id"] = selected_row_id
+            st.session_state["orders_management_selected_context"] = context_key
 
-                    st.session_state["orders_management_selected_row_id"] = selected_row_id
+        selected_context = st.session_state.get("orders_management_selected_context")
+        selected_row_id = st.session_state.get("orders_management_selected_row_id")
 
-                    if st.button(
-                        f"Open Order #{selected_row_id}",
-                        key=f"open_order_{title}_{type_value}_{selected_row_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state["orders_management_selected_row_id"] = selected_row_id
-                        st.rerun()
+        if selected_context == context_key and selected_row_id is not None:
+            visible_ids = set(sorted_type_df["_row_id"].dropna().astype(int).tolist())
+            if int(selected_row_id) in visible_ids:
+                st.divider()
+                _render_order_detail_editor(work_df, int(selected_row_id), context_key)
 
-    main_tabs = st.tabs([
+    queue_options = [
         "Planning",
         "Ready for Dispatch",
         "Active Orders",
         "Closed / Billing",
-    ])
+    ]
+    queue_map = {
+        "Planning": planning_df,
+        "Ready for Dispatch": ready_df,
+        "Active Orders": active_df,
+        "Closed / Billing": closed_df,
+    }
 
-    with main_tabs[0]:
-        render_clickable_order_table(planning_df, "Planning")
+    selected_queue = st.radio("Order Queue", queue_options, horizontal=True, key="orders_management_queue")
+    if st.session_state.get("orders_management_last_queue") != selected_queue:
+        st.session_state["orders_management_last_queue"] = selected_queue
+        clear_order_editor()
 
-    with main_tabs[1]:
-        render_clickable_order_table(ready_df, "Ready for Dispatch")
+    render_clickable_order_table(queue_map[selected_queue], selected_queue)
 
-    with main_tabs[2]:
-        render_clickable_order_table(active_df, "Active Orders")
-
-    with main_tabs[3]:
-        render_clickable_order_table(closed_df, "Closed / Billing")
-
-    st.divider()
-    st.markdown("### Order Detail Editor")
-
-    selected_row_id = st.session_state.get("orders_management_selected_row_id")
-
-    if selected_row_id is None:
-        st.info("Click a row above, then click Open Order to edit it.")
-        return
-
-    selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
-
-    if selected_df.empty:
-        st.warning("Selected order was not found.")
-        return
-
-    selected_load = selected_df.iloc[0]
-
-    st.caption(
-        f"Editing: {selected_load.get('Booking Number', '')} | "
-        f"{selected_load.get('Customer', '')} | row {selected_row_id}"
-    )
-
-    with st.form(f"order_detail_editor_{selected_row_id}"):
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            type_val = st.selectbox(
-                "TYPE",
-                LOAD_TYPE_TABS,
-                index=LOAD_TYPE_TABS.index(_safe_str(selected_load.get("TYPE", "")))
-                if _safe_str(selected_load.get("TYPE", "")) in LOAD_TYPE_TABS else 0,
-            )
-            booking = st.text_input("Booking Number", value=_safe_str(selected_load.get("Booking Number", "")))
-            load_id = st.text_input("Load ID", value=_safe_str(selected_load.get("Load ID", "")))
-            reference = st.text_input("Reference Number", value=_safe_str(selected_load.get("Reference Number", "")))
-            customer = st.text_input("Customer", value=_safe_str(selected_load.get("Customer", "")))
-            container = st.text_input("Container Number", value=_safe_str(selected_load.get("Container Number", "")))
-
-        with c2:
-            port = st.text_input("Port / Pickup", value=_safe_str(selected_load.get("Port", "")))
-            warehouse = st.text_input("Warehouse / Delivery", value=_safe_str(selected_load.get("Warehouse", "")))
-            address = st.text_input("Address", value=_safe_str(selected_load.get("Address", "")))
-            delivery_need = st.date_input(
-                "Delivery Need Date",
-                value=_parse_date_or_none(selected_load.get("Delivery Need Date", "")),
-                key=f"order_delivery_need_{selected_row_id}",
-            )
-            lfd = st.date_input(
-                "LFD",
-                value=_parse_date_or_none(selected_load.get("LFD", "")),
-                key=f"order_lfd_{selected_row_id}",
-            )
-
-        with c3:
-            status = st.selectbox(
-                "Status",
-                LOAD_STATUS_FLOW,
-                index=LOAD_STATUS_FLOW.index(_safe_str(selected_load.get("Status", "New")))
-                if _safe_str(selected_load.get("Status", "New")) in LOAD_STATUS_FLOW else 0,
-            )
-            driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")))
-            truck = st.text_input("Truck Assigned", value=_safe_str(selected_load.get("Truck Assigned", "")))
-            chassis = st.text_input("Chassis", value=_safe_str(selected_load.get("Chassis", "")))
-            notes = st.text_area(
-                "Dispatcher Notes",
-                value=_safe_str(selected_load.get("Dispatcher Notes", "")),
-                height=135,
-            )
-
-        save_order = st.form_submit_button("Save Order Updates")
-
-    if save_order:
-        updates = {
-            "type": type_val,
-            "booking_number": booking.strip(),
-            "load_id": load_id.strip(),
-            "reference_number": reference.strip(),
-            "customer": customer.strip(),
-            "container_number": container.strip(),
-            "port": port.strip(),
-            "warehouse": warehouse.strip(),
-            "address": address.strip(),
-            "delivery_need_date": delivery_need,
-            "lfd": lfd,
-            "status": status,
-            "driver_name": driver.strip(),
-            "truck_assigned": truck.strip(),
-            "chassis": chassis.strip(),
-            "dispatcher_notes": notes.strip(),
-        }
-
-        DispatchDatabaseClient().update_row_fields(selected_row_id, updates)
-        refresh_data()
-        st.success("Order updated successfully.")
-        st.rerun()
+    st.caption("Select any order row to edit it under that queue. Changing queue or load type clears the previous editor.")
 def render_billing(df: pd.DataFrame) -> None:
     st.subheader("Billing / ProfitTools")
 
