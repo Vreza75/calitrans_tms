@@ -178,9 +178,11 @@ def create_load_from_intake(record_id: int, edited_data: dict[str, Any]) -> int:
             "Container Number": edited_data.get("Container Number", ""),
             "Port": edited_data.get("Port", ""),
             "Warehouse": edited_data.get("Warehouse", ""),
+            "Address": edited_data.get("Address", ""),
             "Document Cutoff": edited_data.get("Document Cutoff", ""),
             "Delivery Need Date": edited_data.get("Delivery Need Date", ""),
             "LFD": edited_data.get("LFD", ""),
+            "Size": edited_data.get("Size", ""),
             "Status": edited_data.get("Status", "New") or "New",
             "Dispatcher Notes": edited_data.get("Dispatcher Notes", ""),
         }

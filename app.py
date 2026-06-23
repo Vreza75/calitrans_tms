@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from datetime import date, datetime
 from email.utils import parseaddr
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, unquote
 import base64
 import os
 import smtplib
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.message import EmailMessage
@@ -16,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from admin_pages import render_master_data_admin
-from config import ACTIVE_STATUSES, APP_NAME, EDITABLE_COLUMNS
+from config import ACTIVE_STATUSES, APP_NAME, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS
 from db_client import DispatchDatabaseClient, execute, read_df
 from email_client import fetch_recent_operations_emails
 from email_parser import parse_email_text
@@ -26,6 +28,18 @@ from operations_ai import (
     is_operations_ai_configured,
 )
 from order_parser import extract_text_from_pdf, parse_order_text
+from port_houston_client import (
+    BOOKING_FIELDS,
+    PortHoustonClient,
+    PortHoustonError,
+    UNIT_FIELDS,
+    VESSEL_FIELDS,
+    content_records,
+    flatten_record,
+    get_nested,
+    get_port_houston_settings,
+    summarize_unit,
+)
 from profittools_export import export_ready_loads
 from validators import validate_dispatch_rows
 from order_intake import get_intake_queue, get_intake_record, create_load_from_intake, update_intake_status, render_order_upload_panel, render_email_intake_panel
@@ -948,6 +962,24 @@ INBOX_TERMINAL_REVIEW_STATUSES = [
     "Closed",
 ]
 
+DEFAULT_OPERATIONS_QUEUE_ORDER = [
+    "All",
+    "Needs Details",
+    "Customer Requests",
+    "New Bookings",
+    "Booking Updates",
+    "Appointments",
+    "Quote Requests",
+    "Missing Info",
+    "POD Requests",
+    "Cancellations",
+    "Waiting",
+    "Needs Review",
+]
+
+OPERATIONS_QUEUE_ORDER_SESSION_KEY = "operations_queue_order"
+OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY = "operations_inbox_queue_order"
+
 
 def _normalize_reference_token(value: str) -> str:
     return re.sub(r"\s+", "-", str(value or "").strip(" :#-")).upper()
@@ -1000,6 +1032,13 @@ APPOINTMENT_INTENT_TERMS = [
     "move appointment",
     "change time",
     "change date",
+    "cita",
+    "cita de entrega",
+    "cita de recogida",
+    "programar",
+    "reprogramar",
+    "cambiar hora",
+    "cambiar fecha",
 ]
 
 QUOTE_INTENT_TERMS = [
@@ -1014,6 +1053,13 @@ QUOTE_INTENT_TERMS = [
     "can you quote",
     "quote this",
     "rate this",
+    "cotizacion",
+    "cotización",
+    "tarifa",
+    "precio",
+    "solicitud de tarifa",
+    "pueden cotizar",
+    "necesito tarifa",
 ]
 
 UPDATE_INTENT_TERMS = [
@@ -1034,6 +1080,17 @@ UPDATE_INTENT_TERMS = [
     "released",
     "last free day",
     "lfd",
+    "actualizacion",
+    "actualización",
+    "estado",
+    "estatus",
+    "alguna novedad",
+    "donde esta",
+    "dónde está",
+    "contenedor liberado",
+    "liberado",
+    "ultimo dia libre",
+    "último día libre",
 ]
 
 NEW_ORDER_INTENT_TERMS = [
@@ -1049,6 +1106,11 @@ NEW_ORDER_INTENT_TERMS = [
     "attached order",
     "attached load",
     "please book",
+    "nuevo booking",
+    "nueva carga",
+    "orden de carga",
+    "orden adjunta",
+    "favor reservar",
 ]
 
 MISSING_INFO_TERMS = [
@@ -1058,12 +1120,88 @@ MISSING_INFO_TERMS = [
     "need information",
     "incomplete",
     "please provide",
+    "falta informacion",
+    "falta información",
+    "informacion faltante",
+    "información faltante",
+    "incompleto",
+    "por favor envie",
+    "por favor envíe",
+]
+
+CANCELLATION_TERMS = ["cancel", "cancelled", "canceled", "cancelar", "cancelado", "cancelacion", "cancelación"]
+POD_TERMS = ["pod", "proof of delivery", "prueba de entrega", "comprobante de entrega"]
+
+REPLY_LANGUAGE_OPTIONS = ["Auto", "English", "Spanish", "Bilingual"]
+
+SPANISH_LANGUAGE_TERMS = [
+    "actualizacion",
+    "actualización",
+    "carga",
+    "contenedor",
+    "cotizacion",
+    "cotización",
+    "entrega",
+    "estado",
+    "favor",
+    "gracias",
+    "hola",
+    "informacion",
+    "información",
+    "necesito",
+    "pod",
+    "podria",
+    "podría",
+    "puede",
+    "pueden",
+    "recogida",
+    "referencia",
+    "reserva",
+    "solicito",
+]
+
+ENGLISH_LANGUAGE_TERMS = [
+    "appointment",
+    "booking",
+    "container",
+    "delivery",
+    "hello",
+    "information",
+    "please",
+    "quote",
+    "rate",
+    "reference",
+    "request",
+    "status",
+    "thank",
+    "update",
 ]
 
 
 def _contains_any(text: str, terms: list[str]) -> bool:
     lowered = str(text or "").lower()
     return any(term in lowered for term in terms)
+
+
+def _detect_customer_language(subject: str, body: str) -> str:
+    text = f"{subject or ''} {body or ''}".lower()
+    spanish_score = sum(1 for term in SPANISH_LANGUAGE_TERMS if term in text)
+    english_score = sum(1 for term in ENGLISH_LANGUAGE_TERMS if term in text)
+
+    if spanish_score >= 2 and english_score >= 2:
+        return "Bilingual"
+    if spanish_score > english_score:
+        return "Spanish"
+    return "English"
+
+
+def _resolve_reply_language(reply_language: str, subject: str, body: str) -> str:
+    reply_language = str(reply_language or "Auto").strip()
+    if reply_language == "Auto":
+        return _detect_customer_language(subject, body)
+    if reply_language in REPLY_LANGUAGE_OPTIONS:
+        return reply_language
+    return "English"
 
 
 def _coerce_parsed_for_classification(subject: str, body: str, parsed: dict | None = None) -> dict:
@@ -1131,10 +1269,10 @@ def classify_customer_request(subject: str, body: str, parsed: dict | None = Non
     if _contains_any(text, MISSING_INFO_TERMS):
         return "Missing Information"
 
-    if _contains_any(text, ["cancel", "cancelled", "canceled"]):
+    if _contains_any(text, CANCELLATION_TERMS):
         return "Cancellation" if has_reference else "Customer Request"
 
-    if _contains_any(text, ["pod", "proof of delivery"]):
+    if _contains_any(text, POD_TERMS):
         return "POD Request" if has_reference else "Customer Request"
 
     if _contains_any(text, APPOINTMENT_INTENT_TERMS):
@@ -1319,9 +1457,338 @@ def _json_dump(data: dict) -> str:
     return json.dumps(data or {}, default=str)
 
 
+def _normalize_operations_queue_order(order: list[str] | tuple[str, ...] | None) -> list[str]:
+    available = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
+    incoming = [str(item) for item in (order or []) if str(item) in available]
+    normalized = []
+    for item in incoming + available:
+        if item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def _ensure_operations_inbox_preferences_table() -> None:
+    execute(
+        """
+        create table if not exists operations_inbox_preferences (
+            preference_name text primary key,
+            preference_value jsonb not null,
+            updated_at timestamptz not null default now()
+        )
+        """
+    )
+
+
+def _load_operations_queue_order() -> list[str]:
+    session_order = st.session_state.get(OPERATIONS_QUEUE_ORDER_SESSION_KEY)
+    if session_order:
+        order = _normalize_operations_queue_order(session_order)
+        st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
+        return order
+
+    try:
+        _ensure_operations_inbox_preferences_table()
+        pref_df = read_df(
+            """
+            select preference_value
+            from operations_inbox_preferences
+            where preference_name = :preference_name
+            limit 1
+            """,
+            {"preference_name": OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY},
+        )
+        if not pref_df.empty:
+            value = pref_df.iloc[0].get("preference_value")
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                value = value.get("order", [])
+            order = _normalize_operations_queue_order(value if isinstance(value, list) else [])
+            st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
+            return order
+    except Exception:
+        pass
+
+    order = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
+    st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
+    return order
+
+
+def _save_operations_queue_order(order: list[str]) -> bool:
+    normalized = _normalize_operations_queue_order(order)
+    st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = normalized
+    try:
+        _ensure_operations_inbox_preferences_table()
+        execute(
+            """
+            insert into operations_inbox_preferences (
+                preference_name,
+                preference_value,
+                updated_at
+            )
+            values (
+                :preference_name,
+                cast(:preference_value as jsonb),
+                now()
+            )
+            on conflict (preference_name)
+            do update set
+                preference_value = excluded.preference_value,
+                updated_at = now()
+            """,
+            {
+                "preference_name": OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY,
+                "preference_value": _json_dump({"order": normalized}),
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _move_operations_queue(order: list[str], queue_name: str, offset: int) -> list[str]:
+    updated = _normalize_operations_queue_order(order)
+    if queue_name not in updated:
+        return updated
+    index = updated.index(queue_name)
+    new_index = max(0, min(len(updated) - 1, index + offset))
+    if new_index == index:
+        return updated
+    item = updated.pop(index)
+    updated.insert(new_index, item)
+    return updated
+
+
+def _render_operations_queue_preferences(queue_order: list[str]) -> None:
+    with st.expander("Inbox Tab Preferences", expanded=False):
+        st.caption("Move your most-used Operations Inbox queues earlier in the list.")
+        move_queue = st.selectbox(
+            "Tab to move",
+            queue_order,
+            key="operations_queue_preference_target",
+        )
+        c1, c2, c3, c4 = st.columns(4)
+
+        if c1.button("Move Earlier", key="operations_queue_move_earlier", use_container_width=True):
+            updated = _move_operations_queue(queue_order, move_queue, -1)
+            if not _save_operations_queue_order(updated):
+                st.warning("Saved for this session only. Database preference table could not be updated.")
+            st.rerun()
+
+        if c2.button("Move Later", key="operations_queue_move_later", use_container_width=True):
+            updated = _move_operations_queue(queue_order, move_queue, 1)
+            if not _save_operations_queue_order(updated):
+                st.warning("Saved for this session only. Database preference table could not be updated.")
+            st.rerun()
+
+        if c3.button("Move First", key="operations_queue_move_first", use_container_width=True):
+            updated = _normalize_operations_queue_order(queue_order)
+            if move_queue in updated:
+                updated.remove(move_queue)
+                updated.insert(0, move_queue)
+            if not _save_operations_queue_order(updated):
+                st.warning("Saved for this session only. Database preference table could not be updated.")
+            st.rerun()
+
+        if c4.button("Reset Order", key="operations_queue_reset_order", use_container_width=True):
+            if not _save_operations_queue_order(list(DEFAULT_OPERATIONS_QUEUE_ORDER)):
+                st.warning("Saved for this session only. Database preference table could not be updated.")
+            st.rerun()
+
+        st.write("Current order: " + " | ".join(queue_order))
+
+
+OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
+OPERATIONS_ORDER_FIELDS = [
+    "TYPE",
+    "Customer",
+    "Booking Number",
+    "Reference Number",
+    "Container Number",
+    "Size",
+    "Port",
+    "Warehouse",
+    "Address",
+    "Delivery Need Date",
+    "Document Cutoff",
+    "LFD",
+    "Dispatcher Notes",
+]
+
+
+def _safe_storage_name(value: str, fallback: str = "file") -> str:
+    name = Path(str(value or fallback)).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name or fallback
+
+
+def _operations_pdf_storage_dir() -> Path:
+    storage_dir = Path(DOCUMENT_STORAGE_DIR) / "operations_inbox"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    return storage_dir
+
+
+def _parse_operations_pdf_bytes(content: bytes, filename: str) -> tuple[str, dict]:
+    pdf_file = BytesIO(content or b"")
+    pdf_file.name = filename or "attachment.pdf"
+    pdf_text = extract_text_from_pdf(pdf_file)
+    pdf_parsed = parse_order_text(pdf_text) if pdf_text else {}
+    return pdf_text, pdf_parsed
+
+
+def _field_count(parsed: dict) -> int:
+    return sum(1 for field in OPERATIONS_ORDER_FIELDS if _safe_str(parsed.get(field, "")))
+
+
+def _save_operations_pdf_attachment(
+    *,
+    content: bytes,
+    filename: str,
+    message_id: str,
+    attachment_index: int,
+) -> dict:
+    safe_message = _safe_storage_name(message_id, "operations_email")[:90]
+    safe_filename = _safe_storage_name(filename, f"attachment_{attachment_index}.pdf")
+    stored_path = _operations_pdf_storage_dir() / f"{safe_message}_{attachment_index}_{safe_filename}"
+    stored_path.write_bytes(content or b"")
+
+    try:
+        pdf_text, pdf_parsed = _parse_operations_pdf_bytes(content or b"", safe_filename)
+        parse_error = ""
+    except Exception as exc:
+        pdf_text = ""
+        pdf_parsed = {}
+        parse_error = str(exc)
+
+    return {
+        "filename": safe_filename,
+        "file_path": str(stored_path),
+        "content_type": "application/pdf",
+        "parsed_data": pdf_parsed,
+        "fields_found": _field_count(pdf_parsed),
+        "text_preview": pdf_text[:1800],
+        "parse_error": parse_error,
+        "imported_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
+    attachments = parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, [])
+    if not isinstance(attachments, list):
+        attachments = []
+
+    normalized = [item for item in attachments if isinstance(item, dict)]
+
+    if record is not None:
+        filename = _safe_str(record.get("filename", "") if hasattr(record, "get") else "")
+        file_path = _safe_str(record.get("file_path", "") if hasattr(record, "get") else "")
+        if filename and file_path and not any(_safe_str(item.get("file_path", "")) == file_path for item in normalized):
+            normalized.append(
+                {
+                    "filename": filename,
+                    "file_path": file_path,
+                    "content_type": "application/pdf",
+                    "parsed_data": {},
+                    "fields_found": 0,
+                    "text_preview": "",
+                    "parse_error": "",
+                }
+            )
+
+    return normalized
+
+
+def _operations_pdf_count_from_row(row) -> int:
+    parsed = _coerce_json_dict(row.get("parsed_data")) if hasattr(row, "get") else {}
+    return len(_extract_operations_pdf_attachments(parsed, row))
+
+
+def _merge_operations_order_fields(body_parsed: dict, pdf_parsed: dict) -> tuple[dict, list[dict], list[str]]:
+    final_data = {}
+    rows = []
+    conflicts = []
+
+    for field in OPERATIONS_ORDER_FIELDS:
+        body_value = _safe_str(body_parsed.get(field, ""))
+        pdf_value = _safe_str(pdf_parsed.get(field, ""))
+        final_value = pdf_value or body_value
+        final_data[field] = final_value
+
+        if body_value and pdf_value and body_value.lower() != pdf_value.lower():
+            status = "Review mismatch"
+            conflicts.append(field)
+        elif final_value:
+            status = "Found"
+        else:
+            status = "Blank"
+
+        rows.append(
+            {
+                "Field": field,
+                "Email Body": body_value,
+                "PDF": pdf_value,
+                "Final Value": final_value,
+                "Status": status,
+            }
+        )
+
+    return final_data, rows, conflicts
+
+
+def _store_operations_parsed_data(intake_id: int, parsed_data: dict, action_required: str | None = None) -> None:
+    execute(
+        """
+        update order_intake
+        set parsed_data = cast(:parsed_data as jsonb),
+            action_required = coalesce(:action_required, action_required)
+        where id = :intake_id
+        """,
+        {
+            "intake_id": int(intake_id),
+            "parsed_data": _json_dump(parsed_data),
+            "action_required": action_required,
+        },
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _read_operations_pdf_file(file_path: str, modified_ns: int) -> bytes:
+    return Path(file_path).read_bytes()
+
+
+def _read_operations_pdf_bytes(file_path: str) -> bytes:
+    path = Path(file_path)
+    return _read_operations_pdf_file(str(path), path.stat().st_mtime_ns)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _parse_operations_pdf_file(file_path: str, filename: str, modified_ns: int) -> tuple[str, dict]:
+    content = Path(file_path).read_bytes()
+    return _parse_operations_pdf_bytes(content, filename)
+
+
+def _parse_saved_operations_pdf(file_path: str, filename: str) -> tuple[str, dict]:
+    path = Path(file_path)
+    return _parse_operations_pdf_file(str(path), filename, path.stat().st_mtime_ns)
+
+
 def _extract_email_address(value: str) -> str:
     parsed = parseaddr(str(value or ""))
     return parsed[1] or str(value or "").strip()
+
+
+def _email_received_lookup_key(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(parsed):
+        return _safe_str(value)
+    return parsed.isoformat()
 
 
 def _inbox_review_where_clause() -> str:
@@ -1329,11 +1796,112 @@ def _inbox_review_where_clause() -> str:
     return f"where coalesce(review_status, 'Open') not in ({terminal})"
 
 
-def _operations_email_already_imported(message_id: str, subject: str, sender: str, received_at: str | None = None) -> bool:
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
+    return read_df(
+        f"""
+        select
+            id,
+            created_at,
+            source_received_at,
+            source,
+            source_subject,
+            source_sender,
+            filename,
+            file_path,
+            parsed_data,
+            left(coalesce(raw_text, ''), 1200) as raw_text_preview,
+            intake_status,
+            request_type,
+            conversation_key,
+            matched_load_id,
+            confidence_score,
+            action_required,
+            review_status
+        from order_intake
+        {where_clause}
+        order by created_at desc
+        """
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_inbox_record(intake_id: int) -> pd.DataFrame:
+    return read_df(
+        """
+        select
+            id,
+            created_at,
+            source_received_at,
+            source,
+            source_subject,
+            source_sender,
+            filename,
+            file_path,
+            parsed_data,
+            raw_text,
+            intake_status,
+            request_type,
+            conversation_key,
+            matched_load_id,
+            confidence_score,
+            action_required,
+            review_status
+        from order_intake
+        where id = :intake_id
+        limit 1
+        """,
+        {"intake_id": int(intake_id)},
+    )
+
+
+def _load_operations_inbox_record_set(where_clause: str) -> pd.DataFrame:
+    return read_df(
+        f"""
+        select
+            id,
+            source_subject,
+            parsed_data,
+            raw_text,
+            request_type,
+            conversation_key,
+            matched_load_id,
+            confidence_score,
+            action_required
+        from order_intake
+        {where_clause}
+        order by created_at desc
+        """
+    )
+
+
+def _operations_items_needing_smart_group_update(inbox_df: pd.DataFrame) -> pd.Series:
+    current_type = inbox_df["request_type"].fillna("").astype(str).str.strip()
+    confidence = pd.to_numeric(inbox_df["confidence_score"], errors="coerce").fillna(0)
+    has_match = inbox_df["matched_load_id"].notna() & ~inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
+
+    action_type_needs_reference = current_type.isin([
+        "New Booking",
+        "Booking Update",
+        "Appointment Update",
+        "Quote Request",
+        "Cancellation",
+        "POD Request",
+    ]) & ~has_match & confidence.lt(70)
+
+    return current_type.isin(["", "Needs Classification", "Other"]) | action_type_needs_reference
+
+
+def _find_existing_operations_email_record(
+    message_id: str,
+    subject: str,
+    sender: str,
+    received_at: str | None = None,
+) -> dict | None:
     if message_id:
         existing = read_df(
             """
-            select id
+            select id, parsed_data, filename, file_path, raw_text, action_required
             from order_intake
             where source_message_id = :message_id
             limit 1
@@ -1341,12 +1909,12 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
             {"message_id": message_id},
         )
         if not existing.empty:
-            return True
+            return existing.iloc[0].to_dict()
 
     if received_at:
         fallback = read_df(
             """
-            select id
+            select id, parsed_data, filename, file_path, raw_text, action_required
             from order_intake
             where source in ('operations_email', 'email_body', 'email_combined')
               and coalesce(source_subject, '') = :subject
@@ -1356,11 +1924,12 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
             """,
             {"subject": subject or "", "sender": sender or "", "received_at": received_at},
         )
-        return not fallback.empty
+        if not fallback.empty:
+            return fallback.iloc[0].to_dict()
 
     fallback = read_df(
         """
-        select id
+        select id, parsed_data, filename, file_path, raw_text, action_required
         from order_intake
         where source in ('operations_email', 'email_body', 'email_combined')
           and coalesce(source_subject, '') = :subject
@@ -1370,7 +1939,193 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
         """,
         {"subject": subject or "", "sender": sender or ""},
     )
-    return not fallback.empty
+    if not fallback.empty:
+        return fallback.iloc[0].to_dict()
+
+    return None
+
+
+def _load_existing_operations_email_lookup(limit: int = 5000) -> dict:
+    lookup = {
+        "loaded": False,
+        "by_message_id": {},
+        "by_received": {},
+        "by_subject_sender_no_received": {},
+    }
+
+    try:
+        existing_df = read_df(
+            """
+            select
+                id,
+                parsed_data,
+                filename,
+                file_path,
+                raw_text,
+                action_required,
+                source_message_id,
+                coalesce(source_subject, '') as source_subject,
+                coalesce(source_sender, '') as source_sender,
+                source_received_at
+            from order_intake
+            where source in ('operations_email', 'email_body', 'email_combined')
+               or source_message_id is not null
+            order by created_at desc
+            limit :limit
+            """,
+            {"limit": int(limit)},
+        )
+    except Exception:
+        return lookup
+
+    lookup["loaded"] = True
+    for _, row in existing_df.iterrows():
+        record = row.to_dict()
+        message_id = _safe_str(record.get("source_message_id", ""))
+        subject = _safe_str(record.get("source_subject", ""))
+        sender = _safe_str(record.get("source_sender", ""))
+        received_key = _email_received_lookup_key(record.get("source_received_at"))
+
+        if message_id and message_id not in lookup["by_message_id"]:
+            lookup["by_message_id"][message_id] = record
+        if received_key:
+            lookup["by_received"].setdefault((subject, sender, received_key), record)
+        else:
+            lookup["by_subject_sender_no_received"].setdefault((subject, sender), record)
+
+    return lookup
+
+
+def _find_existing_operations_email_record_from_lookup(
+    lookup: dict,
+    message_id: str,
+    subject: str,
+    sender: str,
+    received_at: str | None = None,
+) -> dict | None:
+    message_id = _safe_str(message_id)
+    subject = _safe_str(subject)
+    sender = _safe_str(sender)
+
+    if message_id:
+        existing = lookup.get("by_message_id", {}).get(message_id)
+        if existing:
+            return existing
+
+    received_key = _email_received_lookup_key(received_at)
+    if received_key:
+        existing = lookup.get("by_received", {}).get((subject, sender, received_key))
+        if existing:
+            return existing
+
+    return lookup.get("by_subject_sender_no_received", {}).get((subject, sender))
+
+
+def _operations_email_already_imported(message_id: str, subject: str, sender: str, received_at: str | None = None) -> bool:
+    return _find_existing_operations_email_record(message_id, subject, sender, received_at) is not None
+
+
+def _backfill_operations_pdf_attachments(
+    *,
+    existing_record: dict,
+    email_item: dict,
+    message_id: str,
+) -> int:
+    parsed = _coerce_json_dict(existing_record.get("parsed_data"))
+    existing_attachments = _extract_operations_pdf_attachments(parsed, existing_record)
+    existing_names = {_safe_str(item.get("filename", "")).lower() for item in existing_attachments}
+    existing_paths = {_safe_str(item.get("file_path", "")) for item in existing_attachments}
+
+    new_attachments = []
+    for attachment_index, attachment in enumerate(email_item.get("attachments", []) or [], start=1):
+        filename = _safe_str(attachment.get("filename", ""))
+        content = attachment.get("content") or b""
+        if not filename.lower().endswith(".pdf") or not content:
+            continue
+        if filename.lower() in existing_names:
+            continue
+
+        saved = _save_operations_pdf_attachment(
+            content=content,
+            filename=filename,
+            message_id=message_id or f"intake-{existing_record.get('id')}",
+            attachment_index=len(existing_attachments) + len(new_attachments) + attachment_index,
+        )
+        if _safe_str(saved.get("file_path", "")) in existing_paths:
+            continue
+        new_attachments.append(saved)
+
+    if not new_attachments:
+        return 0
+
+    merged_attachments = existing_attachments + new_attachments
+    updated_parsed = dict(parsed)
+    for attachment in new_attachments:
+        pdf_parsed = attachment.get("parsed_data") or {}
+        for field in OPERATIONS_ORDER_FIELDS:
+            if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(updated_parsed.get(field, "")):
+                updated_parsed[field] = _safe_str(pdf_parsed.get(field, ""))
+    updated_parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = merged_attachments
+
+    primary = merged_attachments[0]
+    execute(
+        """
+        update order_intake
+        set parsed_data = cast(:parsed_data as jsonb),
+            filename = coalesce(filename, :filename),
+            file_path = coalesce(file_path, :file_path),
+            action_required = case
+                when coalesce(action_required, '') = '' then :action_required
+                else action_required
+            end
+        where id = :intake_id
+        """,
+        {
+            "intake_id": int(existing_record["id"]),
+            "parsed_data": _json_dump(updated_parsed),
+            "filename": primary.get("filename"),
+            "file_path": primary.get("file_path"),
+            "action_required": _order_action_required_from_parsed(updated_parsed),
+        },
+    )
+
+    return len(new_attachments)
+
+
+def _operations_inbox_status_counts() -> pd.DataFrame:
+    try:
+        return read_df(
+            """
+            select
+                coalesce(review_status, 'Open') as review_status,
+                count(*) as email_count
+            from order_intake
+            where source in ('operations_email', 'email_body', 'email_combined')
+            group by coalesce(review_status, 'Open')
+            order by email_count desc, review_status
+            """
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _render_no_open_inbox_explanation() -> None:
+    result = st.session_state.get("operations_email_import_result") or {}
+    fetched = int(result.get("fetched", 0) or 0)
+    imported = int(result.get("imported", 0) or 0)
+    skipped = int(result.get("skipped", 0) or 0)
+
+    if fetched > 0 and imported == 0 and skipped > 0:
+        st.info(
+            "The recent Yahoo scan found emails that are already saved in Operations Inbox. "
+            "Nothing new was added, so if no rows appear here, those saved requests are likely already closed, attached, "
+            "converted to orders/quotes, or otherwise filtered out of the open inbox."
+        )
+
+    status_counts = _operations_inbox_status_counts()
+    if not status_counts.empty:
+        st.caption("Saved operations email status counts")
+        st.dataframe(status_counts, use_container_width=True, hide_index=True)
 
 
 def _action_required_for_request(
@@ -1514,6 +2269,62 @@ def _build_operations_email_classification(
         "tokens": tokens,
         "matched_load_id": matched_load_id,
         "confidence_score": confidence,
+        "conversation_key": conversation_key,
+        "action_required": action_required,
+    }
+
+
+def _operations_classification_for_review(record, parsed: dict, subject: str, body: str, fallback_key: str) -> dict:
+    saved_type = _safe_str(record.get("request_type", ""))
+    saved_confidence = pd.to_numeric(record.get("confidence_score", 0), errors="coerce")
+    if pd.isna(saved_confidence):
+        saved_confidence = 0
+
+    saved_match = record.get("matched_load_id")
+    saved_matched_load_id = None
+    if pd.notna(saved_match) and _safe_str(saved_match):
+        try:
+            saved_matched_load_id = int(saved_match)
+        except Exception:
+            saved_matched_load_id = None
+
+    saved_is_usable = (
+        saved_type in REQUEST_TYPES
+        and saved_type not in ["Needs Classification", "Other"]
+        and (int(saved_confidence) >= 70 or saved_matched_load_id is not None)
+    )
+
+    if not saved_is_usable:
+        return _build_operations_email_classification(
+            subject,
+            body,
+            parsed,
+            fallback_key=fallback_key,
+        )
+
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    conversation_key = (
+        _safe_str(record.get("conversation_key", ""))
+        or tokens.get("booking_number")
+        or tokens.get("container_number")
+        or tokens.get("reference_number")
+        or fallback_key
+        or "customer-request"
+    )
+    action_required = _safe_str(record.get("action_required", "")) or _action_required_for_request(
+        saved_type,
+        parsed,
+        body,
+        subject=subject,
+        tokens=tokens,
+        matched_load_id=saved_matched_load_id,
+    )
+
+    return {
+        "request_type": saved_type,
+        "tokens": tokens,
+        "matched_load_id": saved_matched_load_id,
+        "confidence_score": int(saved_confidence),
         "conversation_key": conversation_key,
         "action_required": action_required,
     }
@@ -2030,10 +2841,12 @@ def _apply_ai_suggestion_to_classification(
     return updated
 
 
-def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
+def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int]:
     emails = fetch_recent_operations_emails(limit=limit)
+    existing_lookup = _load_existing_operations_email_lookup()
     imported = 0
     skipped = 0
+    pdf_updated = 0
     fetched = len(emails)
 
     for item in emails:
@@ -2043,14 +2856,53 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
         message_id = str(item.get("message_id", "") or item.get("id", "") or "")
         received_at = item.get("received_at")
 
-        if _operations_email_already_imported(message_id, subject, sender, received_at):
+        if existing_lookup.get("loaded"):
+            existing_record = _find_existing_operations_email_record_from_lookup(
+                existing_lookup,
+                message_id,
+                subject,
+                sender,
+                received_at,
+            )
+        else:
+            existing_record = _find_existing_operations_email_record(message_id, subject, sender, received_at)
+        if existing_record:
+            pdf_updated += _backfill_operations_pdf_attachments(
+                existing_record=existing_record,
+                email_item=item,
+                message_id=message_id or f"email-{skipped + 1}",
+            )
             skipped += 1
             continue
 
         try:
-            parsed = parse_email_text(subject, body)
+            body_parsed = parse_email_text(subject, body)
         except Exception:
-            parsed = {}
+            body_parsed = {}
+
+        pdf_attachments = []
+        for attachment_index, attachment in enumerate(item.get("attachments", []) or [], start=1):
+            filename = _safe_str(attachment.get("filename", ""))
+            content = attachment.get("content") or b""
+            if not filename.lower().endswith(".pdf") or not content:
+                continue
+            pdf_attachments.append(
+                _save_operations_pdf_attachment(
+                    content=content,
+                    filename=filename,
+                    message_id=message_id or f"operations-{imported + 1}",
+                    attachment_index=attachment_index,
+                )
+            )
+
+        parsed = dict(body_parsed)
+        if pdf_attachments:
+            for attachment in pdf_attachments:
+                pdf_parsed = attachment.get("parsed_data") or {}
+                for field in OPERATIONS_ORDER_FIELDS:
+                    if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(parsed.get(field, "")):
+                        parsed[field] = _safe_str(pdf_parsed.get(field, ""))
+            parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = pdf_attachments
 
         classification = _build_operations_email_classification(
             subject,
@@ -2069,6 +2921,7 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
                 load_context=load_context,
                 load_candidates=load_candidates,
                 feedback_examples=_recent_operations_ai_feedback_examples(),
+                response_language=_resolve_reply_language("Auto", subject, body),
                 company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
             )
             classification = _apply_ai_suggestion_to_classification(classification, ai_suggestion, load_candidates)
@@ -2081,6 +2934,8 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
                 source_sender,
                 source_received_at,
                 source_message_id,
+                filename,
+                file_path,
                 parsed_data,
                 raw_text,
                 intake_status,
@@ -2097,6 +2952,8 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
                 :source_sender,
                 :source_received_at,
                 :source_message_id,
+                :filename,
+                :file_path,
                 cast(:parsed_data as jsonb),
                 :raw_text,
                 'Needs Review',
@@ -2113,6 +2970,8 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
                 "source_sender": sender,
                 "source_received_at": received_at,
                 "source_message_id": message_id or None,
+                "filename": pdf_attachments[0].get("filename") if pdf_attachments else None,
+                "file_path": pdf_attachments[0].get("file_path") if pdf_attachments else None,
                 "parsed_data": _json_dump(parsed),
                 "raw_text": body,
                 "request_type": classification["request_type"],
@@ -2124,7 +2983,7 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
         )
         imported += 1
 
-    return imported, skipped, fetched
+    return imported, skipped, fetched, pdf_updated
 
 
 def _default_operations_reply_subject(subject: str, request_type: str) -> str:
@@ -2142,6 +3001,7 @@ def _default_operations_reply_body(
     matched_load_id,
     subject: str = "",
     body: str = "",
+    reply_language: str = "Auto",
 ) -> str:
     company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
     booking = _safe_str(parsed.get("Booking Number", ""))
@@ -2159,7 +3019,50 @@ def _default_operations_reply_body(
         or (f"load {matched_load_id}" if matched_load_id else "your request")
     )
     text = f"{subject or ''} {body or ''}"
+    resolved_language = _resolve_reply_language(reply_language, subject, body)
 
+    english_reply = _default_operations_reply_body_english(
+        request_type,
+        parsed,
+        matched_load_id,
+        subject,
+        body,
+        company_name,
+        reference,
+        tokens,
+        text,
+    )
+    if resolved_language == "English":
+        return english_reply
+
+    spanish_reply = _default_operations_reply_body_spanish(
+        request_type,
+        parsed,
+        matched_load_id,
+        subject,
+        body,
+        company_name,
+        reference,
+        tokens,
+        text,
+    )
+    if resolved_language == "Spanish":
+        return spanish_reply
+
+    return f"{english_reply}\n\n---\n\n{spanish_reply}"
+
+
+def _default_operations_reply_body_english(
+    request_type: str,
+    parsed: dict,
+    matched_load_id,
+    subject: str,
+    body: str,
+    company_name: str,
+    reference: str,
+    tokens: dict,
+    text: str,
+) -> str:
     if request_type == "Customer Request":
         if _contains_any(text, UPDATE_INTENT_TERMS) and not _has_reference_details(tokens, parsed):
             return (
@@ -2253,6 +3156,111 @@ def _default_operations_reply_body(
         f"Thank you,\n{company_name} Dispatch"
     )
 
+
+def _default_operations_reply_body_spanish(
+    request_type: str,
+    parsed: dict,
+    matched_load_id,
+    subject: str,
+    body: str,
+    company_name: str,
+    reference: str,
+    tokens: dict,
+    text: str,
+) -> str:
+    if request_type == "Customer Request":
+        if _contains_any(text, UPDATE_INTENT_TERMS) and not _has_reference_details(tokens, parsed):
+            return (
+                "Hola,\n\n"
+                "Con gusto podemos revisar esto. Por favor envíe el número de booking, número de contenedor "
+                "o número de referencia para ubicar la carga correcta y enviarle una actualización de estado.\n\n"
+                f"Gracias,\n{company_name} Dispatch"
+            )
+        if _contains_any(text, QUOTE_INTENT_TERMS) and not _has_quote_details(text, parsed, tokens):
+            return (
+                "Hola,\n\n"
+                "Con gusto podemos preparar una cotización. Por favor envíe el lugar de recogida, lugar de entrega, "
+                "tamaño/tipo de contenedor, fecha solicitada y cualquier instrucción especial para cotizar correctamente.\n\n"
+                f"Gracias,\n{company_name} Dispatch"
+            )
+        if _contains_any(text, NEW_ORDER_INTENT_TERMS) and not _has_new_order_details(text, parsed, tokens):
+            return (
+                "Hola,\n\n"
+                "Con gusto podemos avanzar con esto. Por favor envíe la orden de carga o el número de booking, "
+                "nombre del cliente, número de contenedor, terminal de recogida, lugar de entrega y fecha solicitada de entrega.\n\n"
+                f"Gracias,\n{company_name} Dispatch"
+            )
+        return (
+            "Hola,\n\n"
+            "Recibimos su mensaje y nuestro equipo de despacho lo está revisando. "
+            "Le daremos seguimiento con la próxima actualización o con cualquier información necesaria.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Appointment Update":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su solicitud de cita para {reference}. "
+            "Estamos revisando la disponibilidad de la terminal y la entrega, y confirmaremos la ventana de cita en breve.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Quote Request":
+        return (
+            "Hola,\n\n"
+            "Gracias por la solicitud de tarifa. Estamos revisando la ruta, el tiempo, el equipo "
+            "y cualquier cargo adicional aplicable. Le enviaremos la cotización en breve.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Booking Update":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su actualización para {reference}. "
+            "La estamos revisando contra la orden y confirmaremos cuando el horario o las notas de la orden estén actualizados.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "New Booking":
+        return (
+            "Hola,\n\n"
+            f"Recibimos los detalles del booking para {reference}. "
+            "Nuestro equipo de despacho está revisando la configuración de la orden, las citas necesarias y los requisitos de entrega. "
+            "Le contactaremos si falta alguna información antes de despachar.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Missing Information":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su mensaje para {reference}. "
+            "Estamos revisando la información faltante y le enviaremos la actualización tan pronto sea confirmada.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Cancellation":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su solicitud de cancelación para {reference}. "
+            "Estamos verificando los detalles de la orden y confirmaremos cuando el cambio esté completo.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "POD Request":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su solicitud de POD para {reference}. "
+            "Estamos revisando el estado del documento y se lo enviaremos tan pronto esté disponible.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    return (
+        "Hola,\n\n"
+        f"Recibimos su mensaje para {reference}. "
+        "Nuestro equipo de despacho lo está revisando y le dará seguimiento en breve.\n\n"
+        f"Gracias,\n{company_name} Dispatch"
+    )
+
 def save_operations_email_reply(
     *,
     intake_id: int,
@@ -2299,9 +3307,30 @@ def save_operations_email_reply(
         },
     )
 
-def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
+def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
+    updated_count = 0
+
     for _, row in inbox_df.iterrows():
         current_type = str(row.get("request_type", "") or "").strip()
+        existing_match = row.get("matched_load_id")
+        existing_has_match = pd.notna(existing_match) and _safe_str(existing_match) != ""
+        existing_confidence = pd.to_numeric(row.get("confidence_score", 0), errors="coerce")
+        if pd.isna(existing_confidence):
+            existing_confidence = 0
+
+        current_is_action_type = current_type in [
+            "New Booking",
+            "Booking Update",
+            "Appointment Update",
+            "Quote Request",
+            "Cancellation",
+            "POD Request",
+        ]
+        needs_classification = current_type in ["", "Needs Classification", "Other"]
+        needs_correction_check = current_is_action_type and not existing_has_match and existing_confidence < 70
+
+        if not needs_classification and not needs_correction_check:
+            continue
 
         intake_id = int(row["id"])
         subject = str(row.get("source_subject", "") or "")
@@ -2318,23 +3347,7 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
         matched_load_id = classification["matched_load_id"]
         confidence = classification["confidence_score"]
 
-        should_update = current_type in ["", "Needs Classification", "Other"]
-        if not should_update and detected_type == "Customer Request":
-            current_is_action_type = current_type in [
-                "New Booking",
-                "Booking Update",
-                "Appointment Update",
-                "Quote Request",
-                "Cancellation",
-                "POD Request",
-            ]
-            existing_match = row.get("matched_load_id")
-            existing_has_match = pd.notna(existing_match) and _safe_str(existing_match) != ""
-            existing_confidence = pd.to_numeric(row.get("confidence_score", 0), errors="coerce")
-            if pd.isna(existing_confidence):
-                existing_confidence = 0
-            should_update = current_is_action_type and not existing_has_match and existing_confidence < 70
-
+        should_update = needs_classification or (needs_correction_check and detected_type == "Customer Request")
         if not should_update:
             continue
 
@@ -2346,6 +3359,420 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
             confidence,
             classification["action_required"],
         )
+        updated_count += 1
+
+    return updated_count
+
+
+OPERATIONS_LOAD_UPDATE_FIELD_TO_DB = {
+    "TYPE": "type",
+    "Booking Number": "booking_number",
+    "Reference Number": "reference_number",
+    "Container Number": "container_number",
+    "Customer": "customer",
+    "Size": "size",
+    "Port": "port",
+    "Warehouse": "warehouse",
+    "Address": "address",
+    "Delivery Need Date": "delivery_need_date",
+    "Document Cutoff": "document_cutoff",
+    "LFD": "lfd",
+    "Dispatcher Notes": "dispatcher_notes",
+}
+
+
+def _order_action_required_from_parsed(parsed: dict) -> str:
+    missing = [
+        field
+        for field in ["Booking Number", "Customer", "Warehouse"]
+        if not _safe_str(parsed.get(field, ""))
+    ]
+    if missing:
+        return "Missing order details: " + ", ".join(missing)
+    return "PDF and email data ready for order review."
+
+
+def _save_pdf_data_to_operations_request(
+    *,
+    intake_id: int,
+    subject: str,
+    body: str,
+    parsed_data: dict,
+    filename: str,
+    file_path: str,
+    pdf_text: str,
+) -> None:
+    action_required = _order_action_required_from_parsed(parsed_data)
+    classification = _build_operations_email_classification(
+        subject,
+        f"{body}\n\nPDF TEXT:\n{pdf_text[:5000]}",
+        parsed_data,
+        fallback_key=f"intake-{intake_id}",
+    )
+
+    execute(
+        """
+        update order_intake
+        set parsed_data = cast(:parsed_data as jsonb),
+            filename = :filename,
+            file_path = :file_path,
+            request_type = :request_type,
+            conversation_key = :conversation_key,
+            matched_load_id = :matched_load_id,
+            confidence_score = :confidence_score,
+            action_required = :action_required
+        where id = :intake_id
+        """,
+        {
+            "intake_id": int(intake_id),
+            "parsed_data": _json_dump(parsed_data),
+            "filename": filename,
+            "file_path": file_path,
+            "request_type": classification["request_type"],
+            "conversation_key": classification["conversation_key"],
+            "matched_load_id": classification["matched_load_id"],
+            "confidence_score": classification["confidence_score"],
+            "action_required": action_required,
+        },
+    )
+
+
+def _attach_saved_pdf_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_pdf") -> None:
+    execute(
+        """
+        insert into documents (load_id, document_type, filename, file_path, source)
+        select :load_id, 'load_order', :filename, :file_path, :source
+        where not exists (
+            select 1
+            from documents
+            where load_id = :load_id
+              and file_path = :file_path
+        )
+        """,
+        {
+            "load_id": int(load_id),
+            "filename": filename,
+            "file_path": file_path,
+            "source": source,
+        },
+    )
+
+
+def _update_load_from_operations_pdf(load_id: int, parsed: dict, fill_blank_only: bool = True) -> dict:
+    db_columns = list(OPERATIONS_LOAD_UPDATE_FIELD_TO_DB.values())
+    current_df = read_df(
+        f"""
+        select {", ".join(db_columns)}
+        from loads
+        where id = :load_id
+        limit 1
+        """,
+        {"load_id": int(load_id)},
+    )
+    current = current_df.iloc[0].to_dict() if not current_df.empty else {}
+
+    updates = {}
+    for field, db_column in OPERATIONS_LOAD_UPDATE_FIELD_TO_DB.items():
+        value = _safe_str(parsed.get(field, ""))
+        if not value:
+            continue
+        if fill_blank_only and _safe_str(current.get(db_column, "")):
+            continue
+        updates[field] = value
+
+    if updates:
+        DispatchDatabaseClient().update_row_fields(int(load_id), updates)
+
+    return updates
+
+
+def _import_uploaded_pdf_to_operations_request(intake_id: int, parsed: dict, uploaded_file) -> dict:
+    content = uploaded_file.getvalue()
+    attachment = _save_operations_pdf_attachment(
+        content=content,
+        filename=uploaded_file.name,
+        message_id=f"intake-{intake_id}",
+        attachment_index=len(_extract_operations_pdf_attachments(parsed)) + 1,
+    )
+
+    updated_parsed = dict(parsed)
+    attachments = _extract_operations_pdf_attachments(updated_parsed)
+    attachments.append(attachment)
+
+    pdf_parsed = attachment.get("parsed_data") or {}
+    for field in OPERATIONS_ORDER_FIELDS:
+        if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(updated_parsed.get(field, "")):
+            updated_parsed[field] = _safe_str(pdf_parsed.get(field, ""))
+    updated_parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = attachments
+
+    execute(
+        """
+        update order_intake
+        set parsed_data = cast(:parsed_data as jsonb),
+            filename = coalesce(filename, :filename),
+            file_path = coalesce(file_path, :file_path),
+            action_required = :action_required
+        where id = :intake_id
+        """,
+        {
+            "intake_id": int(intake_id),
+            "parsed_data": _json_dump(updated_parsed),
+            "filename": attachment.get("filename"),
+            "file_path": attachment.get("file_path"),
+            "action_required": _order_action_required_from_parsed(updated_parsed),
+        },
+    )
+
+    return attachment
+
+
+def _render_pdf_preview(content: bytes, filename: str) -> None:
+    encoded = base64.b64encode(content).decode("ascii")
+    st.markdown(
+        f"""
+        <iframe
+            title="{filename}"
+            src="data:application/pdf;base64,{encoded}"
+            width="100%"
+            height="620"
+            style="border: 1px solid #d1d5db; border-radius: 8px;"
+        ></iframe>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_operations_pdf_panel(
+    *,
+    selected_id: int,
+    record,
+    parsed: dict,
+    subject: str,
+    sender: str,
+    body: str,
+    matched_load_id,
+    conversation_key: str,
+) -> None:
+    attachments = _extract_operations_pdf_attachments(parsed, record)
+
+    with st.expander("PDF Attachments / Order Documents", expanded=bool(attachments)):
+        uploaded_pdf = st.file_uploader(
+            "Add PDF to this request",
+            type=["pdf"],
+            key=f"operations_pdf_upload_{selected_id}",
+        )
+        if uploaded_pdf is not None:
+            if st.button(
+                "Import Uploaded PDF",
+                key=f"operations_pdf_import_upload_{selected_id}",
+                use_container_width=True,
+            ):
+                attachment = _import_uploaded_pdf_to_operations_request(int(selected_id), parsed, uploaded_pdf)
+                st.success(f"Imported PDF: {attachment.get('filename', uploaded_pdf.name)}")
+                refresh_data()
+                st.rerun()
+
+        if not attachments:
+            st.info("No PDF attachments were saved with this inbox request.")
+            return
+
+        labels = []
+        for idx, attachment in enumerate(attachments):
+            filename = _safe_str(attachment.get("filename", f"attachment_{idx + 1}.pdf"))
+            fields_found = int(attachment.get("fields_found", 0) or 0)
+            labels.append(f"{idx + 1}. {filename} ({fields_found} field(s) found)")
+
+        selected_label = st.selectbox(
+            "Select PDF",
+            labels,
+            key=f"operations_pdf_select_{selected_id}",
+        )
+        selected_index = labels.index(selected_label)
+        attachment = attachments[selected_index]
+        filename = _safe_str(attachment.get("filename", f"attachment_{selected_index + 1}.pdf"))
+        file_path = _safe_str(attachment.get("file_path", ""))
+
+        if not file_path or not Path(file_path).exists():
+            st.warning("The saved PDF file could not be found on disk.")
+            return
+
+        try:
+            content = _read_operations_pdf_bytes(file_path)
+        except Exception as exc:
+            st.error(f"Could not read saved PDF: {exc}")
+            return
+
+        d1, d2, d3 = st.columns([1, 1, 2])
+        with d1:
+            st.download_button(
+                "Download PDF",
+                data=content,
+                file_name=filename,
+                mime="application/pdf",
+                key=f"operations_pdf_download_{selected_id}_{selected_index}",
+                use_container_width=True,
+            )
+        with d2:
+            show_preview = st.checkbox(
+                "View PDF",
+                value=False,
+                key=f"operations_pdf_preview_{selected_id}_{selected_index}",
+            )
+        with d3:
+            st.caption(f"Saved file: {filename}")
+
+        if show_preview:
+            _render_pdf_preview(content, filename)
+
+        try:
+            pdf_text, pdf_parsed = _parse_saved_operations_pdf(file_path, filename)
+            parse_error = ""
+        except Exception as exc:
+            pdf_text = _safe_str(attachment.get("text_preview", ""))
+            pdf_parsed = attachment.get("parsed_data") or {}
+            parse_error = str(exc)
+
+        if parse_error:
+            st.warning(f"PDF text parse needs review: {parse_error}")
+
+        try:
+            body_parsed = parse_email_text(subject, body)
+        except Exception:
+            body_parsed = {}
+
+        base_parsed = {}
+        for field in OPERATIONS_ORDER_FIELDS:
+            base_parsed[field] = _safe_str(body_parsed.get(field, "")) or _safe_str(parsed.get(field, ""))
+
+        final_data, comparison_rows, conflicts = _merge_operations_order_fields(base_parsed, pdf_parsed)
+        final_data[OPERATIONS_PDF_ATTACHMENTS_KEY] = attachments
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Email Fields", _field_count(body_parsed))
+        c2.metric("PDF Fields", _field_count(pdf_parsed))
+        c3.metric("Mismatches", len(conflicts))
+
+        if conflicts:
+            st.warning("Review mismatched fields before creating or updating a load: " + ", ".join(conflicts))
+
+        st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
+
+        with st.expander("Extracted PDF Text", expanded=False):
+            st.text_area(
+                "PDF Text",
+                value=pdf_text or "No text was extracted from this PDF.",
+                height=220,
+                disabled=True,
+                key=f"operations_pdf_text_{selected_id}_{selected_index}",
+            )
+
+        fill_blank_only = st.checkbox(
+            "Only fill blank fields when updating an existing load",
+            value=True,
+            key=f"operations_pdf_fill_blank_only_{selected_id}_{selected_index}",
+        )
+
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            if st.button("Use PDF Data", key=f"use_pdf_data_{selected_id}_{selected_index}", use_container_width=True):
+                _save_pdf_data_to_operations_request(
+                    intake_id=int(selected_id),
+                    subject=subject,
+                    body=body,
+                    parsed_data=final_data,
+                    filename=filename,
+                    file_path=file_path,
+                    pdf_text=pdf_text,
+                )
+                st.success("PDF data saved to this Operations request.")
+                refresh_data()
+                st.rerun()
+
+        can_create_from_pdf = bool(_safe_str(final_data.get("Booking Number", "")) and _safe_str(final_data.get("Customer", "")))
+        with b2:
+            if st.button(
+                "Create Load",
+                key=f"create_load_from_pdf_{selected_id}_{selected_index}",
+                use_container_width=True,
+                disabled=not can_create_from_pdf,
+            ):
+                _save_pdf_data_to_operations_request(
+                    intake_id=int(selected_id),
+                    subject=subject,
+                    body=body,
+                    parsed_data=final_data,
+                    filename=filename,
+                    file_path=file_path,
+                    pdf_text=pdf_text,
+                )
+                load_id = create_load_from_intake(int(selected_id), final_data)
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Order Created',
+                        matched_load_id = :load_id,
+                        request_type = 'New Booking',
+                        conversation_key = :conversation_key
+                    where id = :intake_id
+                    """,
+                    {
+                        "intake_id": int(selected_id),
+                        "load_id": load_id,
+                        "conversation_key": conversation_key or final_data.get("Booking Number"),
+                    },
+                )
+                refresh_data()
+                st.success(f"Created load ID {load_id} from selected PDF.")
+                st.rerun()
+
+        with b3:
+            if st.button(
+                "Attach PDF",
+                key=f"attach_pdf_to_load_{selected_id}_{selected_index}",
+                use_container_width=True,
+                disabled=matched_load_id is None,
+            ):
+                _attach_saved_pdf_to_load(int(matched_load_id), filename, file_path)
+                save_load_communication(
+                    matched_load_id,
+                    int(selected_id),
+                    conversation_key,
+                    "PDF Attachment",
+                    subject,
+                    sender,
+                    f"Attached PDF document from Operations Inbox: {filename}",
+                )
+                st.success("PDF attached to the matched load.")
+                st.rerun()
+
+        with b4:
+            if st.button(
+                "Update Load",
+                key=f"update_load_from_pdf_{selected_id}_{selected_index}",
+                use_container_width=True,
+                disabled=matched_load_id is None,
+            ):
+                updates = _update_load_from_operations_pdf(
+                    int(matched_load_id),
+                    final_data,
+                    fill_blank_only=fill_blank_only,
+                )
+                if updates:
+                    _attach_saved_pdf_to_load(int(matched_load_id), filename, file_path)
+                    save_load_communication(
+                        matched_load_id,
+                        int(selected_id),
+                        conversation_key,
+                        "PDF Update",
+                        subject,
+                        sender,
+                        "Updated load fields from Operations Inbox PDF: " + ", ".join(updates.keys()),
+                    )
+                    refresh_data()
+                    st.success("Updated matched load fields: " + ", ".join(updates.keys()))
+                    st.rerun()
+                else:
+                    st.info("No load fields needed updating from the selected PDF.")
         
 def render_operations_inbox() -> None:
     st.subheader("Operations Inbox")
@@ -2360,11 +3787,12 @@ def render_operations_inbox() -> None:
     with c2:
         if st.button("Check Client Email", use_container_width=True):
             try:
-                imported, skipped, fetched = import_recent_operations_emails(limit=50)
+                imported, skipped, fetched, pdf_updated = import_recent_operations_emails(limit=50)
                 st.session_state["operations_email_import_result"] = {
                     "fetched": fetched,
                     "imported": imported,
                     "skipped": skipped,
+                    "pdf_updated": pdf_updated,
                 }
                 refresh_data()
                 st.rerun()
@@ -2377,39 +3805,18 @@ def render_operations_inbox() -> None:
             fetched = int(result.get("fetched", 0))
             imported = int(result.get("imported", 0))
             skipped = int(result.get("skipped", 0))
+            pdf_updated = int(result.get("pdf_updated", 0))
             if fetched == 0:
                 st.warning("Yahoo inbox connected, but no messages were returned from the recent inbox scan.")
             else:
-                st.success(f"Yahoo inbox fetched {fetched} email(s), imported {imported}, skipped {skipped} already in Operations Inbox.")
+                pdf_note = f", updated {pdf_updated} PDF attachment(s)" if pdf_updated else ""
+                st.success(f"Yahoo inbox fetched {fetched} email(s), imported {imported}, skipped {skipped} already in Operations Inbox{pdf_note}.")
         else:
             st.info("Open items are classified automatically. Replies can be sent from the request review panel.")
             
     try:
         where_clause = _inbox_review_where_clause()
-        inbox_df = read_df(
-            f"""
-            select
-                id,
-                created_at,
-                source_received_at,
-                source,
-                source_subject,
-                source_sender,
-                filename,
-                parsed_data,
-                raw_text,
-                intake_status,
-                request_type,
-                conversation_key,
-                matched_load_id,
-                confidence_score,
-                action_required,
-                review_status
-            from order_intake
-            {where_clause}
-            order by created_at desc
-            """
-        )
+        inbox_df = _load_operations_inbox_df(where_clause)
     except Exception as exc:
         st.error(f"Could not load Operations Inbox: {exc}")
         st.info("If this is the first time using Operations Inbox email, run database/operations_email_workflow_migration.sql in Supabase.")
@@ -2417,34 +3824,9 @@ def render_operations_inbox() -> None:
 
     if inbox_df.empty:
         st.success("No open customer requests.")
+        _render_no_open_inbox_explanation()
         return
 
-    auto_classify_open_inbox_items(inbox_df)
-
-    inbox_df = read_df(
-        f"""
-        select
-            id,
-            created_at,
-            source_received_at,
-            source,
-            source_subject,
-            source_sender,
-            filename,
-            parsed_data,
-            raw_text,
-            intake_status,
-            request_type,
-            conversation_key,
-            matched_load_id,
-            confidence_score,
-            action_required,
-            review_status
-        from order_intake
-        {where_clause}
-        order by created_at desc
-        """
-        )
     inbox_df["request_type_clean"] = (
         inbox_df["request_type"]
                 .fillna("Needs Classification")
@@ -2488,17 +3870,19 @@ def render_operations_inbox() -> None:
         errors="coerce",
     ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
 
-    inbox_df["reference_hint"] = (
-        inbox_df["source_subject"].fillna("") + " " + inbox_df["raw_text"].fillna("")
-    ).apply(extract_reference_from_text)
-
-    inbox_df["requested_time"] = inbox_df["raw_text"].fillna("").apply(extract_requested_time)
+    inbox_df["reference_hint"] = inbox_df["conversation_key"].fillna("").astype(str)
+    generic_reference = inbox_df["reference_hint"].str.lower().isin(["", "customer-request"]) | inbox_df["reference_hint"].str.lower().str.startswith(("email-", "intake-"))
+    inbox_df.loc[generic_reference, "reference_hint"] = (
+        inbox_df.loc[generic_reference, "source_subject"].fillna("").apply(extract_reference_from_text)
+    )
+    inbox_df["requested_time"] = ""
     inbox_df["review_status_clean"] = (
         inbox_df["review_status"]
                 .fillna("Open")
                 .astype(str)
                 .str.strip()
         )
+    inbox_df["pdf_count"] = inbox_df.apply(_operations_pdf_count_from_row, axis=1)
 
     no_matched_load = inbox_df["matched_load_id"].isna() | inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
     needs_details_mask = (
@@ -2522,6 +3906,23 @@ def render_operations_inbox() -> None:
     m4.metric("Quotes", int(inbox_df["request_type_clean"].eq("Quote Request").sum()))
     m5.metric("Waiting", int(inbox_df["review_status_clean"].eq("Waiting on Customer").sum()))
 
+    smart_group_result = st.session_state.pop("operations_smart_group_update_result", None)
+    if smart_group_result is not None:
+        st.success(f"Smart groups updated {int(smart_group_result)} item(s).")
+
+    c_update, c_note = st.columns([1, 4])
+    with c_update:
+        if st.button("Recheck Groups", key="operations_recheck_smart_groups", use_container_width=True):
+            with st.spinner("Updating smart groups..."):
+                full_inbox_df = _load_operations_inbox_record_set(where_clause)
+                update_mask = _operations_items_needing_smart_group_update(full_inbox_df)
+                classified_count = auto_classify_open_inbox_items(full_inbox_df[update_mask].copy())
+                st.session_state["operations_smart_group_update_result"] = classified_count
+                refresh_data()
+                st.rerun()
+    with c_note:
+        st.caption("Routine inbox clicks stay fast. Use Recheck Groups when older messages need to be regrouped.")
+
     with st.expander("Operations Inbox Process Feedback", expanded=False):
         st.markdown(
             """
@@ -2533,22 +3934,7 @@ def render_operations_inbox() -> None:
             """.strip()
         )
 
-    tab_labels = [
-        "All",
-        "Needs Details",
-        "Customer Requests",
-        "New Bookings",
-        "Booking Updates",
-        "Appointments",
-        "Quote Requests",
-        "Missing Info",
-        "POD Requests",
-        "Cancellations",
-        "Waiting",
-        "Needs Review",
-    ]
-
-    queue_tabs = st.tabs(tab_labels)
+    tab_labels = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
 
     queue_map = {
         "All": inbox_df,
@@ -2576,6 +3962,7 @@ def render_operations_inbox() -> None:
             "request_type",
             "review_status",
             "source_subject",
+            "pdf_count",
             "matched_load_id",
             "confidence_score",
             "action_required",
@@ -2587,6 +3974,7 @@ def render_operations_inbox() -> None:
             "client_name",
             "request_type",
             "source_subject",
+            "pdf_count",
             "reference_hint",
             "confidence_score",
             "action_required",
@@ -2597,6 +3985,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "reference_hint",
             "matched_load_id",
             "action_required",
@@ -2607,6 +3996,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "reference_hint",
             "confidence_score",
             "action_required",
@@ -2617,6 +4007,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "reference_hint",
             "matched_load_id",
             "confidence_score",
@@ -2630,6 +4021,7 @@ def render_operations_inbox() -> None:
             "reference_hint",
             "requested_time",
             "source_subject",
+            "pdf_count",
             "matched_load_id",
             "action_required",
         ],
@@ -2640,6 +4032,7 @@ def render_operations_inbox() -> None:
             "client_name",
             "reference_hint",
             "source_subject",
+            "pdf_count",
             "confidence_score",
             "action_required",
         ],
@@ -2649,6 +4042,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "matched_load_id",
             "action_required",
         ],
@@ -2658,6 +4052,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "reference_hint",
             "matched_load_id",
             "action_required",
@@ -2668,6 +4063,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "matched_load_id",
             "confidence_score",
             "action_required",
@@ -2678,6 +4074,7 @@ def render_operations_inbox() -> None:
             "email_received",
             "client_name",
             "source_subject",
+            "pdf_count",
             "matched_load_id",
             "review_status",
             "action_required",
@@ -2690,67 +4087,78 @@ def render_operations_inbox() -> None:
             "request_type",
             "source_sender",
             "source_subject",
+            "pdf_count",
             "confidence_score",
             "action_required",
         ],
     }
 
 
-    for idx, (tab, tab_name) in enumerate(zip(queue_tabs, tab_labels)):
-        with tab:
-            tab_df = queue_map[tab_name].copy()
+    tab_titles = [
+        f"{label} ({len(queue_map.get(label, pd.DataFrame()))})"
+        for label in tab_labels
+    ]
+    queue_tabs = st.tabs(tab_titles)
+
+    for selected_queue, queue_tab in zip(tab_labels, queue_tabs):
+        with queue_tab:
+            tab_df = queue_map[selected_queue].copy()
             active_display_cols = [
-                c for c in tab_display_cols.get(tab_name, tab_display_cols["All"])
+                c for c in tab_display_cols.get(selected_queue, tab_display_cols["All"])
                 if c in tab_df.columns
             ]
-            st.markdown(f"### {tab_name}")
+            if "reference_hint" in active_display_cols:
+                blank_reference = tab_df["reference_hint"].fillna("").astype(str).str.strip().eq("")
+                if blank_reference.any():
+                    preview = tab_df["raw_text_preview"] if "raw_text_preview" in tab_df.columns else ""
+                    tab_df.loc[blank_reference, "reference_hint"] = (
+                        tab_df.loc[blank_reference, "source_subject"].fillna("")
+                        + " "
+                        + pd.Series(preview, index=tab_df.index).fillna("")
+                    ).apply(extract_reference_from_text)
+            if "requested_time" in active_display_cols:
+                if "raw_text_preview" in tab_df.columns:
+                    tab_df["requested_time"] = tab_df["raw_text_preview"].fillna("").apply(extract_requested_time)
+                else:
+                    tab_df["requested_time"] = tab_df["source_subject"].fillna("").apply(extract_requested_time)
+
             st.caption(f"{len(tab_df)} item(s)")
 
-            if st.button(f"Use {tab_name}", key=f"use_tab_{idx}_{tab_name}"):
-                st.session_state["operations_current_tab"] = tab_name
-                st.session_state.pop("selected_operations_request_id", None)
-                st.session_state.pop("selected_operations_tab", None)
-                st.rerun()
-
             if tab_df.empty:
-                st.info(f"No {tab_name.lower()} items.")
-                continue
-
-            event = st.dataframe(
-                tab_df[active_display_cols],
-                use_container_width=True,
-                hide_index=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                key=f"operations_inbox_table_{idx}_{tab_name}",
-            )
-
-            selected_rows = event.selection.rows
-
-            if selected_rows:
-                row_id = int(tab_df.iloc[selected_rows[0]]["id"])
-
-                if st.button(
-                    f"Open Request #{row_id}",
-                    key=f"open_request_{idx}_{tab_name}_{row_id}",
+                st.info(f"No {selected_queue.lower()} items.")
+            else:
+                event = st.dataframe(
+                    tab_df[active_display_cols],
                     use_container_width=True,
-                ):
-                    st.session_state["operations_current_tab"] = tab_name
-                    st.session_state["selected_operations_request_id"] = row_id
-                    st.session_state["selected_operations_tab"] = tab_name
-                    st.rerun()
+                    hide_index=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    key=f"operations_inbox_table_{selected_queue}",
+                )
+
+                selected_rows = event.selection.rows
+                if selected_rows:
+                    row_id = int(tab_df.iloc[selected_rows[0]]["id"])
+
+                    if st.button(
+                        f"Open Request #{row_id}",
+                        key=f"open_request_{selected_queue}_{row_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["selected_operations_request_id"] = row_id
+                        st.session_state["selected_operations_tab"] = selected_queue
+                        st.rerun()
 
     st.divider()
 
     selected_id = st.session_state.get("selected_operations_request_id")
     selected_tab_name = st.session_state.get("selected_operations_tab")
-    current_tab = st.session_state.get("operations_current_tab")
 
-    if selected_id is None or selected_tab_name != current_tab:
+    if selected_id is None:
         st.info("Select a row, then click Open Request.")
         return
 
-    record_df = inbox_df[inbox_df["id"].astype(int).eq(int(selected_id))]
+    record_df = _load_operations_inbox_record(int(selected_id))
 
     if record_df.empty:
         st.warning("Selected request was not found.")
@@ -2766,10 +4174,11 @@ def render_operations_inbox() -> None:
     sender = str(record.get("source_sender", "") or "")
     body = str(record.get("raw_text", "") or "")
 
-    classification = _build_operations_email_classification(
+    classification = _operations_classification_for_review(
+        record,
+        parsed,
         subject,
         body,
-        parsed,
         fallback_key=f"intake-{selected_id}",
     )
     detected_type = classification["request_type"]
@@ -2786,7 +4195,10 @@ def render_operations_inbox() -> None:
         except Exception:
             pass
 
-    load_context, load_candidates = _build_ai_load_context(classification, parsed)
+    load_context_key = f"operations_load_context_{selected_id}_{matched_load_id or 'none'}"
+    cached_load_context = st.session_state.get(load_context_key) or {}
+    load_context = cached_load_context.get("load_context", {})
+    load_candidates = cached_load_context.get("load_candidates", [])
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Detected Type", detected_type)
@@ -2802,6 +4214,17 @@ def render_operations_inbox() -> None:
         REQUEST_TYPES,
         index=REQUEST_TYPES.index(default_request_type) if default_request_type in REQUEST_TYPES else 0,
     )
+    detected_reply_language = _detect_customer_language(subject, body)
+    language_default = "Auto"
+    reply_language = st.selectbox(
+        "Reply Language",
+        REPLY_LANGUAGE_OPTIONS,
+        index=REPLY_LANGUAGE_OPTIONS.index(language_default),
+        help=f"Auto detected: {detected_reply_language}. Choose Spanish or Bilingual for customer-facing replies when needed.",
+        key=f"operations_reply_language_{selected_id}",
+    )
+    resolved_reply_language = _resolve_reply_language(reply_language, subject, body)
+    st.caption(f"Reply draft language: {resolved_reply_language}")
     selected_action_required = _action_required_for_request(
         request_type,
         parsed,
@@ -2819,20 +4242,48 @@ def render_operations_inbox() -> None:
     with st.expander("Parsed Fields", expanded=False):
         st.json(parsed)
 
+    _render_operations_pdf_panel(
+        selected_id=int(selected_id),
+        record=record,
+        parsed=parsed,
+        subject=subject,
+        sender=sender,
+        body=body,
+        matched_load_id=matched_load_id,
+        conversation_key=conversation_key,
+    )
+
     ai_suggestion_key = f"operations_ai_suggestion_{selected_id}"
     ai_version_key = f"operations_ai_suggestion_version_{selected_id}"
     ai_suggestion = st.session_state.get(ai_suggestion_key)
 
     with st.expander("AI Assist", expanded=False):
         st.caption("AI suggestions are drafts for dispatcher review. They do not send email or create orders.")
+        context_checked = bool(cached_load_context.get("checked"))
+        if st.button(
+            "Load Match Context",
+            key=f"load_ai_context_{selected_id}",
+            use_container_width=True,
+        ):
+            with st.spinner("Checking matching loads and documents..."):
+                load_context, load_candidates = _build_ai_load_context(classification, parsed)
+                st.session_state[load_context_key] = {
+                    "load_context": load_context,
+                    "load_candidates": load_candidates,
+                    "checked": True,
+                }
+                context_checked = True
+
         if load_context:
             st.write("**Matched load context:**")
             st.json(_candidate_summary_from_context(load_context))
         elif load_candidates:
             st.write("**Possible load matches:**")
             st.dataframe(pd.DataFrame(load_candidates), use_container_width=True, hide_index=True)
-        else:
+        elif context_checked:
             st.info("No matching load context found yet. AI will ask for booking, container, or reference details when needed.")
+        else:
+            st.info("Load matching context is available on demand to keep email opening fast.")
 
         if not is_operations_ai_configured():
             st.info("Add OPENAI_API_KEY to enable AI classification and reply drafts.")
@@ -2847,6 +4298,14 @@ def render_operations_inbox() -> None:
                 use_container_width=True,
             ):
                 with st.spinner("Generating AI classification and reply draft..."):
+                    if not context_checked:
+                        load_context, load_candidates = _build_ai_load_context(classification, parsed)
+                        st.session_state[load_context_key] = {
+                            "load_context": load_context,
+                            "load_candidates": load_candidates,
+                            "checked": True,
+                        }
+                        context_checked = True
                     ai_suggestion = generate_operations_ai_suggestion(
                         subject=subject,
                         sender=sender,
@@ -2856,6 +4315,7 @@ def render_operations_inbox() -> None:
                         load_context=load_context,
                         load_candidates=load_candidates,
                         feedback_examples=feedback_examples,
+                        response_language=resolved_reply_language,
                         company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
                     )
                     st.session_state[ai_suggestion_key] = ai_suggestion
@@ -2872,6 +4332,8 @@ def render_operations_inbox() -> None:
                     a3.metric("Priority", ai_suggestion.get("priority", "Normal"))
                     a4.metric("Needs Details", "Yes" if ai_suggestion.get("needs_details") else "No")
 
+                    if ai_suggestion.get("response_language"):
+                        st.write(f"**AI reply language:** {ai_suggestion.get('response_language')}")
                     if ai_suggestion.get("suggested_load_id"):
                         st.write(
                             f"**AI matched load:** {ai_suggestion.get('suggested_load_id')} "
@@ -2927,6 +4389,7 @@ def render_operations_inbox() -> None:
                             feedback_notes=feedback_notes,
                         )
                         st.success("AI classification applied.")
+                        refresh_data()
                         st.rerun()
 
     if st.button("Save Classification", use_container_width=True):
@@ -2961,14 +4424,24 @@ def render_operations_inbox() -> None:
                 feedback_notes=ai_feedback_notes,
             )
         st.success("Classification saved.")
+        refresh_data()
         st.rerun()
 
     st.markdown("### Customer Email Reply")
     ai_reply_body = ""
     if ai_suggestion and ai_suggestion.get("success"):
-        ai_reply_body = _safe_str(ai_suggestion.get("reply_body", ""))
-    reply_body_default = ai_reply_body or _default_operations_reply_body(request_type, parsed, matched_load_id, subject, body)
-    reply_key_seed = f"{request_type}_{st.session_state.get(ai_version_key, 'rule')}"
+        ai_reply_language = _safe_str(ai_suggestion.get("response_language", ""))
+        if not ai_reply_language or ai_reply_language == resolved_reply_language:
+            ai_reply_body = _safe_str(ai_suggestion.get("reply_body", ""))
+    reply_body_default = ai_reply_body or _default_operations_reply_body(
+        request_type,
+        parsed,
+        matched_load_id,
+        subject,
+        body,
+        reply_language=reply_language,
+    )
+    reply_key_seed = f"{request_type}_{resolved_reply_language}_{st.session_state.get(ai_version_key, 'rule')}"
     reply_key_suffix = re.sub(r"[^a-z0-9]+", "_", reply_key_seed.lower()).strip("_")
     with st.form(f"operations_email_reply_{selected_id}"):
         reply_to = st.text_input(
@@ -3094,8 +4567,11 @@ def render_operations_inbox() -> None:
                         "Container Number": parsed.get("Container Number") or tokens.get("container_number"),
                         "Port": parsed.get("Port", ""),
                         "Warehouse": parsed.get("Warehouse", ""),
+                        "Address": parsed.get("Address", ""),
+                        "Document Cutoff": parsed.get("Document Cutoff", ""),
                         "Delivery Need Date": parsed.get("Delivery Need Date", ""),
                         "LFD": parsed.get("LFD", ""),
+                        "Size": parsed.get("Size", ""),
                         "Status": "New",
                         "Dispatcher Notes": f"Created from Operations Inbox request #{selected_id}",
                     },
@@ -4937,6 +6413,781 @@ def render_calendar_view(df: pd.DataFrame) -> None:
                 """,
                 unsafe_allow_html=True,
             )     
+PORT_HOUSTON_ENDPOINTS = {
+    "Container / Unit": {
+        "endpoint": "/inventory/units",
+        "fields": UNIT_FIELDS,
+        "hint": "Container availability, yard position, facility, line, routing, and visit state.",
+    },
+    "Booking": {
+        "endpoint": "/orders/bookings",
+        "fields": BOOKING_FIELDS,
+        "hint": "Booking changes, line, vessel visit, equipment, quantity, and tally status.",
+    },
+    "Vessel Visit": {
+        "endpoint": "/vessel/vesselvisits",
+        "fields": VESSEL_FIELDS,
+        "hint": "Vessel ETA/ETD, begin receive, cargo cutoff, empty pickup, and first availability.",
+    },
+    "Gate Appointments": {"endpoint": "/road/gateappointments", "fields": "", "hint": "Existing appointment visibility."},
+    "Appointment Time Slots": {"endpoint": "/road/appointmenttimeslots", "fields": "", "hint": "Available appointment windows."},
+    "Gate Transactions": {"endpoint": "/road/gatetransactions", "fields": "", "hint": "Ingate/outgate, trouble status, and gate stages."},
+    "Truck Visits": {"endpoint": "/road/truckvisits", "fields": "", "hint": "Truck visit status."},
+    "Service Events": {"endpoint": "/service/events", "fields": "", "hint": "Operational event history."},
+}
+
+PORT_HOUSTON_SUBSCRIPTION_EVENTS = [
+    "Unit",
+    "Booking",
+    "GateAppointment",
+    "TruckTransaction",
+    "TruckVisit",
+    "TruckVisitAppointment",
+    "MoveEvent",
+    "ServiceOrder",
+    "VesselVisit",
+    "VesselBerthing",
+    "AppointmentTimeSlot",
+    "AppointmentQuotaRule",
+]
+
+PORT_HOUSTON_APPOINTMENT_TRAN_TYPES = {
+    "Deliver Import": "DI",
+    "Deliver Empty": "DM",
+    "Deliver Chassis": "DC",
+    "Deliver Export": "DE",
+    "Receive Export": "RE",
+    "Receive Empty": "RM",
+}
+
+
+def _ensure_port_houston_sync_log_table() -> None:
+    execute(
+        """
+        create table if not exists port_houston_sync_log (
+            id bigserial primary key,
+            load_id bigint references loads(id) on delete set null,
+            action_type text not null,
+            lookup_type text,
+            request_reference text,
+            response_summary jsonb,
+            status text not null default 'success',
+            error_message text,
+            created_by text not null default 'streamlit',
+            created_at timestamptz not null default now()
+        )
+        """
+    )
+
+
+def _log_port_houston_event(
+    *,
+    action_type: str,
+    lookup_type: str = "",
+    request_reference: str = "",
+    response_summary: dict | None = None,
+    load_id=None,
+    status: str = "success",
+    error_message: str = "",
+) -> None:
+    try:
+        _ensure_port_houston_sync_log_table()
+        execute(
+            """
+            insert into port_houston_sync_log (
+                load_id,
+                action_type,
+                lookup_type,
+                request_reference,
+                response_summary,
+                status,
+                error_message
+            )
+            values (
+                :load_id,
+                :action_type,
+                :lookup_type,
+                :request_reference,
+                cast(:response_summary as jsonb),
+                :status,
+                :error_message
+            )
+            """,
+            {
+                "load_id": int(load_id) if load_id not in [None, ""] else None,
+                "action_type": action_type,
+                "lookup_type": lookup_type or None,
+                "request_reference": request_reference or None,
+                "response_summary": _json_dump(response_summary or {}),
+                "status": status,
+                "error_message": error_message or None,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _redacted_config_value(value: str) -> str:
+    value = _safe_str(value)
+    if not value:
+        return "Not set"
+    if len(value) <= 10:
+        return "Set"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def _get_port_houston_client_or_none() -> PortHoustonClient | None:
+    try:
+        return PortHoustonClient()
+    except PortHoustonError as exc:
+        st.warning(str(exc))
+        return None
+
+
+def _port_houston_records_df(records: list[dict], mode: str = "flat") -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+    rows = [summarize_unit(record) for record in records] if mode == "unit" else [flatten_record(record) for record in records]
+    return pd.DataFrame(rows)
+
+
+def _store_port_houston_result(key: str, data, lookup_type: str, reference: str, load_id=None) -> None:
+    records = content_records(data)
+    st.session_state[key] = {
+        "data": data,
+        "records": records,
+        "lookup_type": lookup_type,
+        "reference": reference,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _log_port_houston_event(
+        action_type="lookup",
+        lookup_type=lookup_type,
+        request_reference=reference,
+        response_summary={"record_count": len(records)},
+        load_id=load_id,
+    )
+
+
+def _render_port_houston_result(key: str, mode: str = "flat") -> list[dict]:
+    result = st.session_state.get(key)
+    if not result:
+        return []
+
+    records = result.get("records") or []
+    st.caption(f"Last checked: {result.get('checked_at', '')} | {len(records)} record(s)")
+    result_df = _port_houston_records_df(records, mode=mode)
+    if not result_df.empty:
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+    with st.expander("Raw API Response", expanded=False):
+        st.json(result.get("data", {}))
+    return records
+
+
+def _port_houston_load_label(row) -> str:
+    booking = _safe_str(row.get("Booking Number", "")) or "No booking"
+    container = _safe_str(row.get("Container Number", "")) or "No container"
+    customer = _safe_str(row.get("Customer", "")) or "No customer"
+    row_id = _safe_str(row.get("_row_id", ""))
+    return f"{booking} | {container} | {customer} | row {row_id}"
+
+
+def _port_houston_load_options(df: pd.DataFrame) -> list[dict]:
+    if df.empty or "_row_id" not in df.columns:
+        return []
+    active_df = df[~df["Status"].isin(["Closed", "Cancelled", "Invoiced"])].copy() if "Status" in df.columns else df.copy()
+    return [row.to_dict() for _, row in active_df.sort_values("_row_id", ascending=False).head(250).iterrows()]
+
+
+def _append_port_houston_notes(existing: str, summary: dict) -> str:
+    lines = ["Port Houston EVP update:"]
+    for key, value in summary.items():
+        if _safe_str(value):
+            lines.append(f"{key}: {value}")
+    note = "\n".join(lines)
+    existing = _safe_str(existing)
+    return note if not existing else f"{existing}\n\n{note}"
+
+
+def _updates_from_port_houston_unit(load_row: dict, unit_record: dict) -> dict:
+    summary = summarize_unit(unit_record)
+    updates = {}
+    if _safe_str(summary.get("Container", "")) and not _safe_str(load_row.get("Container Number", "")):
+        updates["Container Number"] = summary["Container"]
+    if _safe_str(summary.get("Size", "")) and not _safe_str(load_row.get("Size", "")):
+        updates["Size"] = summary["Size"]
+    if _safe_str(summary.get("Facility", "")) and not _safe_str(load_row.get("Port", "")):
+        updates["Port"] = summary["Facility"]
+    updates["Dispatcher Notes"] = _append_port_houston_notes(load_row.get("Dispatcher Notes", ""), summary)
+    return updates
+
+
+def _updates_from_port_houston_booking(load_row: dict, booking_record: dict) -> dict:
+    updates = {}
+    booking = _safe_str(booking_record.get("nbr", ""))
+    if booking and not _safe_str(load_row.get("Booking Number", "")):
+        updates["Booking Number"] = booking
+    client_ref = _safe_str(booking_record.get("clientRefNo", ""))
+    if client_ref and not _safe_str(load_row.get("Reference Number", "")):
+        updates["Reference Number"] = client_ref
+    if _safe_str(booking_record.get("destination", "")) and not _safe_str(load_row.get("Warehouse", "")):
+        updates["Warehouse"] = _safe_str(booking_record.get("destination", ""))
+
+    first_item = {}
+    items = booking_record.get("items")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        first_item = items[0]
+    size = " ".join(
+        [
+            part
+            for part in [
+                _safe_str(first_item.get("eqSize", "")),
+                _safe_str(first_item.get("eqHeight", "")),
+                _safe_str(first_item.get("eqIsoGroup", "")),
+            ]
+            if part
+        ]
+    )
+    if size and not _safe_str(load_row.get("Size", "")):
+        updates["Size"] = size
+
+    summary = {
+        "Booking": booking,
+        "Line": booking_record.get("lineId", ""),
+        "Visit": get_nested(booking_record, "visit.visitId"),
+        "POL": booking_record.get("polId", ""),
+        "POD": booking_record.get("pod1Id", ""),
+        "Earliest": booking_record.get("earliestDate", ""),
+        "Latest": booking_record.get("latestDate", ""),
+        "Quantity": booking_record.get("quantity", ""),
+        "Tally": booking_record.get("tally", ""),
+    }
+    updates["Dispatcher Notes"] = _append_port_houston_notes(load_row.get("Dispatcher Notes", ""), summary)
+    return updates
+
+
+def _apply_port_houston_updates(load_id: int, updates: dict, action_type: str) -> None:
+    if updates:
+        DispatchDatabaseClient().update_row_fields(load_id, updates)
+        _log_port_houston_event(
+            action_type=action_type,
+            load_id=load_id,
+            response_summary={"updated_fields": list(updates.keys())},
+        )
+
+
+def _xml_escape(value) -> str:
+    text = _safe_str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _build_port_houston_appointment_payload(
+    *,
+    action: str,
+    appointment_nbr: str,
+    appointment_date,
+    appointment_time: str,
+    gate_id: str,
+    truck_license: str,
+    trucking_co_id: str,
+    tran_type: str,
+    container: str,
+    booking: str,
+    chassis: str,
+    equipment_type: str,
+    owns_chassis: bool,
+) -> str:
+    appointment_date_text = appointment_date.strftime("%Y-%m-%d") if hasattr(appointment_date, "strftime") else _safe_str(appointment_date)
+    chassis_owner_text = "true" if owns_chassis else "false"
+    action_tag = {"Create": "create-appointment", "Update": "update-appointment", "Cancel": "cancel-appointment"}.get(action, "create-appointment")
+    lines = ["<gate>", f"  <{action_tag}>"]
+    if action in ["Update", "Cancel"]:
+        lines.append(f"    <appointment-nbr>{_xml_escape(appointment_nbr)}</appointment-nbr>")
+    if action != "Cancel":
+        lines.extend(
+            [
+                f"    <appointment-date>{_xml_escape(appointment_date_text)}</appointment-date>",
+                f"    <appointment-time>{_xml_escape(appointment_time)}</appointment-time>",
+                f"    <gate-id>{_xml_escape(gate_id)}</gate-id>",
+                f"    <truck license-nbr=\"{_xml_escape(truck_license)}\" trucking-co-id=\"{_xml_escape(trucking_co_id)}\" />",
+                f"    <tran-type>{_xml_escape(tran_type)}</tran-type>",
+            ]
+        )
+        if booking:
+            lines.append(
+                f"    <eq-order order-nbr=\"{_xml_escape(booking)}\"><eq-order-items>"
+                f"<eq-order-item type=\"{_xml_escape(equipment_type)}\" />"
+                f"</eq-order-items></eq-order>"
+            )
+        if container:
+            container_attr = f"eqid=\"{_xml_escape(container)}\"" if tran_type in ["DI", "DE", "RE"] else f"type=\"{_xml_escape(equipment_type)}\""
+            lines.append(f"    <container {container_attr} />")
+        if chassis:
+            lines.append(f"    <chassis eqid=\"{_xml_escape(chassis)}\" is-owners=\"{chassis_owner_text}\" />")
+        elif tran_type == "DC":
+            lines.append(f"    <chassis type=\"{_xml_escape(equipment_type)}\" />")
+    lines.extend([f"  </{action_tag}>", "</gate>"])
+    return "\n".join(lines)
+
+
+def _render_port_houston_setup() -> None:
+    settings = get_port_houston_settings()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Configured", "Yes" if settings.is_configured else "No")
+    c2.metric("Operator", settings.operator or "-")
+    c3.metric("API Base", "Set" if settings.base_url else "Missing")
+    c4.metric("Timeout", f"{settings.timeout_seconds}s")
+
+    if settings.missing:
+        st.warning("Missing settings: " + ", ".join(settings.missing))
+        st.caption("Add these to `.env` or Streamlit secrets. Do not put Port Houston credentials in source code.")
+    else:
+        st.success("Port Houston credentials are available from local settings.")
+
+    with st.expander("Connection Settings", expanded=False):
+        st.write(
+            {
+                "PORT_HOUSTON_BASE_URL": settings.base_url,
+                "PORT_HOUSTON_AUTH_URL": settings.auth_url,
+                "PORT_HOUSTON_CLIENT_ID": _redacted_config_value(settings.client_id),
+                "PORT_HOUSTON_CLIENT_SECRET": _redacted_config_value(settings.client_secret),
+                "PORT_HOUSTON_OPERATOR": settings.operator,
+            }
+        )
+
+    if st.button("Test Port Houston Connection", use_container_width=True, disabled=not settings.is_configured):
+        client = _get_port_houston_client_or_none()
+        if client:
+            try:
+                client.get_token(force_refresh=True)
+                _log_port_houston_event(action_type="token_test")
+                st.success("Connection test passed. Token was received and cached for this session.")
+            except Exception as exc:
+                _log_port_houston_event(action_type="token_test", status="failed", error_message=str(exc))
+                st.error(f"Connection test failed: {exc}")
+
+
+def _render_port_houston_selected_load(df: pd.DataFrame) -> None:
+    st.markdown("#### Load Lookup and Sync")
+    st.caption("Pull Port Houston unit or booking data for a TMS load and update safe fields/notes.")
+    load_options = _port_houston_load_options(df)
+    if not load_options:
+        st.info("No active loads are available for Port Houston lookup.")
+        return
+
+    selected_load = st.selectbox("Select Load", load_options, format_func=_port_houston_load_label, key="port_houston_selected_load")
+    load_id = int(selected_load["_row_id"])
+    default_container = _safe_str(selected_load.get("Container Number", ""))
+    default_booking = _safe_str(selected_load.get("Booking Number", ""))
+
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("Booking", default_booking or "-")
+    l2.metric("Container", default_container or "-")
+    l3.metric("Customer", _safe_str(selected_load.get("Customer", "")) or "-")
+    l4.metric("Status", _safe_str(selected_load.get("Status", "")) or "-")
+
+    container_value = st.text_input("Container to Check", value=default_container, key="port_houston_load_container")
+    booking_value = st.text_input("Booking to Check", value=default_booking, key="port_houston_load_booking")
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Lookup Container", key="port_houston_lookup_load_container", use_container_width=True):
+            client = _get_port_houston_client_or_none()
+            if client:
+                try:
+                    data = client.get_inventory_units(container=container_value)
+                    _store_port_houston_result("port_houston_load_unit_result", data, "Container / Unit", container_value, load_id)
+                    st.success("Container lookup complete.")
+                except Exception as exc:
+                    _log_port_houston_event(action_type="lookup", lookup_type="Container / Unit", request_reference=container_value, load_id=load_id, status="failed", error_message=str(exc))
+                    st.error(f"Container lookup failed: {exc}")
+    with b2:
+        if st.button("Lookup Booking", key="port_houston_lookup_load_booking", use_container_width=True):
+            client = _get_port_houston_client_or_none()
+            if client:
+                try:
+                    data = client.get_bookings(booking=booking_value)
+                    _store_port_houston_result("port_houston_load_booking_result", data, "Booking", booking_value, load_id)
+                    st.success("Booking lookup complete.")
+                except Exception as exc:
+                    _log_port_houston_event(action_type="lookup", lookup_type="Booking", request_reference=booking_value, load_id=load_id, status="failed", error_message=str(exc))
+                    st.error(f"Booking lookup failed: {exc}")
+
+    unit_records = _render_port_houston_result("port_houston_load_unit_result", mode="unit")
+    if unit_records and st.button("Update Load From Container Data", key="port_houston_update_from_unit", use_container_width=True):
+        updates = _updates_from_port_houston_unit(selected_load, unit_records[0])
+        _apply_port_houston_updates(load_id, updates, "update_load_from_unit")
+        refresh_data()
+        st.success("Load updated from Port Houston container data.")
+        st.rerun()
+
+    booking_records = _render_port_houston_result("port_houston_load_booking_result")
+    if booking_records and st.button("Update Load From Booking Data", key="port_houston_update_from_booking", use_container_width=True):
+        updates = _updates_from_port_houston_booking(selected_load, booking_records[0])
+        _apply_port_houston_updates(load_id, updates, "update_load_from_booking")
+        refresh_data()
+        st.success("Load updated from Port Houston booking data.")
+        st.rerun()
+        st.divider()
+    st.markdown("#### Express Pass / PIN Request")
+
+    pin_c1, pin_c2, pin_c3 = st.columns(3)
+
+    with pin_c1:
+        pin_driver = st.text_input(
+            "Driver",
+            value=_safe_str(selected_load.get("Driver Name", "")),
+            key=f"pin_driver_{load_id}",
+        )
+
+    with pin_c2:
+        pin_truck = st.text_input(
+            "Truck License / Truck #",
+            value=_safe_str(selected_load.get("Truck Assigned", "")),
+            key=f"pin_truck_{load_id}",
+        )
+
+    with pin_c3:
+        pin_chassis = st.text_input(
+            "Chassis",
+            value=_safe_str(selected_load.get("Chassis", "")),
+            key=f"pin_chassis_{load_id}",
+        )
+
+    pin_tran_label = st.selectbox(
+        "Port Transaction Type",
+        list(PORT_HOUSTON_APPOINTMENT_TRAN_TYPES.keys()),
+        key=f"pin_tran_type_{load_id}",
+    )
+
+    pin_date = st.date_input(
+        "Requested Date",
+        value=date.today(),
+        key=f"pin_date_{load_id}",
+    )
+
+    pin_time = st.selectbox(
+        "Requested Time",
+        ["06:00:00", "07:00:00", "08:00:00", "09:00:00", "10:00:00", "11:00:00", "12:00:00", "13:00:00", "14:00:00", "15:00:00", "16:00:00", "17:00:00"],
+        key=f"pin_time_{load_id}",
+    )
+
+    pin_gate = st.selectbox(
+        "Gate",
+        ["BPT MAIN", "BCT MAIN"],
+        key=f"pin_gate_{load_id}",
+    )
+
+    pin_scac = st.text_input(
+        "Trucking Company / SCAC",
+        value=_get_app_setting("PORT_HOUSTON_OPERATOR", "POHA"),
+        key=f"pin_scac_{load_id}",
+    )
+
+    pin_equipment_type = st.text_input(
+        "Equipment Type",
+        value=_safe_str(selected_load.get("Size", "")) or "40HC",
+        key=f"pin_equipment_{load_id}",
+    )
+
+    pin_payload = _build_port_houston_appointment_payload(
+        action="Create",
+        appointment_nbr="",
+        appointment_date=pin_date,
+        appointment_time=pin_time,
+        gate_id=pin_gate,
+        truck_license=pin_truck,
+        trucking_co_id=pin_scac,
+        tran_type=PORT_HOUSTON_APPOINTMENT_TRAN_TYPES[pin_tran_label],
+        container=container_value,
+        booking=booking_value,
+        chassis=pin_chassis,
+        equipment_type=pin_equipment_type,
+        owns_chassis=True,
+    )
+
+    with st.expander("Review Port Houston PIN / Appointment Payload", expanded=False):
+        st.text_area(
+            "Payload",
+            value=pin_payload,
+            height=260,
+            key=f"pin_payload_{load_id}",
+        )
+
+    if st.button("Save PIN Request To Load", key=f"save_pin_request_{load_id}", use_container_width=True):
+        if not booking_value and not container_value:
+            st.error("Booking or container is required.")
+        elif not pin_truck.strip():
+            st.error("Truck license / truck number is required.")
+        else:
+            execute(
+                """
+                update loads
+                set dispatcher_notes = concat(
+                    coalesce(dispatcher_notes, ''),
+                    E'\n\nPort Houston PIN / Express Pass Request:',
+                    E'\nTransaction Type: ', :tran_type,
+                    E'\nDate/Time: ', :pin_date, ' ', :pin_time,
+                    E'\nGate: ', :gate,
+                    E'\nBooking: ', :booking,
+                    E'\nContainer: ', :container,
+                    E'\nTruck: ', :truck,
+                    E'\nDriver: ', :driver,
+                    E'\nChassis: ', :chassis
+                )
+                where id = :load_id
+                """,
+                {
+                    "load_id": load_id,
+                    "tran_type": pin_tran_label,
+                    "pin_date": str(pin_date),
+                    "pin_time": pin_time,
+                    "gate": pin_gate,
+                    "booking": booking_value,
+                    "container": container_value,
+                    "truck": pin_truck,
+                    "driver": pin_driver,
+                    "chassis": pin_chassis,
+                },
+            )
+
+            _log_port_houston_event(
+                action_type="pin_request_saved",
+                lookup_type="Express Pass / PIN",
+                request_reference=booking_value or container_value,
+                load_id=load_id,
+                response_summary={
+                    "transaction_type": pin_tran_label,
+                    "date": str(pin_date),
+                    "time": pin_time,
+                    "gate": pin_gate,
+                    "booking": booking_value,
+                    "container": container_value,
+                    "truck": pin_truck,
+                    "driver": pin_driver,
+                    "chassis": pin_chassis,
+                    "payload": pin_payload,
+                },
+            )
+
+            refresh_data()
+            st.success("PIN request saved to load notes and Port Houston log.")
+            st.rerun()
+    
+def _render_port_houston_direct_lookup() -> None:
+    st.markdown("#### Live Endpoint Lookup")
+    endpoint_name = st.selectbox("Data Type", list(PORT_HOUSTON_ENDPOINTS.keys()), key="port_houston_endpoint_name")
+    endpoint = PORT_HOUSTON_ENDPOINTS[endpoint_name]
+    st.caption(endpoint["hint"])
+
+    c1, c2 = st.columns(2)
+    reference = c1.text_input("Quick Reference", placeholder="Container, booking, or vessel visit", key="port_houston_reference")
+    predicate = c2.text_input("Predicate", placeholder="Example: routing.pod1Id=TWKHH", key="port_houston_predicate")
+    fields = st.text_area("Fields", value=endpoint["fields"], height=90, key=f"port_houston_fields_{endpoint_name}")
+
+    if st.button("Run Lookup", key="port_houston_direct_lookup", use_container_width=True):
+        client = _get_port_houston_client_or_none()
+        if client:
+            try:
+                if endpoint_name == "Container / Unit":
+                    data = client.get_inventory_units(container=reference, predicate=predicate, fields=fields or UNIT_FIELDS)
+                elif endpoint_name == "Booking":
+                    data = client.get_bookings(booking=reference, predicate=predicate, fields=fields or BOOKING_FIELDS)
+                elif endpoint_name == "Vessel Visit":
+                    data = client.get_vessel_visits(visit_id=reference, predicate=predicate, fields=fields or VESSEL_FIELDS)
+                elif endpoint_name == "Gate Appointments":
+                    data = client.get_gate_appointments(predicate=predicate)
+                elif endpoint_name == "Appointment Time Slots":
+                    data = client.get_appointment_time_slots(predicate=predicate)
+                else:
+                    params = {}
+                    if predicate.strip():
+                        params["predicate"] = predicate.strip()
+                    if fields.strip():
+                        params["fields"] = fields.strip()
+                    data = client.request(endpoint["endpoint"], params=params)
+                _store_port_houston_result("port_houston_direct_result", data, endpoint_name, reference or predicate)
+                st.success("Lookup complete.")
+            except Exception as exc:
+                _log_port_houston_event(action_type="lookup", lookup_type=endpoint_name, request_reference=reference or predicate, status="failed", error_message=str(exc))
+                st.error(f"Lookup failed: {exc}")
+
+    _render_port_houston_result("port_houston_direct_result", mode="unit" if endpoint_name == "Container / Unit" else "flat")
+
+
+def _render_port_houston_appointments(df: pd.DataFrame) -> None:
+    st.markdown("#### Appointment Tools")
+    st.caption("Build Port Houston appointment payloads from a load. Live appointment creation also requires N4 authorization from Port Houston.")
+
+    load_options = _port_houston_load_options(df)
+    selected_load = None
+    if load_options:
+        selected_load = st.selectbox("Use Load Defaults", load_options, format_func=_port_houston_load_label, key="port_houston_appt_load")
+
+    default_container = _safe_str(selected_load.get("Container Number", "")) if selected_load else ""
+    default_booking = _safe_str(selected_load.get("Booking Number", "")) if selected_load else ""
+    default_chassis = _safe_str(selected_load.get("Chassis", "")) if selected_load else ""
+    default_size = _safe_str(selected_load.get("Size", "")) if selected_load else "40HC"
+
+    a1, a2, a3 = st.columns(3)
+    action = a1.selectbox("Action", ["Create", "Update", "Cancel"], key="port_houston_appt_action")
+    appointment_nbr = a2.text_input("Appointment Number", key="port_houston_appt_nbr")
+    tran_label = a3.selectbox("Transaction Type", list(PORT_HOUSTON_APPOINTMENT_TRAN_TYPES.keys()), key="port_houston_appt_tran")
+
+    d1, d2, d3, d4 = st.columns(4)
+    appointment_date = d1.date_input("Appointment Date", value=date.today(), key="port_houston_appt_date")
+    appointment_time = d2.selectbox(
+        "Arrival Hour",
+        ["06:00:00", "07:00:00", "08:00:00", "09:00:00", "10:00:00", "11:00:00", "12:00:00", "13:00:00", "14:00:00", "15:00:00", "16:00:00", "17:00:00"],
+        key="port_houston_appt_time",
+    )
+    gate_id = d3.selectbox("Gate", ["BPT MAIN", "BCT MAIN"], key="port_houston_appt_gate")
+    owns_chassis = d4.checkbox("Driver brings/owns chassis", value=True, key="port_houston_appt_owns_chassis")
+
+    f1, f2, f3 = st.columns(3)
+    truck_license = f1.text_input("Truck License", placeholder="LP12345 or SCAC if unknown", key="port_houston_appt_truck")
+    trucking_co_id = f2.text_input("Trucking Company / SCAC", key="port_houston_appt_scac")
+    equipment_type = f3.text_input("Equipment Type", value=default_size or "40HC", key="port_houston_appt_equipment")
+
+    c1, c2, c3 = st.columns(3)
+    container = c1.text_input("Container", value=default_container, key="port_houston_appt_container")
+    booking = c2.text_input("Booking / Order", value=default_booking, key="port_houston_appt_booking")
+    chassis = c3.text_input("Chassis", value=default_chassis, key="port_houston_appt_chassis")
+
+    payload = _build_port_houston_appointment_payload(
+        action=action,
+        appointment_nbr=appointment_nbr,
+        appointment_date=appointment_date,
+        appointment_time=appointment_time,
+        gate_id=gate_id,
+        truck_license=truck_license,
+        trucking_co_id=trucking_co_id,
+        tran_type=PORT_HOUSTON_APPOINTMENT_TRAN_TYPES[tran_label],
+        container=container,
+        booking=booking,
+        chassis=chassis,
+        equipment_type=equipment_type,
+        owns_chassis=owns_chassis,
+    )
+    st.text_area("Appointment SOAP Payload", value=payload, height=280, key="port_houston_appt_payload")
+    st.download_button("Download Appointment Payload", data=payload, file_name=f"port_houston_{action.lower()}_appointment.xml", mime="application/xml", use_container_width=True)
+
+    predicate = st.text_input("Time Slot Predicate", placeholder="Optional field filter", key="port_houston_timeslot_predicate")
+    if st.button("Check Appointment Time Slots", key="port_houston_check_timeslots", use_container_width=True):
+        client = _get_port_houston_client_or_none()
+        if client:
+            try:
+                data = client.get_appointment_time_slots(predicate=predicate)
+                _store_port_houston_result("port_houston_timeslot_result", data, "Appointment Time Slots", predicate)
+                st.success("Time slot lookup complete.")
+            except Exception as exc:
+                st.error(f"Time slot lookup failed: {exc}")
+    _render_port_houston_result("port_houston_timeslot_result")
+
+
+def _render_port_houston_subscriptions() -> None:
+    st.markdown("#### Event Subscriptions")
+    st.caption("Create or review Navis EVP event subscriptions for booking changes, gate events, units, and vessel updates.")
+
+    s1, s2, s3 = st.columns(3)
+    event_name = s1.selectbox("Event", PORT_HOUSTON_SUBSCRIPTION_EVENTS, key="port_houston_sub_event")
+    operation = s2.selectbox("Operation", ["", "create", "update", "delete"], key="port_houston_sub_operation")
+    persistence = s3.checkbox("Persistent", value=True, key="port_houston_sub_persistent")
+
+    group_default = f"Calitrans{event_name}{datetime.now().strftime('%Y%m%d')}"
+    group_id = st.text_input("Group ID", value=group_default, key="port_houston_sub_group")
+    predicate = st.text_input("Subscription Predicate", placeholder="Example: unitId=ABCD1234567 or freightKind=FCL", key="port_houston_sub_predicate")
+    fields = st.text_area("Fields to Include", value="", placeholder="Comma-separated field list, optional", height=80, key="port_houston_sub_fields")
+
+    filter_payload = {"eventName": event_name}
+    if operation:
+        filter_payload["operation"] = operation
+    if predicate.strip() or fields.strip():
+        filter_payload["filter"] = {}
+        if predicate.strip():
+            filter_payload["filter"]["predicate"] = predicate.strip()
+        if fields.strip():
+            filter_payload["filter"]["fields"] = [field.strip() for field in fields.split(",") if field.strip()]
+
+    payload = {"groupId": group_id, "persistence": persistence, "transport": "ws", "filters": [filter_payload]}
+    st.json(payload)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("List Subscriptions", key="port_houston_list_subscribers", use_container_width=True):
+            client = _get_port_houston_client_or_none()
+            if client:
+                try:
+                    data = client.get_subscribers()
+                    _store_port_houston_result("port_houston_subscribers_result", data, "Subscriptions", "")
+                    st.success("Subscriptions loaded.")
+                except Exception as exc:
+                    st.error(f"Could not load subscriptions: {exc}")
+    with c2:
+        if st.button("Create Subscription", key="port_houston_create_subscriber", use_container_width=True):
+            client = _get_port_houston_client_or_none()
+            if client:
+                try:
+                    data = client.create_subscriber(payload)
+                    _store_port_houston_result("port_houston_subscribers_result", data, "Create Subscription", group_id)
+                    st.success("Subscription request sent.")
+                except Exception as exc:
+                    st.error(f"Could not create subscription: {exc}")
+
+    records = _render_port_houston_result("port_houston_subscribers_result")
+    if records:
+        st.info("For websocket monitoring, connect to the documented stream URL with the returned subscription id and groupId.")
+
+
+def _render_port_houston_mapping() -> None:
+    st.markdown("#### Drayage Mapping")
+    st.caption("Recommended Port Houston EVP data mapping for CaliTrans TMS.")
+    rows = [
+        {"EVP Area": "Inventory Unit", "Endpoint": "/inventory/units", "TMS Use": "Container status, position, yard/facility, routing, return location", "TMS Action": "Update load notes, container size, port/facility, and availability checks"},
+        {"EVP Area": "Booking", "Endpoint": "/orders/bookings", "TMS Use": "Booking changes, quantity/tally, line, vessel visit, receiving window", "TMS Action": "Update booking review, dispatcher notes, and avoid dry runs"},
+        {"EVP Area": "Vessel Visit", "Endpoint": "/vessel/vesselvisits", "TMS Use": "ETA/ETD, begin receive, cutoff, first availability", "TMS Action": "Drive appointment planning and exception alerts"},
+        {"EVP Area": "Gate Appointments", "Endpoint": "/road/gateappointments", "TMS Use": "Existing appointment visibility", "TMS Action": "Confirm appointment state before dispatch"},
+        {"EVP Area": "Gate Transactions", "Endpoint": "/road/gatetransactions", "TMS Use": "Ingate/outgate and trouble stages", "TMS Action": "Update dispatch timeline and customer status"},
+        {"EVP Area": "Notify Subscriptions", "Endpoint": "/notify/subscribers", "TMS Use": "Booking, unit, appointment, and gate event monitoring", "TMS Action": "Future automation feed for Operations Inbox alerts"},
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    with st.expander("Required Local Settings", expanded=False):
+        st.code(
+            "\n".join(
+                [
+                    "PORT_HOUSTON_CLIENT_ID=your_client_id",
+                    "PORT_HOUSTON_CLIENT_SECRET=your_client_secret",
+                    "PORT_HOUSTON_OPERATOR=POHA",
+                    "PORT_HOUSTON_BASE_URL=https://api.america.naviscloudops.com/v3/evp",
+                    "PORT_HOUSTON_AUTH_URL=https://auth-v1.america.naviscloudops.com/auth/realms/phaprod/protocol/openid-connect/token",
+                ]
+            ),
+            language="bash",
+        )
+
+
+def render_port_houston_integration(df: pd.DataFrame) -> None:
+    st.subheader("Port Houston Integration")
+    st.caption("All-in-one Navis EVP workspace for Port Houston container, booking, vessel, gate, appointment, and subscription data.")
+    _render_port_houston_setup()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load Sync", "Live Lookup", "Appointments", "Subscriptions", "Data Map"])
+    with tab1:
+        _render_port_houston_selected_load(df)
+    with tab2:
+        _render_port_houston_direct_lookup()
+    with tab3:
+        _render_port_houston_appointments(df)
+    with tab4:
+        _render_port_houston_subscriptions()
+    with tab5:
+        _render_port_houston_mapping()
+
 
 def main() -> None:
     load_css()
@@ -4962,6 +7213,7 @@ def main() -> None:
         section = st.radio(
             "Navigation",
             [   "Operations Inbox",
+                "Port Houston Integration",
                 "Dashboard",
                 "Orders/Load Management",
                 "Dispatch Board",
@@ -4984,6 +7236,8 @@ def main() -> None:
         _render_status_legend()
     if section == "Operations Inbox":
         render_operations_inbox()
+    elif section == "Port Houston Integration":
+        render_port_houston_integration(df)
     elif section == "Dashboard":
         render_dashboard(df)
     elif section == "Orders/Load Management":

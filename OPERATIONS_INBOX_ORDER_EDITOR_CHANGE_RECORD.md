@@ -148,3 +148,50 @@ COMPANY_NAME
 - Fed recent dispatcher feedback examples back into AI Assist prompts so future suggestions can follow team corrections and preferred reply style.
 - Kept learning as a review-time prompt feedback loop rather than automatic model training.
 - Added safe on-demand table creation so feedback logging can start even before the migration is rerun.
+
+## June 23, 2026 Inbox Refresh Fix
+
+- Optimized open inbox auto-classification so it only rechecks rows that actually need classification or low-confidence correction.
+- Avoided reloading the inbox table after auto-classification unless a row was changed.
+- Added a clearer empty-state explanation when Yahoo fetches duplicate emails but no open requests are visible because existing records are already closed, attached, converted, or filtered.
+- Added saved operations email status counts to help diagnose why fetched emails are not appearing in the open inbox.
+
+## June 23, 2026 Bilingual Operations Inbox
+
+- Added Spanish and English language handling for Operations Inbox customer replies.
+- Added a `Reply Language` selector with `Auto`, `English`, `Spanish`, and `Bilingual` options.
+- Added Spanish rule-based reply templates for customer requests, quote requests, booking updates, appointment updates, missing information, cancellations, POD requests, and new bookings.
+- Updated AI Assist so generated reply drafts follow the selected response language.
+- Expanded inbox classification keywords so Spanish customer emails route into the correct request queues.
+
+## June 23, 2026 Operations Inbox Performance and PDF Intake
+
+- Replaced the multi-tab inbox rendering path with a single active queue selector so selecting or opening an email no longer renders every queue table.
+- Limited automatic reclassification to rows that are missing classification or need a low-confidence correction.
+- Used saved classification data for normal review opens, and moved load/AI match context behind an on-demand button.
+- Saved PDF attachments from Operations email imports into local document storage with parsed field metadata.
+- Added an Operations Inbox PDF panel to select, view, download, parse, compare email-vs-PDF fields, save PDF data to the request, create a load from a PDF, attach a PDF to a matched load, or update matched load fields from PDF data.
+- Added database indexes for Operations Inbox review filters and received-date sorting.
+- Backfilled missing PDF attachments onto already-imported Operations Inbox records when Yahoo returns duplicate/skipped emails.
+- Added manual PDF upload/import inside an Operations request.
+- Added movable Operations Inbox queue preferences so dispatch can move preferred queues earlier and save that order.
+- Carried parsed PDF fields such as address, document cutoff, and size into load creation and update flows.
+
+## June 23, 2026 Port Houston Integration
+
+- Added an all-in-one `Port Houston Integration` app section for Navis EVP data.
+- Added secure credential handling through local environment variables or Streamlit secrets; no Port Houston credentials are stored in source code.
+- Added live lookup tools for inventory units, bookings, vessel visits, gate appointments, appointment time slots, gate transactions, truck visits, and service events.
+- Added selected-load lookup and sync actions so dispatch can pull Port Houston container or booking data into load notes and safe missing fields.
+- Added appointment payload generation for create/update/cancel appointment workflows.
+- Added event subscription tools for Navis EVP notify subscribers and a drayage data mapping guide.
+- Added a Port Houston sync log migration for audit history of lookups and updates.
+
+## June 23, 2026 Operations Inbox Tab Rollback and Speed Pass
+
+- Restored Operations Inbox queues to the standard tab row instead of the queue dropdown and tab preference panel.
+- Added count labels to each queue tab so dispatch can see volume before opening a queue.
+- Split the inbox list query from the full email-detail query so routine queue loading uses a short body preview and full email content loads only after opening a request.
+- Moved heavy smart regrouping behind the `Recheck Groups` button so normal row selection and request opening do not reclassify older messages on every click.
+- Cleared cached inbox data after classification changes so tab counts and open request details refresh immediately after dispatcher actions.
+- Batched duplicate checks during `Check Client Email` so already-imported Yahoo messages are matched against saved inbox records without one database lookup per email.

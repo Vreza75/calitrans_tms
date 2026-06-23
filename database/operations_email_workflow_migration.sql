@@ -97,10 +97,19 @@ create table if not exists operations_ai_feedback (
     created_at timestamptz not null default now()
 );
 
+create table if not exists operations_inbox_preferences (
+    preference_name text primary key,
+    preference_value jsonb not null,
+    updated_at timestamptz not null default now()
+);
+
 create index if not exists idx_order_intake_review_status on order_intake(review_status);
 create index if not exists idx_order_intake_request_type on order_intake(request_type);
 create index if not exists idx_order_intake_conversation_key on order_intake(conversation_key);
 create index if not exists idx_order_intake_matched_load_id on order_intake(matched_load_id);
+create index if not exists idx_order_intake_review_created_at on order_intake(review_status, created_at desc);
+create index if not exists idx_order_intake_source_created_at on order_intake(source, created_at desc);
+create index if not exists idx_order_intake_source_received_at on order_intake(source_received_at desc);
 create unique index if not exists idx_order_intake_source_message_id_unique
     on order_intake(source_message_id)
     where source_message_id is not null;

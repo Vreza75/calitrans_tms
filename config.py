@@ -39,12 +39,14 @@ EDITABLE_COLUMNS = [
     "Port",
     "Warehouse",
     "Address",
+    "Document Cutoff",
     "Delivery Need Date",
     "LFD",
     "Status",
     "Driver Name",
     "Truck Assigned",
     "Chassis",
+    "Size",
     "Dispatcher Notes",
 ]
 

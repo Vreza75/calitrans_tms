@@ -70,6 +70,10 @@ OPERATIONS_AI_SCHEMA = {
             "maximum": 100,
         },
         "status_summary": {"type": "string"},
+        "response_language": {
+            "type": "string",
+            "enum": ["English", "Spanish", "Bilingual"],
+        },
     },
     "required": [
         "request_type",
@@ -86,6 +90,7 @@ OPERATIONS_AI_SCHEMA = {
         "suggested_load_id",
         "load_match_confidence",
         "status_summary",
+        "response_language",
     ],
     "additionalProperties": False,
 }
@@ -167,6 +172,10 @@ def _normalize_suggestion(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(required_details, list):
         required_details = []
 
+    response_language = str(value.get("response_language", "English") or "English").strip()
+    if response_language not in ["English", "Spanish", "Bilingual"]:
+        response_language = "English"
+
     return {
         "request_type": request_type,
         "confidence_score": max(0, min(100, confidence)),
@@ -182,6 +191,7 @@ def _normalize_suggestion(value: dict[str, Any]) -> dict[str, Any]:
         "suggested_load_id": str(value.get("suggested_load_id", "") or "").strip(),
         "load_match_confidence": max(0, min(100, load_match_confidence)),
         "status_summary": str(value.get("status_summary", "") or "").strip(),
+        "response_language": response_language,
         "success": True,
         "error": "",
     }
@@ -197,6 +207,7 @@ def generate_operations_ai_suggestion(
     load_context: dict[str, Any] | None = None,
     load_candidates: list[dict[str, Any]] | None = None,
     feedback_examples: list[dict[str, Any]] | None = None,
+    response_language: str = "Auto",
     company_name: str = "CaliTrans",
 ) -> dict[str, Any]:
     api_key = _get_setting("OPENAI_API_KEY")
@@ -228,6 +239,8 @@ Success criteria:
 - Do not invent status, rate, appointment, POD availability, dates, charges, or promises.
 - Do not mention rates, carrier pay, billing notes, or internal notes.
 - Use dispatcher_feedback_examples as operating guidance. Prefer patterns the dispatch team accepted or corrected recently, but do not copy customer-specific facts from an unrelated example.
+- Draft reply_body in the requested_response_language. If requested_response_language is Auto, use the customer's language. If it is Bilingual, write English first, then Spanish separated by "---".
+- For Spanish replies, use professional Spanish suitable for logistics/dispatch customers.
 - Draft a warm, concise, professional email reply that a dispatcher can edit before sending.
 - Never say the email was processed automatically. The dispatcher is reviewing it.
 """.strip()
@@ -243,6 +256,7 @@ Success criteria:
         "matched_load_context": load_context or {},
         "candidate_loads": load_candidates or [],
         "dispatcher_feedback_examples": feedback_examples or [],
+        "requested_response_language": response_language,
         "allowed_request_types": REQUEST_TYPES,
     }
 
