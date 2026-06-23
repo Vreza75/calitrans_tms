@@ -96,3 +96,55 @@ COMPANY_NAME
 - Client emails are deduped by message id when available.
 - If an imported email matches an existing booking, container, or reference number, the app links it to that load.
 - Sent replies are logged even when delivery fails, so failed email attempts can be reviewed.
+
+## June 22, 2026 Yahoo Inbox Fix
+
+- Updated Yahoo IMAP handling to use `imap.mail.yahoo.com`, port `993`, and `INBOX` by default.
+- Added fallback inbox folder checks for `INBOX`, `Inbox`, and `inbox`.
+- Increased the Yahoo inbox scan window so older recent emails are less likely to be missed.
+- Changed Operations Inbox import so recent inbox emails are not dropped just because they do not contain quote/load keywords.
+- Kept keyword matches as metadata, but classification and tabs now happen inside Operations Inbox.
+- Added a visible import result after `Check Client Email`, showing fetched, imported, and skipped counts.
+- Updated outbound email to work when only `YAHOO_EMAIL` and `YAHOO_APP_PASSWORD` are configured.
+- Reworked `email_ingest.py` into a safe Yahoo inbox diagnostic that uses the same email client as the app.
+
+## June 22, 2026 Intelligent Inbox Update
+
+- Tightened Operations Inbox classification so vague customer update requests without a booking, container, or reference stay in `Customer Request` instead of becoming new bookings, booking updates, or quote requests.
+- Added a `Needs Details` queue for messages that need a first-response request for identifying load details.
+- Split `POD Requests` into their own queue instead of mixing them into general customer requests.
+- Added more specific action guidance for update, quote, order, appointment, POD, cancellation, and customer-detail requests.
+- Improved reply drafts so vague update requests ask for booking/container/reference details, quote requests ask for lane/equipment/date details, and matched operational requests get a more relevant acknowledgment.
+- Disabled `Create New Order` and `Create Quote` when the selected email does not have enough detail for that action.
+- Added an Operations Inbox process-feedback panel with recommended team workflow improvements.
+
+## June 22, 2026 Phase 1 AI Assist
+
+- Added optional OpenAI-powered AI Assist for Operations Inbox review.
+- AI Assist suggests request type, confidence, priority, missing details, next action, and an editable customer reply draft.
+- Added `Apply AI Classification` so dispatch can accept the AI classification after review.
+- Kept all AI email replies human-approved; AI drafts do not send email automatically.
+- Added optional import-time AI classification behind `OPERATIONS_AI_AUTO_CLASSIFY=true`.
+- New settings:
+  - `OPENAI_API_KEY`
+  - `OPERATIONS_AI_MODEL` optional, defaults to `gpt-5.5`
+  - `OPERATIONS_AI_REASONING_EFFORT` optional, defaults to `low`
+  - `OPERATIONS_AI_AUTO_CLASSIFY` optional, defaults to `false`
+
+## June 22, 2026 Phase 2 AI Load Matching
+
+- Added customer-safe load context for AI Assist, including load status, route, LFD, delivery need date, appointment/ETA fields, current location, live load/unload status, and POD/document availability.
+- Added AI load candidates so AI can suggest a matched load only from real candidate records.
+- Added guarded AI matched-load application: the app accepts an AI suggested load only when the ID exists in the candidate list shown to dispatch.
+- Preserved dispatcher-approved matched loads on refresh, even when the original email did not include booking, container, or reference details.
+- Improved AI prompts so matched emails can receive status-aware reply drafts while unmatched emails ask for identifying details.
+- Kept billing, carrier-pay, and internal-note details out of the AI context used for customer replies.
+
+## June 23, 2026 Phase 3 AI Feedback Learning
+
+- Added `operations_ai_feedback` to store dispatcher feedback from AI-assisted inbox work.
+- Saved feedback when dispatch accepts AI classification, manually corrects AI classification/action guidance, or sends an edited AI reply draft.
+- Added optional `Learning Notes` in AI Assist so dispatch can explain what AI got right or wrong.
+- Fed recent dispatcher feedback examples back into AI Assist prompts so future suggestions can follow team corrections and preferred reply style.
+- Kept learning as a review-time prompt feedback loop rather than automatic model training.
+- Added safe on-demand table creation so feedback logging can start even before the migration is rerun.

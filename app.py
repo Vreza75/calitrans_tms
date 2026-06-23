@@ -20,6 +20,11 @@ from config import ACTIVE_STATUSES, APP_NAME, EDITABLE_COLUMNS
 from db_client import DispatchDatabaseClient, execute, read_df
 from email_client import fetch_recent_operations_emails
 from email_parser import parse_email_text
+from operations_ai import (
+    generate_operations_ai_suggestion,
+    is_operations_ai_auto_classify_enabled,
+    is_operations_ai_configured,
+)
 from order_parser import extract_text_from_pdf, parse_order_text
 from profittools_export import export_ready_loads
 from validators import validate_dispatch_rows
@@ -944,42 +949,204 @@ INBOX_TERMINAL_REVIEW_STATUSES = [
 ]
 
 
+def _normalize_reference_token(value: str) -> str:
+    return re.sub(r"\s+", "-", str(value or "").strip(" :#-")).upper()
+
+
 def _extract_reference_tokens(text: str) -> dict:
     text = str(text or "")
 
-    booking_match = re.search(r"\b(?:IMP|EXP|IML|EXL|BOOKING|BK)[-\s]?[A-Z0-9-]{4,}\b", text, re.I)
+    booking_match = (
+        re.search(r"\b(?:booking|bkg|bk)\s*(?:number|no\.?|#)?\s*[:#-]\s*([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
+        or re.search(r"\b(?:IMP|EXP|IML|EXL)[-\s]?[A-Z0-9-]{4,}\b", text, re.I)
+        or re.search(r"\b(?:MAEU|ONEY|COSU|ZIMU|HLCU|MSCU|OOLU|CMDU|EGLV|YMLU|HMMU|SUDU)[A-Z0-9-]{4,}\b", text, re.I)
+    )
     container_match = re.search(r"\b[A-Z]{4}\d{6,7}\b", text, re.I)
-    ref_match = re.search(r"\bREF[-\s]?\d{3,}\b", text, re.I)
+    ref_match = re.search(
+        r"\b(?:ref|reference|po)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})\b",
+        text,
+        re.I,
+    )
+
+    booking_value = ""
+    if booking_match:
+        booking_value = booking_match.group(1) if booking_match.lastindex else booking_match.group(0)
+
+    ref_value = ""
+    if ref_match:
+        ref_value = ref_match.group(1) if ref_match.lastindex else ref_match.group(0)
 
     return {
-        "booking_number": booking_match.group(0).replace(" ", "-").upper() if booking_match else "",
+        "booking_number": _normalize_reference_token(booking_value) if booking_value else "",
         "container_number": container_match.group(0).upper() if container_match else "",
-        "reference_number": ref_match.group(0).replace(" ", "-").upper() if ref_match else "",
+        "reference_number": _normalize_reference_token(ref_value) if ref_value else "",
     }
 
 
-def classify_customer_request(subject: str, body: str) -> str:
-    text = f"{subject} {body}".lower()
+APPOINTMENT_INTENT_TERMS = [
+    "can we load",
+    "load at",
+    "load on",
+    "earlier",
+    "later",
+    "appointment",
+    "appt",
+    "scheduled",
+    "confirmed time",
+    "delivery appointment",
+    "pickup appointment",
+    "change appointment",
+    "reschedule",
+    "move appointment",
+    "change time",
+    "change date",
+]
 
-    if any(x in text for x in ["quote", "rate", "price", "pricing", "cost"]):
-        return "Quote Request"
+QUOTE_INTENT_TERMS = [
+    "quote request",
+    "rate request",
+    "please quote",
+    "need a quote",
+    "need rate",
+    "send rate",
+    "pricing request",
+    "price this load",
+    "can you quote",
+    "quote this",
+    "rate this",
+]
 
-    if any(x in text for x in ["missing info", "missing information", "need info", "need information", "incomplete"]):
+UPDATE_INTENT_TERMS = [
+    "any update",
+    "status update",
+    "please update",
+    "can you update",
+    "where are we",
+    "where is",
+    "eta",
+    "update",
+    "revision",
+    "revised",
+    "changed",
+    "new address",
+    "correction",
+    "container released",
+    "released",
+    "last free day",
+    "lfd",
+]
+
+NEW_ORDER_INTENT_TERMS = [
+    "new booking",
+    "new load",
+    "load order",
+    "delivery order",
+    "work order",
+    "tender",
+    "tendered",
+    "bill of lading",
+    "bol",
+    "attached order",
+    "attached load",
+    "please book",
+]
+
+MISSING_INFO_TERMS = [
+    "missing info",
+    "missing information",
+    "need info",
+    "need information",
+    "incomplete",
+    "please provide",
+]
+
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    lowered = str(text or "").lower()
+    return any(term in lowered for term in terms)
+
+
+def _coerce_parsed_for_classification(subject: str, body: str, parsed: dict | None = None) -> dict:
+    if isinstance(parsed, dict):
+        return parsed
+    try:
+        return parse_email_text(subject, body)
+    except Exception:
+        return {}
+
+
+def _has_reference_details(tokens: dict, parsed: dict) -> bool:
+    parsed_reference_fields = [
+        "Booking Number",
+        "Container Number",
+        "Reference Number",
+    ]
+    return any(_safe_str(tokens.get(key, "")) for key in ["booking_number", "container_number", "reference_number"]) or any(
+        _safe_str(parsed.get(field, "")) for field in parsed_reference_fields
+    )
+
+
+def _has_quote_details(text: str, parsed: dict, tokens: dict) -> bool:
+    detail_score = 0
+
+    if _safe_str(parsed.get("Port", "")):
+        detail_score += 1
+    if _safe_str(parsed.get("Warehouse", "")) or _safe_str(parsed.get("Address", "")):
+        detail_score += 1
+    if _safe_str(parsed.get("Size", "")) or re.search(r"\b(?:20|40|45)\s*(?:ft|hc|hq|dv|std)?\b", text, re.I):
+        detail_score += 1
+    if _safe_str(parsed.get("Delivery Need Date", "")) or re.search(
+        r"\b(?:today|tomorrow|asap|next week|\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b",
+        text,
+        re.I,
+    ):
+        detail_score += 1
+    if re.search(r"\bfrom\s+.{2,80}\s+\bto\s+.{2,80}", text, re.I):
+        detail_score += 2
+    if _has_reference_details(tokens, parsed):
+        detail_score += 1
+
+    return detail_score >= 2
+
+
+def _has_new_order_details(text: str, parsed: dict, tokens: dict) -> bool:
+    detail_score = 0
+    for field in ["Booking Number", "Customer", "Container Number", "Port", "Warehouse", "Delivery Need Date"]:
+        if _safe_str(parsed.get(field, "")):
+            detail_score += 1
+    if _has_reference_details(tokens, parsed):
+        detail_score += 1
+    if _contains_any(text, NEW_ORDER_INTENT_TERMS):
+        detail_score += 1
+
+    return detail_score >= 3
+
+
+def classify_customer_request(subject: str, body: str, parsed: dict | None = None) -> str:
+    text = f"{subject or ''} {body or ''}"
+    parsed = _coerce_parsed_for_classification(subject, body, parsed)
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    has_reference = _has_reference_details(tokens, parsed)
+
+    if _contains_any(text, MISSING_INFO_TERMS):
         return "Missing Information"
 
-    if any(x in text for x in ["cancel", "cancelled", "canceled"]):
-        return "Cancellation"
+    if _contains_any(text, ["cancel", "cancelled", "canceled"]):
+        return "Cancellation" if has_reference else "Customer Request"
 
-    if any(x in text for x in ["appointment", "appt", "scheduled", "confirmed time"]):
-        return "Appointment Update"
+    if _contains_any(text, ["pod", "proof of delivery"]):
+        return "POD Request" if has_reference else "Customer Request"
 
-    if any(x in text for x in ["pod", "proof of delivery"]):
-        return "POD Request"
+    if _contains_any(text, APPOINTMENT_INTENT_TERMS):
+        return "Appointment Update" if has_reference else "Customer Request"
 
-    if any(x in text for x in ["update", "revision", "changed", "new address", "correction"]):
-        return "Booking Update"
+    if _contains_any(text, QUOTE_INTENT_TERMS):
+        return "Quote Request" if _has_quote_details(text, parsed, tokens) else "Customer Request"
 
-    if any(x in text for x in ["booking", "delivery order", "container", "attached"]):
+    if _contains_any(text, UPDATE_INTENT_TERMS):
+        return "Booking Update" if has_reference else "Customer Request"
+
+    if _contains_any(text, NEW_ORDER_INTENT_TERMS) and _has_new_order_details(text, parsed, tokens):
         return "New Booking"
 
     return "Customer Request"
@@ -1032,14 +1199,22 @@ def find_matching_load(tokens: dict) -> tuple[int | None, int]:
         return None, 0
 
 
-def update_intake_classification(intake_id: int, request_type: str, conversation_key: str, matched_load_id, confidence_score: int) -> None:
+def update_intake_classification(
+    intake_id: int,
+    request_type: str,
+    conversation_key: str,
+    matched_load_id,
+    confidence_score: int,
+    action_required: str | None = None,
+) -> None:
     execute(
         """
         update order_intake
         set request_type = :request_type,
             conversation_key = :conversation_key,
             matched_load_id = :matched_load_id,
-            confidence_score = :confidence_score
+            confidence_score = :confidence_score,
+            action_required = coalesce(:action_required, action_required)
         where id = :intake_id
         """,
         {
@@ -1048,6 +1223,7 @@ def update_intake_classification(intake_id: int, request_type: str, conversation
             "conversation_key": conversation_key or None,
             "matched_load_id": matched_load_id,
             "confidence_score": confidence_score,
+            "action_required": action_required,
         },
     )
 
@@ -1153,7 +1329,7 @@ def _inbox_review_where_clause() -> str:
     return f"where coalesce(review_status, 'Open') not in ({terminal})"
 
 
-def _operations_email_already_imported(message_id: str, subject: str, sender: str) -> bool:
+def _operations_email_already_imported(message_id: str, subject: str, sender: str, received_at: str | None = None) -> bool:
     if message_id:
         existing = read_df(
             """
@@ -1167,6 +1343,21 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
         if not existing.empty:
             return True
 
+    if received_at:
+        fallback = read_df(
+            """
+            select id
+            from order_intake
+            where source in ('operations_email', 'email_body', 'email_combined')
+              and coalesce(source_subject, '') = :subject
+              and coalesce(source_sender, '') = :sender
+              and source_received_at = cast(:received_at as timestamptz)
+            limit 1
+            """,
+            {"subject": subject or "", "sender": sender or "", "received_at": received_at},
+        )
+        return not fallback.empty
+
     fallback = read_df(
         """
         select id
@@ -1174,6 +1365,7 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
         where source in ('operations_email', 'email_body', 'email_combined')
           and coalesce(source_subject, '') = :subject
           and coalesce(source_sender, '') = :sender
+          and source_received_at is null
         limit 1
         """,
         {"subject": subject or "", "sender": sender or ""},
@@ -1181,39 +1373,677 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
     return not fallback.empty
 
 
-def _action_required_for_request(request_type: str, parsed: dict, body: str) -> str:
-    missing = []
-    for field in ["Booking Number", "Customer", "Container Number", "Warehouse"]:
-        if not _safe_str(parsed.get(field, "")):
-            missing.append(field)
+def _action_required_for_request(
+    request_type: str,
+    parsed: dict,
+    body: str,
+    subject: str = "",
+    tokens: dict | None = None,
+    matched_load_id=None,
+) -> str:
+    text = f"{subject or ''} {body or ''}"
+    tokens = tokens or _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    has_reference = _has_reference_details(tokens, parsed)
+
+    if request_type == "Customer Request":
+        if _contains_any(text, UPDATE_INTENT_TERMS) and not has_reference:
+            return "Customer is asking for an update but did not include booking, container, or reference. Reply for identifying details."
+        if _contains_any(text, QUOTE_INTENT_TERMS) and not _has_quote_details(text, parsed, tokens):
+            return "Customer may need pricing but did not include enough lane details. Reply for pickup, delivery, equipment, and date."
+        if _contains_any(text, NEW_ORDER_INTENT_TERMS) and not _has_new_order_details(text, parsed, tokens):
+            return "Customer may be sending an order but key load details are missing. Reply for the load order or booking details."
+        return "Review customer question and reply from the inbox."
 
     if request_type == "Quote Request":
-        return "Quote requested; review lane, date, container type, and reply with rate."
+        if not _has_quote_details(text, parsed, tokens):
+            return "Quote intent found, but lane/equipment/date details are missing. Reply before creating a quote."
+        return "Quote details found; review lane, timing, and equipment before sending rate."
+
     if request_type == "Missing Information":
         return "Customer needs missing information; reply or attach to the matching order."
+
     if request_type == "Cancellation":
+        if matched_load_id is None:
+            return "Cancellation requested without a matched order. Ask for booking, container, or reference before cancelling."
         return "Customer requested cancellation; verify matching order before cancelling."
+
     if request_type == "Appointment Update":
+        if matched_load_id is None:
+            return "Appointment request needs booking, container, or reference before updating the schedule."
         return "Appointment update received; attach to matching order and update schedule."
-    if missing:
-        return "Missing: " + ", ".join(missing)
+
+    if request_type == "Booking Update":
+        if matched_load_id is None:
+            return "Update request needs booking, container, or reference before attaching to an order."
+        return "Update matched to an order; attach it and update order notes or schedule."
+
+    if request_type == "POD Request":
+        if matched_load_id is None:
+            return "POD request needs booking, container, or reference before sending documents."
+        return "POD request matched to an order; verify POD status and reply."
+
+    if request_type == "New Booking":
+        missing = []
+        for field in ["Booking Number", "Customer", "Warehouse"]:
+            if not _safe_str(parsed.get(field, "")):
+                missing.append(field)
+        if missing:
+            return "Missing order details: " + ", ".join(missing)
+        return "New booking details found; review parsed fields before creating order."
+
     if body:
         return "Review message and choose the next action."
     return "Review imported email."
 
 
-def import_recent_operations_emails(limit: int = 25) -> tuple[int, int]:
+def _classification_confidence(
+    request_type: str,
+    subject: str,
+    body: str,
+    parsed: dict,
+    tokens: dict,
+    matched_load_id,
+    match_confidence: int,
+) -> int:
+    text = f"{subject or ''} {body or ''}"
+
+    if matched_load_id is not None:
+        return max(match_confidence, 90)
+
+    if request_type == "Customer Request":
+        if (
+            (_contains_any(text, UPDATE_INTENT_TERMS) and not _has_reference_details(tokens, parsed))
+            or (_contains_any(text, QUOTE_INTENT_TERMS) and not _has_quote_details(text, parsed, tokens))
+            or (_contains_any(text, NEW_ORDER_INTENT_TERMS) and not _has_new_order_details(text, parsed, tokens))
+        ):
+            return 60
+        return 70
+
+    if request_type == "Quote Request":
+        return 80 if _has_quote_details(text, parsed, tokens) else 55
+
+    if request_type == "New Booking":
+        return 80 if _has_new_order_details(text, parsed, tokens) else 55
+
+    if request_type in ["Appointment Update", "Booking Update", "Cancellation", "POD Request"]:
+        return 75 if _has_reference_details(tokens, parsed) else 55
+
+    if request_type == "Missing Information":
+        return 75
+
+    return max(match_confidence, 50)
+
+
+def _build_operations_email_classification(
+    subject: str,
+    body: str,
+    parsed: dict | None = None,
+    fallback_key: str = "",
+) -> dict:
+    parsed = _coerce_parsed_for_classification(subject, body, parsed)
+    detected_type = classify_customer_request(subject, body, parsed)
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    matched_load_id, match_confidence = find_matching_load(tokens)
+    confidence = _classification_confidence(
+        detected_type,
+        subject,
+        body,
+        parsed,
+        tokens,
+        matched_load_id,
+        match_confidence,
+    )
+    conversation_key = (
+        tokens.get("booking_number")
+        or tokens.get("container_number")
+        or tokens.get("reference_number")
+        or fallback_key
+        or "customer-request"
+    )
+    action_required = _action_required_for_request(
+        detected_type,
+        parsed,
+        body,
+        subject=subject,
+        tokens=tokens,
+        matched_load_id=matched_load_id,
+    )
+
+    return {
+        "request_type": detected_type,
+        "tokens": tokens,
+        "matched_load_id": matched_load_id,
+        "confidence_score": confidence,
+        "conversation_key": conversation_key,
+        "action_required": action_required,
+    }
+
+
+AI_LOAD_CONTEXT_COLUMNS = [
+    "id",
+    "load_id",
+    "type",
+    "booking_number",
+    "reference_number",
+    "container_number",
+    "customer",
+    "port",
+    "warehouse",
+    "address",
+    "delivery_need_date",
+    "lfd",
+    "status",
+    "driver_name",
+    "truck_assigned",
+    "chassis",
+    "size",
+    "steamship_line",
+    "vessel_name",
+    "terminal",
+    "pickup_appointment",
+    "delivery_appointment",
+    "empty_return_location",
+    "empty_return_date",
+    "current_location",
+    "eta",
+    "live_load_status",
+    "live_unload_status",
+    "last_driver_update",
+]
+
+AI_LOAD_CONTEXT_LABELS = {
+    "id": "Load ID",
+    "load_id": "External Load ID",
+    "type": "Move Type",
+    "booking_number": "Booking Number",
+    "reference_number": "Reference Number",
+    "container_number": "Container Number",
+    "customer": "Customer",
+    "port": "Pickup / Port",
+    "warehouse": "Delivery / Warehouse",
+    "address": "Delivery Address",
+    "delivery_need_date": "Delivery Need Date",
+    "lfd": "LFD",
+    "status": "Status",
+    "driver_name": "Driver",
+    "truck_assigned": "Truck",
+    "chassis": "Chassis",
+    "size": "Container Size",
+    "steamship_line": "Steamship Line",
+    "vessel_name": "Vessel",
+    "terminal": "Terminal",
+    "pickup_appointment": "Pickup Appointment",
+    "delivery_appointment": "Delivery Appointment",
+    "empty_return_location": "Empty Return Location",
+    "empty_return_date": "Empty Return Date",
+    "current_location": "Current Location",
+    "eta": "ETA",
+    "live_load_status": "Live Load Status",
+    "live_unload_status": "Live Unload Status",
+    "last_driver_update": "Last Driver Update",
+}
+
+
+def _clean_ai_context_value(value) -> str:
+    value_str = _safe_str(value)
+    if value_str.lower() in {"nan", "nat"}:
+        return ""
+    return value_str
+
+
+def _existing_load_columns() -> set[str]:
+    try:
+        df = read_df(
+            """
+            select column_name
+            from information_schema.columns
+            where table_name = 'loads'
+            """
+        )
+        return set(df["column_name"].astype(str).tolist())
+    except Exception:
+        return {
+            "id",
+            "load_id",
+            "type",
+            "booking_number",
+            "reference_number",
+            "container_number",
+            "customer",
+            "port",
+            "warehouse",
+            "address",
+            "delivery_need_date",
+            "lfd",
+            "status",
+            "driver_name",
+            "truck_assigned",
+            "chassis",
+            "size",
+        }
+
+
+def _load_context_select_columns() -> list[str]:
+    existing = _existing_load_columns()
+    return [column for column in AI_LOAD_CONTEXT_COLUMNS if column in existing]
+
+
+def _load_row_to_ai_context(row: dict) -> dict:
+    context = {}
+    for key, label in AI_LOAD_CONTEXT_LABELS.items():
+        if key in row:
+            value = _clean_ai_context_value(row.get(key))
+            if value:
+                context[label] = value
+    return context
+
+
+def _load_document_context(load_id) -> dict:
+    if load_id is None:
+        return {}
+
+    try:
+        docs_df = read_df(
+            """
+            select document_type, filename, created_at
+            from documents
+            where load_id = :load_id
+            order by created_at desc
+            limit 12
+            """,
+            {"load_id": int(load_id)},
+        )
+    except Exception:
+        return {}
+
+    if docs_df.empty:
+        return {
+            "Document Count": "0",
+            "POD Available": "No document found",
+        }
+
+    doc_types = [
+        _clean_ai_context_value(value)
+        for value in docs_df.get("document_type", pd.Series(dtype=str)).tolist()
+    ]
+    doc_names = [
+        _clean_ai_context_value(value)
+        for value in docs_df.get("filename", pd.Series(dtype=str)).tolist()
+    ]
+    haystack = " ".join(doc_types + doc_names).lower()
+    pod_available = "Yes" if ("pod" in haystack or "proof" in haystack or "delivery" in haystack) else "No document found"
+
+    return {
+        "Document Count": str(len(docs_df)),
+        "Document Types": ", ".join([value for value in doc_types if value][:6]),
+        "POD Available": pod_available,
+    }
+
+
+def _fetch_ai_load_context(load_id) -> dict:
+    if load_id is None:
+        return {}
+
+    try:
+        columns = _load_context_select_columns()
+        if not columns:
+            return {}
+        load_df = read_df(
+            f"""
+            select {", ".join(columns)}
+            from loads
+            where id = :load_id
+            limit 1
+            """,
+            {"load_id": int(load_id)},
+        )
+    except Exception:
+        return {}
+
+    if load_df.empty:
+        return {}
+
+    context = _load_row_to_ai_context(load_df.iloc[0].to_dict())
+    context.update(_load_document_context(load_id))
+    return context
+
+
+def _candidate_summary_from_context(context: dict) -> dict:
+    keep = [
+        "Load ID",
+        "External Load ID",
+        "Booking Number",
+        "Reference Number",
+        "Container Number",
+        "Customer",
+        "Status",
+        "Pickup / Port",
+        "Delivery / Warehouse",
+        "Delivery Need Date",
+        "LFD",
+        "ETA",
+        "Current Location",
+        "Pickup Appointment",
+        "Delivery Appointment",
+        "POD Available",
+    ]
+    return {key: context.get(key, "") for key in keep if context.get(key)}
+
+
+def _find_ai_load_candidates(tokens: dict, parsed: dict, matched_load_id=None, limit: int = 5) -> list[dict]:
+    candidate_ids = []
+    if matched_load_id is not None:
+        candidate_ids.append(int(matched_load_id))
+
+    conditions = []
+    params = {"limit": int(limit)}
+
+    booking = _safe_str(tokens.get("booking_number") or parsed.get("Booking Number", ""))
+    container = _safe_str(tokens.get("container_number") or parsed.get("Container Number", ""))
+    reference = _safe_str(tokens.get("reference_number") or parsed.get("Reference Number", ""))
+    customer = _safe_str(parsed.get("Customer", ""))
+
+    if booking:
+        conditions.append("lower(coalesce(booking_number, '')) like lower(:booking_like)")
+        params["booking_like"] = f"%{booking}%"
+    if container:
+        conditions.append("lower(coalesce(container_number, '')) like lower(:container_like)")
+        params["container_like"] = f"%{container}%"
+    if reference:
+        conditions.append("lower(coalesce(reference_number, '')) like lower(:reference_like)")
+        params["reference_like"] = f"%{reference}%"
+    if customer and len(customer) >= 4:
+        conditions.append("lower(coalesce(customer, '')) like lower(:customer_like)")
+        params["customer_like"] = f"%{customer}%"
+
+    if conditions:
+        try:
+            ids_df = read_df(
+                f"""
+                select id
+                from loads
+                where {" or ".join(conditions)}
+                order by updated_at desc
+                limit :limit
+                """,
+                params,
+            )
+            for value in ids_df.get("id", pd.Series(dtype=int)).tolist():
+                if pd.notna(value):
+                    candidate_ids.append(int(value))
+        except Exception:
+            pass
+
+    candidates = []
+    seen = set()
+    for load_id in candidate_ids:
+        if load_id in seen:
+            continue
+        seen.add(load_id)
+        context = _fetch_ai_load_context(load_id)
+        if context:
+            candidates.append(_candidate_summary_from_context(context))
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def _build_ai_load_context(classification: dict, parsed: dict) -> tuple[dict, list[dict]]:
+    matched_load_id = classification.get("matched_load_id")
+    tokens = classification.get("tokens") or {}
+    load_context = _fetch_ai_load_context(matched_load_id) if matched_load_id is not None else {}
+    load_candidates = _find_ai_load_candidates(tokens, parsed, matched_load_id=matched_load_id)
+    return load_context, load_candidates
+
+
+def _valid_ai_suggested_load_id(ai_suggestion: dict, load_candidates: list[dict]) -> int | None:
+    if not ai_suggestion or not ai_suggestion.get("success"):
+        return None
+
+    suggested = _safe_str(ai_suggestion.get("suggested_load_id", ""))
+    if not suggested:
+        return None
+
+    valid_ids = {
+        _safe_str(candidate.get("Load ID", ""))
+        for candidate in load_candidates
+        if _safe_str(candidate.get("Load ID", ""))
+    }
+    if suggested not in valid_ids:
+        return None
+
+    try:
+        return int(suggested)
+    except Exception:
+        return None
+
+
+def _ensure_operations_ai_feedback_table() -> None:
+    execute(
+        """
+        create table if not exists operations_ai_feedback (
+            id bigserial primary key,
+            intake_id bigint references order_intake(id) on delete cascade,
+            load_id bigint references loads(id) on delete set null,
+            source_subject text,
+            source_sender text,
+            ai_request_type text,
+            final_request_type text,
+            ai_confidence_score integer,
+            ai_priority text,
+            ai_action_required text,
+            final_action_required text,
+            ai_reply_body text,
+            final_reply_body text,
+            correction_type text not null,
+            feedback_notes text,
+            created_by text not null default 'dispatcher',
+            created_at timestamptz not null default now()
+        )
+        """
+    )
+    execute(
+        """
+        create index if not exists idx_operations_ai_feedback_created_at
+        on operations_ai_feedback(created_at)
+        """
+    )
+    execute(
+        """
+        create index if not exists idx_operations_ai_feedback_intake_id
+        on operations_ai_feedback(intake_id)
+        """
+    )
+
+
+def _truncate_feedback_text(value, limit: int = 700) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].strip() + "..."
+
+
+def _recent_operations_ai_feedback_examples(limit: int = 6) -> list[dict]:
+    try:
+        _ensure_operations_ai_feedback_table()
+        feedback_df = read_df(
+            """
+            select
+                correction_type,
+                source_subject,
+                ai_request_type,
+                final_request_type,
+                ai_action_required,
+                final_action_required,
+                ai_reply_body,
+                final_reply_body,
+                feedback_notes,
+                created_at
+            from operations_ai_feedback
+            order by created_at desc
+            limit :limit
+            """,
+            {"limit": int(limit)},
+        )
+    except Exception:
+        return []
+
+    examples = []
+    for _, row in feedback_df.iterrows():
+        examples.append(
+            {
+                "correction_type": _safe_str(row.get("correction_type", "")),
+                "subject_hint": _truncate_feedback_text(row.get("source_subject", ""), 160),
+                "ai_request_type": _safe_str(row.get("ai_request_type", "")),
+                "final_request_type": _safe_str(row.get("final_request_type", "")),
+                "ai_action_required": _truncate_feedback_text(row.get("ai_action_required", ""), 220),
+                "final_action_required": _truncate_feedback_text(row.get("final_action_required", ""), 220),
+                "ai_reply_body": _truncate_feedback_text(row.get("ai_reply_body", ""), 450),
+                "final_reply_body": _truncate_feedback_text(row.get("final_reply_body", ""), 450),
+                "feedback_notes": _truncate_feedback_text(row.get("feedback_notes", ""), 220),
+            }
+        )
+    return examples
+
+
+def _save_operations_ai_feedback(
+    *,
+    intake_id: int,
+    load_id,
+    source_subject: str,
+    source_sender: str,
+    ai_suggestion: dict | None,
+    final_request_type: str,
+    final_action_required: str = "",
+    final_reply_body: str = "",
+    correction_type: str,
+    feedback_notes: str = "",
+) -> None:
+    if not ai_suggestion or not ai_suggestion.get("success"):
+        return
+
+    try:
+        _ensure_operations_ai_feedback_table()
+        execute(
+            """
+            insert into operations_ai_feedback (
+                intake_id,
+                load_id,
+                source_subject,
+                source_sender,
+                ai_request_type,
+                final_request_type,
+                ai_confidence_score,
+                ai_priority,
+                ai_action_required,
+                final_action_required,
+                ai_reply_body,
+                final_reply_body,
+                correction_type,
+                feedback_notes
+            )
+            values (
+                :intake_id,
+                :load_id,
+                :source_subject,
+                :source_sender,
+                :ai_request_type,
+                :final_request_type,
+                :ai_confidence_score,
+                :ai_priority,
+                :ai_action_required,
+                :final_action_required,
+                :ai_reply_body,
+                :final_reply_body,
+                :correction_type,
+                :feedback_notes
+            )
+            """,
+            {
+                "intake_id": int(intake_id),
+                "load_id": load_id,
+                "source_subject": source_subject,
+                "source_sender": source_sender,
+                "ai_request_type": ai_suggestion.get("request_type", ""),
+                "final_request_type": final_request_type,
+                "ai_confidence_score": int(ai_suggestion.get("confidence_score", 0) or 0),
+                "ai_priority": ai_suggestion.get("priority", ""),
+                "ai_action_required": ai_suggestion.get("action_required", ""),
+                "final_action_required": final_action_required,
+                "ai_reply_body": ai_suggestion.get("reply_body", ""),
+                "final_reply_body": final_reply_body,
+                "correction_type": correction_type,
+                "feedback_notes": feedback_notes,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _operations_ai_rule_context(classification: dict, parsed: dict, subject: str, body: str) -> dict:
+    tokens = classification.get("tokens") or _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    return {
+        "request_type": classification.get("request_type", "Customer Request"),
+        "confidence_score": classification.get("confidence_score", 0),
+        "action_required": classification.get("action_required", ""),
+        "conversation_key": classification.get("conversation_key", ""),
+        "matched_load_id": classification.get("matched_load_id"),
+        "tokens": tokens,
+    }
+
+
+def _conversation_key_from_candidate(candidate: dict, fallback: str) -> str:
+    for key in ["Booking Number", "Container Number", "Reference Number", "External Load ID", "Load ID"]:
+        value = _safe_str(candidate.get(key, ""))
+        if value:
+            return value
+    return fallback
+
+
+def _apply_ai_suggestion_to_classification(
+    classification: dict,
+    ai_suggestion: dict,
+    load_candidates: list[dict] | None = None,
+) -> dict:
+    if not ai_suggestion or not ai_suggestion.get("success"):
+        return classification
+
+    request_type = ai_suggestion.get("request_type")
+    if request_type not in REQUEST_TYPES:
+        return classification
+
+    updated = dict(classification)
+    updated["request_type"] = request_type
+    updated["confidence_score"] = int(ai_suggestion.get("confidence_score", classification.get("confidence_score", 0)) or 0)
+    updated["action_required"] = ai_suggestion.get("action_required") or classification.get("action_required", "")
+    suggested_load_id = _valid_ai_suggested_load_id(ai_suggestion, load_candidates or [])
+    if suggested_load_id is not None:
+        updated["matched_load_id"] = suggested_load_id
+        for candidate in load_candidates or []:
+            if _safe_str(candidate.get("Load ID", "")) == str(suggested_load_id):
+                updated["conversation_key"] = _conversation_key_from_candidate(
+                    candidate,
+                    updated.get("conversation_key", ""),
+                )
+                break
+    return updated
+
+
+def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int]:
     emails = fetch_recent_operations_emails(limit=limit)
     imported = 0
     skipped = 0
+    fetched = len(emails)
 
     for item in emails:
         subject = str(item.get("subject", "") or "")
         sender = str(item.get("from", "") or "")
         body = str(item.get("body", "") or "")
         message_id = str(item.get("message_id", "") or item.get("id", "") or "")
+        received_at = item.get("received_at")
 
-        if _operations_email_already_imported(message_id, subject, sender):
+        if _operations_email_already_imported(message_id, subject, sender, received_at):
             skipped += 1
             continue
 
@@ -1222,16 +2052,26 @@ def import_recent_operations_emails(limit: int = 25) -> tuple[int, int]:
         except Exception:
             parsed = {}
 
-        detected_type = classify_customer_request(subject, body)
-        tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
-        matched_load_id, confidence = find_matching_load(tokens)
-        conversation_key = (
-            tokens.get("booking_number")
-            or tokens.get("container_number")
-            or tokens.get("reference_number")
-            or message_id
-            or f"email-{imported + 1}"
+        classification = _build_operations_email_classification(
+            subject,
+            body,
+            parsed,
+            fallback_key=message_id or f"email-{imported + 1}",
         )
+        if is_operations_ai_auto_classify_enabled():
+            load_context, load_candidates = _build_ai_load_context(classification, parsed)
+            ai_suggestion = generate_operations_ai_suggestion(
+                subject=subject,
+                sender=sender,
+                body=body,
+                parsed=parsed,
+                rule_classification=_operations_ai_rule_context(classification, parsed, subject, body),
+                load_context=load_context,
+                load_candidates=load_candidates,
+                feedback_examples=_recent_operations_ai_feedback_examples(),
+                company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
+            )
+            classification = _apply_ai_suggestion_to_classification(classification, ai_suggestion, load_candidates)
 
         execute(
             """
@@ -1271,20 +2111,20 @@ def import_recent_operations_emails(limit: int = 25) -> tuple[int, int]:
             {
                 "source_subject": subject,
                 "source_sender": sender,
-                "source_received_at": item.get("received_at"),
+                "source_received_at": received_at,
                 "source_message_id": message_id or None,
                 "parsed_data": _json_dump(parsed),
                 "raw_text": body,
-                "request_type": detected_type,
-                "conversation_key": conversation_key,
-                "matched_load_id": matched_load_id,
-                "confidence_score": confidence,
-                "action_required": _action_required_for_request(detected_type, parsed, body),
+                "request_type": classification["request_type"],
+                "conversation_key": classification["conversation_key"],
+                "matched_load_id": classification["matched_load_id"],
+                "confidence_score": classification["confidence_score"],
+                "action_required": classification["action_required"],
             },
         )
         imported += 1
 
-    return imported, skipped
+    return imported, skipped, fetched
 
 
 def _default_operations_reply_subject(subject: str, request_type: str) -> str:
@@ -1296,42 +2136,122 @@ def _default_operations_reply_subject(subject: str, request_type: str) -> str:
     return f"Re: {request_type}"
 
 
-def _default_operations_reply_body(request_type: str, parsed: dict, matched_load_id) -> str:
+def _default_operations_reply_body(
+    request_type: str,
+    parsed: dict,
+    matched_load_id,
+    subject: str = "",
+    body: str = "",
+) -> str:
     company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
     booking = _safe_str(parsed.get("Booking Number", ""))
     container = _safe_str(parsed.get("Container Number", ""))
-    reference = booking or container or (f"load {matched_load_id}" if matched_load_id else "your request")
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    reference_number = _safe_str(parsed.get("Reference Number", "")) or tokens.get("reference_number", "")
+    token_booking = tokens.get("booking_number", "")
+    token_container = tokens.get("container_number", "")
+    reference = (
+        booking
+        or container
+        or reference_number
+        or token_booking
+        or token_container
+        or (f"load {matched_load_id}" if matched_load_id else "your request")
+    )
+    text = f"{subject or ''} {body or ''}"
+
+    if request_type == "Customer Request":
+        if _contains_any(text, UPDATE_INTENT_TERMS) and not _has_reference_details(tokens, parsed):
+            return (
+                "Hello,\n\n"
+                "We can check on this for you. Please send the booking number, container number, "
+                "or reference number so we can pull up the correct load and send a current status update.\n\n"
+                f"Thank you,\n{company_name} Dispatch"
+            )
+        if _contains_any(text, QUOTE_INTENT_TERMS) and not _has_quote_details(text, parsed, tokens):
+            return (
+                "Hello,\n\n"
+                "We can prepare pricing for you. Please send the pickup location, delivery location, "
+                "container size/type, requested date, and any special handling notes so we can quote it accurately.\n\n"
+                f"Thank you,\n{company_name} Dispatch"
+            )
+        if _contains_any(text, NEW_ORDER_INTENT_TERMS) and not _has_new_order_details(text, parsed, tokens):
+            return (
+                "Hello,\n\n"
+                "We can get this moving. Please send the load order or the booking number, customer name, "
+                "container number, pickup terminal, delivery location, and requested delivery date.\n\n"
+                f"Thank you,\n{company_name} Dispatch"
+            )
+        return (
+            "Hello,\n\n"
+            "We received your message and our dispatch team is reviewing it. "
+            "We will follow up with the next update or any details needed.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Appointment Update":
+        return (
+            "Hello,\n\n"
+            f"We received your schedule request for {reference}. "
+            "We are checking terminal and delivery availability now and will confirm the appointment window shortly.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
 
     if request_type == "Quote Request":
         return (
             "Hello,\n\n"
-            f"We received your quote request for {reference}. We are reviewing the lane, timing, and equipment details now "
-            "and will follow up with pricing shortly.\n\n"
+            "Thank you for the rate request. We are reviewing the lane, timing, equipment, "
+            "and any accessorials now and will follow up with pricing shortly.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Booking Update":
+        return (
+            "Hello,\n\n"
+            f"We received your update for {reference}. "
+            "We are reviewing it against the order now and will confirm once the schedule or order notes are updated.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "New Booking":
+        return (
+            "Hello,\n\n"
+            f"We received the booking details for {reference}. "
+            "Our dispatch team is reviewing the order setup, appointment needs, and delivery requirements now. "
+            "We will follow up if anything is missing before dispatch.\n\n"
             f"Thank you,\n{company_name} Dispatch"
         )
 
     if request_type == "Missing Information":
         return (
             "Hello,\n\n"
-            f"We received your message for {reference}. We are checking the missing information now and will send the update "
-            "as soon as it is confirmed.\n\n"
+            f"We received your message for {reference}. "
+            "We are checking the missing information now and will send the update as soon as it is confirmed.\n\n"
             f"Thank you,\n{company_name} Dispatch"
         )
 
     if request_type == "Cancellation":
         return (
             "Hello,\n\n"
-            f"We received your cancellation request for {reference}. We are verifying the order details and will confirm once "
-            "the change is complete.\n\n"
+            f"We received your cancellation request for {reference}. "
+            "We are verifying the order details and will confirm once the change is complete.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "POD Request":
+        return (
+            "Hello,\n\n"
+            f"We received your POD request for {reference}. "
+            "We are checking document status now and will send it over as soon as it is available.\n\n"
             f"Thank you,\n{company_name} Dispatch"
         )
 
     return (
         "Hello,\n\n"
-        f"We received your update for {reference}. Our dispatch team is reviewing it now and will follow up shortly.\n\n"
+        f"We received your message for {reference}. "
+        "Our dispatch team is reviewing it now and will follow up shortly.\n\n"
         f"Thank you,\n{company_name} Dispatch"
     )
-
 
 def save_operations_email_reply(
     *,
@@ -1383,31 +2303,48 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> None:
     for _, row in inbox_df.iterrows():
         current_type = str(row.get("request_type", "") or "").strip()
 
-        if current_type and current_type != "Needs Classification":
-            continue
-
         intake_id = int(row["id"])
         subject = str(row.get("source_subject", "") or "")
         body = str(row.get("raw_text", "") or "")
         parsed = _coerce_json_dict(row.get("parsed_data"))
 
-        detected_type = classify_customer_request(subject, body)
-        tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
-        matched_load_id, confidence = find_matching_load(tokens)
-
-        conversation_key = (
-            tokens.get("booking_number")
-            or tokens.get("container_number")
-            or tokens.get("reference_number")
-            or f"intake-{intake_id}"
+        classification = _build_operations_email_classification(
+            subject,
+            body,
+            parsed,
+            fallback_key=f"intake-{intake_id}",
         )
+        detected_type = classification["request_type"]
+        matched_load_id = classification["matched_load_id"]
+        confidence = classification["confidence_score"]
+
+        should_update = current_type in ["", "Needs Classification", "Other"]
+        if not should_update and detected_type == "Customer Request":
+            current_is_action_type = current_type in [
+                "New Booking",
+                "Booking Update",
+                "Appointment Update",
+                "Quote Request",
+                "Cancellation",
+                "POD Request",
+            ]
+            existing_match = row.get("matched_load_id")
+            existing_has_match = pd.notna(existing_match) and _safe_str(existing_match) != ""
+            existing_confidence = pd.to_numeric(row.get("confidence_score", 0), errors="coerce")
+            if pd.isna(existing_confidence):
+                existing_confidence = 0
+            should_update = current_is_action_type and not existing_has_match and existing_confidence < 70
+
+        if not should_update:
+            continue
 
         update_intake_classification(
             intake_id,
             detected_type,
-            conversation_key,
+            classification["conversation_key"],
             matched_load_id,
             confidence,
+            classification["action_required"],
         )
         
 def render_operations_inbox() -> None:
@@ -1423,15 +2360,29 @@ def render_operations_inbox() -> None:
     with c2:
         if st.button("Check Client Email", use_container_width=True):
             try:
-                imported, skipped = import_recent_operations_emails(limit=25)
+                imported, skipped, fetched = import_recent_operations_emails(limit=50)
+                st.session_state["operations_email_import_result"] = {
+                    "fetched": fetched,
+                    "imported": imported,
+                    "skipped": skipped,
+                }
                 refresh_data()
-                st.success(f"Imported {imported} email(s). Skipped {skipped} already in the inbox.")
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not import client emails: {exc}")
 
     with c3:
-        st.info("Open items are classified automatically. Replies can be sent from the request review panel.")
+        result = st.session_state.get("operations_email_import_result")
+        if result:
+            fetched = int(result.get("fetched", 0))
+            imported = int(result.get("imported", 0))
+            skipped = int(result.get("skipped", 0))
+            if fetched == 0:
+                st.warning("Yahoo inbox connected, but no messages were returned from the recent inbox scan.")
+            else:
+                st.success(f"Yahoo inbox fetched {fetched} email(s), imported {imported}, skipped {skipped} already in Operations Inbox.")
+        else:
+            st.info("Open items are classified automatically. Replies can be sent from the request review panel.")
             
     try:
         where_clause = _inbox_review_where_clause()
@@ -1500,6 +2451,48 @@ def render_operations_inbox() -> None:
                 .astype(str)
                 .str.strip()
         )
+    inbox_df["confidence_score"] = pd.to_numeric(
+        inbox_df["confidence_score"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    def extract_reference_from_text(text: str) -> str:
+        tokens = _extract_reference_tokens(text)
+        return (
+            tokens.get("booking_number")
+            or tokens.get("container_number")
+            or tokens.get("reference_number")
+            or ""
+        )
+
+    def extract_requested_time(text: str) -> str:
+        text = str(text)
+        match = re.search(r"\b(?:at\s*)?(\d{3,4})\s*(?:on\s*)?(\d{1,2}/\d{1,2})?\b", text, re.I)
+        if match:
+            time_part = match.group(1)
+            date_part = match.group(2) or ""
+            return f"{time_part} {date_part}".strip()
+        return ""
+
+    inbox_df["client_name"] = (
+        inbox_df["source_sender"]
+        .fillna("")
+        .astype(str)
+        .str.extract(r"^([^<]+)")[0]
+        .fillna("")
+        .str.strip()
+    )
+
+    inbox_df["email_received"] = pd.to_datetime(
+        inbox_df["source_received_at"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+
+    inbox_df["reference_hint"] = (
+        inbox_df["source_subject"].fillna("") + " " + inbox_df["raw_text"].fillna("")
+    ).apply(extract_reference_from_text)
+
+    inbox_df["requested_time"] = inbox_df["raw_text"].fillna("").apply(extract_requested_time)
     inbox_df["review_status_clean"] = (
         inbox_df["review_status"]
                 .fillna("Open")
@@ -1507,20 +2500,49 @@ def render_operations_inbox() -> None:
                 .str.strip()
         )
 
-    m1, m2, m3, m4 = st.columns(4)
+    no_matched_load = inbox_df["matched_load_id"].isna() | inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
+    needs_details_mask = (
+        no_matched_load
+        & inbox_df["confidence_score"].lt(70)
+        & inbox_df["request_type_clean"].isin([
+            "Customer Request",
+            "New Booking",
+            "Booking Update",
+            "Appointment Update",
+            "Quote Request",
+            "Cancellation",
+            "POD Request",
+        ])
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Open Requests", len(inbox_df))
-    m2.metric("Quotes", int(inbox_df["request_type_clean"].eq("Quote Request").sum()))
-    m3.metric("Missing Info", int(inbox_df["request_type_clean"].eq("Missing Information").sum()))
-    m4.metric("Waiting", int(inbox_df["review_status_clean"].eq("Waiting on Customer").sum()))
+    m2.metric("Needs Details", int(needs_details_mask.sum()))
+    m3.metric("Customer Requests", int(inbox_df["request_type_clean"].eq("Customer Request").sum()))
+    m4.metric("Quotes", int(inbox_df["request_type_clean"].eq("Quote Request").sum()))
+    m5.metric("Waiting", int(inbox_df["review_status_clean"].eq("Waiting on Customer").sum()))
+
+    with st.expander("Operations Inbox Process Feedback", expanded=False):
+        st.markdown(
+            """
+- Treat `Needs Details` as the first-response queue. Ask for booking, container, or reference before creating orders, quotes, cancellations, or POD tasks.
+- Ask frequent customers to include one identifier in the email subject line: booking number, container number, or reference number.
+- Keep `Waiting` clean by moving items there only after a reply is sent, then close or attach the request when the customer responds.
+- Use `Customer Requests` for general status questions and unclear requests so they do not inflate the new order or quote queues.
+- Review repeat vague requests weekly and turn the top missing details into a customer intake template.
+            """.strip()
+        )
 
     tab_labels = [
         "All",
+        "Needs Details",
+        "Customer Requests",
         "New Bookings",
         "Booking Updates",
         "Appointments",
         "Quote Requests",
         "Missing Info",
-        "Customer Requests",
+        "POD Requests",
         "Cancellations",
         "Waiting",
         "Needs Review",
@@ -1530,39 +2552,157 @@ def render_operations_inbox() -> None:
 
     queue_map = {
         "All": inbox_df,
+        "Needs Details": inbox_df[needs_details_mask],
+        "Customer Requests": inbox_df[inbox_df["request_type_clean"].eq("Customer Request")],
         "New Bookings": inbox_df[inbox_df["request_type_clean"].eq("New Booking")],
         "Booking Updates": inbox_df[inbox_df["request_type_clean"].eq("Booking Update")],
         "Appointments": inbox_df[inbox_df["request_type_clean"].eq("Appointment Update")],
         "Quote Requests": inbox_df[inbox_df["request_type_clean"].eq("Quote Request")],
         "Missing Info": inbox_df[inbox_df["request_type_clean"].eq("Missing Information")],
-        "Customer Requests": inbox_df[
-            inbox_df["request_type_clean"].isin(["Customer Request", "POD Request"])
-        ],
+        "POD Requests": inbox_df[inbox_df["request_type_clean"].eq("POD Request")],
         "Cancellations": inbox_df[inbox_df["request_type_clean"].eq("Cancellation")],
         "Waiting": inbox_df[inbox_df["review_status_clean"].eq("Waiting on Customer")],
         "Needs Review": inbox_df[
             inbox_df["request_type_clean"].isin(["Needs Classification", "Other"])
             | inbox_df["confidence_score"].fillna(0).lt(70)
         ],
+        }
+
+    tab_display_cols = {
+        "All": [
+            "id",
+            "email_received",
+            "client_name",
+            "request_type",
+            "review_status",
+            "source_subject",
+            "matched_load_id",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Needs Details": [
+            "id",
+            "email_received",
+            "client_name",
+            "request_type",
+            "source_subject",
+            "reference_hint",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Customer Requests": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "reference_hint",
+            "matched_load_id",
+            "action_required",
+        ],
+
+        "New Bookings": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "reference_hint",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Booking Updates": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "reference_hint",
+            "matched_load_id",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Appointments": [
+            "id",
+            "email_received",
+            "client_name",
+            "reference_hint",
+            "requested_time",
+            "source_subject",
+            "matched_load_id",
+            "action_required",
+        ],
+
+        "Quote Requests": [
+            "id",
+            "email_received",
+            "client_name",
+            "reference_hint",
+            "source_subject",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Missing Info": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "matched_load_id",
+            "action_required",
+        ],
+
+        "POD Requests": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "reference_hint",
+            "matched_load_id",
+            "action_required",
+        ],
+
+        "Cancellations": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "matched_load_id",
+            "confidence_score",
+            "action_required",
+        ],
+
+        "Waiting": [
+            "id",
+            "email_received",
+            "client_name",
+            "source_subject",
+            "matched_load_id",
+            "review_status",
+            "action_required",
+        ],
+
+        "Needs Review": [
+            "id",
+            "email_received",
+            "client_name",
+            "request_type",
+            "source_sender",
+            "source_subject",
+            "confidence_score",
+            "action_required",
+        ],
     }
 
-    display_cols = [
-        "id",
-        "created_at",
-        "request_type",
-        "review_status",
-        "source_sender",
-        "source_subject",
-        "matched_load_id",
-        "confidence_score",
-        "action_required",
-    ]
-    display_cols = [c for c in display_cols if c in inbox_df.columns]
 
     for idx, (tab, tab_name) in enumerate(zip(queue_tabs, tab_labels)):
         with tab:
             tab_df = queue_map[tab_name].copy()
-
+            active_display_cols = [
+                c for c in tab_display_cols.get(tab_name, tab_display_cols["All"])
+                if c in tab_df.columns
+            ]
             st.markdown(f"### {tab_name}")
             st.caption(f"{len(tab_df)} item(s)")
 
@@ -1577,7 +2717,7 @@ def render_operations_inbox() -> None:
                 continue
 
             event = st.dataframe(
-                tab_df[display_cols],
+                tab_df[active_display_cols],
                 use_container_width=True,
                 hide_index=True,
                 selection_mode="single-row",
@@ -1616,7 +2756,7 @@ def render_operations_inbox() -> None:
         st.warning("Selected request was not found.")
         return
 
-    st.markdown(f"### Review Customer Request — {selected_tab_name} — Request #{selected_id}")
+    st.markdown(f"### Review Customer Request - {selected_tab_name} - Request #{selected_id}")
     st.divider()
 
     record = record_df.iloc[0]
@@ -1626,16 +2766,27 @@ def render_operations_inbox() -> None:
     sender = str(record.get("source_sender", "") or "")
     body = str(record.get("raw_text", "") or "")
 
-    detected_type = classify_customer_request(subject, body)
-    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
-    matched_load_id, confidence = find_matching_load(tokens)
-
-    conversation_key = (
-        tokens.get("booking_number")
-        or tokens.get("container_number")
-        or tokens.get("reference_number")
-        or f"intake-{selected_id}"
+    classification = _build_operations_email_classification(
+        subject,
+        body,
+        parsed,
+        fallback_key=f"intake-{selected_id}",
     )
+    detected_type = classification["request_type"]
+    tokens = classification["tokens"]
+    matched_load_id = classification["matched_load_id"]
+    confidence = classification["confidence_score"]
+    conversation_key = classification["conversation_key"]
+
+    saved_matched_load_id = record.get("matched_load_id")
+    if matched_load_id is None and pd.notna(saved_matched_load_id) and _safe_str(saved_matched_load_id):
+        try:
+            matched_load_id = int(saved_matched_load_id)
+            classification["matched_load_id"] = matched_load_id
+        except Exception:
+            pass
+
+    load_context, load_candidates = _build_ai_load_context(classification, parsed)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Detected Type", detected_type)
@@ -1643,10 +2794,21 @@ def render_operations_inbox() -> None:
     c3.metric("Matched Load", matched_load_id or "-")
     c4.metric("Conversation", conversation_key)
 
+    saved_request_type = str(record.get("request_type", "") or "").strip()
+    default_request_type = saved_request_type if saved_request_type in REQUEST_TYPES else detected_type
+
     request_type = st.selectbox(
         "Request Type",
         REQUEST_TYPES,
-        index=REQUEST_TYPES.index(detected_type) if detected_type in REQUEST_TYPES else 0,
+        index=REQUEST_TYPES.index(default_request_type) if default_request_type in REQUEST_TYPES else 0,
+    )
+    selected_action_required = _action_required_for_request(
+        request_type,
+        parsed,
+        body,
+        subject=subject,
+        tokens=tokens,
+        matched_load_id=matched_load_id,
     )
 
     with st.expander("Email / Request Body", expanded=True):
@@ -1657,6 +2819,116 @@ def render_operations_inbox() -> None:
     with st.expander("Parsed Fields", expanded=False):
         st.json(parsed)
 
+    ai_suggestion_key = f"operations_ai_suggestion_{selected_id}"
+    ai_version_key = f"operations_ai_suggestion_version_{selected_id}"
+    ai_suggestion = st.session_state.get(ai_suggestion_key)
+
+    with st.expander("AI Assist", expanded=False):
+        st.caption("AI suggestions are drafts for dispatcher review. They do not send email or create orders.")
+        if load_context:
+            st.write("**Matched load context:**")
+            st.json(_candidate_summary_from_context(load_context))
+        elif load_candidates:
+            st.write("**Possible load matches:**")
+            st.dataframe(pd.DataFrame(load_candidates), use_container_width=True, hide_index=True)
+        else:
+            st.info("No matching load context found yet. AI will ask for booking, container, or reference details when needed.")
+
+        if not is_operations_ai_configured():
+            st.info("Add OPENAI_API_KEY to enable AI classification and reply drafts.")
+        else:
+            feedback_examples = _recent_operations_ai_feedback_examples()
+            if feedback_examples:
+                st.caption(f"Learning from {len(feedback_examples)} recent dispatcher feedback example(s).")
+
+            if st.button(
+                "Generate AI Suggestion",
+                key=f"generate_ai_suggestion_{selected_id}",
+                use_container_width=True,
+            ):
+                with st.spinner("Generating AI classification and reply draft..."):
+                    ai_suggestion = generate_operations_ai_suggestion(
+                        subject=subject,
+                        sender=sender,
+                        body=body,
+                        parsed=parsed,
+                        rule_classification=_operations_ai_rule_context(classification, parsed, subject, body),
+                        load_context=load_context,
+                        load_candidates=load_candidates,
+                        feedback_examples=feedback_examples,
+                        company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
+                    )
+                    st.session_state[ai_suggestion_key] = ai_suggestion
+                    st.session_state[ai_version_key] = str(datetime.now().timestamp()).replace(".", "_")
+
+            ai_suggestion = st.session_state.get(ai_suggestion_key)
+            if ai_suggestion:
+                if not ai_suggestion.get("success"):
+                    st.warning(f"AI suggestion failed: {ai_suggestion.get('error', 'Unknown error')}")
+                else:
+                    a1, a2, a3, a4 = st.columns(4)
+                    a1.metric("AI Type", ai_suggestion.get("request_type", "-"))
+                    a2.metric("AI Confidence", f"{int(ai_suggestion.get('confidence_score', 0) or 0)}%")
+                    a3.metric("Priority", ai_suggestion.get("priority", "Normal"))
+                    a4.metric("Needs Details", "Yes" if ai_suggestion.get("needs_details") else "No")
+
+                    if ai_suggestion.get("suggested_load_id"):
+                        st.write(
+                            f"**AI matched load:** {ai_suggestion.get('suggested_load_id')} "
+                            f"({int(ai_suggestion.get('load_match_confidence', 0) or 0)}% match confidence)"
+                        )
+                    if ai_suggestion.get("status_summary"):
+                        st.write(f"**Status summary:** {ai_suggestion.get('status_summary')}")
+                    if ai_suggestion.get("reason"):
+                        st.write(f"**Why:** {ai_suggestion.get('reason')}")
+                    if ai_suggestion.get("action_required"):
+                        st.write(f"**Suggested action:** {ai_suggestion.get('action_required')}")
+                    required_details = ai_suggestion.get("required_details") or []
+                    if required_details:
+                        st.write("**Details to request:** " + ", ".join(required_details))
+                    feedback_notes = st.text_area(
+                        "Learning Notes",
+                        value="",
+                        placeholder="Optional: tell AI what was right or what dispatch changed.",
+                        height=80,
+                        key=f"operations_ai_feedback_notes_{selected_id}",
+                    )
+
+                    if st.button(
+                        "Apply AI Classification",
+                        key=f"apply_ai_classification_{selected_id}",
+                        use_container_width=True,
+                    ):
+                        ai_matched_load_id = _valid_ai_suggested_load_id(ai_suggestion, load_candidates)
+                        applied_matched_load_id = ai_matched_load_id if ai_matched_load_id is not None else matched_load_id
+                        applied_conversation_key = conversation_key
+                        if ai_matched_load_id is not None:
+                            for candidate in load_candidates:
+                                if _safe_str(candidate.get("Load ID", "")) == str(ai_matched_load_id):
+                                    applied_conversation_key = _conversation_key_from_candidate(candidate, conversation_key)
+                                    break
+                        update_intake_classification(
+                            int(selected_id),
+                            ai_suggestion.get("request_type", request_type),
+                            applied_conversation_key,
+                            applied_matched_load_id,
+                            int(ai_suggestion.get("confidence_score", confidence) or confidence),
+                            ai_suggestion.get("action_required", selected_action_required),
+                        )
+                        _save_operations_ai_feedback(
+                            intake_id=int(selected_id),
+                            load_id=applied_matched_load_id,
+                            source_subject=subject,
+                            source_sender=sender,
+                            ai_suggestion=ai_suggestion,
+                            final_request_type=ai_suggestion.get("request_type", request_type),
+                            final_action_required=ai_suggestion.get("action_required", selected_action_required),
+                            correction_type="classification_accepted",
+                            feedback_notes=feedback_notes,
+                        )
+                        st.success("AI classification applied.")
+                        st.rerun()
+
     if st.button("Save Classification", use_container_width=True):
         update_intake_classification(
             int(selected_id),
@@ -1664,11 +2936,40 @@ def render_operations_inbox() -> None:
             conversation_key,
             matched_load_id,
             confidence,
+            selected_action_required,
         )
+        if ai_suggestion and ai_suggestion.get("success"):
+            ai_feedback_notes = _safe_str(st.session_state.get(f"operations_ai_feedback_notes_{selected_id}", ""))
+            ai_request_type = _safe_str(ai_suggestion.get("request_type", ""))
+            ai_action_required = _safe_str(ai_suggestion.get("action_required", ""))
+            if request_type != ai_request_type:
+                correction_type = "classification_corrected"
+            elif selected_action_required != ai_action_required:
+                correction_type = "action_corrected"
+            else:
+                correction_type = "classification_confirmed"
+
+            _save_operations_ai_feedback(
+                intake_id=int(selected_id),
+                load_id=matched_load_id,
+                source_subject=subject,
+                source_sender=sender,
+                ai_suggestion=ai_suggestion,
+                final_request_type=request_type,
+                final_action_required=selected_action_required,
+                correction_type=correction_type,
+                feedback_notes=ai_feedback_notes,
+            )
         st.success("Classification saved.")
         st.rerun()
 
     st.markdown("### Customer Email Reply")
+    ai_reply_body = ""
+    if ai_suggestion and ai_suggestion.get("success"):
+        ai_reply_body = _safe_str(ai_suggestion.get("reply_body", ""))
+    reply_body_default = ai_reply_body or _default_operations_reply_body(request_type, parsed, matched_load_id, subject, body)
+    reply_key_seed = f"{request_type}_{st.session_state.get(ai_version_key, 'rule')}"
+    reply_key_suffix = re.sub(r"[^a-z0-9]+", "_", reply_key_seed.lower()).strip("_")
     with st.form(f"operations_email_reply_{selected_id}"):
         reply_to = st.text_input(
             "To",
@@ -1682,9 +2983,9 @@ def render_operations_inbox() -> None:
         )
         reply_body = st.text_area(
             "Message",
-            value=_default_operations_reply_body(request_type, parsed, matched_load_id),
+            value=reply_body_default,
             height=220,
-            key=f"operations_reply_body_{selected_id}",
+            key=f"operations_reply_body_{selected_id}_{reply_key_suffix}",
         )
         mark_waiting = st.checkbox(
             "Mark waiting on customer after sending",
@@ -1709,6 +3010,22 @@ def render_operations_inbox() -> None:
                     body=reply_body.strip(),
                     status="sent",
                 )
+
+                if ai_suggestion and ai_suggestion.get("success") and ai_reply_body:
+                    normalized_ai_reply = " ".join(ai_reply_body.split())
+                    normalized_final_reply = " ".join(reply_body.strip().split())
+                    _save_operations_ai_feedback(
+                        intake_id=int(selected_id),
+                        load_id=matched_load_id,
+                        source_subject=subject,
+                        source_sender=sender,
+                        ai_suggestion=ai_suggestion,
+                        final_request_type=request_type,
+                        final_action_required=selected_action_required,
+                        final_reply_body=reply_body.strip(),
+                        correction_type="reply_edited" if normalized_ai_reply != normalized_final_reply else "reply_accepted",
+                        feedback_notes=_safe_str(st.session_state.get(f"operations_ai_feedback_notes_{selected_id}", "")),
+                    )
 
                 if matched_load_id is not None:
                     save_load_communication(
@@ -1753,10 +3070,14 @@ def render_operations_inbox() -> None:
 
     st.markdown("### Operations Actions")
 
+    message_text = f"{subject or ''} {body or ''}"
+    can_create_order = request_type == "New Booking" and _has_new_order_details(message_text, parsed, tokens)
+    can_create_quote = request_type == "Quote Request" and _has_quote_details(message_text, parsed, tokens)
+
     a1, a2, a3, a4, a5 = st.columns(5)
 
     with a1:
-        if st.button("Create New Order", use_container_width=True):
+        if st.button("Create New Order", use_container_width=True, disabled=not can_create_order):
             booking = parsed.get("Booking Number") or tokens.get("booking_number")
             customer = parsed.get("Customer") or ""
 
@@ -1833,7 +3154,7 @@ def render_operations_inbox() -> None:
             st.rerun()
 
     with a3:
-        if st.button("Create Quote", use_container_width=True):
+        if st.button("Create Quote", use_container_width=True, disabled=not can_create_quote):
             create_quote_request_from_intake(int(selected_id), parsed, body[:1000])
 
             execute(
@@ -2224,6 +3545,14 @@ def _get_app_setting(name: str, default=None):
     return os.getenv(name, default)
 
 
+def _get_first_app_setting(names: list[str], default=None):
+    for name in names:
+        value = _get_app_setting(name)
+        if value not in [None, ""]:
+            return value
+    return default
+
+
 def _first_present(load, keys: list[str], fallback: str = "") -> str:
     for key in keys:
         try:
@@ -2361,28 +3690,31 @@ def _log_customer_email_notification(load_id: int, old_status: str, new_status: 
 
 
 def _send_smtp_email(to_email: str, subject: str, body: str) -> None:
-    smtp_host = _get_app_setting("SMTP_HOST")
-    smtp_port = int(_get_app_setting("SMTP_PORT", 587))
-    smtp_user = _get_app_setting("SMTP_USER")
-    smtp_password = _get_app_setting("SMTP_PASSWORD")
-    dispatch_email = _get_app_setting("DISPATCH_EMAIL", smtp_user)
+    smtp_host = _get_app_setting("SMTP_HOST", "smtp.mail.yahoo.com")
+    smtp_port = int(_get_app_setting("SMTP_PORT", 465))
+    smtp_user = _get_first_app_setting(["SMTP_USER", "YAHOO_EMAIL", "EMAIL_ADDRESS"])
+    smtp_password = _get_first_app_setting(["SMTP_PASSWORD", "YAHOO_APP_PASSWORD", "EMAIL_APP_PASSWORD"])
+    dispatch_email = _get_first_app_setting(["DISPATCH_EMAIL", "YAHOO_EMAIL", "EMAIL_ADDRESS"], smtp_user)
 
     if not to_email:
         raise ValueError("Missing customer email address on this load.")
     if not smtp_host or not smtp_user or not smtp_password:
-        raise ValueError("Missing SMTP settings. Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, and DISPATCH_EMAIL.")
+        raise ValueError("Missing email settings. Add YAHOO_EMAIL and YAHOO_APP_PASSWORD, or SMTP_HOST, SMTP_USER, and SMTP_PASSWORD.")
 
     msg = MIMEMultipart()
     msg["From"] = dispatch_email
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
-
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
 
 def _clean_display_value(value, fallback: str = "-") -> str:
     value_str = str(value or "").strip()

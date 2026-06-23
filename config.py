@@ -4,6 +4,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 
@@ -14,8 +15,15 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     except Exception:
         value = None
     return value or os.getenv(name, default)
-
-
+YAHOO_EMAIL = get_secret("YAHOO_EMAIL")
+YAHOO_APP_PASSWORD = get_secret("YAHOO_APP_PASSWORD")
+IMAP_SERVER = get_secret("IMAP_SERVER", "imap.mail.yahoo.com")
+IMAP_PORT = int(get_secret("IMAP_PORT", "993"))
+SMTP_HOST = get_secret("SMTP_HOST", "smtp.mail.yahoo.com")
+SMTP_PORT = int(get_secret("SMTP_PORT", "465"))
+SMTP_USER = get_secret("SMTP_USER", YAHOO_EMAIL)
+SMTP_PASSWORD = get_secret("SMTP_PASSWORD", YAHOO_APP_PASSWORD)
+DISPATCH_EMAIL = get_secret("DISPATCH_EMAIL", YAHOO_EMAIL)
 DATABASE_URL = get_secret("DATABASE_URL")
 
 APP_NAME = "Calitrans Dispatch Center"
