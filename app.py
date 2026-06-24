@@ -47,7 +47,7 @@ from order_intake import get_intake_queue, get_intake_record, create_load_from_i
 
 st.set_page_config(
     page_title="CaliTrans TMS",
-    page_icon="🚚",
+    page_icon="CT",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -114,6 +114,71 @@ SUMMARY_COLUMNS = [
     "LFD",
     "Dispatcher Notes",
 ]
+
+EXT_LOAD_COLUMNS = [
+    "steamship_line",
+    "vessel_name",
+    "terminal",
+    "pickup_appointment",
+    "delivery_appointment",
+    "empty_return_location",
+    "empty_return_date",
+    "chassis_provider",
+    "pickup_reference",
+    "delivery_reference",
+    "invoice_status",
+    "driver_pay_status",
+    "customer_rate",
+    "carrier_pay",
+    "accessorials",
+    "margin",
+    "current_location",
+    "eta",
+    "live_load_status",
+    "live_unload_status",
+    "last_driver_update",
+]
+
+LOAD_SEARCH_COLUMNS = [
+    "Booking Number",
+    "Load ID",
+    "Reference Number",
+    "Container Number",
+    "Customer",
+    "Port",
+    "Warehouse",
+    "Address",
+    "Driver Name",
+    "Truck Assigned",
+    "Chassis",
+    "Status",
+    "Dispatcher Notes",
+]
+
+NAVIGATION_SECTIONS = [
+    "Operations Inbox",
+    "Orders/Load Management",
+    "Dispatch Board",
+    "Calendar View",
+    "Documents",
+    "Billing / ProfitTools",
+    "Port Houston Integration",
+    "Dashboard",
+    "Email Imports",
+    "Validation",
+    "Master Data",
+]
+
+LOAD_DATA_SECTIONS = {
+    "Dashboard",
+    "Orders/Load Management",
+    "Dispatch Board",
+    "Calendar View",
+    "Documents",
+    "Billing / ProfitTools",
+    "Port Houston Integration",
+    "Validation",
+}
 
 
 def load_css() -> None:
@@ -182,6 +247,7 @@ def load_css() -> None:
     )
 
 
+@st.cache_data(show_spinner=False)
 def image_to_base64(path: str) -> str:
     file_path = Path(path)
     if not file_path.exists():
@@ -199,6 +265,11 @@ def normalize_date(value):
 @st.cache_data(ttl=45)
 def load_dispatch_data() -> pd.DataFrame:
     return DispatchDatabaseClient().rows_to_dataframe()
+
+
+@st.cache_data(show_spinner=False, ttl=45)
+def load_tms_data() -> pd.DataFrame:
+    return merge_ext(clean_df(load_dispatch_data()))
 
 
 def refresh_data() -> None:
@@ -238,6 +309,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False, ttl=45)
 def get_ext_df() -> pd.DataFrame:
     """Read additional PortPro-style fields directly from loads."""
     try:
@@ -276,8 +348,23 @@ def get_ext_df() -> pd.DataFrame:
 def merge_ext(df: pd.DataFrame) -> pd.DataFrame:
     ext = get_ext_df()
     if ext.empty or "_row_id" not in df.columns:
+        df = df.copy()
+        for column in EXT_LOAD_COLUMNS:
+            if column not in df.columns:
+                df[column] = ""
         return df
-    return df.merge(ext, on="_row_id", how="left")
+
+    ext_columns = [column for column in ext.columns if column != "_row_id"]
+    base = df.drop(columns=[column for column in ext_columns if column in df.columns], errors="ignore")
+    merged = base.merge(ext, on="_row_id", how="left")
+
+    for column in EXT_LOAD_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = ""
+        else:
+            merged[column] = merged[column].fillna("")
+
+    return merged
 
 
 def filter_loads(df: pd.DataFrame, search_text: str = "", status_filter: str = "All", type_filter: str = "All") -> pd.DataFrame:
@@ -291,10 +378,10 @@ def filter_loads(df: pd.DataFrame, search_text: str = "", status_filter: str = "
 
     if search_text:
         needle = search_text.lower()
-        filtered = filtered[
-            filtered.astype(str)
-            .apply(lambda row: row.str.lower().str.contains(needle, regex=False).any(), axis=1)
-        ]
+        searchable_cols = [column for column in LOAD_SEARCH_COLUMNS if column in filtered.columns]
+        if searchable_cols:
+            searchable = filtered[searchable_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+            filtered = filtered[searchable.str.contains(needle, regex=False, na=False)]
 
     return filtered
 
@@ -977,10 +1064,6 @@ DEFAULT_OPERATIONS_QUEUE_ORDER = [
     "Needs Review",
 ]
 
-OPERATIONS_QUEUE_ORDER_SESSION_KEY = "operations_queue_order"
-OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY = "operations_inbox_queue_order"
-
-
 def _normalize_reference_token(value: str) -> str:
     return re.sub(r"\s+", "-", str(value or "").strip(" :#-")).upper()
 
@@ -1457,147 +1540,6 @@ def _json_dump(data: dict) -> str:
     return json.dumps(data or {}, default=str)
 
 
-def _normalize_operations_queue_order(order: list[str] | tuple[str, ...] | None) -> list[str]:
-    available = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
-    incoming = [str(item) for item in (order or []) if str(item) in available]
-    normalized = []
-    for item in incoming + available:
-        if item not in normalized:
-            normalized.append(item)
-    return normalized
-
-
-def _ensure_operations_inbox_preferences_table() -> None:
-    execute(
-        """
-        create table if not exists operations_inbox_preferences (
-            preference_name text primary key,
-            preference_value jsonb not null,
-            updated_at timestamptz not null default now()
-        )
-        """
-    )
-
-
-def _load_operations_queue_order() -> list[str]:
-    session_order = st.session_state.get(OPERATIONS_QUEUE_ORDER_SESSION_KEY)
-    if session_order:
-        order = _normalize_operations_queue_order(session_order)
-        st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
-        return order
-
-    try:
-        _ensure_operations_inbox_preferences_table()
-        pref_df = read_df(
-            """
-            select preference_value
-            from operations_inbox_preferences
-            where preference_name = :preference_name
-            limit 1
-            """,
-            {"preference_name": OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY},
-        )
-        if not pref_df.empty:
-            value = pref_df.iloc[0].get("preference_value")
-            if isinstance(value, str):
-                value = json.loads(value)
-            if isinstance(value, dict):
-                value = value.get("order", [])
-            order = _normalize_operations_queue_order(value if isinstance(value, list) else [])
-            st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
-            return order
-    except Exception:
-        pass
-
-    order = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
-    st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = order
-    return order
-
-
-def _save_operations_queue_order(order: list[str]) -> bool:
-    normalized = _normalize_operations_queue_order(order)
-    st.session_state[OPERATIONS_QUEUE_ORDER_SESSION_KEY] = normalized
-    try:
-        _ensure_operations_inbox_preferences_table()
-        execute(
-            """
-            insert into operations_inbox_preferences (
-                preference_name,
-                preference_value,
-                updated_at
-            )
-            values (
-                :preference_name,
-                cast(:preference_value as jsonb),
-                now()
-            )
-            on conflict (preference_name)
-            do update set
-                preference_value = excluded.preference_value,
-                updated_at = now()
-            """,
-            {
-                "preference_name": OPERATIONS_QUEUE_ORDER_PREFERENCE_KEY,
-                "preference_value": _json_dump({"order": normalized}),
-            },
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _move_operations_queue(order: list[str], queue_name: str, offset: int) -> list[str]:
-    updated = _normalize_operations_queue_order(order)
-    if queue_name not in updated:
-        return updated
-    index = updated.index(queue_name)
-    new_index = max(0, min(len(updated) - 1, index + offset))
-    if new_index == index:
-        return updated
-    item = updated.pop(index)
-    updated.insert(new_index, item)
-    return updated
-
-
-def _render_operations_queue_preferences(queue_order: list[str]) -> None:
-    with st.expander("Inbox Tab Preferences", expanded=False):
-        st.caption("Move your most-used Operations Inbox queues earlier in the list.")
-        move_queue = st.selectbox(
-            "Tab to move",
-            queue_order,
-            key="operations_queue_preference_target",
-        )
-        c1, c2, c3, c4 = st.columns(4)
-
-        if c1.button("Move Earlier", key="operations_queue_move_earlier", use_container_width=True):
-            updated = _move_operations_queue(queue_order, move_queue, -1)
-            if not _save_operations_queue_order(updated):
-                st.warning("Saved for this session only. Database preference table could not be updated.")
-            st.rerun()
-
-        if c2.button("Move Later", key="operations_queue_move_later", use_container_width=True):
-            updated = _move_operations_queue(queue_order, move_queue, 1)
-            if not _save_operations_queue_order(updated):
-                st.warning("Saved for this session only. Database preference table could not be updated.")
-            st.rerun()
-
-        if c3.button("Move First", key="operations_queue_move_first", use_container_width=True):
-            updated = _normalize_operations_queue_order(queue_order)
-            if move_queue in updated:
-                updated.remove(move_queue)
-                updated.insert(0, move_queue)
-            if not _save_operations_queue_order(updated):
-                st.warning("Saved for this session only. Database preference table could not be updated.")
-            st.rerun()
-
-        if c4.button("Reset Order", key="operations_queue_reset_order", use_container_width=True):
-            if not _save_operations_queue_order(list(DEFAULT_OPERATIONS_QUEUE_ORDER)):
-                st.warning("Saved for this session only. Database preference table could not be updated.")
-            st.rerun()
-
-        st.write("Current order: " + " | ".join(queue_order))
-
-
 OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
 OPERATIONS_ORDER_FIELDS = [
     "TYPE",
@@ -1696,11 +1638,6 @@ def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series |
             )
 
     return normalized
-
-
-def _operations_pdf_count_from_row(row) -> int:
-    parsed = _coerce_json_dict(row.get("parsed_data")) if hasattr(row, "get") else {}
-    return len(_extract_operations_pdf_attachments(parsed, row))
 
 
 def _merge_operations_order_fields(body_parsed: dict, pdf_parsed: dict) -> tuple[dict, list[dict], list[str]]:
@@ -1811,6 +1748,12 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
             file_path,
             parsed_data,
             left(coalesce(raw_text, ''), 1200) as raw_text_preview,
+            case
+                when jsonb_typeof(parsed_data -> :pdf_attachments_key) = 'array'
+                    then jsonb_array_length(parsed_data -> :pdf_attachments_key)
+                when filename is not null and filename <> '' then 1
+                else 0
+            end as pdf_count,
             intake_status,
             request_type,
             conversation_key,
@@ -1821,7 +1764,8 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
         from order_intake
         {where_clause}
         order by created_at desc
-        """
+        """,
+        {"pdf_attachments_key": OPERATIONS_PDF_ATTACHMENTS_KEY},
     )
 
 
@@ -3882,8 +3826,6 @@ def render_operations_inbox() -> None:
                 .astype(str)
                 .str.strip()
         )
-    inbox_df["pdf_count"] = inbox_df.apply(_operations_pdf_count_from_row, axis=1)
-
     no_matched_load = inbox_df["matched_load_id"].isna() | inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
     needs_details_mask = (
         no_matched_load
@@ -5826,6 +5768,152 @@ def render_dispatch_board(df: pd.DataFrame) -> None:
             open_load_workspace_dialog(selected_load)
 
 
+def render_dispatch_board_focused(df: pd.DataFrame) -> None:
+    st.subheader("Dispatch Board")
+    st.caption("Live dispatch, tomorrow planning, and future pipeline.")
+
+    board_df = df.copy()
+    board_df["Delivery Date Parsed"] = pd.to_datetime(
+        board_df["Delivery Need Date"].astype(str).str.strip(),
+        errors="coerce",
+    )
+
+    today = pd.Timestamp(date.today()).normalize()
+    tomorrow = today + pd.Timedelta(days=1)
+
+    live_df = board_df[
+        board_df["Delivery Date Parsed"].dt.normalize().eq(today)
+        & board_df["Status"].isin(DISPATCH_BOARD_STATUSES)
+    ].copy()
+    tomorrow_df = board_df[
+        board_df["Delivery Date Parsed"].dt.normalize().eq(tomorrow)
+        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
+    ].copy()
+    future_df = board_df[
+        board_df["Delivery Date Parsed"].dt.normalize().gt(tomorrow)
+        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
+    ].copy()
+
+    selected_view = st.radio(
+        "Dispatch View",
+        ["Live Dispatch", "Tomorrow Planning", "Future Pipeline"],
+        horizontal=True,
+        key="dispatch_board_view",
+    )
+    type_value = st.radio(
+        "Load Type",
+        LOAD_TYPE_TABS,
+        horizontal=True,
+        key=f"dispatch_board_type_{selected_view}",
+    )
+
+    if selected_view == "Live Dispatch":
+        type_df = live_df[live_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
+        st.markdown("### Live Dispatch")
+        st.caption(f"{len(type_df)} active {type_value} load(s) today")
+
+        status_cols = st.columns(len(DISPATCH_BOARD_STATUSES), gap="small")
+        for idx, status in enumerate(DISPATCH_BOARD_STATUSES):
+            with status_cols[idx]:
+                status_df = type_df[type_df["Status"].astype(str).str.strip().eq(status)].copy()
+                st.markdown(
+                    f"""
+                    <div style="
+                        text-align:center;
+                        font-weight:800;
+                        background:#f1f5f9;
+                        border:1px solid #cbd5e1;
+                        border-radius:10px;
+                        padding:8px;
+                        margin-bottom:8px;
+                    ">
+                        {status}<br>
+                        <span style="font-size:18px;">{len(status_df)}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if status_df.empty:
+                    st.caption("No loads")
+                else:
+                    for _, row in status_df.head(30).iterrows():
+                        render_load_card(row)
+
+    elif selected_view == "Tomorrow Planning":
+        type_df = tomorrow_df[tomorrow_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
+        st.markdown("### Tomorrow Planning")
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Tomorrow Loads", len(tomorrow_df))
+        k2.metric("Assigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().ne("").sum()))
+        k3.metric("Unassigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().isin(["", "nan", "None", "Unassigned"]).sum()))
+        k4.metric("Needs Info", int(tomorrow_df["Status"].eq("Hold/Need Info").sum()))
+
+        st.markdown(f"#### {type_value} - Tomorrow")
+        st.caption(f"{len(type_df)} planned load(s)")
+        if type_df.empty:
+            st.info(f"No {type_value} loads planned for tomorrow.")
+        else:
+            columns = [
+                "_row_id",
+                "TYPE",
+                "Booking Number",
+                "Load ID",
+                "Customer",
+                "Container Number",
+                "Warehouse",
+                "Delivery Need Date",
+                "LFD",
+                "Status",
+                "Driver Name",
+                "Truck Assigned",
+                "Chassis",
+                "Dispatcher Notes",
+            ]
+            display_cols = [c for c in columns if c in type_df.columns]
+            styled = (
+                type_df.sort_values(["Status", "Delivery Need Date"], ascending=[True, True])[display_cols]
+                .style
+                .apply(_status_row_style, axis=1)
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    else:
+        type_df = future_df[future_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
+        st.markdown("### Future Pipeline")
+        st.markdown(f"#### {type_value} - Future")
+        st.caption(f"{len(type_df)} upcoming load(s)")
+        if type_df.empty:
+            st.info(f"No future {type_value} loads found.")
+        else:
+            columns = [
+                "_row_id",
+                "TYPE",
+                "Booking Number",
+                "Load ID",
+                "Customer",
+                "Container Number",
+                "Port",
+                "Warehouse",
+                "Delivery Need Date",
+                "LFD",
+                "Status",
+                "Driver Name",
+                "Dispatcher Notes",
+            ]
+            display_cols = [c for c in columns if c in type_df.columns]
+            st.dataframe(
+                type_df.sort_values("Delivery Need Date")[display_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if st.session_state.get("show_load_workspace_dialog"):
+        selected_load = _get_selected_dispatch_load(df)
+        if selected_load is not None:
+            open_load_workspace_dialog(selected_load)
+
+
 def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
     selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
 
@@ -7189,20 +7277,22 @@ def render_port_houston_integration(df: pd.DataFrame) -> None:
         _render_port_houston_mapping()
 
 
-def main() -> None:
-    load_css()
-    show_header()
-
+def _load_current_tms_data_or_stop() -> pd.DataFrame:
     try:
-        df = clean_df(load_dispatch_data())
-        df = merge_ext(df)
+        return load_tms_data()
     except Exception as exc:
         st.error(f"Could not load PostgreSQL/Supabase data: {exc}")
         st.info("Make sure DATABASE_URL is set and database/schema.sql has been run.")
         st.stop()
 
+
+def main() -> None:
+    load_css()
+    show_header()
+
     selected_booking = st.query_params.get("booking", None)
     if selected_booking:
+        df = _load_current_tms_data_or_stop()
         render_booking_detail(df, selected_booking)
         return
 
@@ -7212,18 +7302,7 @@ def main() -> None:
 
         section = st.radio(
             "Navigation",
-            [   "Operations Inbox",
-                "Port Houston Integration",
-                "Dashboard",
-                "Orders/Load Management",
-                "Dispatch Board",
-                "Calendar View",
-                "Documents",
-                "Email Imports",
-                "Billing / ProfitTools",
-                "Validation",
-                "Master Data",
-            ],
+            NAVIGATION_SECTIONS,
         )
 
         st.divider()
@@ -7234,6 +7313,9 @@ def main() -> None:
 
         st.divider()
         _render_status_legend()
+
+    df = _load_current_tms_data_or_stop() if section in LOAD_DATA_SECTIONS else pd.DataFrame()
+
     if section == "Operations Inbox":
         render_operations_inbox()
     elif section == "Port Houston Integration":
@@ -7243,7 +7325,7 @@ def main() -> None:
     elif section == "Orders/Load Management":
         render_orders_management(df)
     elif section == "Dispatch Board":
-        render_dispatch_board(df)
+        render_dispatch_board_focused(df)
     elif section == "Calendar View":
         render_calendar_view(df)
     elif section == "Documents":

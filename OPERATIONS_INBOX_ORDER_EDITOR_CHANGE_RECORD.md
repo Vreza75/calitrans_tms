@@ -195,3 +195,13 @@ COMPANY_NAME
 - Moved heavy smart regrouping behind the `Recheck Groups` button so normal row selection and request opening do not reclassify older messages on every click.
 - Cleared cached inbox data after classification changes so tab counts and open request details refresh immediately after dispatcher actions.
 - Batched duplicate checks during `Check Client Email` so already-imported Yahoo messages are matched against saved inbox records without one database lookup per email.
+
+## June 23, 2026 Full TMS Speed and Flow Pass
+
+- Deferred full load-board data loading until the selected section actually needs load data, so Operations Inbox and Email Imports open faster.
+- Cached the large header image conversion and full prepared TMS load dataset to reduce repeated work on normal reruns.
+- Fixed extended PortPro-style load fields so real terminal, ETA, appointment, vessel, and live-status values merge cleanly instead of producing duplicate blank columns.
+- Narrowed load search to operational fields instead of scanning every dataframe column row by row.
+- Added a focused Dispatch Board renderer with one `Dispatch View` and one `Load Type` active at a time, matching a dispatcher workflow and avoiding rendering all boards at once.
+- Moved Operations Inbox PDF-count calculation into the database list query and removed the row-by-row JSON parsing from page rendering.
+- Removed unused Operations Inbox tab preference helpers from the active app code after returning to normal tabs.
