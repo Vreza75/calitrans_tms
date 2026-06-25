@@ -20,7 +20,7 @@ import streamlit as st
 from admin_pages import render_master_data_admin
 from config import ACTIVE_STATUSES, APP_NAME, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS
 from db_client import DispatchDatabaseClient, execute, read_df
-from email_client import fetch_recent_operations_emails
+from email_client import fetch_operations_email_sync
 from email_parser import parse_email_text
 from operations_ai import (
     generate_operations_ai_suggestion,
@@ -796,6 +796,9 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
     st.dataframe(exception_df, use_container_width=True, hide_index=True)
 
+    st.divider()
+    render_communication_dashboard()
+
 BOOKING_VERIFICATION_REQUIRED_FIELDS = [
     "TYPE",
     "Booking Number",
@@ -1036,8 +1039,12 @@ REQUEST_TYPES = [
     "Quote Request",
     "Missing Information",
     "Cancellation",
+    "Billing",
+    "Driver Issue",
+    "Port Issue",
     "Customer Request",
     "POD Request",
+    "Spam/Marketing",
     "Other",
 ]
 
@@ -1047,6 +1054,13 @@ INBOX_TERMINAL_REVIEW_STATUSES = [
     "Quote Created",
     "Order Cancelled",
     "Closed",
+]
+
+OPERATIONS_EMAIL_SYNC_SOURCES = [
+    "operations_email",
+    "operations_email_sent",
+    "email_body",
+    "email_combined",
 ]
 
 DEFAULT_OPERATIONS_QUEUE_ORDER = [
@@ -1060,9 +1074,39 @@ DEFAULT_OPERATIONS_QUEUE_ORDER = [
     "Missing Info",
     "POD Requests",
     "Cancellations",
+    "Billing",
+    "Driver Issues",
+    "Port Issues",
+    "Spam",
     "Waiting",
     "Needs Review",
 ]
+
+OPERATIONS_CASE_STATUSES = [
+    "New",
+    "In Review",
+    "Waiting Dispatcher",
+    "Waiting Customer",
+    "Waiting Warehouse",
+    "Waiting Steamship",
+    "Waiting Billing",
+    "Attached to Load",
+    "Closed",
+    "Reopened",
+]
+
+OPERATIONS_CASE_OWNERS = [
+    "Unassigned",
+    "Dispatch",
+    "Manager",
+    "Billing",
+    "Customer Service",
+]
+
+OPERATIONS_CASE_PRIORITIES = ["Normal", "High", "Urgent", "Low"]
+OPERATIONS_SLA_FIRST_RESPONSE_HOURS = 2
+OPERATIONS_SLA_RESOLUTION_HOURS = 48
+
 
 def _normalize_reference_token(value: str) -> str:
     return re.sub(r"\s+", "-", str(value or "").strip(" :#-")).upper()
@@ -1214,8 +1258,68 @@ MISSING_INFO_TERMS = [
 
 CANCELLATION_TERMS = ["cancel", "cancelled", "canceled", "cancelar", "cancelado", "cancelacion", "cancelación"]
 POD_TERMS = ["pod", "proof of delivery", "prueba de entrega", "comprobante de entrega"]
+BILLING_TERMS = [
+    "invoice",
+    "billing",
+    "bill",
+    "payment",
+    "statement",
+    "accessorial",
+    "detention",
+    "demurrage",
+    "lumper",
+    "factura",
+    "facturacion",
+    "facturaciÃ³n",
+    "pago",
+    "cobro",
+]
+DRIVER_ISSUE_TERMS = [
+    "driver",
+    "truck",
+    "chassis",
+    "flat tire",
+    "breakdown",
+    "accident",
+    "late driver",
+    "no show",
+    "chofer",
+    "conductor",
+    "camion",
+    "camiÃ³n",
+    "chasis",
+    "accidente",
+]
+PORT_ISSUE_TERMS = [
+    "port",
+    "terminal",
+    "hold",
+    "customs hold",
+    "line hold",
+    "exam",
+    "x-ray",
+    "gate",
+    "trouble ticket",
+    "puerto",
+    "retenido",
+    "aduana",
+    "inspeccion",
+    "inspecciÃ³n",
+]
+SPAM_MARKETING_TERMS = [
+    "unsubscribe",
+    "newsletter",
+    "marketing",
+    "promotion",
+    "webinar",
+    "seo",
+    "lead generation",
+    "limited time offer",
+    "sales outreach",
+]
 
 REPLY_LANGUAGE_OPTIONS = ["Auto", "English", "Spanish", "Bilingual"]
+REPLY_TONE_OPTIONS = ["Professional", "Concise", "Friendly", "Apology / Delay"]
 
 SPANISH_LANGUAGE_TERMS = [
     "actualizacion",
@@ -1343,81 +1447,276 @@ def _has_new_order_details(text: str, parsed: dict, tokens: dict) -> bool:
     return detail_score >= 3
 
 
-def classify_customer_request(subject: str, body: str, parsed: dict | None = None) -> str:
+def _operations_intent_scores(subject: str, body: str, parsed: dict | None = None) -> dict[str, int]:
     text = f"{subject or ''} {body or ''}"
     parsed = _coerce_parsed_for_classification(subject, body, parsed)
     tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
     has_reference = _has_reference_details(tokens, parsed)
 
+    scores = {request_type: 0 for request_type in REQUEST_TYPES}
+    scores["Customer Request"] = 20
+
+    def add(request_type: str, points: int, condition: bool = True) -> None:
+        if condition and request_type in scores:
+            scores[request_type] += points
+
+    add("Missing Information", 70, _contains_any(text, MISSING_INFO_TERMS))
+    add("Cancellation", 75, _contains_any(text, CANCELLATION_TERMS))
+    add("POD Request", 75, _contains_any(text, POD_TERMS))
+    add("Appointment Update", 70, _contains_any(text, APPOINTMENT_INTENT_TERMS))
+    add("Quote Request", 70, _contains_any(text, QUOTE_INTENT_TERMS))
+    add("Booking Update", 60, _contains_any(text, UPDATE_INTENT_TERMS))
+    add("New Booking", 65, _contains_any(text, NEW_ORDER_INTENT_TERMS))
+    add("Billing", 75, _contains_any(text, BILLING_TERMS))
+    add("Driver Issue", 70, _contains_any(text, DRIVER_ISSUE_TERMS))
+    add("Port Issue", 70, _contains_any(text, PORT_ISSUE_TERMS))
+    add("Spam/Marketing", 85, _contains_any(text, SPAM_MARKETING_TERMS))
+
+    if has_reference:
+        for request_type in [
+            "Booking Update",
+            "Appointment Update",
+            "POD Request",
+            "Cancellation",
+            "Billing",
+            "Driver Issue",
+            "Port Issue",
+        ]:
+            add(request_type, 18)
+    else:
+        for request_type in ["Booking Update", "Appointment Update", "POD Request", "Cancellation"]:
+            scores[request_type] = max(0, scores[request_type] - 35)
+
+    if _has_quote_details(text, parsed, tokens):
+        add("Quote Request", 25)
+    else:
+        scores["Quote Request"] = max(0, scores["Quote Request"] - 30)
+
+    if _has_new_order_details(text, parsed, tokens):
+        add("New Booking", 35)
+    else:
+        scores["New Booking"] = max(0, scores["New Booking"] - 35)
+
+    if _safe_str(parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, "")) or _safe_str(parsed.get("Booking Number", "")):
+        add("New Booking", 15)
+        add("Booking Update", 10)
+
+    if max(scores.values() or [0]) < 45:
+        scores["Customer Request"] = max(scores["Customer Request"], 50)
+
+    return scores
+
+
+def classify_customer_request(subject: str, body: str, parsed: dict | None = None) -> str:
+    text = f"{subject or ''} {body or ''}"
+    parsed = _coerce_parsed_for_classification(subject, body, parsed)
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    has_reference = _has_reference_details(tokens, parsed)
+    scores = _operations_intent_scores(subject, body, parsed)
+    scored_types = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_type = scored_types[0][0] if scored_types else "Customer Request"
+
     if _contains_any(text, MISSING_INFO_TERMS):
         return "Missing Information"
 
-    if _contains_any(text, CANCELLATION_TERMS):
-        return "Cancellation" if has_reference else "Customer Request"
+    if best_type == "Spam/Marketing":
+        return "Spam/Marketing"
 
-    if _contains_any(text, POD_TERMS):
-        return "POD Request" if has_reference else "Customer Request"
-
-    if _contains_any(text, APPOINTMENT_INTENT_TERMS):
-        return "Appointment Update" if has_reference else "Customer Request"
-
-    if _contains_any(text, QUOTE_INTENT_TERMS):
+    if best_type == "Quote Request":
         return "Quote Request" if _has_quote_details(text, parsed, tokens) else "Customer Request"
 
-    if _contains_any(text, UPDATE_INTENT_TERMS):
-        return "Booking Update" if has_reference else "Customer Request"
+    if best_type == "New Booking":
+        return "New Booking" if _has_new_order_details(text, parsed, tokens) else "Customer Request"
 
-    if _contains_any(text, NEW_ORDER_INTENT_TERMS) and _has_new_order_details(text, parsed, tokens):
-        return "New Booking"
+    if best_type in ["Cancellation", "POD Request", "Appointment Update", "Booking Update"]:
+        return best_type if has_reference else "Customer Request"
 
-    return "Customer Request"
+    if best_type in ["Billing", "Driver Issue", "Port Issue"]:
+        return best_type
+
+    return best_type if best_type in REQUEST_TYPES else "Customer Request"
 
 
-def find_matching_load(tokens: dict) -> tuple[int | None, int]:
-    booking = tokens.get("booking_number", "")
-    container = tokens.get("container_number", "")
-    reference = tokens.get("reference_number", "")
+def _extract_load_id_hint(text: str) -> str:
+    match = re.search(r"\b(?:load|order)\s*(?:id|#|number)?\s*[:#-]?\s*(\d{2,})\b", str(text or ""), re.I)
+    return match.group(1) if match else ""
+
+
+def _extract_date_hint(text: str) -> str:
+    match = re.search(r"\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b", str(text or ""))
+    if not match:
+        return ""
+    parsed = pd.to_datetime(match.group(1), errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _row_match_text(row: dict, column: str) -> str:
+    return _safe_str(row.get(column, "")).upper()
+
+
+def _score_load_match_row(row: dict, search: dict) -> tuple[int, list[str]]:
+    score = 0
+    reasons = []
+
+    checks = [
+        ("booking", "booking_number", 100, "Booking"),
+        ("container", "container_number", 98, "Container"),
+        ("reference", "reference_number", 90, "Reference"),
+        ("load_id", "id", 95, "Load ID"),
+        ("load_id", "load_id", 90, "External Load ID"),
+        ("vessel", "vessel_name", 65, "Vessel"),
+    ]
+    for search_key, column, points, label in checks:
+        needle = _safe_str(search.get(search_key, "")).upper()
+        haystack = _row_match_text(row, column)
+        if needle and haystack and (needle == haystack or needle in haystack):
+            score = max(score, points)
+            reasons.append(label)
+
+    customer = _safe_str(search.get("customer", "")).lower()
+    row_customer = _safe_str(row.get("customer", "")).lower()
+    date_hint = _safe_str(search.get("date", ""))
+    row_date = _safe_str(row.get("delivery_need_date", ""))
+    date_matches = date_hint and date_hint in row_date
+    if customer and len(customer) >= 4 and customer in row_customer:
+        score = max(score, 55)
+        reasons.append("Customer")
+        if date_matches:
+            score = max(score, 82)
+            reasons.append("Date")
+    elif date_matches:
+        score = max(score, 45)
+        reasons.append("Date")
+
+    return score, reasons
+
+
+def find_load_match_candidates(
+    tokens: dict,
+    parsed: dict | None = None,
+    subject: str = "",
+    body: str = "",
+    limit: int = 5,
+) -> list[dict]:
+    parsed = parsed or {}
+    text = f"{subject or ''} {body or ''} {parsed}"
+    existing_columns = _existing_load_columns()
+    select_columns = [
+        column
+        for column in [
+            "id",
+            "load_id",
+            "booking_number",
+            "reference_number",
+            "container_number",
+            "customer",
+            "delivery_need_date",
+            "status",
+            "driver_name",
+            "pickup_appointment",
+            "delivery_appointment",
+            "vessel_name",
+            "updated_at",
+        ]
+        if column in existing_columns
+    ]
+    if "id" not in select_columns:
+        return []
+
+    search = {
+        "booking": _safe_str(tokens.get("booking_number") or parsed.get("Booking Number", "")),
+        "container": _safe_str(tokens.get("container_number") or parsed.get("Container Number", "")),
+        "reference": _safe_str(tokens.get("reference_number") or parsed.get("Reference Number", "")),
+        "load_id": _extract_load_id_hint(text),
+        "customer": _safe_str(parsed.get("Customer", "")),
+        "date": _extract_date_hint(text),
+        "vessel": _safe_str(parsed.get("Vessel", "") or parsed.get("Vessel Name", "")),
+    }
 
     conditions = []
-    params = {}
-
-    if booking:
-        conditions.append("lower(booking_number) = lower(:booking)")
-        params["booking"] = booking
-
-    if container:
-        conditions.append("lower(container_number) = lower(:container)")
-        params["container"] = container
-
-    if reference:
-        conditions.append("lower(reference_number) = lower(:reference)")
-        params["reference"] = reference
+    params = {"limit": max(int(limit) * 4, 20)}
+    if search["booking"] and "booking_number" in existing_columns:
+        conditions.append("lower(coalesce(booking_number, '')) like lower(:booking_like)")
+        params["booking_like"] = f"%{search['booking']}%"
+    if search["container"] and "container_number" in existing_columns:
+        conditions.append("lower(coalesce(container_number, '')) like lower(:container_like)")
+        params["container_like"] = f"%{search['container']}%"
+    if search["reference"] and "reference_number" in existing_columns:
+        conditions.append("lower(coalesce(reference_number, '')) like lower(:reference_like)")
+        params["reference_like"] = f"%{search['reference']}%"
+    if search["load_id"]:
+        conditions.append("cast(id as text) = :load_id")
+        params["load_id"] = search["load_id"]
+        if "load_id" in existing_columns:
+            conditions.append("lower(coalesce(load_id, '')) = lower(:external_load_id)")
+            params["external_load_id"] = search["load_id"]
+    if search["customer"] and len(search["customer"]) >= 4 and "customer" in existing_columns:
+        conditions.append("lower(coalesce(customer, '')) like lower(:customer_like)")
+        params["customer_like"] = f"%{search['customer']}%"
+    if search["vessel"] and "vessel_name" in existing_columns:
+        conditions.append("lower(coalesce(vessel_name, '')) like lower(:vessel_like)")
+        params["vessel_like"] = f"%{search['vessel']}%"
 
     if not conditions:
-        return None, 0
+        return []
 
+    order_clause = "updated_at desc nulls last, id desc" if "updated_at" in existing_columns else "id desc"
     try:
         match_df = read_df(
             f"""
-            select id
+            select {", ".join(select_columns)}
             from loads
             where {" or ".join(conditions)}
-            order by updated_at desc
-            limit 1
+            order by {order_clause}
+            limit :limit
             """,
             params,
         )
-
-        if match_df.empty:
-            return None, 35
-
-        if booking or container:
-            return int(match_df.iloc[0]["id"]), 95
-
-        return int(match_df.iloc[0]["id"]), 75
-
     except Exception:
+        return []
+
+    candidates = []
+    for _, row in match_df.iterrows():
+        row_dict = row.to_dict()
+        score, reasons = _score_load_match_row(row_dict, search)
+        if score <= 0:
+            continue
+        candidates.append(
+            {
+                "Load ID": int(row_dict["id"]),
+                "External Load ID": _safe_str(row_dict.get("load_id", "")),
+                "Booking Number": _safe_str(row_dict.get("booking_number", "")),
+                "Container Number": _safe_str(row_dict.get("container_number", "")),
+                "Reference Number": _safe_str(row_dict.get("reference_number", "")),
+                "Customer": _safe_str(row_dict.get("customer", "")),
+                "Status": _safe_str(row_dict.get("status", "")),
+                "Driver": _safe_str(row_dict.get("driver_name", "")),
+                "Pickup Appointment": _safe_str(row_dict.get("pickup_appointment", "")),
+                "Delivery Appointment": _safe_str(row_dict.get("delivery_appointment", "")),
+                "Vessel": _safe_str(row_dict.get("vessel_name", "")),
+                "Match Score": int(score),
+                "Match Reason": ", ".join(reasons),
+            }
+        )
+
+    candidates = sorted(candidates, key=lambda item: item["Match Score"], reverse=True)
+    return candidates[: int(limit)]
+
+
+def find_matching_load(tokens: dict, parsed: dict | None = None, subject: str = "", body: str = "") -> tuple[int | None, int]:
+    candidates = find_load_match_candidates(tokens, parsed=parsed, subject=subject, body=body, limit=5)
+    if not candidates:
         return None, 0
+    top = candidates[0]
+    top_score = int(top.get("Match Score", 0) or 0)
+    second_score = int(candidates[1].get("Match Score", 0) or 0) if len(candidates) > 1 else 0
+    if top_score >= 90 and top_score - second_score >= 5:
+        return int(top["Load ID"]), top_score
+    if top_score >= 98:
+        return int(top["Load ID"]), top_score
+    return None, top_score
 
 
 def update_intake_classification(
@@ -1447,14 +1746,29 @@ def update_intake_classification(
             "action_required": action_required,
         },
     )
+    try:
+        _sync_operations_case_for_intake_id(intake_id)
+    except Exception:
+        pass
 
 
-def save_load_communication(load_id, intake_id, conversation_key, request_type, subject, sender, body, direction: str = "inbound") -> None:
+def save_load_communication(
+    load_id,
+    intake_id,
+    conversation_key,
+    request_type,
+    subject,
+    sender,
+    body,
+    direction: str = "inbound",
+    case_id=None,
+) -> None:
     execute(
         """
         insert into load_communications (
             load_id,
             intake_id,
+            case_id,
             conversation_key,
             communication_type,
             direction,
@@ -1465,6 +1779,7 @@ def save_load_communication(load_id, intake_id, conversation_key, request_type, 
         values (
             :load_id,
             :intake_id,
+            :case_id,
             :conversation_key,
             :communication_type,
             :direction,
@@ -1476,6 +1791,7 @@ def save_load_communication(load_id, intake_id, conversation_key, request_type, 
         {
             "load_id": load_id,
             "intake_id": intake_id,
+            "case_id": _int_or_none(case_id),
             "conversation_key": conversation_key,
             "communication_type": request_type,
             "direction": direction,
@@ -1686,6 +2002,10 @@ def _store_operations_parsed_data(intake_id: int, parsed_data: dict, action_requ
             "action_required": action_required,
         },
     )
+    try:
+        _sync_operations_case_for_intake_id(intake_id)
+    except Exception:
+        pass
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -1728,6 +2048,158 @@ def _email_received_lookup_key(value) -> str:
     return parsed.isoformat()
 
 
+def _sql_literal_list(values: list[str]) -> str:
+    return ", ".join("'" + str(value).replace("'", "''") + "'" for value in values)
+
+
+def _operations_email_source_filter(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}source in ({_sql_literal_list(OPERATIONS_EMAIL_SYNC_SOURCES)})"
+
+
+def _conversation_join_expr(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"coalesce("
+        f"nullif({prefix}conversation_key, ''), "
+        f"nullif({prefix}email_thread_id, ''), "
+        f"nullif({prefix}source_message_id, ''), "
+        f"nullif({prefix}email_normalized_subject, ''), "
+        f"lower(coalesce({prefix}source_subject, ''))"
+        f")"
+    )
+
+
+def _ensure_operations_email_sync_schema() -> None:
+    if st.session_state.get("_operations_email_sync_schema_ready"):
+        _ensure_operations_case_schema()
+        return
+
+    execute("alter table order_intake add column if not exists email_direction text not null default 'inbound'")
+    execute("alter table order_intake add column if not exists email_mailbox text")
+    execute("alter table order_intake add column if not exists email_in_reply_to text")
+    execute("alter table order_intake add column if not exists email_references jsonb not null default '[]'::jsonb")
+    execute("alter table order_intake add column if not exists email_thread_id text")
+    execute("alter table order_intake add column if not exists email_normalized_subject text")
+    execute("alter table order_intake add column if not exists conversation_status text not null default 'New Conversation'")
+    execute("alter table order_intake add column if not exists email_synced_at timestamptz")
+    execute("create index if not exists idx_order_intake_email_thread_id on order_intake(email_thread_id)")
+    execute("create index if not exists idx_order_intake_email_normalized_subject on order_intake(email_normalized_subject)")
+    execute("create index if not exists idx_order_intake_conversation_status on order_intake(conversation_status)")
+    execute("create index if not exists idx_order_intake_email_direction on order_intake(email_direction)")
+    execute("create index if not exists idx_order_intake_email_mailbox on order_intake(email_mailbox)")
+    _ensure_operations_case_schema()
+    st.session_state["_operations_email_sync_schema_ready"] = True
+
+
+def _ensure_operations_case_schema() -> None:
+    if st.session_state.get("_operations_case_schema_ready"):
+        return
+
+    execute(
+        """
+        create table if not exists operations_cases (
+            id bigserial primary key,
+            case_number text unique not null,
+            conversation_key text,
+            status text not null default 'New',
+            owner text not null default 'Unassigned',
+            priority text not null default 'Normal',
+            customer text,
+            source_subject text,
+            request_type text,
+            linked_load_id bigint references loads(id) on delete set null,
+            next_action text,
+            last_message_direction text,
+            last_message_at timestamptz,
+            message_count integer not null default 0,
+            first_response_due_at timestamptz,
+            first_response_at timestamptz,
+            resolution_due_at timestamptz,
+            resolved_at timestamptz,
+            customer_wait_started_at timestamptz,
+            department_wait_started_at timestamptz,
+            sla_status text not null default 'On Track',
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            closed_at timestamptz,
+            reopened_at timestamptz
+        )
+        """
+    )
+    execute(
+        """
+        create table if not exists operations_case_notes (
+            id bigserial primary key,
+            case_id bigint references operations_cases(id) on delete cascade,
+            note_body text not null,
+            note_type text not null default 'internal',
+            created_by text not null default 'dispatcher',
+            created_at timestamptz not null default now()
+        )
+        """
+    )
+    execute(
+        """
+        create table if not exists operations_case_owner_history (
+            id bigserial primary key,
+            case_id bigint references operations_cases(id) on delete cascade,
+            old_owner text,
+            new_owner text not null,
+            changed_by text not null default 'dispatcher',
+            changed_at timestamptz not null default now()
+        )
+        """
+    )
+    execute(
+        """
+        create table if not exists operations_case_events (
+            id bigserial primary key,
+            case_id bigint references operations_cases(id) on delete cascade,
+            event_type text not null,
+            title text,
+            details text,
+            actor text not null default 'system',
+            department text,
+            created_at timestamptz not null default now()
+        )
+        """
+    )
+    execute("alter table operations_cases add column if not exists first_response_due_at timestamptz")
+    execute("alter table operations_cases add column if not exists first_response_at timestamptz")
+    execute("alter table operations_cases add column if not exists resolution_due_at timestamptz")
+    execute("alter table operations_cases add column if not exists resolved_at timestamptz")
+    execute("alter table operations_cases add column if not exists customer_wait_started_at timestamptz")
+    execute("alter table operations_cases add column if not exists department_wait_started_at timestamptz")
+    execute("alter table operations_cases add column if not exists sla_status text not null default 'On Track'")
+    execute(
+        """
+        update operations_cases
+        set first_response_due_at = coalesce(first_response_due_at, created_at + interval '2 hours'),
+            resolution_due_at = coalesce(resolution_due_at, created_at + interval '48 hours')
+        """
+    )
+    execute("alter table order_intake add column if not exists case_id bigint references operations_cases(id) on delete set null")
+    execute("alter table load_communications add column if not exists case_id bigint references operations_cases(id) on delete set null")
+    execute("alter table operations_email_replies add column if not exists case_id bigint references operations_cases(id) on delete set null")
+    execute("create index if not exists idx_operations_cases_conversation_key on operations_cases(conversation_key)")
+    execute("create index if not exists idx_operations_cases_status on operations_cases(status)")
+    execute("create index if not exists idx_operations_cases_owner on operations_cases(owner)")
+    execute("create index if not exists idx_operations_cases_linked_load_id on operations_cases(linked_load_id)")
+    execute("create index if not exists idx_operations_cases_updated_at on operations_cases(updated_at desc)")
+    execute("create index if not exists idx_operations_cases_sla_status on operations_cases(sla_status)")
+    execute("create index if not exists idx_operations_cases_first_response_due_at on operations_cases(first_response_due_at)")
+    execute("create index if not exists idx_operations_cases_resolution_due_at on operations_cases(resolution_due_at)")
+    execute("create index if not exists idx_operations_case_notes_case_id on operations_case_notes(case_id)")
+    execute("create index if not exists idx_operations_case_owner_history_case_id on operations_case_owner_history(case_id)")
+    execute("create index if not exists idx_operations_case_events_case_id on operations_case_events(case_id)")
+    execute("create index if not exists idx_operations_case_events_created_at on operations_case_events(created_at)")
+    execute("create index if not exists idx_order_intake_case_id on order_intake(case_id)")
+    execute("create index if not exists idx_load_communications_case_id on load_communications(case_id)")
+    execute("create index if not exists idx_operations_email_replies_case_id on operations_email_replies(case_id)")
+    st.session_state["_operations_case_schema_ready"] = True
+
+
 def _inbox_review_where_clause() -> str:
     terminal = ", ".join([f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES])
     return f"where coalesce(review_status, 'Open') not in ({terminal})"
@@ -1738,32 +2210,54 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
     return read_df(
         f"""
         select
-            id,
-            created_at,
-            source_received_at,
-            source,
-            source_subject,
-            source_sender,
-            filename,
-            file_path,
-            parsed_data,
-            left(coalesce(raw_text, ''), 1200) as raw_text_preview,
+            oi.id,
+            oi.created_at,
+            oi.source_received_at,
+            oi.source,
+            oi.source_subject,
+            oi.source_sender,
+            oi.source_message_id,
+            oi.email_direction,
+            oi.email_mailbox,
+            oi.email_thread_id,
+            oi.email_normalized_subject,
+            oi.conversation_status,
+            oi.email_in_reply_to,
+            oi.email_references,
+            oi.filename,
+            oi.file_path,
+            oi.parsed_data,
+            left(coalesce(oi.raw_text, ''), 1200) as raw_text_preview,
             case
-                when jsonb_typeof(parsed_data -> :pdf_attachments_key) = 'array'
-                    then jsonb_array_length(parsed_data -> :pdf_attachments_key)
-                when filename is not null and filename <> '' then 1
+                when jsonb_typeof(oi.parsed_data -> :pdf_attachments_key) = 'array'
+                    then jsonb_array_length(oi.parsed_data -> :pdf_attachments_key)
+                when oi.filename is not null and oi.filename <> '' then 1
                 else 0
             end as pdf_count,
-            intake_status,
-            request_type,
-            conversation_key,
-            matched_load_id,
-            confidence_score,
-            action_required,
-            review_status
-        from order_intake
-        {where_clause}
-        order by created_at desc
+            oi.intake_status,
+            oi.request_type,
+            oi.conversation_key,
+            oi.matched_load_id,
+            oi.case_id,
+            oc.case_number,
+            oc.status as case_status,
+            oc.owner as case_owner,
+            oc.priority as case_priority,
+            oc.linked_load_id as case_linked_load_id,
+            oc.next_action as case_next_action,
+            oc.sla_status as case_sla_status,
+            oc.first_response_due_at as case_first_response_due_at,
+            oc.resolution_due_at as case_resolution_due_at,
+            oi.confidence_score,
+            oi.action_required,
+            oi.review_status
+        from (
+            select *
+            from order_intake
+            {where_clause}
+        ) oi
+        left join operations_cases oc on oc.id = oi.case_id
+        order by oi.created_at desc
         """,
         {"pdf_attachments_key": OPERATIONS_PDF_ATTACHMENTS_KEY},
     )
@@ -1774,25 +2268,44 @@ def _load_operations_inbox_record(intake_id: int) -> pd.DataFrame:
     return read_df(
         """
         select
-            id,
-            created_at,
-            source_received_at,
-            source,
-            source_subject,
-            source_sender,
-            filename,
-            file_path,
-            parsed_data,
-            raw_text,
-            intake_status,
-            request_type,
-            conversation_key,
-            matched_load_id,
-            confidence_score,
-            action_required,
-            review_status
-        from order_intake
-        where id = :intake_id
+            oi.id,
+            oi.created_at,
+            oi.source_received_at,
+            oi.source,
+            oi.source_subject,
+            oi.source_sender,
+            oi.source_message_id,
+            oi.email_direction,
+            oi.email_mailbox,
+            oi.email_thread_id,
+            oi.email_normalized_subject,
+            oi.conversation_status,
+            oi.email_in_reply_to,
+            oi.email_references,
+            oi.filename,
+            oi.file_path,
+            oi.parsed_data,
+            oi.raw_text,
+            oi.intake_status,
+            oi.request_type,
+            oi.conversation_key,
+            oi.matched_load_id,
+            oi.case_id,
+            oc.case_number,
+            oc.status as case_status,
+            oc.owner as case_owner,
+            oc.priority as case_priority,
+            oc.linked_load_id as case_linked_load_id,
+            oc.next_action as case_next_action,
+            oc.sla_status as case_sla_status,
+            oc.first_response_due_at as case_first_response_due_at,
+            oc.resolution_due_at as case_resolution_due_at,
+            oi.confidence_score,
+            oi.action_required,
+            oi.review_status
+        from order_intake oi
+        left join operations_cases oc on oc.id = oi.case_id
+        where oi.id = :intake_id
         limit 1
         """,
         {"intake_id": int(intake_id)},
@@ -1805,11 +2318,18 @@ def _load_operations_inbox_record_set(where_clause: str) -> pd.DataFrame:
         select
             id,
             source_subject,
+            source_sender,
+            source_message_id,
+            email_direction,
+            email_thread_id,
+            email_normalized_subject,
+            conversation_status,
             parsed_data,
             raw_text,
             request_type,
             conversation_key,
             matched_load_id,
+            case_id,
             confidence_score,
             action_required
         from order_intake
@@ -1831,9 +2351,1203 @@ def _operations_items_needing_smart_group_update(inbox_df: pd.DataFrame) -> pd.S
         "Quote Request",
         "Cancellation",
         "POD Request",
+        "Billing",
+        "Driver Issue",
+        "Port Issue",
     ]) & ~has_match & confidence.lt(70)
 
     return current_type.isin(["", "Needs Classification", "Other"]) | action_type_needs_reference
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_conversation_summary_df() -> pd.DataFrame:
+    conversation_key_expr = _conversation_join_expr()
+    try:
+        return read_df(
+            f"""
+            select
+                {conversation_key_expr} as conversation_join_key,
+                count(*) as conversation_message_count,
+                max(source_received_at) as last_message_at,
+                (array_agg(coalesce(email_direction, 'inbound') order by source_received_at desc nulls last, created_at desc))[1] as latest_direction,
+                (array_agg(coalesce(source_sender, '') order by source_received_at desc nulls last, created_at desc))[1] as latest_sender,
+                (array_agg(coalesce(conversation_status, 'New Conversation') order by source_received_at desc nulls last, created_at desc))[1] as latest_conversation_status,
+                max(case when coalesce(email_direction, 'inbound') = 'inbound' then source_received_at end) as last_inbound_at,
+                max(case when coalesce(email_direction, 'inbound') = 'outbound' then source_received_at end) as last_outbound_at,
+                max(matched_load_id) as thread_matched_load_id
+            from order_intake
+            where {_operations_email_source_filter()}
+            group by {conversation_key_expr}
+            """
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _row_conversation_join_key(row) -> str:
+    for key in ["conversation_key", "email_thread_id", "source_message_id", "email_normalized_subject", "source_subject"]:
+        value = _safe_str(row.get(key, "") if hasattr(row, "get") else "")
+        if value:
+            return value.lower() if key == "source_subject" else value
+    return ""
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_conversation_timeline(conversation_key: str) -> pd.DataFrame:
+    if not _safe_str(conversation_key):
+        return pd.DataFrame()
+
+    conversation_key_expr = _conversation_join_expr()
+    try:
+        return read_df(
+            f"""
+            select
+                id,
+                source_received_at,
+                created_at,
+                coalesce(email_direction, 'inbound') as email_direction,
+                coalesce(email_mailbox, '') as email_mailbox,
+                coalesce(source_sender, '') as source_sender,
+                coalesce(source_subject, '') as source_subject,
+                coalesce(source_message_id, '') as source_message_id,
+                coalesce(email_thread_id, '') as email_thread_id,
+                coalesce(conversation_status, 'New Conversation') as conversation_status,
+                coalesce(review_status, 'Open') as review_status,
+                left(coalesce(raw_text, ''), 1200) as message_preview
+            from order_intake
+            where {_operations_email_source_filter()}
+              and {conversation_key_expr} = :conversation_key
+            order by coalesce(source_received_at, created_at) asc, id asc
+            """,
+            {"conversation_key": conversation_key},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _conversation_context_from_lookup(lookup: dict, metadata: dict) -> dict:
+    candidates = []
+    for key in [metadata.get("conversation_key"), metadata.get("thread_id")]:
+        key = _safe_str(key)
+        if key:
+            candidates.extend(lookup.get("by_thread_id", {}).get(key, []))
+
+    normalized_subject = _safe_str(metadata.get("normalized_subject", ""))
+    if normalized_subject:
+        candidates.extend(lookup.get("by_normalized_subject", {}).get(normalized_subject, []))
+
+    if not candidates:
+        return {}
+
+    def score(record: dict) -> tuple[int, str]:
+        has_match = 1 if _safe_str(record.get("matched_load_id", "")) else 0
+        direction_score = 1 if _safe_str(record.get("email_direction", "")).lower() == "inbound" else 0
+        return (has_match + direction_score, _safe_str(record.get("source_received_at", "")))
+
+    candidates = sorted(candidates, key=score, reverse=True)
+    chosen = candidates[0]
+    matched_load_id = chosen.get("matched_load_id")
+    if not _safe_str(matched_load_id):
+        matched_load_id = None
+    return {
+        "conversation_key": _safe_str(chosen.get("conversation_key", "")),
+        "matched_load_id": matched_load_id,
+        "request_type": _safe_str(chosen.get("request_type", "")),
+        "conversation_status": _safe_str(chosen.get("conversation_status", "")),
+    }
+
+
+def _sync_conversation_status(conversation_key: str) -> None:
+    if not _safe_str(conversation_key):
+        return
+
+    timeline = _load_operations_conversation_timeline(conversation_key)
+    if timeline.empty:
+        return
+
+    latest = timeline.iloc[-1]
+    latest_direction = _safe_str(latest.get("email_direction", "inbound")).lower() or "inbound"
+    message_count = len(timeline)
+
+    if latest_direction == "outbound":
+        latest_mailbox = _safe_str(latest.get("email_mailbox", "")).lower()
+        new_status = "Waiting Customer" if latest_mailbox == "tms" else "Answered Outside TMS"
+    elif message_count <= 1:
+        new_status = "New Conversation"
+    else:
+        new_status = "Waiting Dispatcher"
+
+    try:
+        execute(
+            f"""
+            update order_intake
+            set conversation_status = :conversation_status
+            where {_operations_email_source_filter()}
+              and {_conversation_join_expr()} = :conversation_key
+            """,
+            {
+                "conversation_status": new_status,
+                "conversation_key": conversation_key,
+            },
+        )
+        _load_operations_conversation_summary_df.clear()
+        _load_operations_conversation_timeline.clear()
+    except Exception:
+        pass
+
+
+def _int_or_none(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    value_text = _safe_str(value)
+    if not value_text:
+        return None
+    try:
+        return int(float(value_text))
+    except Exception:
+        return None
+
+
+def _case_customer_from_sender(sender: str) -> str:
+    name, email = parseaddr(str(sender or ""))
+    return _safe_str(name) or _safe_str(email) or _safe_str(sender)
+
+
+def _default_operations_case_owner(request_type: str) -> str:
+    if request_type in {"New Booking", "Booking Update", "Appointment Update"}:
+        return "Dispatch"
+    if request_type in {"POD Request", "Billing"}:
+        return "Billing"
+    if request_type in {"Cancellation", "Driver Issue", "Port Issue"}:
+        return "Manager"
+    if request_type == "Spam/Marketing":
+        return "Customer Service"
+    if request_type in {"Quote Request", "Missing Information", "Customer Request"}:
+        return "Customer Service"
+    return "Unassigned"
+
+
+def _operations_case_priority_from_text(subject: str, body: str, request_type: str) -> str:
+    text = f"{subject or ''} {body or ''}".lower()
+    if any(term in text for term in ["urgent", "asap", "rush", "critical", "lfd", "last free day"]):
+        return "Urgent"
+    if request_type in {"Cancellation", "POD Request", "Driver Issue", "Port Issue"}:
+        return "High"
+    return "Normal"
+
+
+def _operations_case_status_for_message(direction: str, current_status: str = "", is_new: bool = False) -> str:
+    direction = _safe_str(direction).lower() or "inbound"
+    current_status = _safe_str(current_status)
+    if direction == "outbound":
+        return "Waiting Customer"
+    if current_status == "Closed":
+        return "Reopened"
+    if is_new:
+        return "New"
+    return "Waiting Dispatcher"
+
+
+def _next_operations_case_number() -> str:
+    year = date.today().year
+    prefix = f"CASE-{year}-"
+    last_number = 0
+    try:
+        last_df = read_df(
+            """
+            select max(case_number) as last_case_number
+            from operations_cases
+            where case_number like :case_prefix
+            """,
+            {"case_prefix": f"{prefix}%"},
+        )
+        if not last_df.empty:
+            last_case_number = _safe_str(last_df.iloc[0].get("last_case_number", ""))
+            match = re.search(r"(\d+)$", last_case_number)
+            if match:
+                last_number = int(match.group(1))
+    except Exception:
+        last_number = 0
+    return f"{prefix}{last_number + 1:04d}"
+
+
+def _load_operations_case_by_id(case_id) -> dict:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return {}
+    try:
+        case_df = read_df(
+            """
+            select *
+            from operations_cases
+            where id = :case_id
+            limit 1
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        return {}
+    return case_df.iloc[0].to_dict() if not case_df.empty else {}
+
+
+def _load_operations_case_by_conversation(conversation_key: str) -> dict:
+    if not _safe_str(conversation_key):
+        return {}
+    try:
+        case_df = read_df(
+            """
+            select *
+            from operations_cases
+            where conversation_key = :conversation_key
+            order by updated_at desc, id desc
+            limit 1
+            """,
+            {"conversation_key": conversation_key},
+        )
+    except Exception:
+        return {}
+    return case_df.iloc[0].to_dict() if not case_df.empty else {}
+
+
+def _log_operations_case_event(
+    case_id,
+    event_type: str,
+    title: str = "",
+    details: str = "",
+    actor: str = "system",
+    department: str = "",
+) -> None:
+    case_id = _int_or_none(case_id)
+    if case_id is None or not _safe_str(event_type):
+        return
+    try:
+        execute(
+            """
+            insert into operations_case_events (
+                case_id,
+                event_type,
+                title,
+                details,
+                actor,
+                department
+            )
+            values (
+                :case_id,
+                :event_type,
+                :title,
+                :details,
+                :actor,
+                :department
+            )
+            """,
+            {
+                "case_id": case_id,
+                "event_type": event_type,
+                "title": title or None,
+                "details": details or None,
+                "actor": actor or "system",
+                "department": department or None,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _record_operations_case_owner_change(case_id, old_owner: str, new_owner: str, changed_by: str = "dispatcher") -> None:
+    case_id = _int_or_none(case_id)
+    old_owner = _safe_str(old_owner)
+    new_owner = _safe_str(new_owner) or "Unassigned"
+    if case_id is None or old_owner == new_owner:
+        return
+    try:
+        execute(
+            """
+            insert into operations_case_owner_history (
+                case_id,
+                old_owner,
+                new_owner,
+                changed_by
+            )
+            values (
+                :case_id,
+                :old_owner,
+                :new_owner,
+                :changed_by
+            )
+            """,
+            {
+                "case_id": case_id,
+                "old_owner": old_owner or None,
+                "new_owner": new_owner,
+                "changed_by": changed_by,
+            },
+        )
+        _log_operations_case_event(
+            case_id,
+            "assigned",
+            "Owner changed",
+            f"Owner changed from {old_owner or 'Unassigned'} to {new_owner}.",
+            actor=changed_by,
+            department=new_owner,
+        )
+    except Exception:
+        pass
+
+
+def _update_operations_case_sla(case_id) -> None:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return
+    try:
+        execute(
+            """
+            update operations_cases
+            set sla_status = case
+                    when status = 'Closed'
+                         and first_response_at is not null
+                         and first_response_due_at is not null
+                         and first_response_at <= first_response_due_at
+                         and (resolution_due_at is null or coalesce(resolved_at, closed_at, now()) <= resolution_due_at)
+                        then 'Met'
+                    when status = 'Closed' then 'Closed'
+                    when first_response_at is null
+                         and first_response_due_at is not null
+                         and now() > first_response_due_at
+                        then 'First Response Overdue'
+                    when resolution_due_at is not null
+                         and now() > resolution_due_at
+                        then 'Resolution Overdue'
+                    when first_response_at is null
+                         and first_response_due_at is not null
+                         and now() > first_response_due_at - interval '30 minutes'
+                        then 'Warning'
+                    else 'On Track'
+                end,
+                updated_at = now()
+            where id = :case_id
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        pass
+
+
+def _refresh_operations_case_sla_statuses() -> None:
+    try:
+        execute(
+            """
+            update operations_cases
+            set sla_status = case
+                    when status = 'Closed'
+                         and first_response_at is not null
+                         and first_response_due_at is not null
+                         and first_response_at <= first_response_due_at
+                         and (resolution_due_at is null or coalesce(resolved_at, closed_at, now()) <= resolution_due_at)
+                        then 'Met'
+                    when status = 'Closed' then 'Closed'
+                    when first_response_at is null
+                         and first_response_due_at is not null
+                         and now() > first_response_due_at
+                        then 'First Response Overdue'
+                    when resolution_due_at is not null
+                         and now() > resolution_due_at
+                        then 'Resolution Overdue'
+                    when first_response_at is null
+                         and first_response_due_at is not null
+                         and now() > first_response_due_at - interval '30 minutes'
+                        then 'Warning'
+                    else 'On Track'
+                end
+            where status <> 'Closed'
+               or sla_status not in ('Met', 'Closed')
+            """
+        )
+    except Exception:
+        pass
+
+
+def _get_or_create_operations_case(
+    *,
+    conversation_key: str,
+    subject: str,
+    sender: str,
+    request_type: str,
+    matched_load_id=None,
+    direction: str = "inbound",
+    next_action: str = "",
+    body: str = "",
+) -> dict:
+    _ensure_operations_case_schema()
+    conversation_key = _safe_str(conversation_key)
+    existing_case = _load_operations_case_by_conversation(conversation_key)
+    linked_load_id = _int_or_none(matched_load_id)
+    status = _operations_case_status_for_message(direction, existing_case.get("status", ""), is_new=not existing_case)
+    priority = _operations_case_priority_from_text(subject, body, request_type)
+
+    if existing_case:
+        case_id = int(existing_case["id"])
+        execute(
+            """
+            update operations_cases
+            set status = :status,
+                owner = case
+                    when coalesce(owner, '') = '' or owner = 'Unassigned' then :owner
+                    else owner
+                end,
+                priority = case
+                    when :priority_rank > case
+                        when priority = 'Urgent' then 4
+                        when priority = 'High' then 3
+                        when priority = 'Normal' then 2
+                        else 1
+                    end then :priority
+                    else priority
+                end,
+                customer = coalesce(nullif(customer, ''), :customer),
+                source_subject = coalesce(nullif(source_subject, ''), :source_subject),
+                request_type = coalesce(:request_type, request_type),
+                linked_load_id = coalesce(:linked_load_id, linked_load_id),
+                next_action = coalesce(nullif(:next_action, ''), next_action),
+                last_message_direction = :last_message_direction,
+                last_message_at = now(),
+                first_response_at = case
+                    when :last_message_direction = 'outbound' then coalesce(first_response_at, now())
+                    else first_response_at
+                end,
+                customer_wait_started_at = case
+                    when :status = 'Waiting Customer' then coalesce(customer_wait_started_at, now())
+                    else customer_wait_started_at
+                end,
+                department_wait_started_at = case
+                    when :status like 'Waiting %' and :status <> 'Waiting Customer' then coalesce(department_wait_started_at, now())
+                    else department_wait_started_at
+                end,
+                updated_at = now(),
+                reopened_at = case when status = 'Closed' and :status = 'Reopened' then now() else reopened_at end,
+                closed_at = case when :status = 'Closed' then now() else closed_at end
+            where id = :case_id
+            """,
+            {
+                "case_id": case_id,
+                "status": status,
+                "owner": _default_operations_case_owner(request_type),
+                "priority": priority,
+                "priority_rank": {"Urgent": 4, "High": 3, "Normal": 2, "Low": 1}.get(priority, 2),
+                "customer": _case_customer_from_sender(sender),
+                "source_subject": subject or None,
+                "request_type": request_type or None,
+                "linked_load_id": linked_load_id,
+                "next_action": next_action or None,
+                "last_message_direction": _safe_str(direction).lower() or "inbound",
+            },
+        )
+        updated_case = _load_operations_case_by_id(case_id)
+        _record_operations_case_owner_change(
+            case_id,
+            _safe_str(existing_case.get("owner", "")),
+            _safe_str(updated_case.get("owner", "")),
+            changed_by="system",
+        )
+        _update_operations_case_sla(case_id)
+        return updated_case
+
+    for _ in range(5):
+        case_number = _next_operations_case_number()
+        try:
+            execute(
+                """
+                insert into operations_cases (
+                    case_number,
+                    conversation_key,
+                    status,
+                    owner,
+                    priority,
+                    customer,
+                    source_subject,
+                    request_type,
+                    linked_load_id,
+                    next_action,
+                    last_message_direction,
+                    last_message_at,
+                    first_response_due_at,
+                    resolution_due_at,
+                    customer_wait_started_at,
+                    department_wait_started_at,
+                    first_response_at,
+                    message_count
+                )
+                values (
+                    :case_number,
+                    :conversation_key,
+                    :status,
+                    :owner,
+                    :priority,
+                    :customer,
+                    :source_subject,
+                    :request_type,
+                    :linked_load_id,
+                    :next_action,
+                    :last_message_direction,
+                    now(),
+                    now() + interval '2 hours',
+                    now() + interval '48 hours',
+                    case when :status = 'Waiting Customer' then now() else null end,
+                    case when :status like 'Waiting %' and :status <> 'Waiting Customer' then now() else null end,
+                    case when :last_message_direction = 'outbound' then now() else null end,
+                    0
+                )
+                """,
+                {
+                    "case_number": case_number,
+                    "conversation_key": conversation_key or None,
+                    "status": status,
+                    "owner": _default_operations_case_owner(request_type),
+                    "priority": priority,
+                    "customer": _case_customer_from_sender(sender),
+                    "source_subject": subject or None,
+                    "request_type": request_type or None,
+                    "linked_load_id": linked_load_id,
+                    "next_action": next_action or None,
+                    "last_message_direction": _safe_str(direction).lower() or "inbound",
+                },
+            )
+            created_case = _load_operations_case_by_conversation(conversation_key)
+            if created_case:
+                _record_operations_case_owner_change(
+                    created_case.get("id"),
+                    "",
+                    _safe_str(created_case.get("owner", "")),
+                    changed_by="system",
+                )
+                _log_operations_case_event(
+                    created_case.get("id"),
+                    "created",
+                    "Case created",
+                    _safe_str(created_case.get("source_subject", "")),
+                    actor="system",
+                    department=_safe_str(created_case.get("owner", "")),
+                )
+                _update_operations_case_sla(created_case.get("id"))
+                return created_case
+            return _load_operations_case_by_number(case_number)
+        except Exception:
+            continue
+
+    return _load_operations_case_by_conversation(conversation_key)
+
+
+def _load_operations_case_by_number(case_number: str) -> dict:
+    if not _safe_str(case_number):
+        return {}
+    try:
+        case_df = read_df(
+            """
+            select *
+            from operations_cases
+            where case_number = :case_number
+            limit 1
+            """,
+            {"case_number": case_number},
+        )
+    except Exception:
+        return {}
+    return case_df.iloc[0].to_dict() if not case_df.empty else {}
+
+
+def _sync_operations_case_summary(case_id) -> None:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return
+    try:
+        execute(
+            """
+            update operations_cases oc
+            set message_count = coalesce(summary.message_count, 0),
+                last_message_at = summary.last_message_at,
+                last_message_direction = summary.last_message_direction,
+                linked_load_id = coalesce(oc.linked_load_id, summary.linked_load_id),
+                updated_at = now()
+            from (
+                select
+                    count(*) as message_count,
+                    max(coalesce(source_received_at, created_at)) as last_message_at,
+                    (array_agg(coalesce(email_direction, 'inbound') order by coalesce(source_received_at, created_at) desc, id desc))[1] as last_message_direction,
+                    max(matched_load_id) as linked_load_id
+                from order_intake
+                where case_id = :case_id
+            ) summary
+            where oc.id = :case_id
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        pass
+
+
+def _sync_operations_case_for_intake_record(record) -> dict:
+    conversation_key = _row_conversation_join_key(record)
+    request_type = _safe_str(record.get("request_type", "")) or "Customer Request"
+    case = _get_or_create_operations_case(
+        conversation_key=conversation_key,
+        subject=_safe_str(record.get("source_subject", "")),
+        sender=_safe_str(record.get("source_sender", "")),
+        request_type=request_type,
+        matched_load_id=record.get("matched_load_id"),
+        direction=_safe_str(record.get("email_direction", "inbound")) or "inbound",
+        next_action=_safe_str(record.get("action_required", "")),
+        body=_safe_str(record.get("raw_text", "")),
+    )
+    case_id = _int_or_none(case.get("id"))
+    if case_id is not None:
+        execute(
+            """
+            update order_intake
+            set case_id = :case_id
+            where id = :intake_id
+            """,
+            {"case_id": case_id, "intake_id": int(record["id"])},
+        )
+        _sync_operations_case_summary(case_id)
+    return case
+
+
+def _sync_operations_case_for_intake_id(intake_id: int) -> dict:
+    try:
+        record_df = _load_operations_inbox_record(int(intake_id))
+    except Exception:
+        record_df = pd.DataFrame()
+    if record_df.empty:
+        return {}
+    return _sync_operations_case_for_intake_record(record_df.iloc[0])
+
+
+def _set_operations_case_status(case_id, status: str, next_action: str = "") -> None:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return
+    execute(
+        """
+        update operations_cases
+        set status = :status,
+            next_action = coalesce(nullif(:next_action, ''), next_action),
+            customer_wait_started_at = case
+                when :status = 'Waiting Customer' then coalesce(customer_wait_started_at, now())
+                when :status <> 'Waiting Customer' then null
+                else customer_wait_started_at
+            end,
+            department_wait_started_at = case
+                when :status like 'Waiting %' and :status <> 'Waiting Customer' then coalesce(department_wait_started_at, now())
+                when :status not like 'Waiting %' then null
+                else department_wait_started_at
+            end,
+            closed_at = case when :status = 'Closed' then now() else closed_at end,
+            resolved_at = case when :status = 'Closed' then coalesce(resolved_at, now()) else resolved_at end,
+            reopened_at = case when :status = 'Reopened' then now() else reopened_at end,
+            updated_at = now()
+        where id = :case_id
+        """,
+        {"case_id": case_id, "status": status, "next_action": next_action or None},
+    )
+    execute(
+        """
+        insert into operations_case_notes (
+            case_id,
+            note_body,
+            note_type,
+            created_by
+        )
+        values (
+            :case_id,
+            :note_body,
+            'status_change',
+            'system'
+        )
+        """,
+        {
+            "case_id": case_id,
+            "note_body": f"Case status changed to {status}. {next_action or ''}".strip(),
+        },
+    )
+    _log_operations_case_event(
+        case_id,
+        "status_change",
+        f"Status changed to {status}",
+        next_action,
+        actor="dispatcher",
+    )
+    if status == "Closed":
+        _log_operations_case_event(case_id, "closed", "Case closed", next_action, actor="dispatcher")
+    _update_operations_case_sla(case_id)
+
+
+def _update_operations_case(
+    *,
+    case_id,
+    status: str,
+    owner: str,
+    priority: str,
+    linked_load_id=None,
+    next_action: str = "",
+) -> None:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return
+    old_case = _load_operations_case_by_id(case_id)
+    linked_load_id = _int_or_none(linked_load_id)
+    execute(
+        """
+        update operations_cases
+        set status = :status,
+            owner = :owner,
+            priority = :priority,
+            linked_load_id = :linked_load_id,
+            next_action = nullif(:next_action, ''),
+            customer_wait_started_at = case
+                when :status = 'Waiting Customer' then coalesce(customer_wait_started_at, now())
+                when :status <> 'Waiting Customer' then null
+                else customer_wait_started_at
+            end,
+            department_wait_started_at = case
+                when :status like 'Waiting %' and :status <> 'Waiting Customer' then coalesce(department_wait_started_at, now())
+                when :status not like 'Waiting %' then null
+                else department_wait_started_at
+            end,
+            closed_at = case when :status = 'Closed' then coalesce(closed_at, now()) else closed_at end,
+            resolved_at = case when :status = 'Closed' then coalesce(resolved_at, now()) else resolved_at end,
+            reopened_at = case when :status = 'Reopened' then now() else reopened_at end,
+            updated_at = now()
+        where id = :case_id
+        """,
+        {
+            "case_id": case_id,
+            "status": status,
+            "owner": owner,
+            "priority": priority,
+            "linked_load_id": linked_load_id,
+            "next_action": next_action or None,
+        },
+    )
+    _record_operations_case_owner_change(
+        case_id,
+        _safe_str(old_case.get("owner", "")),
+        owner,
+        changed_by="dispatcher",
+    )
+    if _safe_str(old_case.get("status", "")) != status:
+        _log_operations_case_event(
+            case_id,
+            "status_change",
+            f"Status changed to {status}",
+            next_action,
+            actor="dispatcher",
+            department=owner,
+        )
+    execute(
+        """
+        insert into operations_case_notes (
+            case_id,
+            note_body,
+            note_type,
+            created_by
+        )
+        values (
+            :case_id,
+            :note_body,
+            'status_change',
+            'dispatcher'
+        )
+        """,
+        {
+            "case_id": case_id,
+            "note_body": (
+                f"Case updated to {status}; owner {owner}; priority {priority}; "
+                f"linked load {_safe_str(linked_load_id) or '-'}."
+            ),
+        },
+    )
+    _update_operations_case_sla(case_id)
+    execute(
+        """
+        update order_intake
+        set matched_load_id = coalesce(:linked_load_id, matched_load_id)
+        where case_id = :case_id
+        """,
+        {"case_id": case_id, "linked_load_id": linked_load_id},
+    )
+
+
+def _add_operations_case_note(case_id, note_body: str, note_type: str = "internal", created_by: str = "dispatcher") -> None:
+    case_id = _int_or_none(case_id)
+    note_body = _safe_str(note_body)
+    if case_id is None or not note_body:
+        return
+    execute(
+        """
+        insert into operations_case_notes (
+            case_id,
+            note_body,
+            note_type,
+            created_by
+        )
+        values (
+            :case_id,
+            :note_body,
+            :note_type,
+            :created_by
+        )
+        """,
+        {
+            "case_id": case_id,
+            "note_body": note_body,
+            "note_type": note_type,
+            "created_by": created_by,
+        },
+    )
+    execute("update operations_cases set updated_at = now() where id = :case_id", {"case_id": case_id})
+    _log_operations_case_event(
+        case_id,
+        "note",
+        "Internal note added" if note_type == "internal" else "Case note added",
+        note_body,
+        actor=created_by,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_case_timeline(case_id) -> pd.DataFrame:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return pd.DataFrame()
+    try:
+        return read_df(
+            """
+            select *
+            from (
+                select
+                    coalesce(source_received_at, created_at) as event_at,
+                    'Email' as event_type,
+                    coalesce(email_direction, 'inbound') as actor,
+                    coalesce(source_subject, '') as title,
+                    left(coalesce(raw_text, ''), 1200) as details
+                from order_intake
+                where case_id = :case_id
+                union all
+                select
+                    created_at as event_at,
+                    case
+                        when note_type = 'internal' then 'Internal Note'
+                        when note_type = 'status_change' then 'Status Change'
+                        else note_type
+                    end as event_type,
+                    coalesce(created_by, 'dispatcher') as actor,
+                    'Case Note' as title,
+                    note_body as details
+                from operations_case_notes
+                where case_id = :case_id
+                union all
+                select
+                    created_at as event_at,
+                    'Load Action' as event_type,
+                    coalesce(direction, 'internal') as actor,
+                    coalesce(communication_type, 'Load Communication') as title,
+                    left(coalesce(message_body, ''), 1200) as details
+                from load_communications
+                where case_id = :case_id
+                union all
+                select
+                    created_at as event_at,
+                    initcap(replace(event_type, '_', ' ')) as event_type,
+                    coalesce(actor, 'system') as actor,
+                    coalesce(title, event_type) as title,
+                    coalesce(details, '') as details
+                from operations_case_events
+                where case_id = :case_id
+                  and event_type <> 'note'
+            ) timeline
+            order by event_at asc
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_recent_operations_cases(current_case_id=None) -> pd.DataFrame:
+    current_case_id = _int_or_none(current_case_id)
+    try:
+        return read_df(
+            """
+            select
+                id,
+                case_number,
+                status,
+                owner,
+                priority,
+                customer,
+                source_subject,
+                linked_load_id,
+                updated_at
+            from operations_cases
+            where (:current_case_id is null or id <> :current_case_id)
+            order by updated_at desc, id desc
+            limit 250
+            """,
+            {"current_case_id": current_case_id},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_case_owner_history(case_id) -> pd.DataFrame:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return pd.DataFrame()
+    try:
+        return read_df(
+            """
+            select
+                changed_at,
+                old_owner,
+                new_owner,
+                changed_by
+            from operations_case_owner_history
+            where case_id = :case_id
+            order by changed_at desc, id desc
+            limit 50
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _operations_case_metrics() -> dict:
+    metrics = {
+        "open": 0,
+        "waiting_dispatch": 0,
+        "waiting_customer": 0,
+        "closed": 0,
+    }
+    try:
+        _refresh_operations_case_sla_statuses()
+        case_df = read_df(
+            """
+            select coalesce(status, 'New') as status, count(*) as case_count
+            from operations_cases
+            group by coalesce(status, 'New')
+            """
+        )
+    except Exception:
+        return metrics
+    for _, row in case_df.iterrows():
+        status = _safe_str(row.get("status", "New"))
+        count = int(row.get("case_count", 0) or 0)
+        if status != "Closed":
+            metrics["open"] += count
+        if status == "Waiting Dispatcher":
+            metrics["waiting_dispatch"] += count
+        elif status == "Waiting Customer":
+            metrics["waiting_customer"] += count
+        elif status == "Closed":
+            metrics["closed"] += count
+    return metrics
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_case_dashboard_df() -> pd.DataFrame:
+    try:
+        return read_df(
+            """
+            select
+                id,
+                case_number,
+                status,
+                owner,
+                priority,
+                customer,
+                request_type,
+                linked_load_id,
+                next_action,
+                message_count,
+                sla_status,
+                created_at,
+                updated_at,
+                first_response_due_at,
+                first_response_at,
+                resolution_due_at,
+                resolved_at,
+                customer_wait_started_at,
+                department_wait_started_at,
+                closed_at,
+                source_subject
+            from operations_cases
+            order by updated_at desc, id desc
+            limit 1000
+            """
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _hours_between(start, end) -> float | None:
+    start_ts = pd.to_datetime(start, errors="coerce", utc=True)
+    end_ts = pd.to_datetime(end, errors="coerce", utc=True)
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return None
+    return round((end_ts - start_ts).total_seconds() / 3600, 2)
+
+
+def render_communication_dashboard() -> None:
+    st.markdown("### Communication Dashboard")
+    st.caption("Operations Case visibility across Dispatch, Management, Billing, and Customer Service.")
+    try:
+        _ensure_operations_email_sync_schema()
+    except Exception as exc:
+        st.info(f"Communication dashboard will be available after the Operations Inbox migration is ready: {exc}")
+        return
+
+    _refresh_operations_case_sla_statuses()
+    _load_operations_case_dashboard_df.clear()
+    case_df = _load_operations_case_dashboard_df()
+    if case_df.empty:
+        st.info("No Operations Cases found yet. Sync the Operations Inbox to populate communication metrics.")
+        return
+
+    case_df = case_df.copy()
+    case_df["created_at_dt"] = pd.to_datetime(case_df["created_at"], errors="coerce", utc=True)
+    case_df["first_response_at_dt"] = pd.to_datetime(case_df["first_response_at"], errors="coerce", utc=True)
+    case_df["closed_at_dt"] = pd.to_datetime(case_df["closed_at"], errors="coerce", utc=True)
+    case_df["resolution_at_dt"] = pd.to_datetime(
+        case_df["resolved_at"].fillna(case_df["closed_at"]),
+        errors="coerce",
+        utc=True,
+    )
+    case_df["first_response_hours"] = [
+        _hours_between(created, responded)
+        for created, responded in zip(case_df["created_at_dt"], case_df["first_response_at_dt"])
+    ]
+    case_df["resolution_hours"] = [
+        _hours_between(created, resolved)
+        for created, resolved in zip(case_df["created_at_dt"], case_df["resolution_at_dt"])
+    ]
+
+    open_cases = case_df[~case_df["status"].eq("Closed")].copy()
+    closed_cases = case_df[case_df["status"].eq("Closed")].copy()
+    responded = case_df[pd.notna(case_df["first_response_hours"])].copy()
+    avg_response = responded["first_response_hours"].dropna().mean()
+    sla_met = case_df["sla_status"].isin(["Met", "On Track"]).sum()
+    sla_compliance = int(round((sla_met / max(len(case_df), 1)) * 100))
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Open Cases", len(open_cases))
+    k2.metric("Waiting by Dept", int(open_cases["status"].astype(str).str.startswith("Waiting").sum()))
+    k3.metric("Avg First Response", "-" if pd.isna(avg_response) else f"{avg_response:.1f}h")
+    k4.metric("Cases Closed", len(closed_cases))
+    k5.metric("SLA Compliance", f"{sla_compliance}%")
+
+    owner_summary = (
+        open_cases.groupby(["owner", "status"])
+        .size()
+        .reset_index(name="Cases")
+        .sort_values(["owner", "Cases"], ascending=[True, False])
+    )
+    sla_risk = open_cases[
+        open_cases["sla_status"].isin(["Warning", "First Response Overdue", "Resolution Overdue"])
+    ].copy()
+    owner_counts = (
+        open_cases.groupby("owner")
+        .size()
+        .reset_index(name="Open Cases")
+        .sort_values("Open Cases", ascending=False)
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Owner Workload")
+        st.dataframe(owner_counts, use_container_width=True, hide_index=True)
+        st.markdown("#### Waiting by Department")
+        st.dataframe(owner_summary, use_container_width=True, hide_index=True)
+    with right:
+        st.markdown("#### SLA Watch")
+        if sla_risk.empty:
+            st.success("No cases are currently near or past SLA.")
+        else:
+            watch_cols = [
+                "case_number",
+                "status",
+                "owner",
+                "priority",
+                "sla_status",
+                "first_response_due_at",
+                "resolution_due_at",
+                "customer",
+                "source_subject",
+            ]
+            st.dataframe(sla_risk[watch_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Shared Case View", expanded=False):
+        display_cols = [
+            "case_number",
+            "status",
+            "owner",
+            "priority",
+            "request_type",
+            "linked_load_id",
+            "message_count",
+            "sla_status",
+            "next_action",
+            "customer",
+            "source_subject",
+        ]
+        st.dataframe(case_df[display_cols], use_container_width=True, hide_index=True)
+
+
+def _merge_operations_cases(source_case_id, target_case_id) -> bool:
+    source_case_id = _int_or_none(source_case_id)
+    target_case_id = _int_or_none(target_case_id)
+    if source_case_id is None or target_case_id is None or source_case_id == target_case_id:
+        return False
+
+    source_case = _load_operations_case_by_id(source_case_id)
+    target_case = _load_operations_case_by_id(target_case_id)
+    if not source_case or not target_case:
+        return False
+
+    execute("update order_intake set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    execute("update load_communications set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    execute("update operations_email_replies set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    execute("update operations_case_notes set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    execute("update operations_case_events set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    execute("update operations_case_owner_history set case_id = :target_case_id where case_id = :source_case_id", {"target_case_id": target_case_id, "source_case_id": source_case_id})
+    _add_operations_case_note(
+        target_case_id,
+        f"Merged duplicate case {source_case.get('case_number')} into this case.",
+    )
+    execute(
+        """
+        update operations_cases
+        set status = 'Closed',
+            next_action = :next_action,
+            closed_at = now(),
+            resolved_at = coalesce(resolved_at, now()),
+            updated_at = now()
+        where id = :source_case_id
+        """,
+        {
+            "source_case_id": source_case_id,
+            "next_action": f"Merged into {target_case.get('case_number')}.",
+        },
+    )
+    _sync_operations_case_summary(target_case_id)
+    return True
 
 
 def _find_existing_operations_email_record(
@@ -1845,7 +3559,9 @@ def _find_existing_operations_email_record(
     if message_id:
         existing = read_df(
             """
-            select id, parsed_data, filename, file_path, raw_text, action_required
+            select id, parsed_data, filename, file_path, raw_text, action_required, email_thread_id, email_direction,
+                   email_normalized_subject, conversation_key, matched_load_id, case_id, request_type, conversation_status,
+                   source_subject, source_sender
             from order_intake
             where source_message_id = :message_id
             limit 1
@@ -1857,10 +3573,12 @@ def _find_existing_operations_email_record(
 
     if received_at:
         fallback = read_df(
-            """
-            select id, parsed_data, filename, file_path, raw_text, action_required
+            f"""
+            select id, parsed_data, filename, file_path, raw_text, action_required, email_thread_id, email_direction,
+                   email_normalized_subject, conversation_key, matched_load_id, case_id, request_type, conversation_status,
+                   source_subject, source_sender
             from order_intake
-            where source in ('operations_email', 'email_body', 'email_combined')
+            where {_operations_email_source_filter()}
               and coalesce(source_subject, '') = :subject
               and coalesce(source_sender, '') = :sender
               and source_received_at = cast(:received_at as timestamptz)
@@ -1872,10 +3590,12 @@ def _find_existing_operations_email_record(
             return fallback.iloc[0].to_dict()
 
     fallback = read_df(
-        """
-        select id, parsed_data, filename, file_path, raw_text, action_required
+        f"""
+        select id, parsed_data, filename, file_path, raw_text, action_required, email_thread_id, email_direction,
+               email_normalized_subject, conversation_key, matched_load_id, case_id, request_type, conversation_status,
+               source_subject, source_sender
         from order_intake
-        where source in ('operations_email', 'email_body', 'email_combined')
+        where {_operations_email_source_filter()}
           and coalesce(source_subject, '') = :subject
           and coalesce(source_sender, '') = :sender
           and source_received_at is null
@@ -1893,13 +3613,15 @@ def _load_existing_operations_email_lookup(limit: int = 5000) -> dict:
     lookup = {
         "loaded": False,
         "by_message_id": {},
+        "by_thread_id": {},
+        "by_normalized_subject": {},
         "by_received": {},
         "by_subject_sender_no_received": {},
     }
 
     try:
         existing_df = read_df(
-            """
+            f"""
             select
                 id,
                 parsed_data,
@@ -1907,12 +3629,23 @@ def _load_existing_operations_email_lookup(limit: int = 5000) -> dict:
                 file_path,
                 raw_text,
                 action_required,
+                email_direction,
+                email_mailbox,
+                email_thread_id,
+                email_normalized_subject,
+                email_in_reply_to,
+                email_references,
+                conversation_key,
+                matched_load_id,
+                case_id,
+                request_type,
+                conversation_status,
                 source_message_id,
                 coalesce(source_subject, '') as source_subject,
                 coalesce(source_sender, '') as source_sender,
                 source_received_at
             from order_intake
-            where source in ('operations_email', 'email_body', 'email_combined')
+            where {_operations_email_source_filter()}
                or source_message_id is not null
             order by created_at desc
             limit :limit
@@ -1926,12 +3659,18 @@ def _load_existing_operations_email_lookup(limit: int = 5000) -> dict:
     for _, row in existing_df.iterrows():
         record = row.to_dict()
         message_id = _safe_str(record.get("source_message_id", ""))
+        thread_id = _safe_str(record.get("email_thread_id", ""))
+        normalized_subject = _safe_str(record.get("email_normalized_subject", ""))
         subject = _safe_str(record.get("source_subject", ""))
         sender = _safe_str(record.get("source_sender", ""))
         received_key = _email_received_lookup_key(record.get("source_received_at"))
 
         if message_id and message_id not in lookup["by_message_id"]:
             lookup["by_message_id"][message_id] = record
+        if thread_id:
+            lookup["by_thread_id"].setdefault(thread_id, []).append(record)
+        if normalized_subject:
+            lookup["by_normalized_subject"].setdefault(normalized_subject, []).append(record)
         if received_key:
             lookup["by_received"].setdefault((subject, sender, received_key), record)
         else:
@@ -2039,18 +3778,58 @@ def _backfill_operations_pdf_attachments(
 def _operations_inbox_status_counts() -> pd.DataFrame:
     try:
         return read_df(
-            """
+            f"""
             select
                 coalesce(review_status, 'Open') as review_status,
                 count(*) as email_count
             from order_intake
-            where source in ('operations_email', 'email_body', 'email_combined')
+            where {_operations_email_source_filter()}
             group by coalesce(review_status, 'Open')
             order by email_count desc, review_status
             """
         )
     except Exception:
         return pd.DataFrame()
+
+
+def _operations_email_sync_metrics() -> dict:
+    metrics = {
+        "inbound": 0,
+        "outbound": 0,
+        "threads": 0,
+        "last_sync": "",
+    }
+
+    try:
+        sync_df = read_df(
+            f"""
+            select
+                coalesce(email_direction, 'inbound') as email_direction,
+                count(*) as email_count,
+                count(distinct nullif(email_thread_id, '')) as thread_count,
+                max(email_synced_at) as last_sync
+            from order_intake
+            where {_operations_email_source_filter()}
+            group by coalesce(email_direction, 'inbound')
+            """
+        )
+    except Exception:
+        return metrics
+
+    if sync_df.empty:
+        return metrics
+
+    metrics["threads"] = int(sync_df["thread_count"].fillna(0).sum())
+    last_sync = pd.to_datetime(sync_df["last_sync"], errors="coerce").max()
+    if pd.notna(last_sync):
+        metrics["last_sync"] = last_sync.strftime("%Y-%m-%d %I:%M %p")
+
+    for _, row in sync_df.iterrows():
+        direction = _safe_str(row.get("email_direction", "")).lower() or "inbound"
+        if direction in ["inbound", "outbound"]:
+            metrics[direction] = int(row.get("email_count", 0) or 0)
+
+    return metrics
 
 
 def _render_no_open_inbox_explanation() -> None:
@@ -2121,6 +3900,24 @@ def _action_required_for_request(
             return "POD request needs booking, container, or reference before sending documents."
         return "POD request matched to an order; verify POD status and reply."
 
+    if request_type == "Billing":
+        if matched_load_id is None:
+            return "Billing question needs booking, invoice, container, or reference before billing can respond."
+        return "Billing request matched to a load; review invoice/POD status and route to Billing."
+
+    if request_type == "Driver Issue":
+        if matched_load_id is None:
+            return "Driver issue needs booking, container, truck, or reference before dispatch can resolve it."
+        return "Driver issue matched to a load; dispatch should review driver, truck, appointment, and status."
+
+    if request_type == "Port Issue":
+        if matched_load_id is None:
+            return "Port or terminal issue needs booking, container, or reference before dispatch can resolve it."
+        return "Port issue matched to a load; review terminal/hold/gate details and update the customer."
+
+    if request_type == "Spam/Marketing":
+        return "Marketing or non-operational email; close unless it needs management review."
+
     if request_type == "New Booking":
         missing = []
         for field in ["Booking Number", "Customer", "Warehouse"]:
@@ -2164,11 +3961,14 @@ def _classification_confidence(
     if request_type == "New Booking":
         return 80 if _has_new_order_details(text, parsed, tokens) else 55
 
-    if request_type in ["Appointment Update", "Booking Update", "Cancellation", "POD Request"]:
+    if request_type in ["Appointment Update", "Booking Update", "Cancellation", "POD Request", "Billing", "Driver Issue", "Port Issue"]:
         return 75 if _has_reference_details(tokens, parsed) else 55
 
     if request_type == "Missing Information":
         return 75
+
+    if request_type == "Spam/Marketing":
+        return 90
 
     return max(match_confidence, 50)
 
@@ -2180,9 +3980,11 @@ def _build_operations_email_classification(
     fallback_key: str = "",
 ) -> dict:
     parsed = _coerce_parsed_for_classification(subject, body, parsed)
+    intent_scores = _operations_intent_scores(subject, body, parsed)
     detected_type = classify_customer_request(subject, body, parsed)
     tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
-    matched_load_id, match_confidence = find_matching_load(tokens)
+    load_match_candidates = find_load_match_candidates(tokens, parsed=parsed, subject=subject, body=body, limit=5)
+    matched_load_id, match_confidence = find_matching_load(tokens, parsed=parsed, subject=subject, body=body)
     confidence = _classification_confidence(
         detected_type,
         subject,
@@ -2192,6 +3994,9 @@ def _build_operations_email_classification(
         matched_load_id,
         match_confidence,
     )
+    if intent_scores:
+        top_score = int(max(intent_scores.values()))
+        confidence = max(confidence, min(95, top_score))
     conversation_key = (
         tokens.get("booking_number")
         or tokens.get("container_number")
@@ -2215,6 +4020,8 @@ def _build_operations_email_classification(
         "confidence_score": confidence,
         "conversation_key": conversation_key,
         "action_required": action_required,
+        "intent_scores": intent_scores,
+        "load_match_candidates": load_match_candidates,
     }
 
 
@@ -2745,6 +4552,8 @@ def _operations_ai_rule_context(classification: dict, parsed: dict, subject: str
         "conversation_key": classification.get("conversation_key", ""),
         "matched_load_id": classification.get("matched_load_id"),
         "tokens": tokens,
+        "intent_scores": classification.get("intent_scores", {}),
+        "load_match_candidates": classification.get("load_match_candidates", []),
     }
 
 
@@ -2785,13 +4594,78 @@ def _apply_ai_suggestion_to_classification(
     return updated
 
 
-def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int]:
-    emails = fetch_recent_operations_emails(limit=limit)
+def _email_sync_metadata(item: dict) -> dict:
+    direction = _safe_str(item.get("direction", "inbound")).lower() or "inbound"
+    if direction not in {"inbound", "outbound"}:
+        direction = "inbound"
+
+    references = item.get("references") or []
+    if not isinstance(references, list):
+        references = [_safe_str(references)] if _safe_str(references) else []
+
+    return {
+        "direction": direction,
+        "mailbox": _safe_str(item.get("mailbox", "")),
+        "thread_id": _safe_str(item.get("thread_id", "")),
+        "conversation_key": _safe_str(item.get("conversation_key", "")) or _safe_str(item.get("thread_id", "")),
+        "normalized_subject": _safe_str(item.get("normalized_subject", "")),
+        "in_reply_to": _safe_str(item.get("in_reply_to", "")),
+        "references": [str(value) for value in references if _safe_str(value)],
+    }
+
+
+def _update_existing_operations_email_sync_metadata(existing_record: dict, item: dict, message_id: str) -> None:
+    metadata = _email_sync_metadata(item)
+    try:
+        execute(
+            """
+            update order_intake
+            set email_direction = :email_direction,
+                email_mailbox = coalesce(nullif(email_mailbox, ''), :email_mailbox),
+                email_thread_id = coalesce(nullif(email_thread_id, ''), :email_thread_id),
+                email_normalized_subject = coalesce(nullif(email_normalized_subject, ''), :email_normalized_subject),
+                conversation_key = coalesce(nullif(conversation_key, ''), :conversation_key),
+                email_in_reply_to = coalesce(nullif(email_in_reply_to, ''), :email_in_reply_to),
+                email_references = case
+                    when email_references is null or email_references = '[]'::jsonb
+                        then cast(:email_references as jsonb)
+                    else email_references
+                end,
+                email_synced_at = now(),
+                source_message_id = coalesce(nullif(source_message_id, ''), :source_message_id)
+            where id = :intake_id
+            """,
+            {
+                "intake_id": int(existing_record["id"]),
+                "email_direction": metadata["direction"],
+                "email_mailbox": metadata["mailbox"] or None,
+                "email_thread_id": metadata["thread_id"] or None,
+                "email_normalized_subject": metadata["normalized_subject"] or None,
+                "conversation_key": metadata["conversation_key"] or None,
+                "email_in_reply_to": metadata["in_reply_to"] or None,
+                "email_references": json.dumps(metadata["references"]),
+                "source_message_id": message_id or None,
+            },
+        )
+    except Exception:
+        pass
+
+
+def sync_operations_email_engine(limit: int = 50) -> dict:
+    _ensure_operations_email_sync_schema()
+    emails = fetch_operations_email_sync(limit=limit)
     existing_lookup = _load_existing_operations_email_lookup()
     imported = 0
     skipped = 0
     pdf_updated = 0
     fetched = len(emails)
+    inbound_fetched = 0
+    outbound_fetched = 0
+    inbound_imported = 0
+    outbound_imported = 0
+    cases_touched = set()
+    synced_threads = set()
+    seen_message_ids = set()
 
     for item in emails:
         subject = str(item.get("subject", "") or "")
@@ -2799,6 +4673,28 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
         body = str(item.get("body", "") or "")
         message_id = str(item.get("message_id", "") or item.get("id", "") or "")
         received_at = item.get("received_at")
+        metadata = _email_sync_metadata(item)
+        direction = metadata["direction"]
+        if direction == "outbound":
+            outbound_fetched += 1
+        else:
+            inbound_fetched += 1
+        if metadata["thread_id"]:
+            synced_threads.add(metadata["thread_id"])
+
+        if message_id and message_id in seen_message_ids:
+            skipped += 1
+            continue
+        if message_id:
+            seen_message_ids.add(message_id)
+
+        thread_context = _conversation_context_from_lookup(existing_lookup, metadata)
+        thread_conversation_key = (
+            _safe_str(thread_context.get("conversation_key", ""))
+            or metadata["conversation_key"]
+            or metadata["thread_id"]
+            or message_id
+        )
 
         if existing_lookup.get("loaded"):
             existing_record = _find_existing_operations_email_record_from_lookup(
@@ -2811,6 +4707,30 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
         else:
             existing_record = _find_existing_operations_email_record(message_id, subject, sender, received_at)
         if existing_record:
+            _update_existing_operations_email_sync_metadata(existing_record, item, message_id)
+            existing_case = _get_or_create_operations_case(
+                conversation_key=thread_conversation_key or _safe_str(existing_record.get("conversation_key", "")),
+                subject=subject or _safe_str(existing_record.get("source_subject", "")),
+                sender=sender or _safe_str(existing_record.get("source_sender", "")),
+                request_type=_safe_str(existing_record.get("request_type", "")) or "Customer Request",
+                matched_load_id=existing_record.get("matched_load_id"),
+                direction=direction,
+                next_action=_safe_str(existing_record.get("action_required", "")),
+                body=body or _safe_str(existing_record.get("raw_text", "")),
+            )
+            existing_case_id = _int_or_none(existing_case.get("id"))
+            if existing_case_id is not None:
+                execute(
+                    """
+                    update order_intake
+                    set case_id = :case_id
+                    where id = :intake_id
+                    """,
+                    {"case_id": existing_case_id, "intake_id": int(existing_record["id"])},
+                )
+                cases_touched.add(existing_case_id)
+                _sync_operations_case_summary(existing_case_id)
+            _sync_conversation_status(thread_conversation_key or _safe_str(existing_record.get("conversation_key", "")))
             pdf_updated += _backfill_operations_pdf_attachments(
                 existing_record=existing_record,
                 email_item=item,
@@ -2848,13 +4768,49 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
                         parsed[field] = _safe_str(pdf_parsed.get(field, ""))
             parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = pdf_attachments
 
-        classification = _build_operations_email_classification(
-            subject,
-            body,
-            parsed,
-            fallback_key=message_id or f"email-{imported + 1}",
-        )
-        if is_operations_ai_auto_classify_enabled():
+        parsed["_email_sync"] = {
+            "direction": direction,
+            "mailbox": metadata["mailbox"],
+            "thread_id": metadata["thread_id"],
+            "conversation_key": thread_conversation_key,
+            "normalized_subject": metadata["normalized_subject"],
+            "in_reply_to": metadata["in_reply_to"],
+            "references": metadata["references"],
+            "to": _safe_str(item.get("to", "")),
+            "cc": _safe_str(item.get("cc", "")),
+        }
+
+        if direction == "outbound":
+            classification = {
+                "request_type": "Customer Request",
+                "conversation_key": thread_conversation_key,
+                "matched_load_id": thread_context.get("matched_load_id"),
+                "confidence_score": 100,
+                "action_required": "Synced outbound email; no dispatcher action required.",
+            }
+            review_status = "Closed"
+            intake_status = "Synced"
+            source = "operations_email_sent"
+            conversation_status = "Answered Outside TMS"
+        else:
+            classification = _build_operations_email_classification(
+                subject,
+                body,
+                parsed,
+                fallback_key=thread_conversation_key or f"email-{imported + 1}",
+            )
+            classification["conversation_key"] = thread_conversation_key
+            if thread_context.get("matched_load_id") and classification.get("matched_load_id") is None:
+                classification["matched_load_id"] = thread_context.get("matched_load_id")
+                classification["confidence_score"] = max(int(classification.get("confidence_score", 0) or 0), 90)
+            if thread_context.get("request_type") and classification.get("request_type") == "Customer Request":
+                classification["request_type"] = thread_context["request_type"]
+            review_status = "Open"
+            intake_status = "Needs Review"
+            source = "operations_email"
+            conversation_status = "New Conversation" if not thread_context else "Waiting Dispatcher"
+
+        if direction == "inbound" and is_operations_ai_auto_classify_enabled():
             load_context, load_candidates = _build_ai_load_context(classification, parsed)
             ai_suggestion = generate_operations_ai_suggestion(
                 subject=subject,
@@ -2866,9 +4822,23 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
                 load_candidates=load_candidates,
                 feedback_examples=_recent_operations_ai_feedback_examples(),
                 response_language=_resolve_reply_language("Auto", subject, body),
+                reply_tone="Professional",
                 company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
             )
             classification = _apply_ai_suggestion_to_classification(classification, ai_suggestion, load_candidates)
+            classification["conversation_key"] = thread_conversation_key
+
+        operations_case = _get_or_create_operations_case(
+            conversation_key=classification["conversation_key"] or thread_conversation_key,
+            subject=subject,
+            sender=sender,
+            request_type=classification["request_type"],
+            matched_load_id=classification["matched_load_id"],
+            direction=direction,
+            next_action=classification["action_required"],
+            body=body,
+        )
+        case_id = _int_or_none(operations_case.get("id"))
 
         execute(
             """
@@ -2878,6 +4848,14 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
                 source_sender,
                 source_received_at,
                 source_message_id,
+                email_direction,
+                email_mailbox,
+                email_thread_id,
+                email_normalized_subject,
+                email_in_reply_to,
+                email_references,
+                conversation_status,
+                email_synced_at,
                 filename,
                 file_path,
                 parsed_data,
@@ -2887,47 +4865,105 @@ def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int
                 request_type,
                 conversation_key,
                 matched_load_id,
+                case_id,
                 confidence_score,
                 action_required
             )
             values (
-                'operations_email',
+                :source,
                 :source_subject,
                 :source_sender,
                 :source_received_at,
                 :source_message_id,
+                :email_direction,
+                :email_mailbox,
+                :email_thread_id,
+                :email_normalized_subject,
+                :email_in_reply_to,
+                cast(:email_references as jsonb),
+                :conversation_status,
+                now(),
                 :filename,
                 :file_path,
                 cast(:parsed_data as jsonb),
                 :raw_text,
-                'Needs Review',
-                'Open',
+                :intake_status,
+                :review_status,
                 :request_type,
                 :conversation_key,
                 :matched_load_id,
+                :case_id,
                 :confidence_score,
                 :action_required
             )
             """,
             {
+                "source": source,
                 "source_subject": subject,
                 "source_sender": sender,
                 "source_received_at": received_at,
                 "source_message_id": message_id or None,
+                "email_direction": direction,
+                "email_mailbox": metadata["mailbox"] or None,
+                "email_thread_id": metadata["thread_id"] or None,
+                "email_normalized_subject": metadata["normalized_subject"] or None,
+                "email_in_reply_to": metadata["in_reply_to"] or None,
+                "email_references": json.dumps(metadata["references"]),
+                "conversation_status": conversation_status,
                 "filename": pdf_attachments[0].get("filename") if pdf_attachments else None,
                 "file_path": pdf_attachments[0].get("file_path") if pdf_attachments else None,
                 "parsed_data": _json_dump(parsed),
                 "raw_text": body,
+                "intake_status": intake_status,
+                "review_status": review_status,
                 "request_type": classification["request_type"],
                 "conversation_key": classification["conversation_key"],
                 "matched_load_id": classification["matched_load_id"],
+                "case_id": case_id,
                 "confidence_score": classification["confidence_score"],
                 "action_required": classification["action_required"],
             },
         )
+        if case_id is not None:
+            cases_touched.add(case_id)
+            _log_operations_case_event(
+                case_id,
+                "email_received" if direction == "inbound" else "replied",
+                "Customer email received" if direction == "inbound" else "Outbound email synced",
+                subject,
+                actor="customer" if direction == "inbound" else "dispatcher",
+                department=_safe_str(operations_case.get("owner", "")),
+            )
+            _sync_operations_case_summary(case_id)
+        _sync_conversation_status(thread_conversation_key)
         imported += 1
+        if direction == "outbound":
+            outbound_imported += 1
+        else:
+            inbound_imported += 1
 
-    return imported, skipped, fetched, pdf_updated
+    return {
+        "fetched": fetched,
+        "imported": imported,
+        "skipped": skipped,
+        "pdf_updated": pdf_updated,
+        "inbound_fetched": inbound_fetched,
+        "outbound_fetched": outbound_fetched,
+        "inbound_imported": inbound_imported,
+        "outbound_imported": outbound_imported,
+        "threads_synced": len(synced_threads),
+        "cases_touched": len(cases_touched),
+    }
+
+
+def import_recent_operations_emails(limit: int = 50) -> tuple[int, int, int, int]:
+    result = sync_operations_email_engine(limit=limit)
+    return (
+        int(result.get("imported", 0)),
+        int(result.get("skipped", 0)),
+        int(result.get("fetched", 0)),
+        int(result.get("pdf_updated", 0)),
+    )
 
 
 def _default_operations_reply_subject(subject: str, request_type: str) -> str:
@@ -2939,6 +4975,27 @@ def _default_operations_reply_subject(subject: str, request_type: str) -> str:
     return f"Re: {request_type}"
 
 
+def _apply_operations_reply_tone(body: str, tone: str, language: str) -> str:
+    tone = _safe_str(tone) or "Professional"
+    if tone in ["Professional", "Concise"]:
+        return body
+
+    language = _safe_str(language)
+    if tone == "Friendly":
+        english_line = "Thank you for reaching out. "
+        spanish_line = "Gracias por comunicarse con nosotros. "
+    else:
+        english_line = "We apologize for the delay and are reviewing this now. "
+        spanish_line = "Disculpe la demora; estamos revisando esto ahora. "
+
+    updated = body
+    if language in ["English", "Bilingual"] and "Hello,\n\n" in updated:
+        updated = updated.replace("Hello,\n\n", f"Hello,\n\n{english_line}", 1)
+    if language in ["Spanish", "Bilingual"] and "Hola,\n\n" in updated:
+        updated = updated.replace("Hola,\n\n", f"Hola,\n\n{spanish_line}", 1)
+    return updated
+
+
 def _default_operations_reply_body(
     request_type: str,
     parsed: dict,
@@ -2946,6 +5003,7 @@ def _default_operations_reply_body(
     subject: str = "",
     body: str = "",
     reply_language: str = "Auto",
+    reply_tone: str = "Professional",
 ) -> str:
     company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
     booking = _safe_str(parsed.get("Booking Number", ""))
@@ -2977,7 +5035,7 @@ def _default_operations_reply_body(
         text,
     )
     if resolved_language == "English":
-        return english_reply
+        return _apply_operations_reply_tone(english_reply, reply_tone, "English")
 
     spanish_reply = _default_operations_reply_body_spanish(
         request_type,
@@ -2991,9 +5049,9 @@ def _default_operations_reply_body(
         text,
     )
     if resolved_language == "Spanish":
-        return spanish_reply
+        return _apply_operations_reply_tone(spanish_reply, reply_tone, "Spanish")
 
-    return f"{english_reply}\n\n---\n\n{spanish_reply}"
+    return _apply_operations_reply_tone(f"{english_reply}\n\n---\n\n{spanish_reply}", reply_tone, "Bilingual")
 
 
 def _default_operations_reply_body_english(
@@ -3090,6 +5148,37 @@ def _default_operations_reply_body_english(
             "Hello,\n\n"
             f"We received your POD request for {reference}. "
             "We are checking document status now and will send it over as soon as it is available.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Billing":
+        return (
+            "Hello,\n\n"
+            f"We received your billing request for {reference}. "
+            "We are routing it to Billing and will follow up with invoice, POD, or charge details once reviewed.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Driver Issue":
+        return (
+            "Hello,\n\n"
+            f"We received the driver issue for {reference}. "
+            "Dispatch is reviewing the driver, truck, appointment, and current load status now and will update you shortly.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Port Issue":
+        return (
+            "Hello,\n\n"
+            f"We received the port or terminal issue for {reference}. "
+            "Dispatch is checking terminal status, holds, gate activity, and appointment impact now.\n\n"
+            f"Thank you,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Spam/Marketing":
+        return (
+            "Hello,\n\n"
+            "Thank you for the information. At this time, no dispatch action is required.\n\n"
             f"Thank you,\n{company_name} Dispatch"
         )
 
@@ -3198,6 +5287,37 @@ def _default_operations_reply_body_spanish(
             f"Gracias,\n{company_name} Dispatch"
         )
 
+    if request_type == "Billing":
+        return (
+            "Hola,\n\n"
+            f"Recibimos su solicitud de facturacion para {reference}. "
+            "La enviaremos al equipo de Billing y le daremos seguimiento con detalles de factura, POD o cargos cuando este revisado.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Driver Issue":
+        return (
+            "Hola,\n\n"
+            f"Recibimos el asunto del conductor para {reference}. "
+            "Despacho esta revisando el conductor, camion, cita y estado actual de la carga. Le actualizaremos en breve.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Port Issue":
+        return (
+            "Hola,\n\n"
+            f"Recibimos el asunto de puerto o terminal para {reference}. "
+            "Despacho esta revisando el estado de terminal, retenciones, actividad de gate e impacto en la cita.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
+    if request_type == "Spam/Marketing":
+        return (
+            "Hola,\n\n"
+            "Gracias por la informacion. Por el momento no se requiere accion de despacho.\n\n"
+            f"Gracias,\n{company_name} Dispatch"
+        )
+
     return (
         "Hola,\n\n"
         f"Recibimos su mensaje para {reference}. "
@@ -3209,6 +5329,7 @@ def save_operations_email_reply(
     *,
     intake_id: int,
     load_id,
+    case_id=None,
     recipient: str,
     subject: str,
     body: str,
@@ -3220,6 +5341,7 @@ def save_operations_email_reply(
         insert into operations_email_replies (
             intake_id,
             load_id,
+            case_id,
             recipient,
             subject,
             body,
@@ -3231,6 +5353,7 @@ def save_operations_email_reply(
         values (
             :intake_id,
             :load_id,
+            :case_id,
             :recipient,
             :subject,
             :body,
@@ -3243,6 +5366,7 @@ def save_operations_email_reply(
         {
             "intake_id": intake_id,
             "load_id": load_id,
+            "case_id": _int_or_none(case_id),
             "recipient": recipient,
             "subject": subject,
             "body": body,
@@ -3250,6 +5374,139 @@ def save_operations_email_reply(
             "error_message": error_message or None,
         },
     )
+
+
+def _insert_operations_thread_reply_record(
+    *,
+    intake_id: int,
+    record,
+    reply_to: str,
+    reply_subject: str,
+    reply_body: str,
+    request_type: str,
+    conversation_key: str,
+    matched_load_id,
+    case_id=None,
+) -> None:
+    source_message_id = _safe_str(record.get("source_message_id", "")) if hasattr(record, "get") else ""
+    email_thread_id = _safe_str(record.get("email_thread_id", "")) if hasattr(record, "get") else ""
+    normalized_subject = _safe_str(record.get("email_normalized_subject", "")) if hasattr(record, "get") else ""
+    outbound_message_id = f"tms-reply-{intake_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    references = [value for value in [source_message_id, email_thread_id] if value]
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        operations_case = _get_or_create_operations_case(
+            conversation_key=conversation_key,
+            subject=reply_subject,
+            sender=reply_to,
+            request_type=request_type,
+            matched_load_id=matched_load_id,
+            direction="outbound",
+            next_action="Reply sent; waiting on customer response.",
+            body=reply_body,
+        )
+        case_id = _int_or_none(operations_case.get("id"))
+
+    execute(
+        """
+        insert into order_intake (
+            source,
+            source_subject,
+            source_sender,
+            source_received_at,
+            source_message_id,
+            email_direction,
+            email_mailbox,
+            email_thread_id,
+            email_normalized_subject,
+            email_in_reply_to,
+            email_references,
+            conversation_status,
+            email_synced_at,
+            parsed_data,
+            raw_text,
+            intake_status,
+            review_status,
+            request_type,
+            conversation_key,
+            matched_load_id,
+            case_id,
+            confidence_score,
+            action_required
+        )
+        values (
+            'operations_email_sent',
+            :source_subject,
+            :source_sender,
+            now(),
+            :source_message_id,
+            'outbound',
+            'TMS',
+            :email_thread_id,
+            :email_normalized_subject,
+            :email_in_reply_to,
+            cast(:email_references as jsonb),
+            'Waiting Customer',
+            now(),
+            cast(:parsed_data as jsonb),
+            :raw_text,
+            'Synced',
+            'Closed',
+            :request_type,
+            :conversation_key,
+            :matched_load_id,
+            :case_id,
+            100,
+            'Dispatcher reply sent from TMS.'
+        )
+        """,
+        {
+            "source_subject": reply_subject,
+            "source_sender": reply_to,
+            "source_message_id": outbound_message_id,
+            "email_thread_id": email_thread_id or conversation_key or source_message_id or outbound_message_id,
+            "email_normalized_subject": normalized_subject or _safe_str(reply_subject).lower(),
+            "email_in_reply_to": source_message_id or None,
+            "email_references": json.dumps(references),
+            "parsed_data": _json_dump(
+                {
+                    "_email_sync": {
+                        "direction": "outbound",
+                        "mailbox": "TMS",
+                        "thread_id": email_thread_id,
+                        "conversation_key": conversation_key,
+                        "in_reply_to": source_message_id,
+                        "references": references,
+                    }
+                }
+            ),
+            "raw_text": reply_body,
+            "request_type": request_type,
+            "conversation_key": conversation_key,
+            "matched_load_id": matched_load_id,
+            "case_id": case_id,
+        },
+    )
+    _sync_conversation_status(conversation_key)
+    if case_id is not None:
+        execute(
+            """
+            update operations_cases
+            set first_response_at = coalesce(first_response_at, now())
+            where id = :case_id
+            """,
+            {"case_id": case_id},
+        )
+        _log_operations_case_event(
+            case_id,
+            "replied",
+            "Customer reply sent",
+            reply_subject,
+            actor="dispatcher",
+        )
+        _set_operations_case_status(case_id, "Waiting Customer", "Reply sent; waiting on customer response.")
+        _sync_operations_case_summary(case_id)
+
 
 def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
     updated_count = 0
@@ -3269,6 +5526,9 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
             "Quote Request",
             "Cancellation",
             "POD Request",
+            "Billing",
+            "Driver Issue",
+            "Port Issue",
         ]
         needs_classification = current_type in ["", "Needs Classification", "Other"]
         needs_correction_check = current_is_action_type and not existing_has_match and existing_confidence < 70
@@ -3379,6 +5639,10 @@ def _save_pdf_data_to_operations_request(
             "action_required": action_required,
         },
     )
+    try:
+        _sync_operations_case_for_intake_id(intake_id)
+    except Exception:
+        pass
 
 
 def _attach_saved_pdf_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_pdf") -> None:
@@ -3466,6 +5730,12 @@ def _import_uploaded_pdf_to_operations_request(intake_id: int, parsed: dict, upl
             "action_required": _order_action_required_from_parsed(updated_parsed),
         },
     )
+    try:
+        case = _sync_operations_case_for_intake_id(intake_id)
+        if case:
+            _add_operations_case_note(case.get("id"), f"Imported PDF attachment {attachment.get('filename')}.")
+    except Exception:
+        pass
 
     return attachment
 
@@ -3498,6 +5768,7 @@ def _render_operations_pdf_panel(
     conversation_key: str,
 ) -> None:
     attachments = _extract_operations_pdf_attachments(parsed, record)
+    case_id = _int_or_none(record.get("case_id")) if hasattr(record, "get") else None
 
     with st.expander("PDF Attachments / Order Documents", expanded=bool(attachments)):
         uploaded_pdf = st.file_uploader(
@@ -3665,6 +5936,16 @@ def _render_operations_pdf_panel(
                         "conversation_key": conversation_key or final_data.get("Booking Number"),
                     },
                 )
+                if case_id is not None:
+                    _update_operations_case(
+                        case_id=case_id,
+                        status="Attached to Load",
+                        owner="Dispatch",
+                        priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
+                        linked_load_id=load_id,
+                        next_action=f"Load {load_id} created from PDF.",
+                    )
+                    _add_operations_case_note(case_id, f"Created load {load_id} from PDF {filename}.")
                 refresh_data()
                 st.success(f"Created load ID {load_id} from selected PDF.")
                 st.rerun()
@@ -3685,7 +5966,17 @@ def _render_operations_pdf_panel(
                     subject,
                     sender,
                     f"Attached PDF document from Operations Inbox: {filename}",
+                    case_id=case_id,
                 )
+                if case_id is not None:
+                    _update_operations_case(
+                        case_id=case_id,
+                        status="Attached to Load",
+                        owner=_safe_str(record.get("case_owner", "Dispatch")) or "Dispatch",
+                        priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
+                        linked_load_id=matched_load_id,
+                        next_action=f"PDF {filename} attached to load {matched_load_id}.",
+                    )
                 st.success("PDF attached to the matched load.")
                 st.rerun()
 
@@ -3711,16 +6002,238 @@ def _render_operations_pdf_panel(
                         subject,
                         sender,
                         "Updated load fields from Operations Inbox PDF: " + ", ".join(updates.keys()),
+                        case_id=case_id,
                     )
+                    if case_id is not None:
+                        _update_operations_case(
+                            case_id=case_id,
+                            status="Attached to Load",
+                            owner=_safe_str(record.get("case_owner", "Dispatch")) or "Dispatch",
+                            priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
+                            linked_load_id=matched_load_id,
+                            next_action="Updated load from PDF fields: " + ", ".join(updates.keys()),
+                        )
                     refresh_data()
                     st.success("Updated matched load fields: " + ", ".join(updates.keys()))
                     st.rerun()
                 else:
                     st.info("No load fields needed updating from the selected PDF.")
+
+
+def _render_operations_case_panel(
+    *,
+    selected_id: int,
+    operations_case: dict,
+    matched_load_id,
+) -> None:
+    case_id = _int_or_none(operations_case.get("id"))
+    if case_id is None:
+        st.warning("No Operations Case is linked yet. Save classification or refresh this request to create one.")
+        return
+
+    case_number = _safe_str(operations_case.get("case_number", "")) or f"Case #{case_id}"
+    case_status = _safe_str(operations_case.get("status", "New")) or "New"
+    case_owner = _safe_str(operations_case.get("owner", "Unassigned")) or "Unassigned"
+    case_priority = _safe_str(operations_case.get("priority", "Normal")) or "Normal"
+    case_sla_status = _safe_str(operations_case.get("sla_status", "On Track")) or "On Track"
+    linked_load_id = _int_or_none(operations_case.get("linked_load_id")) or _int_or_none(matched_load_id)
+
+    with st.expander(f"Operations Case - {case_number}", expanded=True):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Case", case_number)
+        c2.metric("Status", case_status)
+        c3.metric("Owner", case_owner)
+        c4.metric("Priority", case_priority)
+        c5.metric("Linked Load", linked_load_id or "-")
+        c6.metric("SLA", case_sla_status)
+        due1, due2 = st.columns(2)
+        due1.caption(f"First response due: {_safe_str(operations_case.get('first_response_due_at', '')) or '-'}")
+        due2.caption(f"Resolution due: {_safe_str(operations_case.get('resolution_due_at', '')) or '-'}")
+
+        with st.form(f"operations_case_update_{case_id}_{selected_id}"):
+            f1, f2, f3, f4 = st.columns([1, 1, 1, 1])
+            status_options = list(OPERATIONS_CASE_STATUSES)
+            if case_status not in status_options:
+                status_options.insert(0, case_status)
+            owner_options = list(OPERATIONS_CASE_OWNERS)
+            if case_owner not in owner_options:
+                owner_options.insert(0, case_owner)
+            priority_options = list(OPERATIONS_CASE_PRIORITIES)
+            if case_priority not in priority_options:
+                priority_options.insert(0, case_priority)
+
+            new_status = f1.selectbox(
+                "Case Status",
+                status_options,
+                index=status_options.index(case_status),
+                key=f"case_status_{case_id}_{selected_id}",
+            )
+            new_owner = f2.selectbox(
+                "Owner",
+                owner_options,
+                index=owner_options.index(case_owner),
+                key=f"case_owner_{case_id}_{selected_id}",
+            )
+            new_priority = f3.selectbox(
+                "Priority",
+                priority_options,
+                index=priority_options.index(case_priority),
+                key=f"case_priority_{case_id}_{selected_id}",
+            )
+            new_linked_load_id = f4.number_input(
+                "Linked Load ID",
+                min_value=0,
+                value=int(linked_load_id or 0),
+                step=1,
+                key=f"case_linked_load_{case_id}_{selected_id}",
+            )
+            next_action = st.text_area(
+                "Next Action",
+                value=_safe_str(operations_case.get("next_action", "")),
+                height=80,
+                key=f"case_next_action_{case_id}_{selected_id}",
+            )
+            if st.form_submit_button("Save Case"):
+                _update_operations_case(
+                    case_id=case_id,
+                    status=new_status,
+                    owner=new_owner,
+                    priority=new_priority,
+                    linked_load_id=new_linked_load_id or None,
+                    next_action=next_action,
+                )
+                refresh_data()
+                st.success("Operations Case updated.")
+                st.rerun()
+
+        q1, q2, q3, q4 = st.columns(4)
+        with q1:
+            if st.button("Waiting Customer", key=f"case_waiting_customer_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Customer", "Waiting on customer response.")
+                refresh_data()
+                st.rerun()
+        with q2:
+            if st.button("Waiting Dispatcher", key=f"case_waiting_dispatcher_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Dispatcher", "Dispatcher needs to review and respond.")
+                refresh_data()
+                st.rerun()
+        with q3:
+            if st.button("Close Case", key=f"case_close_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Closed", "Case closed by operations.")
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Closed'
+                    where case_id = :case_id
+                       or id = :intake_id
+                    """,
+                    {"case_id": case_id, "intake_id": int(selected_id)},
+                )
+                refresh_data()
+                st.rerun()
+        with q4:
+            if st.button("Reopen Case", key=f"case_reopen_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Reopened", "Case reopened by operations.")
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Open'
+                    where case_id = :case_id
+                       or id = :intake_id
+                    """,
+                    {"case_id": case_id, "intake_id": int(selected_id)},
+                )
+                refresh_data()
+                st.rerun()
+
+        note_body = st.text_area(
+            "Internal Note",
+            value="",
+            height=90,
+            key=f"case_note_{case_id}_{selected_id}",
+            placeholder="Internal notes stay inside Operations and do not go to the customer.",
+        )
+        if st.button("Add Internal Note", key=f"case_add_note_{case_id}_{selected_id}", use_container_width=True):
+            if not note_body.strip():
+                st.error("Internal note is blank.")
+            else:
+                _add_operations_case_note(case_id, note_body.strip())
+                refresh_data()
+                st.success("Internal note added.")
+                st.rerun()
+
+        timeline_df = _load_operations_case_timeline(case_id)
+        if timeline_df.empty:
+            st.info("Case timeline will appear after emails, notes, replies, or load actions are linked.")
+        else:
+            timeline_display = timeline_df.copy()
+            timeline_display["event_time"] = pd.to_datetime(
+                timeline_display["event_at"],
+                errors="coerce",
+            ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+            timeline_display = timeline_display[
+                ["event_time", "event_type", "actor", "title", "details"]
+            ].rename(
+                columns={
+                    "event_time": "Time",
+                    "event_type": "Type",
+                    "actor": "Actor",
+                    "title": "Title",
+                    "details": "Details",
+                }
+            )
+            st.dataframe(timeline_display, use_container_width=True, hide_index=True)
+
+        owner_history_df = _load_operations_case_owner_history(case_id)
+        if not owner_history_df.empty:
+            with st.expander("Ownership History", expanded=False):
+                history_display = owner_history_df.copy()
+                history_display["changed_at"] = pd.to_datetime(
+                    history_display["changed_at"],
+                    errors="coerce",
+                ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+                st.dataframe(history_display, use_container_width=True, hide_index=True)
+
+        recent_cases = _load_recent_operations_cases(case_id)
+        if not recent_cases.empty:
+            st.caption("Duplicate Case Merge")
+            case_options = [None] + recent_cases.to_dict("records")
+
+            def _case_merge_label(option) -> str:
+                if option is None:
+                    return "Select target case"
+                return (
+                    f"{option.get('case_number')} | {option.get('status')} | "
+                    f"{option.get('customer') or '-'} | {option.get('source_subject') or '-'}"
+                )
+
+            target_case = st.selectbox(
+                "Merge this case into",
+                case_options,
+                format_func=_case_merge_label,
+                key=f"case_merge_target_{case_id}_{selected_id}",
+            )
+            if st.button(
+                "Merge Duplicate Case",
+                key=f"case_merge_{case_id}_{selected_id}",
+                use_container_width=True,
+                disabled=target_case is None,
+            ):
+                if _merge_operations_cases(case_id, target_case.get("id")):
+                    refresh_data()
+                    st.success(f"Merged {case_number} into {target_case.get('case_number')}.")
+                    st.rerun()
+                else:
+                    st.error("Could not merge the selected cases.")
         
 def render_operations_inbox() -> None:
     st.subheader("Operations Inbox")
-    st.caption("Classify customer emails, match updates to existing loads, create bookings, create quote requests, or send replies.")
+    st.caption("Synchronize Inbox/Sent email, group conversations, classify requests, match loads, create bookings, create quote requests, or send replies.")
+    try:
+        _ensure_operations_email_sync_schema()
+    except Exception as exc:
+        st.warning(f"Email sync schema is not ready yet: {exc}")
+
     c1, c2, c3 = st.columns([1, 1, 3])
 
     with c1:
@@ -3729,19 +6242,13 @@ def render_operations_inbox() -> None:
             st.rerun()
 
     with c2:
-        if st.button("Check Client Email", use_container_width=True):
+        if st.button("Sync Email Engine", use_container_width=True):
             try:
-                imported, skipped, fetched, pdf_updated = import_recent_operations_emails(limit=50)
-                st.session_state["operations_email_import_result"] = {
-                    "fetched": fetched,
-                    "imported": imported,
-                    "skipped": skipped,
-                    "pdf_updated": pdf_updated,
-                }
+                st.session_state["operations_email_import_result"] = sync_operations_email_engine(limit=50)
                 refresh_data()
                 st.rerun()
             except Exception as exc:
-                st.error(f"Could not import client emails: {exc}")
+                st.error(f"Could not synchronize email: {exc}")
 
     with c3:
         result = st.session_state.get("operations_email_import_result")
@@ -3754,9 +6261,31 @@ def render_operations_inbox() -> None:
                 st.warning("Yahoo inbox connected, but no messages were returned from the recent inbox scan.")
             else:
                 pdf_note = f", updated {pdf_updated} PDF attachment(s)" if pdf_updated else ""
-                st.success(f"Yahoo inbox fetched {fetched} email(s), imported {imported}, skipped {skipped} already in Operations Inbox{pdf_note}.")
+                inbound = int(result.get("inbound_fetched", 0))
+                outbound = int(result.get("outbound_fetched", 0))
+                threads = int(result.get("threads_synced", 0))
+                cases = int(result.get("cases_touched", 0))
+                st.success(
+                    f"Email sync fetched {fetched} message(s) "
+                    f"({inbound} inbox, {outbound} sent), imported {imported}, skipped {skipped}, "
+                    f"threaded {threads} conversation(s), updated {cases} case(s){pdf_note}."
+                )
         else:
-            st.info("Open items are classified automatically. Replies can be sent from the request review panel.")
+            st.info("Use Sync Email Engine to import Inbox and Sent mail with Message-ID, References, thread IDs, timestamps, attachments, and deduplication.")
+
+    sync_metrics = _operations_email_sync_metrics()
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Synced Inbox", int(sync_metrics.get("inbound", 0)))
+    s2.metric("Synced Sent", int(sync_metrics.get("outbound", 0)))
+    s3.metric("Email Threads", int(sync_metrics.get("threads", 0)))
+    s4.metric("Last Sync", sync_metrics.get("last_sync") or "-")
+
+    case_metrics = _operations_case_metrics()
+    cm1, cm2, cm3, cm4 = st.columns(4)
+    cm1.metric("Open Cases", int(case_metrics.get("open", 0)))
+    cm2.metric("Waiting Dispatch", int(case_metrics.get("waiting_dispatch", 0)))
+    cm3.metric("Waiting Customer", int(case_metrics.get("waiting_customer", 0)))
+    cm4.metric("Closed Cases", int(case_metrics.get("closed", 0)))
             
     try:
         where_clause = _inbox_review_where_clause()
@@ -3770,6 +6299,28 @@ def render_operations_inbox() -> None:
         st.success("No open customer requests.")
         _render_no_open_inbox_explanation()
         return
+
+    inbox_df["conversation_join_key"] = inbox_df.apply(_row_conversation_join_key, axis=1)
+    conversation_summary = _load_operations_conversation_summary_df()
+    if not conversation_summary.empty:
+        inbox_df = inbox_df.merge(
+            conversation_summary,
+            on="conversation_join_key",
+            how="left",
+        )
+    for column in ["latest_direction", "latest_conversation_status", "conversation_message_count"]:
+        if column not in inbox_df.columns:
+            inbox_df[column] = ""
+    inbox_df["latest_direction"] = inbox_df["latest_direction"].fillna(inbox_df["email_direction"].fillna("inbound"))
+    inbox_df["reply_status"] = inbox_df["latest_conversation_status"].fillna(inbox_df["conversation_status"].fillna("New Conversation"))
+    inbox_df["conversation_message_count"] = pd.to_numeric(
+        inbox_df["conversation_message_count"],
+        errors="coerce",
+    ).fillna(1).astype(int)
+    inbox_df["last_message_at"] = pd.to_datetime(
+        inbox_df.get("last_message_at", pd.Series(dtype=str)),
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
 
     inbox_df["request_type_clean"] = (
         inbox_df["request_type"]
@@ -3838,6 +6389,9 @@ def render_operations_inbox() -> None:
             "Quote Request",
             "Cancellation",
             "POD Request",
+            "Billing",
+            "Driver Issue",
+            "Port Issue",
         ])
     )
 
@@ -3876,6 +6430,18 @@ def render_operations_inbox() -> None:
             """.strip()
         )
 
+    owner_filter_options = ["All Owners"] + [owner for owner in OPERATIONS_CASE_OWNERS if owner != "Unassigned"]
+    owner_filter = st.selectbox(
+        "Owner Queue",
+        owner_filter_options,
+        index=0,
+        key="operations_owner_queue_filter",
+    )
+    if owner_filter != "All Owners" and "case_owner" in inbox_df.columns:
+        inbox_df = inbox_df[inbox_df["case_owner"].fillna("Unassigned").eq(owner_filter)].copy()
+        if inbox_df.empty:
+            st.info(f"No open Operations Inbox items assigned to {owner_filter}.")
+
     tab_labels = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
 
     queue_map = {
@@ -3889,6 +6455,10 @@ def render_operations_inbox() -> None:
         "Missing Info": inbox_df[inbox_df["request_type_clean"].eq("Missing Information")],
         "POD Requests": inbox_df[inbox_df["request_type_clean"].eq("POD Request")],
         "Cancellations": inbox_df[inbox_df["request_type_clean"].eq("Cancellation")],
+        "Billing": inbox_df[inbox_df["request_type_clean"].eq("Billing")],
+        "Driver Issues": inbox_df[inbox_df["request_type_clean"].eq("Driver Issue")],
+        "Port Issues": inbox_df[inbox_df["request_type_clean"].eq("Port Issue")],
+        "Spam": inbox_df[inbox_df["request_type_clean"].eq("Spam/Marketing")],
         "Waiting": inbox_df[inbox_df["review_status_clean"].eq("Waiting on Customer")],
         "Needs Review": inbox_df[
             inbox_df["request_type_clean"].isin(["Needs Classification", "Other"])
@@ -3901,10 +6471,15 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "request_type",
             "review_status",
             "source_subject",
             "pdf_count",
+            "email_thread_id",
             "matched_load_id",
             "confidence_score",
             "action_required",
@@ -3914,6 +6489,10 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "request_type",
             "source_subject",
             "pdf_count",
@@ -3926,8 +6505,13 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "source_subject",
             "pdf_count",
+            "email_thread_id",
             "reference_hint",
             "matched_load_id",
             "action_required",
@@ -3937,6 +6521,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
             "source_subject",
             "pdf_count",
             "reference_hint",
@@ -3948,6 +6535,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
             "source_subject",
             "pdf_count",
             "reference_hint",
@@ -3960,6 +6550,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "reference_hint",
             "requested_time",
             "source_subject",
@@ -3972,6 +6565,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "reference_hint",
             "source_subject",
             "pdf_count",
@@ -3983,6 +6579,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "source_subject",
             "pdf_count",
             "matched_load_id",
@@ -3993,6 +6592,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "source_subject",
             "pdf_count",
             "reference_hint",
@@ -4004,6 +6606,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "source_subject",
             "pdf_count",
             "matched_load_id",
@@ -4015,6 +6620,9 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "source_subject",
             "pdf_count",
             "matched_load_id",
@@ -4026,15 +6634,27 @@ def render_operations_inbox() -> None:
             "id",
             "email_received",
             "client_name",
+            "email_direction",
+            "latest_direction",
+            "reply_status",
+            "conversation_message_count",
             "request_type",
             "source_sender",
             "source_subject",
             "pdf_count",
+            "email_thread_id",
             "confidence_score",
             "action_required",
         ],
     }
 
+    case_context_cols = ["case_number", "case_status", "case_owner", "case_priority", "case_sla_status"]
+    for columns in tab_display_cols.values():
+        anchor = "client_name" if "client_name" in columns else "id"
+        insert_at = columns.index(anchor) + 1 if anchor in columns else 0
+        for case_col in reversed(case_context_cols):
+            if case_col not in columns:
+                columns.insert(insert_at, case_col)
 
     tab_titles = [
         f"{label} ({len(queue_map.get(label, pd.DataFrame()))})"
@@ -4137,16 +6757,111 @@ def render_operations_inbox() -> None:
         except Exception:
             pass
 
+    operations_case = _load_operations_case_by_id(record.get("case_id"))
+    if not operations_case:
+        operations_case = _sync_operations_case_for_intake_record(record)
+    if operations_case:
+        for case_field, record_field in [
+            ("id", "case_id"),
+            ("case_number", "case_number"),
+            ("status", "case_status"),
+            ("owner", "case_owner"),
+            ("priority", "case_priority"),
+            ("linked_load_id", "case_linked_load_id"),
+            ("next_action", "case_next_action"),
+            ("sla_status", "case_sla_status"),
+            ("first_response_due_at", "case_first_response_due_at"),
+            ("resolution_due_at", "case_resolution_due_at"),
+        ]:
+            record[record_field] = operations_case.get(case_field)
+        case_load_id = _int_or_none(operations_case.get("linked_load_id"))
+        if matched_load_id is None and case_load_id is not None:
+            matched_load_id = case_load_id
+            classification["matched_load_id"] = matched_load_id
+        viewed_key = f"operations_case_viewed_{operations_case.get('id')}_{selected_id}"
+        if not st.session_state.get(viewed_key):
+            _log_operations_case_event(
+                operations_case.get("id"),
+                "viewed",
+                "Request viewed",
+                f"Operations request #{selected_id} opened for review.",
+                actor="dispatcher",
+                department=_safe_str(operations_case.get("owner", "")),
+            )
+            st.session_state[viewed_key] = True
+
     load_context_key = f"operations_load_context_{selected_id}_{matched_load_id or 'none'}"
     cached_load_context = st.session_state.get(load_context_key) or {}
     load_context = cached_load_context.get("load_context", {})
     load_candidates = cached_load_context.get("load_candidates", [])
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Detected Type", detected_type)
     c2.metric("Confidence", f"{confidence}%")
     c3.metric("Matched Load", matched_load_id or "-")
-    c4.metric("Conversation", conversation_key)
+    c4.metric("Case", _safe_str(operations_case.get("case_number", "")) or "-")
+    c5.metric("Conversation", conversation_key)
+
+    selected_conversation_key = _row_conversation_join_key(record)
+    with st.expander("Email Synchronization Metadata", expanded=False):
+        st.write(f"**Direction:** {_safe_str(record.get('email_direction', 'inbound')) or 'inbound'}")
+        st.write(f"**Mailbox:** {_safe_str(record.get('email_mailbox', '')) or '-'}")
+        st.write(f"**Message ID:** {_safe_str(record.get('source_message_id', '')) or '-'}")
+        st.write(f"**Thread ID:** {_safe_str(record.get('email_thread_id', '')) or '-'}")
+        st.write(f"**Conversation Key:** {selected_conversation_key or '-'}")
+        st.write(f"**In Reply To:** {_safe_str(record.get('email_in_reply_to', '')) or '-'}")
+        references = record.get("email_references")
+        if isinstance(references, str):
+            try:
+                references = json.loads(references)
+            except Exception:
+                references = []
+        st.write("**References:** " + (", ".join(references or []) if references else "-"))
+
+    with st.expander("Conversation Timeline", expanded=True):
+        timeline_df = _load_operations_conversation_timeline(selected_conversation_key)
+        if timeline_df.empty:
+            st.info("No additional messages found for this conversation yet.")
+        else:
+            timeline_df = timeline_df.copy()
+            timeline_df["message_time"] = pd.to_datetime(
+                timeline_df["source_received_at"].fillna(timeline_df["created_at"]),
+                errors="coerce",
+            ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+            display_timeline = timeline_df[
+                [
+                    "message_time",
+                    "email_direction",
+                    "conversation_status",
+                    "review_status",
+                    "source_sender",
+                    "source_subject",
+                    "message_preview",
+                ]
+            ].rename(
+                columns={
+                    "message_time": "Time",
+                    "email_direction": "Direction",
+                    "conversation_status": "Thread Status",
+                    "review_status": "Request Status",
+                    "source_sender": "From",
+                    "source_subject": "Subject",
+                    "message_preview": "Preview",
+                }
+            )
+            latest_direction = _safe_str(timeline_df.iloc[-1].get("email_direction", "inbound")).title()
+            latest_status = _safe_str(timeline_df.iloc[-1].get("conversation_status", "New Conversation"))
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Messages", len(timeline_df))
+            t2.metric("Latest Direction", latest_direction or "-")
+            t3.metric("Thread Status", latest_status or "-")
+            st.dataframe(display_timeline, use_container_width=True, hide_index=True)
+
+    _render_operations_case_panel(
+        selected_id=int(selected_id),
+        operations_case=operations_case,
+        matched_load_id=matched_load_id,
+    )
 
     saved_request_type = str(record.get("request_type", "") or "").strip()
     default_request_type = saved_request_type if saved_request_type in REQUEST_TYPES else detected_type
@@ -4165,8 +6880,14 @@ def render_operations_inbox() -> None:
         help=f"Auto detected: {detected_reply_language}. Choose Spanish or Bilingual for customer-facing replies when needed.",
         key=f"operations_reply_language_{selected_id}",
     )
+    reply_tone = st.selectbox(
+        "Reply Tone",
+        REPLY_TONE_OPTIONS,
+        index=0,
+        key=f"operations_reply_tone_{selected_id}",
+    )
     resolved_reply_language = _resolve_reply_language(reply_language, subject, body)
-    st.caption(f"Reply draft language: {resolved_reply_language}")
+    st.caption(f"Reply draft language: {resolved_reply_language}; tone: {reply_tone}")
     selected_action_required = _action_required_for_request(
         request_type,
         parsed,
@@ -4194,6 +6915,92 @@ def render_operations_inbox() -> None:
         matched_load_id=matched_load_id,
         conversation_key=conversation_key,
     )
+
+    load_match_candidates = classification.get("load_match_candidates") or find_load_match_candidates(
+        tokens,
+        parsed=parsed,
+        subject=subject,
+        body=body,
+        limit=5,
+    )
+    with st.expander("Load Match Suggestions", expanded=matched_load_id is None and bool(load_match_candidates)):
+        if matched_load_id is not None:
+            st.success(f"This request is linked to load {matched_load_id}.")
+        if not load_match_candidates:
+            st.info("No load match candidates found from booking, container, reference, customer/date, or vessel details.")
+        else:
+            st.dataframe(pd.DataFrame(load_match_candidates), use_container_width=True, hide_index=True)
+            candidate_options = [None] + load_match_candidates
+
+            def _load_match_label(option) -> str:
+                if option is None:
+                    return "Select load candidate"
+                return (
+                    f"Load {option.get('Load ID')} | {option.get('Match Score')}% | "
+                    f"{option.get('Booking Number') or option.get('Container Number') or option.get('Reference Number') or '-'} | "
+                    f"{option.get('Customer') or '-'}"
+                )
+
+            selected_candidate = st.selectbox(
+                "Candidate Load",
+                candidate_options,
+                format_func=_load_match_label,
+                key=f"operations_load_match_candidate_{selected_id}",
+            )
+            c_accept, c_reject = st.columns(2)
+            with c_accept:
+                if st.button(
+                    "Accept Load Match",
+                    key=f"operations_accept_load_match_{selected_id}",
+                    use_container_width=True,
+                    disabled=selected_candidate is None,
+                ):
+                    accepted_load_id = int(selected_candidate["Load ID"])
+                    accepted_key = _conversation_key_from_candidate(selected_candidate, conversation_key)
+                    update_intake_classification(
+                        int(selected_id),
+                        request_type,
+                        accepted_key,
+                        accepted_load_id,
+                        int(selected_candidate.get("Match Score", confidence) or confidence),
+                        f"Dispatcher accepted load match {accepted_load_id}: {selected_candidate.get('Match Reason', '')}",
+                    )
+                    current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
+                    if current_case_id is not None:
+                        _update_operations_case(
+                            case_id=current_case_id,
+                            status="Attached to Load",
+                            owner=_safe_str(operations_case.get("owner", "Dispatch")) or "Dispatch",
+                            priority=_safe_str(operations_case.get("priority", "Normal")) or "Normal",
+                            linked_load_id=accepted_load_id,
+                            next_action=f"Load match accepted for load {accepted_load_id}.",
+                        )
+                    refresh_data()
+                    st.success(f"Accepted load match {accepted_load_id}.")
+                    st.rerun()
+            with c_reject:
+                if st.button(
+                    "Reject Suggested Match",
+                    key=f"operations_reject_load_match_{selected_id}",
+                    use_container_width=True,
+                    disabled=matched_load_id is None and selected_candidate is None,
+                ):
+                    execute(
+                        """
+                        update order_intake
+                        set matched_load_id = null,
+                            confidence_score = least(confidence_score, 60),
+                            action_required = 'Dispatcher rejected suggested load match; review manually.'
+                        where id = :intake_id
+                        """,
+                        {"intake_id": int(selected_id)},
+                    )
+                    current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
+                    if current_case_id is not None:
+                        _add_operations_case_note(current_case_id, "Dispatcher rejected suggested load match; manual review needed.")
+                    refresh_data()
+                    st.warning("Suggested load match rejected.")
+                    st.rerun()
 
     ai_suggestion_key = f"operations_ai_suggestion_{selected_id}"
     ai_version_key = f"operations_ai_suggestion_version_{selected_id}"
@@ -4258,6 +7065,7 @@ def render_operations_inbox() -> None:
                         load_candidates=load_candidates,
                         feedback_examples=feedback_examples,
                         response_language=resolved_reply_language,
+                        reply_tone=reply_tone,
                         company_name=_get_app_setting("COMPANY_NAME", "CaliTrans"),
                     )
                     st.session_state[ai_suggestion_key] = ai_suggestion
@@ -4382,6 +7190,7 @@ def render_operations_inbox() -> None:
         subject,
         body,
         reply_language=reply_language,
+        reply_tone=reply_tone,
     )
     reply_key_seed = f"{request_type}_{resolved_reply_language}_{st.session_state.get(ai_version_key, 'rule')}"
     reply_key_suffix = re.sub(r"[^a-z0-9]+", "_", reply_key_seed.lower()).strip("_")
@@ -4415,15 +7224,28 @@ def render_operations_inbox() -> None:
         elif not reply_subject.strip() or not reply_body.strip():
             st.error("Subject and message are required.")
         else:
+            current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
             try:
                 _send_smtp_email(reply_to.strip(), reply_subject.strip(), reply_body.strip())
                 save_operations_email_reply(
                     intake_id=int(selected_id),
                     load_id=matched_load_id,
+                    case_id=current_case_id,
                     recipient=reply_to.strip(),
                     subject=reply_subject.strip(),
                     body=reply_body.strip(),
                     status="sent",
+                )
+                _insert_operations_thread_reply_record(
+                    intake_id=int(selected_id),
+                    record=record,
+                    reply_to=reply_to.strip(),
+                    reply_subject=reply_subject.strip(),
+                    reply_body=reply_body.strip(),
+                    request_type=request_type,
+                    conversation_key=selected_conversation_key or conversation_key,
+                    matched_load_id=matched_load_id,
+                    case_id=current_case_id,
                 )
 
                 if ai_suggestion and ai_suggestion.get("success") and ai_reply_body:
@@ -4452,6 +7274,7 @@ def render_operations_inbox() -> None:
                         reply_to.strip(),
                         reply_body.strip(),
                         direction="outbound",
+                        case_id=current_case_id,
                     )
 
                 if mark_waiting:
@@ -4464,6 +7287,12 @@ def render_operations_inbox() -> None:
                         """,
                         {"intake_id": int(selected_id)},
                     )
+                    if current_case_id is not None:
+                        _set_operations_case_status(
+                            current_case_id,
+                            "Waiting Customer",
+                            "Reply sent; waiting on customer response.",
+                        )
 
                 st.success(f"Email sent to {reply_to.strip()}.")
                 refresh_data()
@@ -4473,6 +7302,7 @@ def render_operations_inbox() -> None:
                     save_operations_email_reply(
                         intake_id=int(selected_id),
                         load_id=matched_load_id,
+                        case_id=current_case_id,
                         recipient=reply_to.strip(),
                         subject=reply_subject.strip(),
                         body=reply_body.strip(),
@@ -4485,6 +7315,7 @@ def render_operations_inbox() -> None:
 
     st.markdown("### Operations Actions")
 
+    current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
     message_text = f"{subject or ''} {body or ''}"
     can_create_order = request_type == "New Booking" and _has_new_order_details(message_text, parsed, tokens)
     can_create_quote = request_type == "Quote Request" and _has_quote_details(message_text, parsed, tokens)
@@ -4534,6 +7365,16 @@ def render_operations_inbox() -> None:
                         "conversation_key": conversation_key,
                     },
                 )
+                if current_case_id is not None:
+                    _update_operations_case(
+                        case_id=current_case_id,
+                        status="Attached to Load",
+                        owner="Dispatch",
+                        priority=_safe_str(operations_case.get("priority", "Normal")) or "Normal",
+                        linked_load_id=load_id,
+                        next_action=f"New load {load_id} created from Operations Inbox.",
+                    )
+                    _add_operations_case_note(current_case_id, f"Created new load {load_id} from request #{selected_id}.")
 
                 refresh_data()
                 st.success(f"Created new order/load ID {load_id}.")
@@ -4549,6 +7390,7 @@ def render_operations_inbox() -> None:
                 subject,
                 sender,
                 body,
+                case_id=current_case_id,
             )
 
             execute(
@@ -4567,7 +7409,17 @@ def render_operations_inbox() -> None:
                     "conversation_key": conversation_key,
                 },
             )
+            if current_case_id is not None:
+                _update_operations_case(
+                    case_id=current_case_id,
+                    status="Attached to Load",
+                    owner=_safe_str(operations_case.get("owner", "Dispatch")) or "Dispatch",
+                    priority=_safe_str(operations_case.get("priority", "Normal")) or "Normal",
+                    linked_load_id=matched_load_id,
+                    next_action=f"Request attached to load {matched_load_id}.",
+                )
 
+            refresh_data()
             st.success("Request attached to existing order communication history.")
             st.rerun()
 
@@ -4588,7 +7440,11 @@ def render_operations_inbox() -> None:
                     "conversation_key": conversation_key,
                 },
             )
+            if current_case_id is not None:
+                _set_operations_case_status(current_case_id, "In Review", "Quote request created; waiting for pricing follow-up.")
+                _add_operations_case_note(current_case_id, f"Quote request created from Operations Inbox request #{selected_id}.")
 
+            refresh_data()
             st.success("Quote request created.")
             st.rerun()
 
@@ -4618,6 +7474,9 @@ def render_operations_inbox() -> None:
                     "conversation_key": conversation_key,
                 },
             )
+            if current_case_id is not None:
+                _set_operations_case_status(current_case_id, "Closed", f"Load {matched_load_id} cancelled.")
+                _add_operations_case_note(current_case_id, f"Cancelled matched load {matched_load_id}.")
 
             refresh_data()
             st.warning("Matched order was cancelled.")
@@ -4633,7 +7492,10 @@ def render_operations_inbox() -> None:
                 """,
                 {"intake_id": int(selected_id)},
             )
+            if current_case_id is not None:
+                _set_operations_case_status(current_case_id, "Closed", "Closed from Operations Inbox with no further action.")
 
+            refresh_data()
             st.info("Request closed.")
             st.rerun()  
 def render_booking_review(df: pd.DataFrame) -> None:

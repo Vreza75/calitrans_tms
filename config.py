@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import os
 import streamlit as st
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 
 load_dotenv()

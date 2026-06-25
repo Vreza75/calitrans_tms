@@ -1,10 +1,16 @@
 import os
 import imaplib
 import email
+import os
 import re
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 try:
     import streamlit as st
@@ -12,6 +18,10 @@ except Exception:
     st = None
 
 load_dotenv()
+
+
+MESSAGE_ID_RE = re.compile(r"<([^>]+)>")
+SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.I)
 
 
 def get_setting(name, default=None):
@@ -39,6 +49,63 @@ def decode_text(value):
         else:
             result += part
     return result
+
+
+def normalize_message_id(value):
+    text = decode_text(value).strip()
+    if not text:
+        return ""
+    match = MESSAGE_ID_RE.search(text)
+    if match:
+        return match.group(1).strip().lower()
+    return text.strip("<> ").lower()
+
+
+def parse_reference_ids(value):
+    text = decode_text(value)
+    if not text:
+        return []
+    matches = MESSAGE_ID_RE.findall(text)
+    if matches:
+        return [item.strip().lower() for item in matches if item.strip()]
+    return [item.strip("<> ").lower() for item in text.split() if item.strip()]
+
+
+def normalize_subject(value):
+    text = decode_text(value)
+    while SUBJECT_PREFIX_RE.match(text):
+        text = SUBJECT_PREFIX_RE.sub("", text, count=1)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def derive_thread_id(message_id, in_reply_to, references):
+    reference_ids = parse_reference_ids(references)
+    if reference_ids:
+        return reference_ids[0]
+
+    reply_id = normalize_message_id(in_reply_to)
+    if reply_id:
+        return reply_id
+
+    return normalize_message_id(message_id)
+
+
+def derive_conversation_key(message_id, in_reply_to, references, subject):
+    reference_ids = parse_reference_ids(references)
+    if reference_ids:
+        return reference_ids[0]
+
+    reply_id = normalize_message_id(in_reply_to)
+    if reply_id:
+        return reply_id
+
+    normalized_message_id = normalize_message_id(message_id)
+    if normalized_message_id:
+        return normalized_message_id
+
+    normalized_subject = normalize_subject(subject)
+    return f"subject:{normalized_subject}" if normalized_subject else ""
 
 
 def _decode_payload(part):
@@ -107,14 +174,13 @@ def _get_int_setting(name, default):
         return int(default)
 
 
-def _select_mailbox(mail, selected_mailbox):
+def _split_mailbox_candidates(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _select_mailbox(mail, selected_mailbox, fallback_mailboxes=None):
     attempted = []
-    candidates = [
-        selected_mailbox,
-        "INBOX",
-        "Inbox",
-        "inbox",
-    ]
+    candidates = [selected_mailbox] + list(fallback_mailboxes or ["INBOX", "Inbox", "inbox"])
 
     for mailbox in candidates:
         if not mailbox or mailbox in attempted:
@@ -125,7 +191,7 @@ def _select_mailbox(mail, selected_mailbox):
         if status == "OK":
             return mailbox
 
-    raise ValueError(f"Could not open Yahoo inbox folder. Tried: {', '.join(attempted)}")
+    raise ValueError(f"Could not open email folder. Tried: {', '.join(attempted)}")
 
 
 def _search_message_ids(mail, search_query):
@@ -150,6 +216,8 @@ def _fetch_recent_emails(
     terms=None,
     scan_window=None,
     mailbox=None,
+    mailbox_candidates=None,
+    direction="inbound",
     require_terms=False,
 ):
     email_address = get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS")
@@ -166,7 +234,7 @@ def _fetch_recent_emails(
     mail = imaplib.IMAP4_SSL(imap_server, imap_port)
     try:
         mail.login(email_address, email_password)
-        selected_mailbox = _select_mailbox(mail, selected_mailbox)
+        selected_mailbox = _select_mailbox(mail, selected_mailbox, mailbox_candidates)
 
         email_ids = _search_message_ids(mail, search_query)
         if not email_ids:
@@ -186,6 +254,7 @@ def _fetch_recent_emails(
             msg = email.message_from_bytes(raw_email)
             subject = decode_text(msg.get("Subject"))
             sender = decode_text(msg.get("From"))
+            recipients = decode_text(msg.get("To"))
             body = get_email_body(msg)
             haystack = f"{subject}\n{sender}\n{body}".lower()
             matched_terms = [term for term in normalized_terms if term in haystack]
@@ -193,13 +262,32 @@ def _fetch_recent_emails(
             if require_terms and normalized_terms and not matched_terms:
                 continue
 
+            message_id = normalize_message_id(msg.get("Message-ID")) or email_id.decode()
+            in_reply_to = normalize_message_id(msg.get("In-Reply-To"))
+            references = parse_reference_ids(msg.get("References"))
+            thread_id = derive_thread_id(message_id, in_reply_to, msg.get("References"))
+            normalized_subject = normalize_subject(subject)
+            conversation_key = derive_conversation_key(
+                message_id,
+                in_reply_to,
+                msg.get("References"),
+                subject,
+            )
+
             results.append({
                 "id": email_id.decode(),
-                "message_id": decode_text(msg.get("Message-ID")) or email_id.decode(),
+                "message_id": message_id,
                 "mailbox": selected_mailbox,
+                "direction": direction,
+                "thread_id": thread_id,
+                "conversation_key": conversation_key,
+                "normalized_subject": normalized_subject,
+                "in_reply_to": in_reply_to,
+                "references": references,
                 "subject": subject,
                 "from": sender,
-                "to": decode_text(msg.get("To")),
+                "to": recipients,
+                "cc": decode_text(msg.get("Cc")),
                 "date": decode_text(msg.get("Date")),
                 "received_at": _parse_email_date(msg.get("Date")),
                 "body": body,
@@ -238,7 +326,55 @@ def fetch_recent_operations_emails(limit=25):
     return _fetch_recent_emails(
         limit=limit,
         search_query=get_setting("EMAIL_OPERATIONS_IMAP_SEARCH", "ALL"),
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
         terms=search_terms,
         scan_window=max(limit * 10, 250),
         require_terms=False,
     )
+
+
+def fetch_operations_email_sync(limit=50):
+    terms = get_setting(
+        "EMAIL_OPERATIONS_TERMS",
+        "quote,rate,pricing,missing info,missing,load,booking,container,appointment,pod,cancel,delivery",
+    )
+    search_terms = [term.strip() for term in str(terms).split(",") if term.strip()]
+    per_mailbox_limit = max(1, int(limit))
+
+    inbox_messages = _fetch_recent_emails(
+        limit=per_mailbox_limit,
+        search_query=get_setting("EMAIL_OPERATIONS_IMAP_SEARCH", "ALL"),
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=search_terms,
+        scan_window=max(per_mailbox_limit * 10, 250),
+        require_terms=False,
+    )
+
+    try:
+        sent_messages = _fetch_recent_emails(
+            limit=per_mailbox_limit,
+            search_query=get_setting("EMAIL_OPERATIONS_SENT_IMAP_SEARCH", "ALL"),
+            mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+            mailbox_candidates=_split_mailbox_candidates(
+                get_setting(
+                    "EMAIL_SENT_FOLDER_CANDIDATES",
+                    "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                )
+            ),
+            direction="outbound",
+            terms=search_terms,
+            scan_window=max(per_mailbox_limit * 10, 250),
+            require_terms=False,
+        )
+    except Exception:
+        sent_messages = []
+
+    return inbox_messages + sent_messages

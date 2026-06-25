@@ -205,3 +205,56 @@ COMPANY_NAME
 - Added a focused Dispatch Board renderer with one `Dispatch View` and one `Load Type` active at a time, matching a dispatcher workflow and avoiding rendering all boards at once.
 - Moved Operations Inbox PDF-count calculation into the database list query and removed the row-by-row JSON parsing from page rendering.
 - Removed unused Operations Inbox tab preference helpers from the active app code after returning to normal tabs.
+
+## June 25, 2026 Phase 0 Email Synchronization Engine
+
+- Added Inbox plus Sent synchronization for Operations Inbox so inbound and outbound customer communication can be tracked together.
+- Captured email direction, mailbox, normalized Message-ID, In-Reply-To, References, thread ID, timestamps, and PDF attachments during sync.
+- Added sync-level deduplication by Message-ID and fallback subject/sender/timestamp matching.
+- Imported outbound Sent messages as closed synchronized records so they support conversation history without creating new open requests.
+- Added Operations Inbox sync metrics for synced Inbox messages, synced Sent messages, thread count, and last sync time.
+- Added an Email Synchronization Metadata panel on each request review.
+- Added migration columns and indexes for email direction, mailbox, thread IDs, references, and sync timestamps.
+
+## June 25, 2026 Epic 0.2 Conversation Threads
+
+- Added normalized subject handling so `Re:`, `FW:`, `Fwd:`, extra spacing, and casing differences do not break thread matching.
+- Added conversation keys that prefer References, then In-Reply-To, then Message-ID, then normalized subject.
+- Added conversation status tracking with `New Conversation`, `Waiting Dispatcher`, `Waiting Customer`, and `Answered Outside TMS`.
+- Made inbound and outbound sync inherit existing thread context, matched load, and request type when replies arrive in the same conversation.
+- Added latest direction, reply status, and message count columns to Operations Inbox queues.
+- Added a chronological `Conversation Timeline` panel to request review with inbound/outbound messages in one place.
+- Inserted dispatcher replies sent from the TMS back into the same thread timeline so internal TMS replies and outside Sent-folder replies are both visible.
+- Added migration columns and indexes for normalized subject and conversation status.
+
+## June 25, 2026 Epic 0.3 Operations Cases
+
+- Added `operations_cases` and `operations_case_notes` so email conversations become trackable Operations Cases.
+- Added readable case numbers such as `CASE-2026-0001`.
+- Linked Operations Inbox records, sent replies, load communications, PDF actions, and internal notes back to the same case.
+- Automatically creates or updates a case during Inbox/Sent email sync.
+- Reopens a closed case when a new inbound customer reply arrives.
+- Added case status, owner, priority, linked load, next action, and message count tracking.
+- Added Operations Case dashboard metrics for open cases, waiting dispatch, waiting customer, and closed cases.
+- Added case number, case status, owner, and priority columns to Operations Inbox queues.
+- Added an Operations Case panel inside request review with quick actions: save case, waiting customer, waiting dispatcher, close, reopen, add internal note, and merge duplicate case.
+- Added a case timeline that combines emails, internal notes, status changes, and load actions.
+- Updated PDF create/attach/update actions so document-driven load work updates the linked case.
+- Added migration columns and indexes for case linking across `order_intake`, `load_communications`, and `operations_email_replies`.
+
+## June 25, 2026 Epic 0.4-0.13 Operations Intelligence Expansion
+
+- Added weighted intent scoring for Operations Inbox classification instead of keyword-only routing.
+- Expanded supported intent categories to Billing, Driver Issue, Port Issue, and Spam/Marketing.
+- Added top intent-score context to the AI Assist rule payload.
+- Added scored load-match candidates using booking number, container number, reference number, load ID, customer/date, and vessel.
+- Added dispatcher accept/reject controls for suggested load matches.
+- Added automatic owner suggestions, manual owner queue filtering, and ownership history.
+- Added Operations Case activity events for viewed, assigned, replied, status change, closed, and synced email actions.
+- Added SLA fields for first response, resolution, customer wait, department wait, and SLA status.
+- Added SLA status refresh and dashboard visibility for warning/overdue cases.
+- Added tone selection for smart replies: Professional, Concise, Friendly, and Apology / Delay.
+- Added reply templates for Billing, Driver Issue, Port Issue, and Spam/Marketing in English and Spanish.
+- Added a Communication Dashboard section inside Dashboard with open cases, waiting by department, average first response, cases closed, SLA compliance, owner workload, SLA watch, and shared case view.
+- Added migration tables for `operations_case_owner_history` and `operations_case_events`.
+- Added migration backfill for first-response and resolution SLA due dates on existing cases.

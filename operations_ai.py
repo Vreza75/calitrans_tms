@@ -30,8 +30,12 @@ REQUEST_TYPES = [
     "Quote Request",
     "Missing Information",
     "Cancellation",
+    "Billing",
+    "Driver Issue",
+    "Port Issue",
     "Customer Request",
     "POD Request",
+    "Spam/Marketing",
     "Other",
 ]
 
@@ -208,6 +212,7 @@ def generate_operations_ai_suggestion(
     load_candidates: list[dict[str, Any]] | None = None,
     feedback_examples: list[dict[str, Any]] | None = None,
     response_language: str = "Auto",
+    reply_tone: str = "Professional",
     company_name: str = "CaliTrans",
 ) -> dict[str, Any]:
     api_key = _get_setting("OPENAI_API_KEY")
@@ -240,6 +245,7 @@ Success criteria:
 - Do not mention rates, carrier pay, billing notes, or internal notes.
 - Use dispatcher_feedback_examples as operating guidance. Prefer patterns the dispatch team accepted or corrected recently, but do not copy customer-specific facts from an unrelated example.
 - Draft reply_body in the requested_response_language. If requested_response_language is Auto, use the customer's language. If it is Bilingual, write English first, then Spanish separated by "---".
+- Follow requested_reply_tone. Professional is neutral dispatch language, Concise is brief, Friendly is warmer, and Apology / Delay acknowledges a delay without admitting fault.
 - For Spanish replies, use professional Spanish suitable for logistics/dispatch customers.
 - Draft a warm, concise, professional email reply that a dispatcher can edit before sending.
 - Never say the email was processed automatically. The dispatcher is reviewing it.
@@ -257,6 +263,7 @@ Success criteria:
         "candidate_loads": load_candidates or [],
         "dispatcher_feedback_examples": feedback_examples or [],
         "requested_response_language": response_language,
+        "requested_reply_tone": reply_tone,
         "allowed_request_types": REQUEST_TYPES,
     }
 

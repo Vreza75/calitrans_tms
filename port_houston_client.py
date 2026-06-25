@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 try:
     import streamlit as st
