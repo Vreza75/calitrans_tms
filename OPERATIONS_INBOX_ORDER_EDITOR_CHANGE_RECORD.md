@@ -311,3 +311,17 @@ COMPANY_NAME
 - Added a case-first review header showing case number, customer, booking, container, linked load, priority, owner, status, last reply, last customer email, total messages, and SLA timing.
 - Changed the review timeline to show the full Operations Case conversation and activity stream, including inbound emails, synced replies, internal notes, load actions, and system events.
 - Added custom owner support and quick waiting statuses for Manager, Driver, Port, and Warehouse so cases can show who or what the operation is waiting on.
+
+## June 26, 2026 Shared Mailbox Case Action Center
+
+- Added default shared Operations mailbox support for `margiea@calitranscorp.com`, `dispatch@calitranscorp.com`, and `accounting@calitranscorp.com`.
+- Updated Operations email sync to scan configured shared mailbox accounts and attach inbound/outbound messages from those accounts into the same case-matching workflow.
+- Stored the source mailbox account/folder in synced message metadata so timelines can show whether a message came from Dispatch, Margie, Accounting, or TMS.
+- Added a Case Action Center reply mode with `Reply to Customer`, `Reply All`, and `Forward`.
+- Added a `Reply From` selector with smart defaults: Billing routes to Accounting, manager/critical cases route to Margie, and normal operational replies route to Dispatch.
+- Updated outbound case reply records so the timeline records the sender mailbox used for the customer reply.
+- Preserved shared mailbox account/folder metadata when re-syncing already-imported emails.
+- Added account count and sync duration to the Operations Email Engine sync result message.
+- Made action-specific reply fields reset correctly when switching between customer reply, reply all, and forward modes.
+- Set Forward mode to avoid marking the case as waiting on the customer by default.
+- Normalized To/CC recipient parsing for comma- or semicolon-separated address lists.

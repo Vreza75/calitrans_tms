@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime
-from email.utils import parseaddr
+from email.utils import getaddresses, parseaddr
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -5876,6 +5876,8 @@ def _email_sync_metadata(item: dict) -> dict:
     return {
         "direction": direction,
         "mailbox": _safe_str(item.get("mailbox", "")),
+        "mailbox_account": _safe_str(item.get("mailbox_account", "")),
+        "mailbox_folder": _safe_str(item.get("mailbox_folder", "")),
         "thread_id": _safe_str(item.get("thread_id", "")),
         "conversation_key": _safe_str(item.get("conversation_key", "")) or _safe_str(item.get("thread_id", "")),
         "normalized_subject": _safe_str(item.get("normalized_subject", "")),
@@ -5886,6 +5888,19 @@ def _email_sync_metadata(item: dict) -> dict:
 
 def _update_existing_operations_email_sync_metadata(existing_record: dict, item: dict, message_id: str) -> None:
     metadata = _email_sync_metadata(item)
+    email_sync_metadata = {
+        "direction": metadata["direction"],
+        "mailbox": metadata["mailbox"],
+        "mailbox_account": metadata["mailbox_account"],
+        "mailbox_folder": metadata["mailbox_folder"],
+        "thread_id": metadata["thread_id"],
+        "conversation_key": metadata["conversation_key"],
+        "normalized_subject": metadata["normalized_subject"],
+        "in_reply_to": metadata["in_reply_to"],
+        "references": metadata["references"],
+        "to": _safe_str(item.get("to", "")),
+        "cc": _safe_str(item.get("cc", "")),
+    }
     try:
         execute(
             """
@@ -5901,6 +5916,20 @@ def _update_existing_operations_email_sync_metadata(existing_record: dict, item:
                         then cast(:email_references as jsonb)
                     else email_references
                 end,
+                parsed_data = jsonb_set(
+                    case
+                        when jsonb_typeof(coalesce(parsed_data, '{}'::jsonb)) = 'object'
+                            then coalesce(parsed_data, '{}'::jsonb)
+                        else '{}'::jsonb
+                    end,
+                    '{_email_sync}',
+                    case
+                        when jsonb_typeof(parsed_data -> '_email_sync') = 'object'
+                            then parsed_data -> '_email_sync'
+                        else '{}'::jsonb
+                    end || cast(:email_sync_metadata as jsonb),
+                    true
+                ),
                 email_synced_at = now(),
                 source_message_id = coalesce(nullif(source_message_id, ''), :source_message_id)
             where id = :intake_id
@@ -5914,6 +5943,7 @@ def _update_existing_operations_email_sync_metadata(existing_record: dict, item:
                 "conversation_key": metadata["conversation_key"] or None,
                 "email_in_reply_to": metadata["in_reply_to"] or None,
                 "email_references": json.dumps(metadata["references"]),
+                "email_sync_metadata": _json_dump(email_sync_metadata),
                 "source_message_id": message_id or None,
             },
         )
@@ -5922,6 +5952,7 @@ def _update_existing_operations_email_sync_metadata(existing_record: dict, item:
 
 
 def sync_operations_email_engine(limit: int = 50) -> dict:
+    sync_started_at = datetime.now()
     _ensure_operations_email_sync_schema()
     emails = fetch_operations_email_sync(limit=limit)
     existing_lookup = _load_existing_operations_email_lookup()
@@ -5935,6 +5966,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
     outbound_imported = 0
     cases_touched = set()
     synced_threads = set()
+    synced_accounts = set()
     seen_message_ids = set()
 
     for item in emails:
@@ -5945,6 +5977,8 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         received_at = item.get("received_at")
         metadata = _email_sync_metadata(item)
         direction = metadata["direction"]
+        if metadata.get("mailbox_account"):
+            synced_accounts.add(metadata["mailbox_account"])
         if direction == "outbound":
             outbound_fetched += 1
         else:
@@ -6038,6 +6072,8 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         parsed["_email_sync"] = {
             "direction": direction,
             "mailbox": metadata["mailbox"],
+            "mailbox_account": metadata["mailbox_account"],
+            "mailbox_folder": metadata["mailbox_folder"],
             "thread_id": metadata["thread_id"],
             "conversation_key": thread_conversation_key,
             "normalized_subject": metadata["normalized_subject"],
@@ -6233,6 +6269,8 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         "outbound_imported": outbound_imported,
         "threads_synced": len(synced_threads),
         "cases_touched": len(cases_touched),
+        "accounts_synced": len(synced_accounts),
+        "elapsed_seconds": round((datetime.now() - sync_started_at).total_seconds(), 1),
     }
 
 
@@ -6253,6 +6291,15 @@ def _default_operations_reply_subject(subject: str, request_type: str) -> str:
     if clean_subject:
         return f"Re: {clean_subject}"
     return f"Re: {request_type}"
+
+
+def _default_operations_action_subject(subject: str, request_type: str, action_mode: str) -> str:
+    clean_subject = str(subject or "").strip()
+    if action_mode == "Forward":
+        if clean_subject.lower().startswith(("fw:", "fwd:")):
+            return clean_subject
+        return f"Fwd: {clean_subject}" if clean_subject else f"Fwd: {request_type}"
+    return _default_operations_reply_subject(subject, request_type)
 
 
 def _apply_operations_reply_tone(body: str, tone: str, language: str) -> str:
@@ -6660,9 +6707,11 @@ def _insert_operations_thread_reply_record(
     *,
     intake_id: int,
     record,
+    reply_from: str,
     reply_to: str,
     reply_subject: str,
     reply_body: str,
+    reply_cc: str = "",
     request_type: str,
     conversation_key: str,
     matched_load_id,
@@ -6742,7 +6791,7 @@ def _insert_operations_thread_reply_record(
         """,
         {
             "source_subject": reply_subject,
-            "source_sender": reply_to,
+            "source_sender": reply_from or "TMS",
             "source_message_id": outbound_message_id,
             "email_thread_id": email_thread_id or conversation_key or source_message_id or outbound_message_id,
             "email_normalized_subject": normalized_subject or _safe_str(reply_subject).lower(),
@@ -6752,11 +6801,16 @@ def _insert_operations_thread_reply_record(
                 {
                     "_email_sync": {
                         "direction": "outbound",
-                        "mailbox": "TMS",
+                        "mailbox": f"{reply_from}:TMS" if reply_from else "TMS",
+                        "mailbox_account": reply_from,
+                        "mailbox_folder": "TMS",
                         "thread_id": email_thread_id,
                         "conversation_key": conversation_key,
                         "in_reply_to": source_message_id,
                         "references": references,
+                        "from": reply_from,
+                        "to": reply_to,
+                        "cc": reply_cc,
                     }
                 }
             ),
@@ -7735,9 +7789,14 @@ def render_operations_inbox() -> None:
                 outbound = int(result.get("outbound_fetched", 0))
                 threads = int(result.get("threads_synced", 0))
                 cases = int(result.get("cases_touched", 0))
+                accounts = int(result.get("accounts_synced", 0))
+                elapsed = result.get("elapsed_seconds")
+                account_note = f" across {accounts} account(s)" if accounts else ""
+                elapsed_note = f" in {elapsed}s" if elapsed is not None else ""
                 st.success(
                     f"Email sync fetched {fetched} message(s) "
-                    f"({inbound} inbox, {outbound} sent), imported {imported}, skipped {skipped}, "
+                    f"({inbound} inbox, {outbound} sent){account_note}{elapsed_note}, "
+                    f"imported {imported}, skipped {skipped}, "
                     f"threaded {threads} conversation(s), updated {cases} case(s){pdf_note}."
                 )
         else:
@@ -8710,7 +8769,7 @@ def render_operations_inbox() -> None:
         refresh_data()
         st.rerun()
 
-    st.markdown("### Customer Email Reply")
+    st.markdown("### Case Action Center")
     ai_reply_body = ""
     if ai_suggestion and ai_suggestion.get("success"):
         ai_reply_language = _safe_str(ai_suggestion.get("response_language", ""))
@@ -8727,16 +8786,42 @@ def render_operations_inbox() -> None:
     )
     reply_key_seed = f"{request_type}_{resolved_reply_language}_{st.session_state.get(ai_version_key, 'rule')}"
     reply_key_suffix = re.sub(r"[^a-z0-9]+", "_", reply_key_seed.lower()).strip("_")
+    reply_sender_options = _operations_reply_sender_options()
+    suggested_reply_from = _suggested_operations_reply_sender(request_type, operations_case)
+    if suggested_reply_from not in reply_sender_options:
+        reply_sender_options.insert(0, suggested_reply_from)
+    default_reply_from_index = reply_sender_options.index(suggested_reply_from) if suggested_reply_from in reply_sender_options else 0
+    action_mode = st.selectbox(
+        "Action",
+        ["Reply to Customer", "Reply All", "Forward"],
+        index=0,
+        key=f"operations_action_mode_{selected_id}",
+    )
+    reply_from = st.selectbox(
+        "Reply From",
+        reply_sender_options,
+        index=default_reply_from_index,
+        key=f"operations_reply_from_{selected_id}",
+    )
+    action_key_suffix = re.sub(r"[^a-z0-9]+", "_", action_mode.lower()).strip("_")
+    reply_from_key_suffix = re.sub(r"[^a-z0-9]+", "_", reply_from.lower()).strip("_")
     with st.form(f"operations_email_reply_{selected_id}"):
+        default_reply_to = "" if action_mode == "Forward" else _extract_email_address(sender)
         reply_to = st.text_input(
             "To",
-            value=_extract_email_address(sender),
-            key=f"operations_reply_to_{selected_id}",
+            value=default_reply_to,
+            key=f"operations_reply_to_{selected_id}_{action_key_suffix}",
+        )
+        reply_cc_default = _reply_all_cc_from_record(parsed, reply_from, default_reply_to) if action_mode == "Reply All" else ""
+        reply_cc = st.text_input(
+            "CC",
+            value=reply_cc_default,
+            key=f"operations_reply_cc_{selected_id}_{action_key_suffix}_{reply_from_key_suffix}",
         )
         reply_subject = st.text_input(
             "Subject",
-            value=_default_operations_reply_subject(subject, request_type),
-            key=f"operations_reply_subject_{selected_id}",
+            value=_default_operations_action_subject(subject, request_type, action_mode),
+            key=f"operations_reply_subject_{selected_id}_{action_key_suffix}",
         )
         reply_body = st.text_area(
             "Message",
@@ -8746,10 +8831,10 @@ def render_operations_inbox() -> None:
         )
         mark_waiting = st.checkbox(
             "Mark waiting on customer after sending",
-            value=True,
-            key=f"operations_reply_waiting_{selected_id}",
+            value=action_mode != "Forward",
+            key=f"operations_reply_waiting_{selected_id}_{action_key_suffix}",
         )
-        send_reply = st.form_submit_button("Send Email Reply")
+        send_reply = st.form_submit_button("Send / Record Action")
 
     if send_reply:
         if not reply_to.strip():
@@ -8759,7 +8844,13 @@ def render_operations_inbox() -> None:
         else:
             current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
             try:
-                _send_smtp_email(reply_to.strip(), reply_subject.strip(), reply_body.strip())
+                _send_smtp_email(
+                    reply_to.strip(),
+                    reply_subject.strip(),
+                    reply_body.strip(),
+                    from_email=reply_from,
+                    cc_email=reply_cc.strip(),
+                )
                 save_operations_email_reply(
                     intake_id=int(selected_id),
                     load_id=matched_load_id,
@@ -8772,7 +8863,9 @@ def render_operations_inbox() -> None:
                 _insert_operations_thread_reply_record(
                     intake_id=int(selected_id),
                     record=record,
+                    reply_from=reply_from,
                     reply_to=reply_to.strip(),
+                    reply_cc=reply_cc.strip(),
                     reply_subject=reply_subject.strip(),
                     reply_body=reply_body.strip(),
                     request_type=request_type,
@@ -8804,7 +8897,7 @@ def render_operations_inbox() -> None:
                         conversation_key,
                         request_type,
                         reply_subject.strip(),
-                        reply_to.strip(),
+                        reply_from,
                         reply_body.strip(),
                         direction="outbound",
                         case_id=current_case_id,
@@ -8827,7 +8920,7 @@ def render_operations_inbox() -> None:
                             "Reply sent; waiting on customer response.",
                         )
 
-                st.success(f"Email sent to {reply_to.strip()}.")
+                st.success(f"Email sent from {reply_from} to {reply_to.strip()}.")
                 refresh_data()
                 st.rerun()
             except Exception as exc:
@@ -9402,6 +9495,100 @@ def _get_first_app_setting(names: list[str], default=None):
     return default
 
 
+OPERATIONS_REPLY_MAILBOXES = [
+    "dispatch@calitranscorp.com",
+    "margiea@calitranscorp.com",
+    "accounting@calitranscorp.com",
+]
+
+
+def _setting_suffix_for_email(email_address: str) -> str:
+    local_part = _safe_str(email_address).split("@", 1)[0]
+    return re.sub(r"[^A-Za-z0-9]+", "_", local_part).strip("_").upper()
+
+
+def _split_email_list(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").replace(";", ",").split(",") if item.strip()]
+
+
+def _operations_reply_sender_options() -> list[str]:
+    configured = _split_email_list(
+        _get_first_app_setting(
+            ["OPERATIONS_REPLY_FROM_ADDRESSES", "OPERATIONS_CASE_MAILBOXES", "OPERATIONS_EMAIL_ACCOUNTS"],
+            ",".join(OPERATIONS_REPLY_MAILBOXES),
+        )
+    )
+    for email_address in OPERATIONS_REPLY_MAILBOXES:
+        if email_address not in configured:
+            configured.append(email_address)
+
+    seen = set()
+    options = []
+    for email_address in configured:
+        normalized = email_address.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        options.append(email_address)
+    return options
+
+
+def _suggested_operations_reply_sender(request_type: str, operations_case: dict) -> str:
+    request_type = _safe_str(request_type)
+    owner = _safe_str(operations_case.get("owner", "") if isinstance(operations_case, dict) else "").lower()
+    status = _safe_str(operations_case.get("status", "") if isinstance(operations_case, dict) else "").lower()
+    if request_type == "Billing" or owner == "billing":
+        return "accounting@calitranscorp.com"
+    if "manager" in owner or "manager" in status or _safe_str(operations_case.get("priority", "")).lower() in {"critical", "urgent"}:
+        return "margiea@calitranscorp.com"
+    return "dispatch@calitranscorp.com"
+
+
+def _split_email_addresses(value: str) -> list[str]:
+    addresses = []
+    for _, address in getaddresses([str(value or "").replace(";", ",")]):
+        clean_address = _safe_str(address)
+        if clean_address:
+            addresses.append(clean_address)
+    return addresses
+
+
+def _reply_all_cc_from_record(parsed: dict, reply_from: str, reply_to: str) -> str:
+    sync_meta = parsed.get("_email_sync", {}) if isinstance(parsed, dict) else {}
+    candidates = []
+    candidates.extend(_split_email_addresses(sync_meta.get("to", "")))
+    candidates.extend(_split_email_addresses(sync_meta.get("cc", "")))
+    excluded = {
+        _safe_str(reply_from).lower(),
+        _safe_str(reply_to).lower(),
+    }
+    cleaned = []
+    seen = set()
+    for address in candidates:
+        normalized = address.lower()
+        if not normalized or normalized in excluded or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(address)
+    return ", ".join(cleaned)
+
+
+def _smtp_credentials_for_sender(from_email: str) -> tuple[str, str, str]:
+    smtp_user_default = _get_first_app_setting(["SMTP_USER", "YAHOO_EMAIL", "EMAIL_ADDRESS"])
+    smtp_password_default = _get_first_app_setting(["SMTP_PASSWORD", "YAHOO_APP_PASSWORD", "EMAIL_APP_PASSWORD"])
+    from_email = _safe_str(from_email) or _get_first_app_setting(["DISPATCH_EMAIL", "YAHOO_EMAIL", "EMAIL_ADDRESS"], smtp_user_default)
+    suffix = _setting_suffix_for_email(from_email)
+    smtp_user = _get_first_app_setting(
+        [f"SMTP_USER_{suffix}", f"YAHOO_EMAIL_{suffix}", f"EMAIL_ADDRESS_{suffix}"],
+        from_email or smtp_user_default,
+    )
+    smtp_password = _get_first_app_setting(
+        [f"SMTP_PASSWORD_{suffix}", f"YAHOO_APP_PASSWORD_{suffix}", f"EMAIL_APP_PASSWORD_{suffix}"],
+        smtp_password_default if _safe_str(smtp_user).lower() == _safe_str(smtp_user_default).lower() else None,
+    )
+    return from_email, smtp_user, smtp_password
+
+
 def _first_present(load, keys: list[str], fallback: str = "") -> str:
     for key in keys:
         try:
@@ -9538,32 +9725,42 @@ def _log_customer_email_notification(load_id: int, old_status: str, new_status: 
         pass
 
 
-def _send_smtp_email(to_email: str, subject: str, body: str) -> None:
+def _send_smtp_email(to_email: str, subject: str, body: str, from_email: str = "", cc_email: str = "") -> None:
     smtp_host = _get_app_setting("SMTP_HOST", "smtp.mail.yahoo.com")
     smtp_port = int(_get_app_setting("SMTP_PORT", 465))
-    smtp_user = _get_first_app_setting(["SMTP_USER", "YAHOO_EMAIL", "EMAIL_ADDRESS"])
-    smtp_password = _get_first_app_setting(["SMTP_PASSWORD", "YAHOO_APP_PASSWORD", "EMAIL_APP_PASSWORD"])
-    dispatch_email = _get_first_app_setting(["DISPATCH_EMAIL", "YAHOO_EMAIL", "EMAIL_ADDRESS"], smtp_user)
+    dispatch_email, smtp_user, smtp_password = _smtp_credentials_for_sender(from_email)
+    to_recipients = _split_email_addresses(to_email)
+    cc_recipients = _split_email_addresses(cc_email)
 
-    if not to_email:
+    if not to_recipients:
         raise ValueError("Missing customer email address on this load.")
     if not smtp_host or not smtp_user or not smtp_password:
         raise ValueError("Missing email settings. Add YAHOO_EMAIL and YAHOO_APP_PASSWORD, or SMTP_HOST, SMTP_USER, and SMTP_PASSWORD.")
 
     msg = MIMEMultipart()
     msg["From"] = dispatch_email
-    msg["To"] = to_email
+    msg["To"] = ", ".join(to_recipients)
+    if cc_recipients:
+        msg["Cc"] = ", ".join(cc_recipients)
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
+    recipients = []
+    seen = set()
+    for address in to_recipients + cc_recipients:
+        normalized = address.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        recipients.append(address)
     if smtp_port == 465:
         with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
             server.login(smtp_user, smtp_password)
-            server.send_message(msg)
+            server.sendmail(dispatch_email, recipients, msg.as_string())
     else:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.starttls()
             server.login(smtp_user, smtp_password)
-            server.send_message(msg)
+            server.sendmail(dispatch_email, recipients, msg.as_string())
 
 def _clean_display_value(value, fallback: str = "-") -> str:
     value_str = str(value or "").strip()
