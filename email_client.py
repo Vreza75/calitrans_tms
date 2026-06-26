@@ -144,15 +144,89 @@ def get_email_body(msg):
     return re.sub(r"<[^<]+?>", " ", html_body).strip()
 
 
-def get_pdf_attachments(msg):
+def _attachment_filename(part, index):
+    filename = part.get_filename()
+    if filename:
+        return decode_text(filename)
+
+    content_type = part.get_content_type() or "application/octet-stream"
+    extension = {
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/csv": ".csv",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+    }.get(content_type, "")
+    return f"attachment_{index}{extension}"
+
+
+def get_email_attachments(msg):
     attachments = []
-    for part in msg.walk():
+    seen = set()
+    for index, part in enumerate(msg.walk(), start=1):
+        content_type = part.get_content_type() or "application/octet-stream"
+        if content_type == "message/rfc822":
+            payload = part.get_payload()
+            nested_messages = payload if isinstance(payload, list) else []
+            for nested in nested_messages:
+                for nested_attachment in get_email_attachments(nested):
+                    nested_content = nested_attachment.get("content") or b""
+                    nested_key = (
+                        str(nested_attachment.get("filename", "")).lower(),
+                        str(nested_attachment.get("content_type", "")),
+                        len(nested_content),
+                        nested_content[:32],
+                    )
+                    if nested_key in seen:
+                        continue
+                    seen.add(nested_key)
+                    attachments.append(nested_attachment)
+            continue
+
+        if part.is_multipart():
+            continue
+
+        disposition = str(part.get("Content-Disposition") or "").lower()
         filename = part.get_filename()
-        if filename:
-            filename = decode_text(filename)
-        if filename and filename.lower().endswith(".pdf"):
-            attachments.append({"filename": filename, "content": part.get_payload(decode=True)})
+        inline_without_filename = "inline" in disposition and not filename
+        has_attachment_marker = "attachment" in disposition or bool(filename)
+        if inline_without_filename and content_type != "application/pdf":
+            continue
+        if not has_attachment_marker and content_type in {"text/plain", "text/html"}:
+            continue
+
+        content = part.get_payload(decode=True)
+        if not content:
+            continue
+
+        filename = _attachment_filename(part, index)
+        dedupe_key = (filename.lower(), content_type, len(content), content[:32])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        attachments.append(
+            {
+                "filename": filename,
+                "content": content,
+                "content_type": content_type,
+                "size_bytes": len(content),
+                "disposition": disposition,
+                "content_id": decode_text(part.get("Content-ID")),
+            }
+        )
     return attachments
+
+
+def get_pdf_attachments(msg):
+    return [
+        attachment
+        for attachment in get_email_attachments(msg)
+        if str(attachment.get("filename", "")).lower().endswith(".pdf")
+        or str(attachment.get("content_type", "")).lower() == "application/pdf"
+    ]
 
 
 def _parse_email_date(value):
@@ -293,7 +367,7 @@ def _fetch_recent_emails(
                 "body": body,
                 "snippet": body[:300],
                 "matched_terms": matched_terms,
-                "attachments": get_pdf_attachments(msg),
+                "attachments": get_email_attachments(msg),
             })
 
             if len(results) >= limit:
@@ -372,6 +446,47 @@ def fetch_operations_email_sync(limit=50):
             direction="outbound",
             terms=search_terms,
             scan_window=max(per_mailbox_limit * 10, 250),
+            require_terms=False,
+        )
+    except Exception:
+        sent_messages = []
+
+    return inbox_messages + sent_messages
+
+
+def fetch_operations_email_by_message_id(message_id, limit=5):
+    normalized_message_id = normalize_message_id(message_id)
+    if not normalized_message_id:
+        return []
+
+    search_query = f'HEADER Message-ID "{normalized_message_id}"'
+    inbox_messages = _fetch_recent_emails(
+        limit=limit,
+        search_query=search_query,
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=[],
+        scan_window=max(limit * 4, 20),
+        require_terms=False,
+    )
+
+    try:
+        sent_messages = _fetch_recent_emails(
+            limit=limit,
+            search_query=search_query,
+            mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+            mailbox_candidates=_split_mailbox_candidates(
+                get_setting(
+                    "EMAIL_SENT_FOLDER_CANDIDATES",
+                    "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                )
+            ),
+            direction="outbound",
+            terms=[],
+            scan_window=max(limit * 4, 20),
             require_terms=False,
         )
     except Exception:

@@ -52,6 +52,39 @@ def _infer_type(text: str) -> str:
     return ""
 
 
+def _append_note(existing: str, note: str) -> str:
+    existing = _clean(existing)
+    note = _clean(note)
+    if not note:
+        return existing
+    return note if not existing else f"{existing}; {note}"
+
+
+def _first_container(text: str) -> str:
+    match = re.search(r"\b[A-Z]{4}\d{7}\b", text, re.I)
+    return match.group(0).upper() if match else ""
+
+
+def _container_correction(text: str) -> tuple[str, str]:
+    match = re.search(
+        r"\bcontainer\s+([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+        text,
+        re.I | re.S,
+    )
+    if match:
+        return match.group(1).upper(), match.group(2).upper()
+
+    match = re.search(
+        r"\b([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+        text,
+        re.I | re.S,
+    )
+    if match:
+        return match.group(1).upper(), match.group(2).upper()
+
+    return "", ""
+
+
 def parse_email_text(subject: str | None = None, body: str | None = None) -> dict[str, str]:
     """Parse load order fields from email text.
 
@@ -70,14 +103,70 @@ def parse_email_text(subject: str | None = None, body: str | None = None) -> dic
     if not parsed["TYPE"]:
         parsed["TYPE"] = _infer_type(combined)
 
+    corrected_container, replaced_container = _container_correction(combined)
+    if corrected_container:
+        parsed["Container Number"] = corrected_container
+        parsed["Dispatcher Notes"] = _append_note(
+            parsed["Dispatcher Notes"],
+            f"Container correction noted: use {corrected_container} instead of {replaced_container}.",
+        )
+
+    subject_pair = re.search(r"\b(\d{5,})\s*/\s*([A-Z]{4}\d{7})\b", subject or "", re.I)
+    if subject_pair:
+        if not parsed["Reference Number"]:
+            parsed["Reference Number"] = subject_pair.group(1)
+        if not parsed["Container Number"]:
+            parsed["Container Number"] = subject_pair.group(2).upper()
+
     if not parsed["Container Number"]:
-        match = re.search(r"\b[A-Z]{4}\d{7}\b", combined)
-        if match:
-            parsed["Container Number"] = match.group(0)
+        parsed["Container Number"] = _first_container(combined)
 
     if not parsed["Booking Number"]:
         match = re.search(r"\b(?:MAEU|ONEY|COSU|ZIMU|HLCU|MSCU)[A-Z0-9-]{4,}\b", combined, re.I)
         if match:
             parsed["Booking Number"] = match.group(0).upper()
+
+    if not parsed["Reference Number"]:
+        match = (
+            re.search(r"\b(?:ref(?:erence)?|po|order|load)\s*(?:#|number|no\.?)?\s*[:#-]?\s*([0-9][0-9\s-]{4,})\b", combined, re.I)
+            or re.search(r"/\s*([0-9][0-9\s-]{3,})\b", subject or "")
+            or re.search(r"\b([0-9]{6,})\s*/\s*[A-Z]{4}\d{7}\b", subject or "", re.I)
+        )
+        if match:
+            parsed["Reference Number"] = re.sub(r"\s+", " ", match.group(1)).strip()
+
+    if not parsed["Customer"]:
+        if re.search(r"\bflat\s*world\b|@flatworldgs\.com\b", combined, re.I):
+            parsed["Customer"] = "Flat World Global Logistics"
+
+    if not parsed["Size"]:
+        match = re.search(r"\b(?:\d+\s*x\s*)?(20|40|45)\s*'?\s*(?:ft|hc|hq|std|drayage)?\b", combined, re.I)
+        if match:
+            parsed["Size"] = match.group(1)
+
+    if not parsed["Delivery Need Date"]:
+        match = (
+            re.search(r"\bready\s+for\s+loading\s+on\s+(?:the\s+)?(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b", combined, re.I)
+            or re.search(r"\bready\s+(?:on|for)\s+(?:the\s+)?(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b", combined, re.I)
+        )
+        if match:
+            parsed["Delivery Need Date"] = match.group(1)
+
+    if not parsed["Document Cutoff"]:
+        match = re.search(r"\b(?:doc(?:ument)?\s*)?cut\s*off|cutoff\b", combined, re.I)
+        if match:
+            date_match = re.search(r"\b(?:doc(?:ument)?\s*)?(?:cut\s*off|cutoff)\s*(?:is|:)?\s*(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", combined, re.I)
+            if date_match:
+                parsed["Document Cutoff"] = date_match.group(1)
+
+    lowered = combined.lower()
+    if "delivery order" in lowered:
+        parsed["Dispatcher Notes"] = _append_note(parsed["Dispatcher Notes"], "Delivery order mentioned in email")
+    if "packing list" in lowered:
+        parsed["Dispatcher Notes"] = _append_note(parsed["Dispatcher Notes"], "Packing list mentioned in email")
+    if "hazmat" in lowered:
+        parsed["Dispatcher Notes"] = _append_note(parsed["Dispatcher Notes"], "Hazmat mentioned in email")
+    if "imo" in lowered or "imos" in lowered:
+        parsed["Dispatcher Notes"] = _append_note(parsed["Dispatcher Notes"], "IMO documents mentioned in email")
 
     return parsed

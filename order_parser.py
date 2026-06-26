@@ -2,6 +2,32 @@ import re
 import pdfplumber
 
 
+def _append_note(existing, note):
+    existing = str(existing or "").strip()
+    note = str(note or "").strip()
+    if not note:
+        return existing
+    return note if not existing else f"{existing}; {note}"
+
+
+def _container_correction(text):
+    match = re.search(
+        r"\bcontainer\s+([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+        text or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return match.group(1).upper(), match.group(2).upper()
+    match = re.search(
+        r"\b([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+        text or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return match.group(1).upper(), match.group(2).upper()
+    return "", ""
+
+
 def extract_text_from_pdf(uploaded_file):
     text = ""
 
@@ -145,6 +171,8 @@ def parse_order_text(text):
         })
         return parsed
 
+    corrected_container, replaced_container = _container_correction(text)
+
     parsed.update({
         "Booking Number": find_pattern(text, [
             r"Booking Number[:\s]+([A-Z0-9\-]+)",
@@ -156,10 +184,18 @@ def parse_order_text(text):
             r"Container Number[:\s]+([A-Z]{4}\d{7})",
             r"Container #:\s*([A-Z]{4}\d{7})",
             r"Container[:\s]+([A-Z]{4}\d{7})",
+            r"\b([A-Z]{4}\d{7})\b",
+        ]),
+        "Reference Number": find_pattern(text, [
+            r"Reference Number[:\s]+([A-Z0-9\-]+)",
+            r"Reference #[:\s]+([A-Z0-9\-]+)",
+            r"Ref[:#\s]+([A-Z0-9\-]+)",
+            r"\b([0-9]{6,})\s*/\s*[A-Z]{4}\d{7}\b",
         ]),
         "Customer": find_pattern(text, [
             r"Customer[:\s]+(.+)",
             r"Consignee[:\s]+(.+)",
+            r"(Flat\s*World\s*Global\s*Logistics)",
         ]),
         "Port": find_pattern(text, [
             r"Port[:\s]+(.+)",
@@ -177,6 +213,16 @@ def parse_order_text(text):
         ]),
         "Dispatcher Notes": "Parsed from generic order PDF",
     })
+
+    if corrected_container:
+        parsed["Container Number"] = corrected_container
+        parsed["Dispatcher Notes"] = _append_note(
+            parsed.get("Dispatcher Notes", ""),
+            f"Container correction noted: use {corrected_container} instead of {replaced_container}.",
+        )
+
+    if not parsed.get("Customer") and re.search(r"\bflat\s*world\b|@flatworldgs\.com\b", text or "", re.IGNORECASE):
+        parsed["Customer"] = "Flat World Global Logistics"
 
     return parsed
 def find_pattern(text, patterns):

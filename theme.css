@@ -11,15 +11,12 @@
 }
 
 [data-testid="stAppViewContainer"] {
-    background:
-        linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,248,251,0.96)),
-        radial-gradient(circle at top right, rgba(255,210,0,.15), transparent 38%),
-        radial-gradient(circle at bottom left, rgba(0,59,142,.13), transparent 35%);
+    background: #f6f8fb;
 }
 
 .block-container {
-    padding-top: 1.4rem;
-    max-width: 1500px;
+    padding-top: 0.8rem;
+    max-width: 1320px;
 }
 
 #MainMenu {visibility: hidden;}
@@ -28,15 +25,15 @@ footer {visibility: hidden;}
 .hero {
     position: relative;
     overflow: hidden;
-    border-radius: 18px;
-    margin-bottom: 22px;
-    min-height: 245px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    min-height: 210px;
     background:
         linear-gradient(90deg, rgba(6,27,58,.98) 0%, rgba(0,59,142,.92) 45%, rgba(6,27,58,.78) 100%),
         url("https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1800&q=80");
     background-size: cover;
     background-position: center;
-    box-shadow: 0 12px 35px rgba(6, 27, 58, .22);
+    box-shadow: 0 8px 18px rgba(6, 27, 58, .14);
 }
 
 .hero::before {
@@ -78,18 +75,18 @@ footer {visibility: hidden;}
     width: 170px;
     height: auto;
     background: white;
-    border-radius: 12px;
+    border-radius: 8px;
     padding: 8px 12px;
     box-shadow: 0 8px 25px rgba(0,0,0,.18);
 }
 
 .hero h1 {
     color: white;
-    font-size: 42px;
+    font-size: 36px;
     line-height: 1.05;
     margin: 0;
     font-weight: 900;
-    letter-spacing: -0.03em;
+    letter-spacing: 0;
 }
 
 .hero p {
@@ -112,9 +109,9 @@ footer {visibility: hidden;}
 .kpi-card {
     background: rgba(255,255,255,.96);
     border: 1px solid var(--ct-border);
-    border-radius: 16px;
+    border-radius: 8px;
     padding: 22px 20px;
-    box-shadow: 0 8px 24px rgba(15, 23, 42, .08);
+    box-shadow: none;
     display: flex;
     gap: 16px;
     align-items: center;
@@ -159,7 +156,7 @@ footer {visibility: hidden;}
 
 .section-title {
     color: var(--ct-navy);
-    font-size: 30px;
+    font-size: 24px;
     font-weight: 900;
     margin: 26px 0 14px 0;
     border-left: 7px solid var(--ct-yellow);
@@ -174,7 +171,7 @@ footer {visibility: hidden;}
 .stTabs [data-baseweb="tab"] {
     height: 52px;
     padding: 0 12px;
-    font-weight: 800;
+    font-weight: 700;
     color: var(--ct-navy);
 }
 
@@ -184,20 +181,20 @@ footer {visibility: hidden;}
 }
 
 [data-testid="stDataFrame"] {
-    border-radius: 14px;
+    border-radius: 8px;
     overflow: hidden;
     border: 1px solid var(--ct-border);
-    box-shadow: 0 6px 22px rgba(15, 23, 42, .06);
+    box-shadow: none;
 }
 
 .stButton > button {
     background: linear-gradient(90deg, var(--ct-yellow), #ffbd00);
     color: #061B3A;
     border: 0;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: .65rem 1.1rem;
     font-weight: 900;
-    box-shadow: 0 6px 14px rgba(255, 210, 0, .25);
+    box-shadow: none;
 }
 
 .stButton > button:hover {
@@ -209,7 +206,7 @@ footer {visibility: hidden;}
 .footer-band {
     margin-top: 40px;
     padding: 18px;
-    border-radius: 14px;
+    border-radius: 8px;
     color: var(--ct-yellow);
     background:
         linear-gradient(90deg, #061B3A, #003B8E, #061B3A);
@@ -246,10 +243,10 @@ footer {visibility: hidden;}
 /* Banner spacing */
 .banner-wrapper {
     width: 100%;
-    margin-bottom: 8px;
-    border-radius: 18px;
+    margin-bottom: 16px;
+    border-radius: 8px;
     overflow: hidden;
-    box-shadow: 0 12px 35px rgba(6, 27, 58, .20);
+    box-shadow: 0 8px 18px rgba(6, 27, 58, .14);
     background: white;
 }
 
@@ -257,7 +254,7 @@ footer {visibility: hidden;}
     width: 100%;
     height: auto;
     display: block;
-    border-radius: 18px;
+    border-radius: 8px;
 }
 
 /* Reduce gap after banner */
@@ -286,11 +283,6 @@ div[data-testid="stHorizontalBlock"] {
     border: 2px solid #FFD200 !important;
     border-bottom: 4px solid #FFD200 !important;
 }
-/* Pull KPI cards closer to banner */
-.banner-wrapper {
-    margin-bottom: -65px !important;
-}
-
 div[data-testid="stHorizontalBlock"] {
     margin-top: 0px !important;
     padding-top: 0px !important;

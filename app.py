@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 from datetime import date, datetime
 from email.utils import parseaddr
+from html import escape
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, unquote
 import base64
+import importlib
 import os
 import smtplib
+import zipfile
+import xml.etree.ElementTree as ET
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -20,7 +24,7 @@ import streamlit as st
 from admin_pages import render_master_data_admin
 from config import ACTIVE_STATUSES, APP_NAME, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS
 from db_client import DispatchDatabaseClient, execute, read_df
-from email_client import fetch_operations_email_sync
+import email_client as _email_client
 from email_parser import parse_email_text
 from operations_ai import (
     generate_operations_ai_suggestion,
@@ -43,6 +47,12 @@ from port_houston_client import (
 from profittools_export import export_ready_loads
 from validators import validate_dispatch_rows
 from order_intake import get_intake_queue, get_intake_record, create_load_from_intake, update_intake_status, render_order_upload_panel, render_email_intake_panel
+
+if not hasattr(_email_client, "fetch_operations_email_by_message_id"):
+    _email_client = importlib.reload(_email_client)
+
+fetch_operations_email_sync = _email_client.fetch_operations_email_sync
+fetch_operations_email_by_message_id = getattr(_email_client, "fetch_operations_email_by_message_id", None)
 
 
 st.set_page_config(
@@ -240,6 +250,137 @@ def load_css() -> None:
             background: #dcfce7;
             color: #166534;
             font-weight: 700;
+        }
+        html, body, [class*="css"] {
+            font-family: "Inter", "Segoe UI", Arial, sans-serif;
+        }
+        [data-testid="stAppViewContainer"] {
+            background: #f6f8fb;
+        }
+        .block-container {
+            max-width: 1320px;
+            padding-top: 0.8rem;
+            padding-bottom: 2rem;
+        }
+        h1, h2, h3 {
+            letter-spacing: 0;
+            color: #0f172a;
+        }
+        h2, h3 {
+            font-weight: 750;
+        }
+        div[data-testid="stExpander"] {
+            border: 1px solid #d8e0ec;
+            border-radius: 8px;
+            background: #ffffff;
+            box-shadow: none;
+        }
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #d8e0ec;
+            border-radius: 8px;
+            padding: 10px 12px;
+            box-shadow: none;
+        }
+        div[data-testid="stMetricLabel"] {
+            font-size: 0.72rem;
+            color: #475569;
+            font-weight: 650;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.35rem;
+            color: #0f172a;
+            font-weight: 750;
+        }
+        .stButton > button {
+            border-radius: 8px !important;
+            min-height: 2.35rem;
+            padding: 0.45rem 0.9rem;
+            font-size: 0.82rem;
+            font-weight: 700;
+            box-shadow: none !important;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px !important;
+            border-bottom: 1px solid #d8e0ec !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            min-height: 38px !important;
+            height: 38px !important;
+            padding: 0 10px !important;
+            border-radius: 8px 8px 0 0 !important;
+            font-size: 0.78rem !important;
+            font-weight: 650 !important;
+            box-shadow: none !important;
+        }
+        .stTabs [aria-selected="true"] {
+            background: #fff8d7 !important;
+            border-color: #ffd200 !important;
+            border-bottom: 3px solid #ffd200 !important;
+        }
+        [data-testid="stDataFrame"] {
+            border-radius: 8px !important;
+            border: 1px solid #d8e0ec !important;
+            box-shadow: none !important;
+        }
+        .ops-header {
+            margin: 0.25rem 0 0.85rem 0;
+            padding: 0;
+        }
+        .ops-kicker {
+            color: #64748b;
+            font-size: 0.78rem;
+            font-weight: 650;
+            text-transform: uppercase;
+            letter-spacing: 0;
+            margin-bottom: 0.25rem;
+        }
+        .ops-title {
+            color: #0f172a;
+            font-size: 1.35rem;
+            line-height: 1.2;
+            font-weight: 800;
+            margin: 0;
+        }
+        .ops-subtitle {
+            color: #64748b;
+            font-size: 0.86rem;
+            line-height: 1.45;
+            margin-top: 0.35rem;
+            max-width: 780px;
+        }
+        .ops-metric-card {
+            background: #ffffff;
+            border: 1px solid #d8e0ec;
+            border-radius: 8px;
+            padding: 10px 12px;
+            min-height: 74px;
+        }
+        .ops-metric-label {
+            color: #64748b;
+            font-size: 0.72rem;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+        }
+        .ops-metric-value {
+            color: #0f172a;
+            font-size: 1.45rem;
+            font-weight: 800;
+            line-height: 1.05;
+        }
+        .ops-metric-sub {
+            color: #64748b;
+            font-size: 0.72rem;
+            margin-top: 0.25rem;
+        }
+        .ops-alert {
+            border: 1px solid #cfe0f8;
+            border-radius: 8px;
+            background: #eaf3ff;
+            color: #064b91;
+            padding: 0.75rem 0.85rem;
+            font-size: 0.84rem;
+            line-height: 1.45;
         }
         </style>
         """,
@@ -1064,32 +1205,28 @@ OPERATIONS_EMAIL_SYNC_SOURCES = [
 ]
 
 DEFAULT_OPERATIONS_QUEUE_ORDER = [
-    "All",
-    "Needs Details",
-    "Customer Requests",
-    "New Bookings",
-    "Booking Updates",
-    "Appointments",
-    "Quote Requests",
-    "Missing Info",
-    "POD Requests",
-    "Cancellations",
-    "Billing",
-    "Driver Issues",
-    "Port Issues",
-    "Spam",
+    "Action Required",
+    "New Orders",
+    "Existing Loads",
     "Waiting",
-    "Needs Review",
+    "Documents",
+    "Billing",
+    "Review",
 ]
 
 OPERATIONS_CASE_STATUSES = [
     "New",
+    "Open",
     "In Review",
     "Waiting Dispatcher",
+    "Waiting Manager",
     "Waiting Customer",
+    "Waiting Driver",
+    "Waiting Port",
     "Waiting Warehouse",
     "Waiting Steamship",
     "Waiting Billing",
+    "Waiting Safety",
     "Attached to Load",
     "Closed",
     "Reopened",
@@ -1098,12 +1235,18 @@ OPERATIONS_CASE_STATUSES = [
 OPERATIONS_CASE_OWNERS = [
     "Unassigned",
     "Dispatch",
-    "Manager",
+    "Operations",
     "Billing",
+    "Safety",
+    "Customer",
+    "Driver",
+    "Port",
+    "Warehouse",
     "Customer Service",
+    "Manager",
 ]
 
-OPERATIONS_CASE_PRIORITIES = ["Normal", "High", "Urgent", "Low"]
+OPERATIONS_CASE_PRIORITIES = ["Critical", "High", "Medium", "Low", "Normal", "Urgent"]
 OPERATIONS_SLA_FIRST_RESPONSE_HOURS = 2
 OPERATIONS_SLA_RESOLUTION_HOURS = 48
 
@@ -1115,6 +1258,19 @@ def _normalize_reference_token(value: str) -> str:
 def _extract_reference_tokens(text: str) -> dict:
     text = str(text or "")
 
+    corrected_container_match = (
+        re.search(
+            r"\bcontainer\s+([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+            text,
+            re.I | re.S,
+        )
+        or re.search(
+            r"\b([A-Z]{4}\d{7})\b.{0,80}?\b(?:instead\s+of|not|rather\s+than)\s+([A-Z]{4}\d{7})\b",
+            text,
+            re.I | re.S,
+        )
+    )
+    subject_pair_match = re.search(r"\b(\d{5,})\s*/\s*([A-Z]{4}\d{7})\b", text, re.I)
     booking_match = (
         re.search(r"\b(?:booking|bkg|bk)\s*(?:number|no\.?|#)?\s*[:#-]\s*([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
         or re.search(r"\b(?:IMP|EXP|IML|EXL)[-\s]?[A-Z0-9-]{4,}\b", text, re.I)
@@ -1134,10 +1290,20 @@ def _extract_reference_tokens(text: str) -> dict:
     ref_value = ""
     if ref_match:
         ref_value = ref_match.group(1) if ref_match.lastindex else ref_match.group(0)
+    elif subject_pair_match:
+        ref_value = subject_pair_match.group(1)
+
+    container_value = ""
+    if corrected_container_match:
+        container_value = corrected_container_match.group(1).upper()
+    elif container_match:
+        container_value = container_match.group(0).upper()
+    elif subject_pair_match:
+        container_value = subject_pair_match.group(2).upper()
 
     return {
         "booking_number": _normalize_reference_token(booking_value) if booking_value else "",
-        "container_number": container_match.group(0).upper() if container_match else "",
+        "container_number": container_value,
         "reference_number": _normalize_reference_token(ref_value) if ref_value else "",
     }
 
@@ -1220,6 +1386,43 @@ UPDATE_INTENT_TERMS = [
     "último día libre",
 ]
 
+INFORMATION_UPDATE_TERMS = [
+    "please note",
+    "note the",
+    "fyi",
+    "for your information",
+    "for your records",
+    "see below",
+    "please see",
+    "hours",
+    "receiving hours",
+    "delivery hours",
+    "warehouse hours",
+    "office hours",
+    "mon - fri",
+    "mon-fri",
+    "monday",
+    "friday",
+    "correction",
+    "corrected",
+    "instead of",
+    "revised",
+    "updated",
+    "confirmed",
+    "pre-alert",
+    "pre alert",
+    "please be advised",
+    "tomar nota",
+    "para su informacion",
+    "para su informaciÃ³n",
+    "horario",
+    "horarios",
+    "correccion",
+    "correcciÃ³n",
+    "actualizado",
+    "confirmado",
+]
+
 NEW_ORDER_INTENT_TERMS = [
     "new booking",
     "new load",
@@ -1238,6 +1441,36 @@ NEW_ORDER_INTENT_TERMS = [
     "orden de carga",
     "orden adjunta",
     "favor reservar",
+]
+
+ORDER_PLACEMENT_TERMS = [
+    "new booking",
+    "new load",
+    "create order",
+    "create load",
+    "please book",
+    "please arrange",
+    "please schedule",
+    "please dispatch",
+    "please pick up",
+    "please pickup",
+    "please deliver",
+    "need drayage",
+    "drayage for the booking",
+    "drayage for booking",
+    "set up this load",
+    "setup this load",
+    "load order attached",
+    "delivery order attached",
+    "attached delivery order",
+    "attached load order",
+    "nuevo booking",
+    "nueva carga",
+    "crear orden",
+    "favor reservar",
+    "favor programar",
+    "favor recoger",
+    "favor entregar",
 ]
 
 MISSING_INFO_TERMS = [
@@ -1370,6 +1603,30 @@ def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term in lowered for term in terms)
 
 
+def _subject_is_reply(subject: str) -> bool:
+    return bool(re.match(r"^\s*(?:re|fw|fwd)\s*:", _safe_str(subject), re.I))
+
+
+def _is_information_update(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if _contains_any(lowered, INFORMATION_UPDATE_TERMS):
+        return True
+    return bool(re.search(r"\b(?:please\s+note|note)\b.{0,80}\b(?:hours?|schedule|address|cutoff|lfd)\b", lowered, re.I))
+
+
+def _has_order_placement_signal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if _contains_any(lowered, ORDER_PLACEMENT_TERMS):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:please|pls)\b.{0,60}\b(?:arrange|book|schedule|dispatch|pickup|pick up|deliver|handle|process)\b",
+            lowered,
+            re.I,
+        )
+    )
+
+
 def _detect_customer_language(subject: str, body: str) -> str:
     text = f"{subject or ''} {body or ''}".lower()
     spanish_score = sum(1 for term in SPANISH_LANGUAGE_TERMS if term in text)
@@ -1435,13 +1692,18 @@ def _has_quote_details(text: str, parsed: dict, tokens: dict) -> bool:
 
 
 def _has_new_order_details(text: str, parsed: dict, tokens: dict) -> bool:
+    has_order_signal = _has_order_placement_signal(text)
+    has_order_document_signal = _contains_any(text, ["delivery order", "load order", "work order", "tender", "tendered"]) and not _is_information_update(text)
+    if not has_order_signal and not has_order_document_signal:
+        return False
+
     detail_score = 0
     for field in ["Booking Number", "Customer", "Container Number", "Port", "Warehouse", "Delivery Need Date"]:
         if _safe_str(parsed.get(field, "")):
             detail_score += 1
     if _has_reference_details(tokens, parsed):
         detail_score += 1
-    if _contains_any(text, NEW_ORDER_INTENT_TERMS):
+    if has_order_signal or has_order_document_signal:
         detail_score += 1
 
     return detail_score >= 3
@@ -1452,6 +1714,8 @@ def _operations_intent_scores(subject: str, body: str, parsed: dict | None = Non
     parsed = _coerce_parsed_for_classification(subject, body, parsed)
     tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
     has_reference = _has_reference_details(tokens, parsed)
+    is_info_update = _is_information_update(text)
+    has_order_signal = _has_order_placement_signal(text)
 
     scores = {request_type: 0 for request_type in REQUEST_TYPES}
     scores["Customer Request"] = 20
@@ -1471,6 +1735,8 @@ def _operations_intent_scores(subject: str, body: str, parsed: dict | None = Non
     add("Driver Issue", 70, _contains_any(text, DRIVER_ISSUE_TERMS))
     add("Port Issue", 70, _contains_any(text, PORT_ISSUE_TERMS))
     add("Spam/Marketing", 85, _contains_any(text, SPAM_MARKETING_TERMS))
+    add("Booking Update", 45, is_info_update and has_reference)
+    add("Customer Request", 35, is_info_update and not has_reference)
 
     if has_reference:
         for request_type in [
@@ -1497,8 +1763,15 @@ def _operations_intent_scores(subject: str, body: str, parsed: dict | None = Non
     else:
         scores["New Booking"] = max(0, scores["New Booking"] - 35)
 
+    if is_info_update and not has_order_signal:
+        scores["New Booking"] = max(0, scores["New Booking"] - 70)
+        if has_reference:
+            scores["Booking Update"] = max(scores["Booking Update"], 78)
+        else:
+            scores["Customer Request"] = max(scores["Customer Request"], 65)
+
     if _safe_str(parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, "")) or _safe_str(parsed.get("Booking Number", "")):
-        add("New Booking", 15)
+        add("New Booking", 15, has_order_signal and not is_info_update)
         add("Booking Update", 10)
 
     if max(scores.values() or [0]) < 45:
@@ -1512,6 +1785,9 @@ def classify_customer_request(subject: str, body: str, parsed: dict | None = Non
     parsed = _coerce_parsed_for_classification(subject, body, parsed)
     tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
     has_reference = _has_reference_details(tokens, parsed)
+    if _is_information_update(text) and not _has_order_placement_signal(text):
+        return "Booking Update" if has_reference else "Customer Request"
+
     scores = _operations_intent_scores(subject, body, parsed)
     scored_types = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     best_type = scored_types[0][0] if scored_types else "Customer Request"
@@ -1856,6 +2132,7 @@ def _json_dump(data: dict) -> str:
     return json.dumps(data or {}, default=str)
 
 
+OPERATIONS_ATTACHMENTS_KEY = "_operations_attachments"
 OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
 OPERATIONS_ORDER_FIELDS = [
     "TYPE",
@@ -1886,6 +2163,40 @@ def _operations_pdf_storage_dir() -> Path:
     return storage_dir
 
 
+def _is_pdf_filename(filename: str, content_type: str = "") -> bool:
+    return _safe_str(filename).lower().endswith(".pdf") or _safe_str(content_type).lower() == "application/pdf"
+
+
+def _decode_text_attachment(content: bytes) -> str:
+    for encoding in ["utf-8", "latin-1", "cp1252"]:
+        try:
+            return (content or b"").decode(encoding, errors="ignore").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _extract_docx_text(content: bytes) -> str:
+    try:
+        with zipfile.ZipFile(BytesIO(content or b"")) as archive:
+            xml_data = archive.read("word/document.xml")
+    except Exception:
+        return ""
+
+    try:
+        root = ET.fromstring(xml_data)
+    except Exception:
+        return ""
+
+    text_nodes = []
+    for node in root.iter():
+        if node.tag.endswith("}t") and node.text:
+            text_nodes.append(node.text)
+        elif node.tag.endswith("}p"):
+            text_nodes.append("\n")
+    return " ".join(text_nodes).replace(" \n ", "\n").strip()
+
+
 def _parse_operations_pdf_bytes(content: bytes, filename: str) -> tuple[str, dict]:
     pdf_file = BytesIO(content or b"")
     pdf_file.name = filename or "attachment.pdf"
@@ -1894,8 +2205,63 @@ def _parse_operations_pdf_bytes(content: bytes, filename: str) -> tuple[str, dic
     return pdf_text, pdf_parsed
 
 
+def _parse_operations_attachment_bytes(content: bytes, filename: str, content_type: str = "") -> tuple[str, dict]:
+    filename_lower = _safe_str(filename).lower()
+    content_type = _safe_str(content_type).lower()
+
+    if _is_pdf_filename(filename, content_type):
+        return _parse_operations_pdf_bytes(content, filename)
+
+    if filename_lower.endswith(".docx") or content_type.endswith("wordprocessingml.document"):
+        text = _extract_docx_text(content)
+        return text, parse_order_text(text) if text else {}
+
+    if filename_lower.endswith((".txt", ".csv", ".tsv")) or content_type.startswith("text/"):
+        text = _decode_text_attachment(content)
+        return text, parse_order_text(text) if text else {}
+
+    return "", {}
+
+
 def _field_count(parsed: dict) -> int:
     return sum(1 for field in OPERATIONS_ORDER_FIELDS if _safe_str(parsed.get(field, "")))
+
+
+def _save_operations_attachment(
+    *,
+    content: bytes,
+    filename: str,
+    message_id: str,
+    attachment_index: int,
+    content_type: str = "",
+) -> dict:
+    safe_message = _safe_storage_name(message_id, "operations_email")[:90]
+    fallback_extension = ".pdf" if _safe_str(content_type).lower() == "application/pdf" else ""
+    safe_filename = _safe_storage_name(filename, f"attachment_{attachment_index}{fallback_extension}")
+    stored_path = _operations_pdf_storage_dir() / f"{safe_message}_{attachment_index}_{safe_filename}"
+    stored_path.write_bytes(content or b"")
+
+    try:
+        attachment_text, attachment_parsed = _parse_operations_attachment_bytes(content or b"", safe_filename, content_type)
+        parse_error = ""
+    except Exception as exc:
+        attachment_text = ""
+        attachment_parsed = {}
+        parse_error = str(exc)
+
+    is_pdf = _is_pdf_filename(safe_filename, content_type)
+    return {
+        "filename": safe_filename,
+        "file_path": str(stored_path),
+        "content_type": content_type or ("application/pdf" if is_pdf else "application/octet-stream"),
+        "is_pdf": is_pdf,
+        "parsed_data": attachment_parsed,
+        "fields_found": _field_count(attachment_parsed),
+        "text_preview": attachment_text[:1800],
+        "parse_error": parse_error,
+        "size_bytes": len(content or b""),
+        "imported_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def _save_operations_pdf_attachment(
@@ -1905,37 +2271,24 @@ def _save_operations_pdf_attachment(
     message_id: str,
     attachment_index: int,
 ) -> dict:
-    safe_message = _safe_storage_name(message_id, "operations_email")[:90]
-    safe_filename = _safe_storage_name(filename, f"attachment_{attachment_index}.pdf")
-    stored_path = _operations_pdf_storage_dir() / f"{safe_message}_{attachment_index}_{safe_filename}"
-    stored_path.write_bytes(content or b"")
-
-    try:
-        pdf_text, pdf_parsed = _parse_operations_pdf_bytes(content or b"", safe_filename)
-        parse_error = ""
-    except Exception as exc:
-        pdf_text = ""
-        pdf_parsed = {}
-        parse_error = str(exc)
-
-    return {
-        "filename": safe_filename,
-        "file_path": str(stored_path),
-        "content_type": "application/pdf",
-        "parsed_data": pdf_parsed,
-        "fields_found": _field_count(pdf_parsed),
-        "text_preview": pdf_text[:1800],
-        "parse_error": parse_error,
-        "imported_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    return _save_operations_attachment(
+        content=content,
+        filename=filename,
+        message_id=message_id,
+        attachment_index=attachment_index,
+        content_type="application/pdf",
+    )
 
 
-def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
-    attachments = parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, [])
+def _extract_operations_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
+    attachments = parsed.get(OPERATIONS_ATTACHMENTS_KEY, [])
     if not isinstance(attachments, list):
         attachments = []
 
     normalized = [item for item in attachments if isinstance(item, dict)]
+    for pdf_item in parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, []) or []:
+        if isinstance(pdf_item, dict) and not any(_safe_str(item.get("file_path", "")) == _safe_str(pdf_item.get("file_path", "")) for item in normalized):
+            normalized.append(pdf_item)
 
     if record is not None:
         filename = _safe_str(record.get("filename", "") if hasattr(record, "get") else "")
@@ -1945,7 +2298,8 @@ def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series |
                 {
                     "filename": filename,
                     "file_path": file_path,
-                    "content_type": "application/pdf",
+                    "content_type": "application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream",
+                    "is_pdf": filename.lower().endswith(".pdf"),
                     "parsed_data": {},
                     "fields_found": 0,
                     "text_preview": "",
@@ -1954,6 +2308,14 @@ def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series |
             )
 
     return normalized
+
+
+def _extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
+    return [
+        item
+        for item in _extract_operations_attachments(parsed, record)
+        if _is_pdf_filename(item.get("filename", ""), item.get("content_type", "")) or bool(item.get("is_pdf"))
+    ]
 
 
 def _merge_operations_order_fields(body_parsed: dict, pdf_parsed: dict) -> tuple[dict, list[dict], list[str]]:
@@ -1979,13 +2341,41 @@ def _merge_operations_order_fields(body_parsed: dict, pdf_parsed: dict) -> tuple
             {
                 "Field": field,
                 "Email Body": body_value,
-                "PDF": pdf_value,
+                "Document": pdf_value,
                 "Final Value": final_value,
                 "Status": status,
             }
         )
 
     return final_data, rows, conflicts
+
+
+def _merge_operations_body_parsed_fields(current: dict, reparsed: dict) -> tuple[dict, bool]:
+    updated = dict(current or {})
+    changed = False
+
+    for field in OPERATIONS_ORDER_FIELDS:
+        existing_value = _safe_str(updated.get(field, ""))
+        incoming_value = _safe_str((reparsed or {}).get(field, ""))
+        if not incoming_value:
+            continue
+
+        should_replace = not existing_value
+        if field == "Container Number" and incoming_value and existing_value.upper() != incoming_value.upper():
+            incoming_notes = _safe_str((reparsed or {}).get("Dispatcher Notes", ""))
+            should_replace = "container correction noted" in incoming_notes.lower()
+
+        if should_replace:
+            updated[field] = incoming_value
+            changed = True
+
+    current_notes = _safe_str(updated.get("Dispatcher Notes", ""))
+    incoming_notes = _safe_str((reparsed or {}).get("Dispatcher Notes", ""))
+    if incoming_notes and incoming_notes.lower() not in current_notes.lower():
+        updated["Dispatcher Notes"] = f"{current_notes}; {incoming_notes}".strip("; ").strip()
+        changed = True
+
+    return updated, changed
 
 
 def _store_operations_parsed_data(intake_id: int, parsed_data: dict, action_required: str | None = None) -> None:
@@ -2013,9 +2403,13 @@ def _read_operations_pdf_file(file_path: str, modified_ns: int) -> bytes:
     return Path(file_path).read_bytes()
 
 
-def _read_operations_pdf_bytes(file_path: str) -> bytes:
+def _read_operations_attachment_bytes(file_path: str) -> bytes:
     path = Path(file_path)
     return _read_operations_pdf_file(str(path), path.stat().st_mtime_ns)
+
+
+def _read_operations_pdf_bytes(file_path: str) -> bytes:
+    return _read_operations_attachment_bytes(file_path)
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -2027,6 +2421,17 @@ def _parse_operations_pdf_file(file_path: str, filename: str, modified_ns: int) 
 def _parse_saved_operations_pdf(file_path: str, filename: str) -> tuple[str, dict]:
     path = Path(file_path)
     return _parse_operations_pdf_file(str(path), filename, path.stat().st_mtime_ns)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _parse_operations_attachment_file(file_path: str, filename: str, content_type: str, modified_ns: int) -> tuple[str, dict]:
+    content = Path(file_path).read_bytes()
+    return _parse_operations_attachment_bytes(content, filename, content_type)
+
+
+def _parse_saved_operations_attachment(file_path: str, filename: str, content_type: str = "") -> tuple[str, dict]:
+    path = Path(file_path)
+    return _parse_operations_attachment_file(str(path), filename, content_type, path.stat().st_mtime_ns)
 
 
 def _extract_email_address(value: str) -> str:
@@ -2234,6 +2639,19 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
                 when oi.filename is not null and oi.filename <> '' then 1
                 else 0
             end as pdf_count,
+            case
+                when jsonb_typeof(oi.parsed_data -> :attachments_key) = 'array'
+                    then jsonb_array_length(oi.parsed_data -> :attachments_key)
+                when jsonb_typeof(oi.parsed_data -> :pdf_attachments_key) = 'array'
+                    then jsonb_array_length(oi.parsed_data -> :pdf_attachments_key)
+                when oi.filename is not null and oi.filename <> '' then 1
+                else 0
+            end as attachment_count,
+            case
+                when coalesce(oi.parsed_data #>> '{{_email_sync,source_attachment_count}}', '') ~ '^[0-9]+$'
+                    then (oi.parsed_data #>> '{{_email_sync,source_attachment_count}}')::int
+                else 0
+            end as source_attachment_count,
             oi.intake_status,
             oi.request_type,
             oi.conversation_key,
@@ -2243,11 +2661,17 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
             oc.status as case_status,
             oc.owner as case_owner,
             oc.priority as case_priority,
+            oc.customer as case_customer,
             oc.linked_load_id as case_linked_load_id,
             oc.next_action as case_next_action,
             oc.sla_status as case_sla_status,
+            oc.message_count as case_message_count,
+            oc.last_message_at as case_last_message_at,
+            oc.last_message_direction as case_last_message_direction,
             oc.first_response_due_at as case_first_response_due_at,
             oc.resolution_due_at as case_resolution_due_at,
+            oc.customer_wait_started_at as case_customer_wait_started_at,
+            oc.department_wait_started_at as case_department_wait_started_at,
             oi.confidence_score,
             oi.action_required,
             oi.review_status
@@ -2259,7 +2683,10 @@ def _load_operations_inbox_df(where_clause: str) -> pd.DataFrame:
         left join operations_cases oc on oc.id = oi.case_id
         order by oi.created_at desc
         """,
-        {"pdf_attachments_key": OPERATIONS_PDF_ATTACHMENTS_KEY},
+        {
+            "pdf_attachments_key": OPERATIONS_PDF_ATTACHMENTS_KEY,
+            "attachments_key": OPERATIONS_ATTACHMENTS_KEY,
+        },
     )
 
 
@@ -2295,11 +2722,17 @@ def _load_operations_inbox_record(intake_id: int) -> pd.DataFrame:
             oc.status as case_status,
             oc.owner as case_owner,
             oc.priority as case_priority,
+            oc.customer as case_customer,
             oc.linked_load_id as case_linked_load_id,
             oc.next_action as case_next_action,
             oc.sla_status as case_sla_status,
+            oc.message_count as case_message_count,
+            oc.last_message_at as case_last_message_at,
+            oc.last_message_direction as case_last_message_direction,
             oc.first_response_due_at as case_first_response_due_at,
             oc.resolution_due_at as case_resolution_due_at,
+            oc.customer_wait_started_at as case_customer_wait_started_at,
+            oc.department_wait_started_at as case_department_wait_started_at,
             oi.confidence_score,
             oi.action_required,
             oi.review_status
@@ -2343,6 +2776,12 @@ def _operations_items_needing_smart_group_update(inbox_df: pd.DataFrame) -> pd.S
     current_type = inbox_df["request_type"].fillna("").astype(str).str.strip()
     confidence = pd.to_numeric(inbox_df["confidence_score"], errors="coerce").fillna(0)
     has_match = inbox_df["matched_load_id"].notna() & ~inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
+    subject_series = inbox_df["source_subject"].fillna("").astype(str) if "source_subject" in inbox_df.columns else pd.Series("", index=inbox_df.index)
+    body_series = inbox_df["raw_text"].fillna("").astype(str) if "raw_text" in inbox_df.columns else pd.Series("", index=inbox_df.index)
+    message_series = subject_series + "\n" + body_series
+    obvious_info_new_booking = current_type.eq("New Booking") & message_series.apply(
+        lambda value: _is_information_update(value) and not _has_order_placement_signal(value)
+    )
 
     action_type_needs_reference = current_type.isin([
         "New Booking",
@@ -2356,7 +2795,7 @@ def _operations_items_needing_smart_group_update(inbox_df: pd.DataFrame) -> pd.S
         "Port Issue",
     ]) & ~has_match & confidence.lt(70)
 
-    return current_type.isin(["", "Needs Classification", "Other"]) | action_type_needs_reference
+    return current_type.isin(["", "Needs Classification", "Other", "Spam/Marketing"]) | action_type_needs_reference | obvious_info_new_booking
 
 
 @st.cache_data(show_spinner=False, ttl=30)
@@ -2411,6 +2850,9 @@ def _load_operations_conversation_timeline(conversation_key: str) -> pd.DataFram
                 coalesce(source_subject, '') as source_subject,
                 coalesce(source_message_id, '') as source_message_id,
                 coalesce(email_thread_id, '') as email_thread_id,
+                coalesce(conversation_key, '') as conversation_key,
+                matched_load_id,
+                parsed_data,
                 coalesce(conversation_status, 'New Conversation') as conversation_status,
                 coalesce(review_status, 'Open') as review_status,
                 left(coalesce(raw_text, ''), 1200) as message_preview
@@ -2423,6 +2865,69 @@ def _load_operations_conversation_timeline(conversation_key: str) -> pd.DataFram
         )
     except Exception:
         return pd.DataFrame()
+
+
+def _timeline_filter_tokens(record, tokens: dict, subject: str, body: str) -> set[str]:
+    parsed = _coerce_json_dict(record.get("parsed_data") if hasattr(record, "get") else {})
+    candidates = [
+        tokens.get("booking_number", ""),
+        tokens.get("container_number", ""),
+        tokens.get("reference_number", ""),
+        parsed.get("Booking Number", ""),
+        parsed.get("Container Number", ""),
+        parsed.get("Reference Number", ""),
+        record.get("matched_load_id", "") if hasattr(record, "get") else "",
+    ]
+    text_tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    candidates.extend([text_tokens.get("booking_number", ""), text_tokens.get("container_number", ""), text_tokens.get("reference_number", "")])
+    return {_safe_str(value).upper() for value in candidates if len(_safe_str(value)) >= 4}
+
+
+def _filter_operations_timeline_for_record(
+    timeline_df: pd.DataFrame,
+    record,
+    tokens: dict,
+    subject: str,
+    body: str,
+) -> pd.DataFrame:
+    if timeline_df.empty:
+        return timeline_df
+
+    selected_id = _int_or_none(record.get("id") if hasattr(record, "get") else None)
+    selected_thread = _safe_str(record.get("email_thread_id", "") if hasattr(record, "get") else "")
+    selected_message_id = _safe_str(record.get("source_message_id", "") if hasattr(record, "get") else "")
+    token_values = _timeline_filter_tokens(record, tokens, subject, body)
+    if not token_values:
+        return timeline_df
+
+    def row_matches(row) -> bool:
+        row_id = _int_or_none(row.get("id"))
+        if selected_id is not None and row_id == selected_id:
+            return True
+        if selected_message_id and _safe_str(row.get("source_message_id", "")) == selected_message_id:
+            return True
+
+        haystack = " ".join(
+            [
+                _safe_str(row.get("source_subject", "")),
+                _safe_str(row.get("message_preview", "")),
+                _safe_str(row.get("conversation_key", "")),
+                _safe_str(row.get("parsed_data", "")),
+                _safe_str(row.get("matched_load_id", "")),
+            ]
+        ).upper()
+        if any(value and value in haystack for value in token_values):
+            return True
+
+        if selected_thread and _safe_str(row.get("email_thread_id", "")) == selected_thread:
+            row_tokens = _extract_reference_tokens(haystack)
+            row_token_values = {_safe_str(value).upper() for value in row_tokens.values() if _safe_str(value)}
+            return bool(token_values & row_token_values)
+
+        return False
+
+    filtered = timeline_df[timeline_df.apply(row_matches, axis=1)].copy()
+    return filtered if not filtered.empty else timeline_df
 
 
 def _conversation_context_from_lookup(lookup: dict, metadata: dict) -> dict:
@@ -2519,26 +3024,47 @@ def _case_customer_from_sender(sender: str) -> str:
 
 
 def _default_operations_case_owner(request_type: str) -> str:
-    if request_type in {"New Booking", "Booking Update", "Appointment Update"}:
+    if request_type in {"New Booking", "Booking Update", "Appointment Update", "Quote Request"}:
         return "Dispatch"
-    if request_type in {"POD Request", "Billing"}:
+    if request_type == "Billing":
         return "Billing"
-    if request_type in {"Cancellation", "Driver Issue", "Port Issue"}:
-        return "Manager"
+    if request_type == "Driver Issue":
+        return "Driver"
+    if request_type == "Port Issue":
+        return "Port"
+    if request_type in {"Cancellation", "POD Request"}:
+        return "Operations"
     if request_type == "Spam/Marketing":
-        return "Customer Service"
+        return "Operations"
     if request_type in {"Quote Request", "Missing Information", "Customer Request"}:
-        return "Customer Service"
+        return "Customer"
     return "Unassigned"
 
 
 def _operations_case_priority_from_text(subject: str, body: str, request_type: str) -> str:
     text = f"{subject or ''} {body or ''}".lower()
-    if any(term in text for term in ["urgent", "asap", "rush", "critical", "lfd", "last free day"]):
-        return "Urgent"
-    if request_type in {"Cancellation", "POD Request", "Driver Issue", "Port Issue"}:
+    critical_terms = [
+        "urgent",
+        "asap",
+        "critical",
+        "last free day today",
+        "lfd today",
+        "driver stuck",
+        "driver waiting",
+        "truck down",
+        "no show",
+        "gate closed",
+        "hold",
+    ]
+    if any(term in text for term in critical_terms):
+        return "Critical"
+    if any(term in text for term in ["rush", "last free day", "lfd", "cutoff", "appointment today", "same day"]):
         return "High"
-    return "Normal"
+    if request_type in {"Cancellation", "Driver Issue", "Port Issue"}:
+        return "High"
+    if request_type in {"Billing", "Spam/Marketing"}:
+        return "Low"
+    return "Medium"
 
 
 def _operations_case_status_for_message(direction: str, current_status: str = "", is_new: bool = False) -> str:
@@ -2612,6 +3138,178 @@ def _load_operations_case_by_conversation(conversation_key: str) -> dict:
     except Exception:
         return {}
     return case_df.iloc[0].to_dict() if not case_df.empty else {}
+
+
+def _normalize_case_subject(subject: str) -> str:
+    text = _safe_str(subject).lower()
+    text = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _case_identity_values(
+    *,
+    conversation_key: str = "",
+    subject: str = "",
+    sender: str = "",
+    body: str = "",
+    parsed: dict | None = None,
+    matched_load_id=None,
+) -> dict:
+    parsed = parsed if isinstance(parsed, dict) else {}
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    identifiers = {
+        _safe_str(tokens.get("booking_number", "")),
+        _safe_str(tokens.get("container_number", "")),
+        _safe_str(tokens.get("reference_number", "")),
+        _safe_str(parsed.get("Booking Number", "")),
+        _safe_str(parsed.get("Container Number", "")),
+        _safe_str(parsed.get("Reference Number", "")),
+    }
+    identifiers = {value.upper() for value in identifiers if len(_safe_str(value)) >= 4}
+    sender_domain = _feedback_sender_domain(sender)
+    subject_key = _normalize_case_subject(subject)
+    return {
+        "conversation_key": _safe_str(conversation_key),
+        "subject_key": subject_key,
+        "sender_domain": sender_domain,
+        "identifiers": identifiers,
+        "matched_load_id": _int_or_none(matched_load_id),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_case_match_context(limit: int = 1000) -> pd.DataFrame:
+    try:
+        return read_df(
+            """
+            select
+                oc.id,
+                oc.case_number,
+                oc.conversation_key,
+                oc.status,
+                oc.owner,
+                oc.priority,
+                oc.customer,
+                oc.source_subject,
+                oc.request_type,
+                oc.linked_load_id,
+                oc.updated_at,
+                lower(coalesce(oc.source_subject, '')) as case_subject_key,
+                string_agg(distinct lower(coalesce(oi.conversation_key, '')), ' ') as intake_conversation_keys,
+                string_agg(distinct lower(coalesce(oi.email_thread_id, '')), ' ') as intake_thread_ids,
+                string_agg(distinct lower(coalesce(oi.email_normalized_subject, '')), ' ') as intake_subject_keys,
+                string_agg(distinct lower(coalesce(oi.source_subject, '')), ' ') as intake_subjects,
+                string_agg(distinct lower(coalesce(oi.source_sender, '')), ' ') as intake_senders,
+                string_agg(
+                    distinct upper(
+                        concat_ws(
+                            ' ',
+                            coalesce(oi.conversation_key, ''),
+                            coalesce(oi.source_subject, ''),
+                            coalesce(left(oi.raw_text, 900), ''),
+                            coalesce(oi.parsed_data #>> '{Booking Number}', ''),
+                            coalesce(oi.parsed_data #>> '{Container Number}', ''),
+                            coalesce(oi.parsed_data #>> '{Reference Number}', ''),
+                            coalesce(oi.matched_load_id::text, '')
+                        )
+                    ),
+                    ' '
+                ) as identity_blob
+            from operations_cases oc
+            left join order_intake oi on oi.case_id = oc.id
+            where coalesce(oc.status, 'New') <> 'Closed'
+            group by oc.id
+            order by oc.updated_at desc, oc.id desc
+            limit :limit
+            """,
+            {"limit": int(limit)},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def _score_operations_case_identity(case_row: dict, identity: dict) -> int:
+    score = 0
+    matched_load_id = identity.get("matched_load_id")
+    case_load_id = _int_or_none(case_row.get("linked_load_id"))
+    if matched_load_id is not None and case_load_id == matched_load_id:
+        score += 110
+
+    conversation_key = _safe_str(identity.get("conversation_key", "")).lower()
+    if conversation_key:
+        case_conversation = _safe_str(case_row.get("conversation_key", "")).lower()
+        intake_keys = _safe_str(case_row.get("intake_conversation_keys", "")).lower()
+        intake_threads = _safe_str(case_row.get("intake_thread_ids", "")).lower()
+        if conversation_key == case_conversation:
+            score += 100
+        elif conversation_key in intake_keys or conversation_key in intake_threads:
+            score += 90
+
+    identity_blob = _safe_str(case_row.get("identity_blob", "")).upper()
+    identifiers = identity.get("identifiers") or set()
+    identifier_matches = [value for value in identifiers if value and value in identity_blob]
+    if identifier_matches:
+        score += 70 + (10 * min(2, len(identifier_matches) - 1))
+
+    subject_key = _safe_str(identity.get("subject_key", "")).lower()
+    if len(subject_key) >= 8:
+        case_subject_key = _safe_str(case_row.get("case_subject_key", "")).lower()
+        intake_subject_keys = _safe_str(case_row.get("intake_subject_keys", "")).lower()
+        intake_subjects = _safe_str(case_row.get("intake_subjects", "")).lower()
+        if subject_key == case_subject_key or subject_key in intake_subject_keys:
+            score += 45
+        elif subject_key in intake_subjects:
+            score += 30
+
+    sender_domain = _safe_str(identity.get("sender_domain", "")).lower()
+    if sender_domain and sender_domain in _safe_str(case_row.get("intake_senders", "")).lower():
+        score += 15
+
+    return score
+
+
+def _find_existing_operations_case_for_message(
+    *,
+    conversation_key: str,
+    subject: str,
+    sender: str,
+    request_type: str,
+    matched_load_id=None,
+    body: str = "",
+    parsed: dict | None = None,
+) -> dict:
+    identity = _case_identity_values(
+        conversation_key=conversation_key,
+        subject=subject,
+        sender=sender,
+        body=body,
+        parsed=parsed,
+        matched_load_id=matched_load_id,
+    )
+
+    exact_case = _load_operations_case_by_conversation(identity["conversation_key"])
+
+    context_df = _load_operations_case_match_context()
+    if context_df.empty:
+        return exact_case or {}
+
+    scored_cases = []
+    for _, row in context_df.iterrows():
+        row_dict = row.to_dict()
+        score = _score_operations_case_identity(row_dict, identity)
+        if score:
+            scored_cases.append((score, row_dict))
+
+    if not scored_cases:
+        return exact_case or {}
+
+    scored_cases.sort(key=lambda item: (item[0], _safe_str(item[1].get("updated_at", ""))), reverse=True)
+    best_score, best_case = scored_cases[0]
+    if best_score >= 70 or (best_score >= 60 and request_type in {"Booking Update", "Appointment Update", "Customer Request"}):
+        return _load_operations_case_by_id(best_case.get("id"))
+
+    return exact_case or {}
 
 
 def _log_operations_case_event(
@@ -2784,7 +3482,20 @@ def _get_or_create_operations_case(
 ) -> dict:
     _ensure_operations_case_schema()
     conversation_key = _safe_str(conversation_key)
-    existing_case = _load_operations_case_by_conversation(conversation_key)
+    parsed_for_identity = {}
+    try:
+        parsed_for_identity = parse_email_text(subject, body)
+    except Exception:
+        parsed_for_identity = {}
+    existing_case = _find_existing_operations_case_for_message(
+        conversation_key=conversation_key,
+        subject=subject,
+        sender=sender,
+        request_type=request_type,
+        matched_load_id=matched_load_id,
+        body=body,
+        parsed=parsed_for_identity,
+    )
     linked_load_id = _int_or_none(matched_load_id)
     status = _operations_case_status_for_message(direction, existing_case.get("status", ""), is_new=not existing_case)
     priority = _operations_case_priority_from_text(subject, body, request_type)
@@ -2801,8 +3512,10 @@ def _get_or_create_operations_case(
                 end,
                 priority = case
                     when :priority_rank > case
+                        when priority = 'Critical' then 5
                         when priority = 'Urgent' then 4
                         when priority = 'High' then 3
+                        when priority = 'Medium' then 2
                         when priority = 'Normal' then 2
                         else 1
                     end then :priority
@@ -2837,7 +3550,7 @@ def _get_or_create_operations_case(
                 "status": status,
                 "owner": _default_operations_case_owner(request_type),
                 "priority": priority,
-                "priority_rank": {"Urgent": 4, "High": 3, "Normal": 2, "Low": 1}.get(priority, 2),
+                "priority_rank": {"Critical": 5, "Urgent": 5, "High": 4, "Medium": 3, "Normal": 3, "Low": 1}.get(priority, 3),
                 "customer": _case_customer_from_sender(sender),
                 "source_subject": subject or None,
                 "request_type": request_type or None,
@@ -3230,9 +3943,20 @@ def _load_operations_case_timeline(case_id) -> pd.DataFrame:
             from (
                 select
                     coalesce(source_received_at, created_at) as event_at,
-                    'Email' as event_type,
-                    coalesce(email_direction, 'inbound') as actor,
-                    coalesce(source_subject, '') as title,
+                    case
+                        when coalesce(email_direction, 'inbound') = 'outbound'
+                            then 'Reply Sent'
+                        else 'Customer Email'
+                    end as event_type,
+                    coalesce(nullif(source_sender, ''), coalesce(email_direction, 'inbound')) as actor,
+                    case
+                        when coalesce(email_direction, 'inbound') = 'outbound'
+                             and lower(coalesce(email_mailbox, '')) = 'tms'
+                            then 'Reply sent from TMS'
+                        when coalesce(email_direction, 'inbound') = 'outbound'
+                            then 'Reply synced from email'
+                        else coalesce(source_subject, 'Customer email')
+                    end as title,
                     left(coalesce(raw_text, ''), 1200) as details
                 from order_intake
                 where case_id = :case_id
@@ -3708,14 +4432,33 @@ def _operations_email_already_imported(message_id: str, subject: str, sender: st
     return _find_existing_operations_email_record(message_id, subject, sender, received_at) is not None
 
 
-def _backfill_operations_pdf_attachments(
+def _merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict]) -> dict:
+    updated = dict(parsed)
+    for attachment in saved_attachments:
+        attachment_parsed = attachment.get("parsed_data") or {}
+        for field in OPERATIONS_ORDER_FIELDS:
+            if _safe_str(attachment_parsed.get(field, "")) and not _safe_str(updated.get(field, "")):
+                updated[field] = _safe_str(attachment_parsed.get(field, ""))
+    if saved_attachments:
+        updated[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
+        pdf_attachments = [
+            item
+            for item in saved_attachments
+            if _is_pdf_filename(item.get("filename", ""), item.get("content_type", "")) or bool(item.get("is_pdf"))
+        ]
+        if pdf_attachments:
+            updated[OPERATIONS_PDF_ATTACHMENTS_KEY] = pdf_attachments
+    return updated
+
+
+def _backfill_operations_email_attachments(
     *,
     existing_record: dict,
     email_item: dict,
     message_id: str,
 ) -> int:
     parsed = _coerce_json_dict(existing_record.get("parsed_data"))
-    existing_attachments = _extract_operations_pdf_attachments(parsed, existing_record)
+    existing_attachments = _extract_operations_attachments(parsed, existing_record)
     existing_names = {_safe_str(item.get("filename", "")).lower() for item in existing_attachments}
     existing_paths = {_safe_str(item.get("file_path", "")) for item in existing_attachments}
 
@@ -3723,16 +4466,18 @@ def _backfill_operations_pdf_attachments(
     for attachment_index, attachment in enumerate(email_item.get("attachments", []) or [], start=1):
         filename = _safe_str(attachment.get("filename", ""))
         content = attachment.get("content") or b""
-        if not filename.lower().endswith(".pdf") or not content:
+        content_type = _safe_str(attachment.get("content_type", ""))
+        if not filename or not content:
             continue
         if filename.lower() in existing_names:
             continue
 
-        saved = _save_operations_pdf_attachment(
+        saved = _save_operations_attachment(
             content=content,
             filename=filename,
             message_id=message_id or f"intake-{existing_record.get('id')}",
             attachment_index=len(existing_attachments) + len(new_attachments) + attachment_index,
+            content_type=content_type,
         )
         if _safe_str(saved.get("file_path", "")) in existing_paths:
             continue
@@ -3742,15 +4487,12 @@ def _backfill_operations_pdf_attachments(
         return 0
 
     merged_attachments = existing_attachments + new_attachments
-    updated_parsed = dict(parsed)
-    for attachment in new_attachments:
-        pdf_parsed = attachment.get("parsed_data") or {}
-        for field in OPERATIONS_ORDER_FIELDS:
-            if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(updated_parsed.get(field, "")):
-                updated_parsed[field] = _safe_str(pdf_parsed.get(field, ""))
-    updated_parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = merged_attachments
+    updated_parsed = _merge_saved_attachment_fields(parsed, merged_attachments)
 
-    primary = merged_attachments[0]
+    primary = next(
+        (item for item in merged_attachments if _is_pdf_filename(item.get("filename", ""), item.get("content_type", ""))),
+        merged_attachments[0],
+    )
     execute(
         """
         update order_intake
@@ -3773,6 +4515,369 @@ def _backfill_operations_pdf_attachments(
     )
 
     return len(new_attachments)
+
+
+def _backfill_operations_pdf_attachments(*, existing_record: dict, email_item: dict, message_id: str) -> int:
+    return _backfill_operations_email_attachments(
+        existing_record=existing_record,
+        email_item=email_item,
+        message_id=message_id,
+    )
+
+
+def _email_subject_match_key(value: str) -> str:
+    text = _safe_str(value).lower()
+    while True:
+        cleaned = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", text, flags=re.I)
+        if cleaned == text:
+            break
+        text = cleaned
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _email_body_match_key(value: str) -> str:
+    text = re.sub(r"\s+", " ", _safe_str(value).lower()).strip()
+    return text[:240]
+
+
+def _email_item_matches_operations_record(item: dict, record: dict) -> bool:
+    item_message_id = _safe_str(item.get("message_id") or item.get("id", ""))
+    record_message_id = _safe_str(record.get("source_message_id", ""))
+    if item_message_id and record_message_id and item_message_id == record_message_id:
+        return True
+
+    item_subject = _email_subject_match_key(item.get("subject", ""))
+    record_subject = _email_subject_match_key(record.get("source_subject", ""))
+    if not item_subject or item_subject != record_subject:
+        return False
+
+    item_sender = _extract_email_address(item.get("from", "")).lower()
+    record_sender = _extract_email_address(record.get("source_sender", "")).lower()
+    if item_sender and record_sender and item_sender != record_sender:
+        return False
+
+    item_received = _email_received_lookup_key(item.get("received_at"))
+    record_received = _email_received_lookup_key(record.get("source_received_at"))
+    if item_received and record_received and item_received == record_received:
+        return True
+
+    item_body = _email_body_match_key(item.get("body", ""))
+    record_body = _email_body_match_key(record.get("raw_text", ""))
+    return bool(item_body and record_body and (item_body in record_body or record_body in item_body))
+
+
+def _message_mentions_attachment(subject: str, body: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(attached|attachment|attachments|adjunto|adjuntos|pdf|doc(?:ument)?|delivery order|packing list|imo|bol)\b",
+            f"{subject or ''}\n{body or ''}",
+            re.I,
+        )
+    )
+
+
+def _operations_attachment_status_for_row(row) -> str:
+    saved_count = int(float(row.get("attachment_count", 0) or 0)) if hasattr(row, "get") else 0
+    source_count = int(float(row.get("source_attachment_count", 0) or 0)) if hasattr(row, "get") else 0
+    subject = _safe_str(row.get("source_subject", "") if hasattr(row, "get") else "")
+    preview = _safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else "")
+    if saved_count > 0:
+        return f"Saved {saved_count}"
+    if source_count > 0:
+        return f"Mailbox {source_count}"
+    if _message_mentions_attachment(subject, preview):
+        return "Mentioned"
+    return "None"
+
+
+def _effective_operations_request_type_for_row(row) -> str:
+    saved_type = _safe_str(row.get("request_type", "") if hasattr(row, "get") else "") or "Needs Classification"
+    if saved_type != "New Booking":
+        return saved_type
+
+    subject = _safe_str(row.get("source_subject", "") if hasattr(row, "get") else "")
+    body = _safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else "") or _safe_str(
+        row.get("raw_text", "") if hasattr(row, "get") else ""
+    )
+    text = f"{subject}\n{body}"
+    parsed = _coerce_json_dict(row.get("parsed_data") if hasattr(row, "get") else {})
+    tokens = _extract_reference_tokens(f"{text}\n{parsed}")
+    has_reference = _has_reference_details(tokens, parsed)
+
+    if _is_information_update(text) and not _has_order_placement_signal(text):
+        return "Booking Update" if has_reference else "Customer Request"
+
+    if _subject_is_reply(subject) and not _has_new_order_details(text, parsed, tokens):
+        return "Booking Update" if has_reference else "Customer Request"
+
+    return saved_type
+
+
+def _operations_has_matched_load(row) -> bool:
+    value = row.get("matched_load_id", "") if hasattr(row, "get") else ""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    return _safe_str(value).lower() not in {"", "nan", "none", "null"}
+
+
+def _operations_row_text(row) -> str:
+    if not hasattr(row, "get"):
+        return ""
+    return "\n".join(
+        [
+            _safe_str(row.get("source_subject", "")),
+            _safe_str(row.get("raw_text_preview", "")),
+            _safe_str(row.get("raw_text", "")),
+            _safe_str(row.get("action_required", "")),
+        ]
+    )
+
+
+def _normalize_operations_owner(value: str) -> str:
+    owner = _safe_str(value)
+    if owner == "Customer Service":
+        return "Customer"
+    if owner == "Manager":
+        return "Operations"
+    return owner
+
+
+def _operations_owner_label_for_row(row) -> str:
+    saved_owner = _normalize_operations_owner(row.get("case_owner", "") if hasattr(row, "get") else "")
+    if saved_owner and saved_owner != "Unassigned":
+        return saved_owner
+
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    text = _operations_row_text(row).lower()
+    if request_type == "Billing" or any(term in text for term in ["invoice", "billing", "detention", "demurrage", "rate"]):
+        return "Billing"
+    if request_type == "Driver Issue" or any(term in text for term in ["driver", "truck", "chassis"]):
+        return "Driver"
+    if request_type == "Port Issue" or any(term in text for term in ["port", "terminal", "gate", "steamship"]):
+        return "Port"
+    if request_type in {"Customer Request", "Missing Information"}:
+        return "Customer"
+    if request_type == "Spam/Marketing":
+        return "Operations"
+    if request_type in {"Cancellation", "POD Request"}:
+        return "Operations"
+    return "Dispatch"
+
+
+def _operations_priority_label_for_row(row) -> str:
+    saved_priority = _safe_str(row.get("case_priority", "") if hasattr(row, "get") else "")
+    priority_map = {
+        "Urgent": "Critical",
+        "Normal": "Medium",
+        "Critical": "Critical",
+        "High": "High",
+        "Medium": "Medium",
+        "Low": "Low",
+    }
+    if saved_priority in priority_map:
+        return priority_map[saved_priority]
+
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    text = _operations_row_text(row).lower()
+    critical_terms = [
+        "urgent",
+        "asap",
+        "critical",
+        "lfd today",
+        "last free day today",
+        "driver waiting",
+        "driver stuck",
+        "no show",
+        "gate closed",
+        "truck down",
+    ]
+    high_terms = [
+        "lfd",
+        "last free day",
+        "cutoff",
+        "appointment today",
+        "same day",
+        "hold",
+        "released",
+        "available now",
+        "cancel",
+    ]
+    if any(term in text for term in critical_terms):
+        return "Critical"
+    if any(term in text for term in high_terms) or request_type in {"Cancellation", "Driver Issue", "Port Issue"}:
+        return "High"
+    if request_type in {"Billing", "Spam/Marketing"}:
+        return "Low"
+    return "Medium"
+
+
+def _operations_status_label_for_row(row) -> str:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    action_required = _safe_str(row.get("action_required", "") if hasattr(row, "get") else "")
+    confidence = int(float(row.get("confidence_score", 0) or 0)) if hasattr(row, "get") else 0
+    has_match = _operations_has_matched_load(row)
+    review_status = _safe_str(row.get("review_status_clean", "") if hasattr(row, "get") else "")
+    case_status = _safe_str(row.get("case_status", "") if hasattr(row, "get") else "")
+
+    if request_type == "Missing Information" or "missing" in action_required.lower():
+        return "Needs Details"
+    if (
+        not has_match
+        and confidence < 70
+        and request_type in {
+            "New Booking",
+            "Booking Update",
+            "Appointment Update",
+            "Quote Request",
+            "Cancellation",
+            "POD Request",
+            "Billing",
+            "Driver Issue",
+            "Port Issue",
+        }
+    ):
+        return "Needs Details"
+    if case_status:
+        return case_status
+    if review_status in {"Waiting on Customer", "Waiting Customer"}:
+        return "Waiting Customer"
+    if review_status:
+        return review_status
+    return "Open"
+
+
+def _operations_document_signal_for_row(row) -> bool:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    if request_type == "POD Request":
+        return True
+    text = _operations_row_text(row).lower()
+    document_terms = [
+        "pod",
+        "proof of delivery",
+        "delivery order",
+        "bill of lading",
+        "bol",
+        "packing list",
+        "hazmat",
+        "imo",
+        "document",
+        "documents attached",
+        "attachment contains",
+    ]
+    if any(term in text for term in document_terms):
+        return True
+    attachment_status = _safe_str(row.get("attachment_status", "") if hasattr(row, "get") else "")
+    return attachment_status.startswith(("Saved", "Mailbox")) and request_type not in {"New Booking", "Quote Request"}
+
+
+def _operations_work_queue_for_row(row) -> str:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    status_label = _safe_str(row.get("status_label", "") if hasattr(row, "get") else "")
+    review_status = _safe_str(row.get("review_status_clean", "") if hasattr(row, "get") else "")
+    confidence = int(float(row.get("confidence_score", 0) or 0)) if hasattr(row, "get") else 0
+    has_match = _operations_has_matched_load(row)
+
+    if request_type == "Spam/Marketing":
+        return "Review"
+    if status_label.startswith("Waiting") or review_status in {"Waiting on Customer", "Waiting Customer"}:
+        return "Waiting"
+    if request_type == "Billing" or _operations_owner_label_for_row(row) == "Billing":
+        return "Billing"
+    if request_type in {"Needs Classification", "Other", ""} or confidence < 50:
+        return "Review"
+    if _operations_document_signal_for_row(row):
+        return "Documents"
+    if request_type in {"New Booking", "Quote Request"}:
+        return "New Orders"
+    if has_match or request_type in {
+        "Booking Update",
+        "Appointment Update",
+        "Cancellation",
+        "Driver Issue",
+        "Port Issue",
+    }:
+        return "Existing Loads"
+    if request_type in {"Customer Request", "Missing Information"}:
+        return "Action Required"
+    return "Action Required"
+
+
+def _collapse_operations_inbox_to_cases(inbox_df: pd.DataFrame) -> pd.DataFrame:
+    if inbox_df.empty:
+        return inbox_df
+
+    collapsed = inbox_df.copy()
+    collapsed["case_row_key"] = collapsed.apply(
+        lambda row: f"case-{int(float(row.get('case_id')))}"
+        if _int_or_none(row.get("case_id")) is not None
+        else f"intake-{int(row.get('id'))}",
+        axis=1,
+    )
+    collapsed["_case_sort_time"] = pd.to_datetime(
+        collapsed.get("case_last_message_at", collapsed.get("source_received_at")),
+        errors="coerce",
+    )
+    fallback_sort_time = pd.to_datetime(collapsed.get("source_received_at"), errors="coerce").fillna(
+        pd.to_datetime(collapsed.get("created_at"), errors="coerce")
+    )
+    collapsed["_case_sort_time"] = collapsed["_case_sort_time"].fillna(fallback_sort_time)
+
+    collapsed = (
+        collapsed.sort_values(["case_row_key", "_case_sort_time", "id"])
+        .drop_duplicates("case_row_key", keep="last")
+        .sort_values("_case_sort_time", ascending=False)
+        .drop(columns=["_case_sort_time"], errors="ignore")
+    )
+    return collapsed
+
+
+def _rescan_operations_request_attachments(record, limit: int = 250) -> dict:
+    record_dict = record.to_dict() if hasattr(record, "to_dict") else dict(record or {})
+    result = {
+        "checked": 0,
+        "matched": 0,
+        "source_attachment_count": 0,
+        "saved": 0,
+        "attachment_names": [],
+    }
+
+    message_id = _safe_str(record_dict.get("source_message_id", ""))
+    emails = []
+    if message_id and callable(fetch_operations_email_by_message_id):
+        try:
+            emails.extend(fetch_operations_email_by_message_id(message_id, limit=5))
+        except Exception:
+            pass
+    exact_matches = [item for item in emails if _email_item_matches_operations_record(item, record_dict)]
+    if exact_matches:
+        emails = exact_matches
+    else:
+        emails = fetch_operations_email_sync(limit=limit)
+    result["checked"] = len(emails)
+
+    for item in emails:
+        if not _email_item_matches_operations_record(item, record_dict):
+            continue
+        result["matched"] += 1
+        attachments = item.get("attachments", []) or []
+        result["source_attachment_count"] += len(attachments)
+        result["attachment_names"].extend(
+            [_safe_str(attachment.get("filename", "")) for attachment in attachments if _safe_str(attachment.get("filename", ""))]
+        )
+        message_id = _safe_str(item.get("message_id") or item.get("id") or record_dict.get("source_message_id", ""))
+        result["saved"] += _backfill_operations_email_attachments(
+            existing_record=record_dict,
+            email_item=item,
+            message_id=message_id or f"intake-{record_dict.get('id')}",
+        )
+
+    result["attachment_names"] = sorted(set(result["attachment_names"]))
+    return result
 
 
 def _operations_inbox_status_counts() -> pd.DataFrame:
@@ -3978,6 +5083,7 @@ def _build_operations_email_classification(
     body: str,
     parsed: dict | None = None,
     fallback_key: str = "",
+    sender: str = "",
 ) -> dict:
     parsed = _coerce_parsed_for_classification(subject, body, parsed)
     intent_scores = _operations_intent_scores(subject, body, parsed)
@@ -4013,7 +5119,7 @@ def _build_operations_email_classification(
         matched_load_id=matched_load_id,
     )
 
-    return {
+    classification = {
         "request_type": detected_type,
         "tokens": tokens,
         "matched_load_id": matched_load_id,
@@ -4023,6 +5129,7 @@ def _build_operations_email_classification(
         "intent_scores": intent_scores,
         "load_match_candidates": load_match_candidates,
     }
+    return _apply_learned_classification_adjustment(classification, subject, body, parsed, sender=sender)
 
 
 def _operations_classification_for_review(record, parsed: dict, subject: str, body: str, fallback_key: str) -> dict:
@@ -4051,6 +5158,7 @@ def _operations_classification_for_review(record, parsed: dict, subject: str, bo
             body,
             parsed,
             fallback_key=fallback_key,
+            sender=_safe_str(record.get("source_sender", "")),
         )
 
     tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
@@ -4469,6 +5577,169 @@ def _recent_operations_ai_feedback_examples(limit: int = 6) -> list[dict]:
     return examples
 
 
+OPERATIONS_LEARNING_TOKEN_STOPWORDS = {
+    "about",
+    "after",
+    "before",
+    "booking",
+    "confirmation",
+    "customer",
+    "delivery",
+    "dispatch",
+    "email",
+    "from",
+    "hello",
+    "load",
+    "need",
+    "order",
+    "please",
+    "request",
+    "status",
+    "thanks",
+    "trucking",
+    "update",
+}
+
+
+def _feedback_sender_domain(sender: str) -> str:
+    email = _extract_email_address(sender).lower()
+    if "@" not in email:
+        return ""
+    return email.rsplit("@", 1)[-1]
+
+
+def _subject_learning_tokens(*parts: str) -> set[str]:
+    text = " ".join([str(part or "") for part in parts]).lower()
+    tokens = set()
+    for token in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", text):
+        clean_token = token.strip("_-")
+        if len(clean_token) < 4:
+            continue
+        if clean_token in OPERATIONS_LEARNING_TOKEN_STOPWORDS:
+            continue
+        tokens.add(clean_token)
+    return tokens
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _recent_operations_learning_rules(limit: int = 250) -> list[dict]:
+    try:
+        _ensure_operations_ai_feedback_table()
+        feedback_df = read_df(
+            """
+            select
+                source_subject,
+                source_sender,
+                ai_request_type,
+                final_request_type,
+                correction_type,
+                feedback_notes,
+                created_at
+            from operations_ai_feedback
+            where coalesce(final_request_type, '') <> ''
+            order by created_at desc
+            limit :limit
+            """,
+            {"limit": int(limit)},
+        )
+    except Exception:
+        return []
+
+    rules = []
+    for _, row in feedback_df.iterrows():
+        final_type = _safe_str(row.get("final_request_type", ""))
+        if final_type not in REQUEST_TYPES:
+            continue
+        rules.append(
+            {
+                "source_subject": _safe_str(row.get("source_subject", "")),
+                "source_sender": _safe_str(row.get("source_sender", "")),
+                "sender_domain": _feedback_sender_domain(row.get("source_sender", "")),
+                "subject_tokens": _subject_learning_tokens(row.get("source_subject", "")),
+                "ai_request_type": _safe_str(row.get("ai_request_type", "")),
+                "final_request_type": final_type,
+                "correction_type": _safe_str(row.get("correction_type", "")),
+                "feedback_notes": _safe_str(row.get("feedback_notes", "")),
+            }
+        )
+    return rules
+
+
+def _apply_learned_classification_adjustment(
+    classification: dict,
+    subject: str,
+    body: str,
+    parsed: dict,
+    sender: str = "",
+) -> dict:
+    learning_rules = _recent_operations_learning_rules()
+    if not learning_rules:
+        return classification
+
+    sender_domain = _feedback_sender_domain(sender)
+    current_tokens = _subject_learning_tokens(subject, body, json.dumps(parsed, default=str))
+    votes: dict[str, dict[str, int]] = {}
+
+    for rule in learning_rules:
+        final_type = rule.get("final_request_type", "")
+        if final_type not in REQUEST_TYPES:
+            continue
+
+        score = 0
+        if sender_domain and sender_domain == rule.get("sender_domain", ""):
+            score += 3
+
+        overlap = current_tokens.intersection(rule.get("subject_tokens", set()))
+        if overlap:
+            score += min(5, len(overlap) * 2)
+
+        correction_type = _safe_str(rule.get("correction_type", ""))
+        if correction_type and correction_type not in {"classification_confirmed", "classification_accepted"}:
+            score += 1
+
+        if score < 4:
+            continue
+
+        vote = votes.setdefault(final_type, {"score": 0, "count": 0})
+        vote["score"] += score
+        vote["count"] += 1
+
+    if not votes:
+        return classification
+
+    learned_type, learned_vote = max(
+        votes.items(),
+        key=lambda item: (item[1]["score"], item[1]["count"]),
+    )
+    current_type = _safe_str(classification.get("request_type", ""))
+    if learned_type == current_type:
+        updated = dict(classification)
+        updated["learning_applied"] = True
+        updated["learning_reason"] = f"Confirmed by {learned_vote['count']} recent dispatcher correction(s)."
+        return updated
+
+    updated = dict(classification)
+    updated["request_type"] = learned_type
+    updated["confidence_score"] = max(
+        int(updated.get("confidence_score", 0) or 0),
+        min(88, 72 + int(learned_vote["score"])),
+    )
+    updated["action_required"] = _action_required_for_request(
+        learned_type,
+        parsed,
+        body,
+        subject=subject,
+        tokens=updated.get("tokens"),
+        matched_load_id=updated.get("matched_load_id"),
+    )
+    updated["learning_applied"] = True
+    updated["learning_reason"] = (
+        f"Routed as {learned_type} from {learned_vote['count']} recent dispatcher correction(s) "
+        "for this sender/topic pattern."
+    )
+    return updated
+
+
 def _save_operations_ai_feedback(
     *,
     intake_id: int,
@@ -4482,8 +5753,7 @@ def _save_operations_ai_feedback(
     correction_type: str,
     feedback_notes: str = "",
 ) -> None:
-    if not ai_suggestion or not ai_suggestion.get("success"):
-        return
+    suggestion = ai_suggestion if ai_suggestion and ai_suggestion.get("success") else {}
 
     try:
         _ensure_operations_ai_feedback_table()
@@ -4527,13 +5797,13 @@ def _save_operations_ai_feedback(
                 "load_id": load_id,
                 "source_subject": source_subject,
                 "source_sender": source_sender,
-                "ai_request_type": ai_suggestion.get("request_type", ""),
+                "ai_request_type": suggestion.get("request_type", ""),
                 "final_request_type": final_request_type,
-                "ai_confidence_score": int(ai_suggestion.get("confidence_score", 0) or 0),
-                "ai_priority": ai_suggestion.get("priority", ""),
-                "ai_action_required": ai_suggestion.get("action_required", ""),
+                "ai_confidence_score": int(suggestion.get("confidence_score", 0) or 0),
+                "ai_priority": suggestion.get("priority", ""),
+                "ai_action_required": suggestion.get("action_required", ""),
                 "final_action_required": final_action_required,
-                "ai_reply_body": ai_suggestion.get("reply_body", ""),
+                "ai_reply_body": suggestion.get("reply_body", ""),
                 "final_reply_body": final_reply_body,
                 "correction_type": correction_type,
                 "feedback_notes": feedback_notes,
@@ -4744,29 +6014,26 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         except Exception:
             body_parsed = {}
 
-        pdf_attachments = []
+        saved_attachments = []
         for attachment_index, attachment in enumerate(item.get("attachments", []) or [], start=1):
             filename = _safe_str(attachment.get("filename", ""))
             content = attachment.get("content") or b""
-            if not filename.lower().endswith(".pdf") or not content:
+            content_type = _safe_str(attachment.get("content_type", ""))
+            if not filename or not content:
                 continue
-            pdf_attachments.append(
-                _save_operations_pdf_attachment(
+            saved_attachments.append(
+                _save_operations_attachment(
                     content=content,
                     filename=filename,
                     message_id=message_id or f"operations-{imported + 1}",
                     attachment_index=attachment_index,
+                    content_type=content_type,
                 )
             )
 
         parsed = dict(body_parsed)
-        if pdf_attachments:
-            for attachment in pdf_attachments:
-                pdf_parsed = attachment.get("parsed_data") or {}
-                for field in OPERATIONS_ORDER_FIELDS:
-                    if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(parsed.get(field, "")):
-                        parsed[field] = _safe_str(pdf_parsed.get(field, ""))
-            parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = pdf_attachments
+        if saved_attachments:
+            parsed = _merge_saved_attachment_fields(parsed, saved_attachments)
 
         parsed["_email_sync"] = {
             "direction": direction,
@@ -4778,6 +6045,12 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             "references": metadata["references"],
             "to": _safe_str(item.get("to", "")),
             "cc": _safe_str(item.get("cc", "")),
+            "source_attachment_count": len(item.get("attachments", []) or []),
+            "source_attachment_names": [
+                _safe_str(attachment.get("filename", ""))
+                for attachment in (item.get("attachments", []) or [])
+                if _safe_str(attachment.get("filename", ""))
+            ],
         }
 
         if direction == "outbound":
@@ -4798,6 +6071,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
                 body,
                 parsed,
                 fallback_key=thread_conversation_key or f"email-{imported + 1}",
+                sender=sender,
             )
             classification["conversation_key"] = thread_conversation_key
             if thread_context.get("matched_load_id") and classification.get("matched_load_id") is None:
@@ -4809,6 +6083,10 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             intake_status = "Needs Review"
             source = "operations_email"
             conversation_status = "New Conversation" if not thread_context else "Waiting Dispatcher"
+            if classification.get("request_type") == "Spam/Marketing":
+                review_status = "Closed"
+                intake_status = "Closed"
+                conversation_status = "Closed"
 
         if direction == "inbound" and is_operations_ai_auto_classify_enabled():
             load_context, load_candidates = _build_ai_load_context(classification, parsed)
@@ -4828,16 +6106,18 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             classification = _apply_ai_suggestion_to_classification(classification, ai_suggestion, load_candidates)
             classification["conversation_key"] = thread_conversation_key
 
-        operations_case = _get_or_create_operations_case(
-            conversation_key=classification["conversation_key"] or thread_conversation_key,
-            subject=subject,
-            sender=sender,
-            request_type=classification["request_type"],
-            matched_load_id=classification["matched_load_id"],
-            direction=direction,
-            next_action=classification["action_required"],
-            body=body,
-        )
+        operations_case = {}
+        if not (direction == "inbound" and classification.get("request_type") == "Spam/Marketing"):
+            operations_case = _get_or_create_operations_case(
+                conversation_key=classification["conversation_key"] or thread_conversation_key,
+                subject=subject,
+                sender=sender,
+                request_type=classification["request_type"],
+                matched_load_id=classification["matched_load_id"],
+                direction=direction,
+                next_action=classification["action_required"],
+                body=body,
+            )
         case_id = _int_or_none(operations_case.get("id"))
 
         execute(
@@ -4910,8 +6190,8 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
                 "email_in_reply_to": metadata["in_reply_to"] or None,
                 "email_references": json.dumps(metadata["references"]),
                 "conversation_status": conversation_status,
-                "filename": pdf_attachments[0].get("filename") if pdf_attachments else None,
-                "file_path": pdf_attachments[0].get("file_path") if pdf_attachments else None,
+                "filename": saved_attachments[0].get("filename") if saved_attachments else None,
+                "file_path": saved_attachments[0].get("file_path") if saved_attachments else None,
                 "parsed_data": _json_dump(parsed),
                 "raw_text": body,
                 "intake_status": intake_status,
@@ -5513,6 +6793,20 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
 
     for _, row in inbox_df.iterrows():
         current_type = str(row.get("request_type", "") or "").strip()
+        if current_type == "Spam/Marketing":
+            execute(
+                """
+                update order_intake
+                set review_status = 'Closed',
+                    intake_status = 'Closed',
+                    conversation_status = 'Closed',
+                    action_required = coalesce(nullif(action_required, ''), 'Marketing or non-operational email auto-archived.')
+                where id = :intake_id
+                """,
+                {"intake_id": int(row["id"])},
+            )
+            updated_count += 1
+            continue
         existing_match = row.get("matched_load_id")
         existing_has_match = pd.notna(existing_match) and _safe_str(existing_match) != ""
         existing_confidence = pd.to_numeric(row.get("confidence_score", 0), errors="coerce")
@@ -5532,8 +6826,13 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
         ]
         needs_classification = current_type in ["", "Needs Classification", "Other"]
         needs_correction_check = current_is_action_type and not existing_has_match and existing_confidence < 70
+        obvious_info_new_booking = (
+            current_type == "New Booking"
+            and _is_information_update(f"{row.get('source_subject', '')}\n{row.get('raw_text', '')}")
+            and not _has_order_placement_signal(f"{row.get('source_subject', '')}\n{row.get('raw_text', '')}")
+        )
 
-        if not needs_classification and not needs_correction_check:
+        if not needs_classification and not needs_correction_check and not obvious_info_new_booking:
             continue
 
         intake_id = int(row["id"])
@@ -5546,12 +6845,15 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
             body,
             parsed,
             fallback_key=f"intake-{intake_id}",
+            sender=str(row.get("source_sender", "") or ""),
         )
         detected_type = classification["request_type"]
         matched_load_id = classification["matched_load_id"]
         confidence = classification["confidence_score"]
 
-        should_update = needs_classification or (needs_correction_check and detected_type == "Customer Request")
+        should_update = needs_classification or obvious_info_new_booking or (
+            needs_correction_check and detected_type in ["Customer Request", "Booking Update", "Missing Information"]
+        )
         if not should_update:
             continue
 
@@ -5563,9 +6865,34 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
             confidence,
             classification["action_required"],
         )
+        if detected_type == "Spam/Marketing":
+            execute(
+                """
+                update order_intake
+                set review_status = 'Closed',
+                    intake_status = 'Closed',
+                    conversation_status = 'Closed'
+                where id = :intake_id
+                """,
+                {"intake_id": intake_id},
+            )
         updated_count += 1
 
     return updated_count
+
+
+def sync_operations_case_links_for_inbox_items(inbox_df: pd.DataFrame) -> int:
+    relinked_count = 0
+    for _, row in inbox_df.iterrows():
+        try:
+            old_case_id = _int_or_none(row.get("case_id"))
+            case = _sync_operations_case_for_intake_record(row)
+            new_case_id = _int_or_none(case.get("id"))
+            if new_case_id is not None and new_case_id != old_case_id:
+                relinked_count += 1
+        except Exception:
+            continue
+    return relinked_count
 
 
 OPERATIONS_LOAD_UPDATE_FIELD_TO_DB = {
@@ -5612,6 +6939,7 @@ def _save_pdf_data_to_operations_request(
         f"{body}\n\nPDF TEXT:\n{pdf_text[:5000]}",
         parsed_data,
         fallback_key=f"intake-{intake_id}",
+        sender="",
     )
 
     execute(
@@ -5645,11 +6973,12 @@ def _save_pdf_data_to_operations_request(
         pass
 
 
-def _attach_saved_pdf_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_pdf") -> None:
+def _attach_saved_operations_file_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_attachment") -> None:
+    document_type = "load_order" if _safe_str(filename).lower().endswith(".pdf") else "operations_attachment"
     execute(
         """
         insert into documents (load_id, document_type, filename, file_path, source)
-        select :load_id, 'load_order', :filename, :file_path, :source
+        select :load_id, :document_type, :filename, :file_path, :source
         where not exists (
             select 1
             from documents
@@ -5659,11 +6988,16 @@ def _attach_saved_pdf_to_load(load_id: int, filename: str, file_path: str, sourc
         """,
         {
             "load_id": int(load_id),
+            "document_type": document_type,
             "filename": filename,
             "file_path": file_path,
             "source": source,
         },
     )
+
+
+def _attach_saved_pdf_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_pdf") -> None:
+    _attach_saved_operations_file_to_load(load_id, filename, file_path, source)
 
 
 def _update_load_from_operations_pdf(load_id: int, parsed: dict, fill_blank_only: bool = True) -> dict:
@@ -5694,24 +7028,20 @@ def _update_load_from_operations_pdf(load_id: int, parsed: dict, fill_blank_only
     return updates
 
 
-def _import_uploaded_pdf_to_operations_request(intake_id: int, parsed: dict, uploaded_file) -> dict:
+def _import_uploaded_operations_attachment(intake_id: int, parsed: dict, uploaded_file) -> dict:
     content = uploaded_file.getvalue()
-    attachment = _save_operations_pdf_attachment(
+    attachment = _save_operations_attachment(
         content=content,
         filename=uploaded_file.name,
         message_id=f"intake-{intake_id}",
-        attachment_index=len(_extract_operations_pdf_attachments(parsed)) + 1,
+        attachment_index=len(_extract_operations_attachments(parsed)) + 1,
+        content_type=getattr(uploaded_file, "type", "") or "",
     )
 
     updated_parsed = dict(parsed)
-    attachments = _extract_operations_pdf_attachments(updated_parsed)
+    attachments = _extract_operations_attachments(updated_parsed)
     attachments.append(attachment)
-
-    pdf_parsed = attachment.get("parsed_data") or {}
-    for field in OPERATIONS_ORDER_FIELDS:
-        if _safe_str(pdf_parsed.get(field, "")) and not _safe_str(updated_parsed.get(field, "")):
-            updated_parsed[field] = _safe_str(pdf_parsed.get(field, ""))
-    updated_parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = attachments
+    updated_parsed = _merge_saved_attachment_fields(updated_parsed, attachments)
 
     execute(
         """
@@ -5733,11 +7063,15 @@ def _import_uploaded_pdf_to_operations_request(intake_id: int, parsed: dict, upl
     try:
         case = _sync_operations_case_for_intake_id(intake_id)
         if case:
-            _add_operations_case_note(case.get("id"), f"Imported PDF attachment {attachment.get('filename')}.")
+            _add_operations_case_note(case.get("id"), f"Imported attachment {attachment.get('filename')}.")
     except Exception:
         pass
 
     return attachment
+
+
+def _import_uploaded_pdf_to_operations_request(intake_id: int, parsed: dict, uploaded_file) -> dict:
+    return _import_uploaded_operations_attachment(intake_id, parsed, uploaded_file)
 
 
 def _render_pdf_preview(content: bytes, filename: str) -> None:
@@ -5767,69 +7101,103 @@ def _render_operations_pdf_panel(
     matched_load_id,
     conversation_key: str,
 ) -> None:
-    attachments = _extract_operations_pdf_attachments(parsed, record)
+    attachments = _extract_operations_attachments(parsed, record)
     case_id = _int_or_none(record.get("case_id")) if hasattr(record, "get") else None
 
-    with st.expander("PDF Attachments / Order Documents", expanded=bool(attachments)):
+    with st.expander("Email Attachments / Order Documents", expanded=bool(attachments)):
         uploaded_pdf = st.file_uploader(
-            "Add PDF to this request",
-            type=["pdf"],
+            "Add document to this request",
+            type=["pdf", "docx", "txt", "csv", "png", "jpg", "jpeg"],
             key=f"operations_pdf_upload_{selected_id}",
         )
         if uploaded_pdf is not None:
             if st.button(
-                "Import Uploaded PDF",
+                "Import Uploaded Document",
                 key=f"operations_pdf_import_upload_{selected_id}",
                 use_container_width=True,
             ):
-                attachment = _import_uploaded_pdf_to_operations_request(int(selected_id), parsed, uploaded_pdf)
-                st.success(f"Imported PDF: {attachment.get('filename', uploaded_pdf.name)}")
+                attachment = _import_uploaded_operations_attachment(int(selected_id), parsed, uploaded_pdf)
+                st.success(f"Imported document: {attachment.get('filename', uploaded_pdf.name)}")
                 refresh_data()
                 st.rerun()
 
         if not attachments:
-            st.info("No PDF attachments were saved with this inbox request.")
+            if _message_mentions_attachment(subject, body):
+                st.warning("This email mentions an attachment or order document, but no files are saved on this request yet.")
+            else:
+                st.info("No email attachments were saved with this inbox request yet.")
+
+            if st.button(
+                "Rescan This Email for Attachments",
+                key=f"operations_attachment_rescan_{selected_id}",
+                use_container_width=True,
+            ):
+                with st.spinner("Checking the mailbox for this email's attachments..."):
+                    try:
+                        rescan_result = _rescan_operations_request_attachments(record)
+                    except Exception as exc:
+                        st.error(f"Attachment rescan failed: {exc}")
+                        return
+
+                saved_count = int(rescan_result.get("saved", 0) or 0)
+                found_count = int(rescan_result.get("source_attachment_count", 0) or 0)
+                matched_count = int(rescan_result.get("matched", 0) or 0)
+                names = rescan_result.get("attachment_names") or []
+                if saved_count:
+                    st.success(f"Saved {saved_count} attachment(s): {', '.join(names) if names else 'document files'}.")
+                    refresh_data()
+                    st.rerun()
+                elif matched_count and found_count:
+                    st.info("The mailbox found this email and attachment metadata, but no new files needed to be saved.")
+                elif matched_count:
+                    st.warning("The mailbox found this email, but it did not include downloadable attachments in the scanned message.")
+                else:
+                    st.warning("No matching email was found in the recent mailbox scan. Try increasing the email sync window or import the document manually here.")
             return
 
         labels = []
         for idx, attachment in enumerate(attachments):
-            filename = _safe_str(attachment.get("filename", f"attachment_{idx + 1}.pdf"))
+            filename = _safe_str(attachment.get("filename", f"attachment_{idx + 1}"))
             fields_found = int(attachment.get("fields_found", 0) or 0)
-            labels.append(f"{idx + 1}. {filename} ({fields_found} field(s) found)")
+            content_type = _safe_str(attachment.get("content_type", ""))
+            doc_kind = "PDF" if _is_pdf_filename(filename, content_type) else (content_type or "document")
+            labels.append(f"{idx + 1}. {filename} | {doc_kind} | {fields_found} field(s) found")
 
         selected_label = st.selectbox(
-            "Select PDF",
+            "Select Attachment",
             labels,
             key=f"operations_pdf_select_{selected_id}",
         )
         selected_index = labels.index(selected_label)
         attachment = attachments[selected_index]
-        filename = _safe_str(attachment.get("filename", f"attachment_{selected_index + 1}.pdf"))
+        filename = _safe_str(attachment.get("filename", f"attachment_{selected_index + 1}"))
         file_path = _safe_str(attachment.get("file_path", ""))
+        content_type = _safe_str(attachment.get("content_type", "application/octet-stream")) or "application/octet-stream"
+        is_pdf = _is_pdf_filename(filename, content_type) or bool(attachment.get("is_pdf"))
 
         if not file_path or not Path(file_path).exists():
-            st.warning("The saved PDF file could not be found on disk.")
+            st.warning("The saved attachment file could not be found on disk.")
             return
 
         try:
-            content = _read_operations_pdf_bytes(file_path)
+            content = _read_operations_attachment_bytes(file_path)
         except Exception as exc:
-            st.error(f"Could not read saved PDF: {exc}")
+            st.error(f"Could not read saved attachment: {exc}")
             return
 
         d1, d2, d3 = st.columns([1, 1, 2])
         with d1:
             st.download_button(
-                "Download PDF",
+                "Download Attachment",
                 data=content,
                 file_name=filename,
-                mime="application/pdf",
+                mime=content_type,
                 key=f"operations_pdf_download_{selected_id}_{selected_index}",
                 use_container_width=True,
             )
         with d2:
             show_preview = st.checkbox(
-                "View PDF",
+                "View File",
                 value=False,
                 key=f"operations_pdf_preview_{selected_id}_{selected_index}",
             )
@@ -5837,18 +7205,23 @@ def _render_operations_pdf_panel(
             st.caption(f"Saved file: {filename}")
 
         if show_preview:
-            _render_pdf_preview(content, filename)
+            if is_pdf:
+                _render_pdf_preview(content, filename)
+            elif content_type.startswith("image/"):
+                st.image(content, caption=filename, use_container_width=True)
+            else:
+                st.info("Preview is available for PDFs and images. Download this document to view it.")
 
         try:
-            pdf_text, pdf_parsed = _parse_saved_operations_pdf(file_path, filename)
+            document_text, document_parsed = _parse_saved_operations_attachment(file_path, filename, content_type)
             parse_error = ""
         except Exception as exc:
-            pdf_text = _safe_str(attachment.get("text_preview", ""))
-            pdf_parsed = attachment.get("parsed_data") or {}
+            document_text = _safe_str(attachment.get("text_preview", ""))
+            document_parsed = attachment.get("parsed_data") or {}
             parse_error = str(exc)
 
         if parse_error:
-            st.warning(f"PDF text parse needs review: {parse_error}")
+            st.warning(f"Document text parse needs review: {parse_error}")
 
         try:
             body_parsed = parse_email_text(subject, body)
@@ -5859,12 +7232,19 @@ def _render_operations_pdf_panel(
         for field in OPERATIONS_ORDER_FIELDS:
             base_parsed[field] = _safe_str(body_parsed.get(field, "")) or _safe_str(parsed.get(field, ""))
 
-        final_data, comparison_rows, conflicts = _merge_operations_order_fields(base_parsed, pdf_parsed)
-        final_data[OPERATIONS_PDF_ATTACHMENTS_KEY] = attachments
+        final_data, comparison_rows, conflicts = _merge_operations_order_fields(base_parsed, document_parsed)
+        final_data[OPERATIONS_ATTACHMENTS_KEY] = attachments
+        pdf_attachments = [
+            item
+            for item in attachments
+            if _is_pdf_filename(item.get("filename", ""), item.get("content_type", "")) or bool(item.get("is_pdf"))
+        ]
+        if pdf_attachments:
+            final_data[OPERATIONS_PDF_ATTACHMENTS_KEY] = pdf_attachments
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Email Fields", _field_count(body_parsed))
-        c2.metric("PDF Fields", _field_count(pdf_parsed))
+        c2.metric("Document Fields", _field_count(document_parsed))
         c3.metric("Mismatches", len(conflicts))
 
         if conflicts:
@@ -5872,24 +7252,20 @@ def _render_operations_pdf_panel(
 
         st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
 
-        with st.expander("Extracted PDF Text", expanded=False):
+        with st.expander("Extracted Document Text", expanded=False):
             st.text_area(
-                "PDF Text",
-                value=pdf_text or "No text was extracted from this PDF.",
+                "Document Text",
+                value=document_text or "No text was extracted from this document.",
                 height=220,
                 disabled=True,
                 key=f"operations_pdf_text_{selected_id}_{selected_index}",
             )
 
-        fill_blank_only = st.checkbox(
-            "Only fill blank fields when updating an existing load",
-            value=True,
-            key=f"operations_pdf_fill_blank_only_{selected_id}_{selected_index}",
-        )
+        st.caption("Use document data here to update the parsed request, then complete order, quote, or close actions in the Order / Quote Actions section below.")
 
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b2 = st.columns(2)
         with b1:
-            if st.button("Use PDF Data", key=f"use_pdf_data_{selected_id}_{selected_index}", use_container_width=True):
+            if st.button("Use Document Data", key=f"use_pdf_data_{selected_id}_{selected_index}", use_container_width=True):
                 _save_pdf_data_to_operations_request(
                     intake_id=int(selected_id),
                     subject=subject,
@@ -5897,75 +7273,28 @@ def _render_operations_pdf_panel(
                     parsed_data=final_data,
                     filename=filename,
                     file_path=file_path,
-                    pdf_text=pdf_text,
+                    pdf_text=document_text,
                 )
-                st.success("PDF data saved to this Operations request.")
+                st.success("Document data saved to this Operations request.")
                 refresh_data()
                 st.rerun()
 
-        can_create_from_pdf = bool(_safe_str(final_data.get("Booking Number", "")) and _safe_str(final_data.get("Customer", "")))
         with b2:
             if st.button(
-                "Create Load",
-                key=f"create_load_from_pdf_{selected_id}_{selected_index}",
-                use_container_width=True,
-                disabled=not can_create_from_pdf,
-            ):
-                _save_pdf_data_to_operations_request(
-                    intake_id=int(selected_id),
-                    subject=subject,
-                    body=body,
-                    parsed_data=final_data,
-                    filename=filename,
-                    file_path=file_path,
-                    pdf_text=pdf_text,
-                )
-                load_id = create_load_from_intake(int(selected_id), final_data)
-                execute(
-                    """
-                    update order_intake
-                    set review_status = 'Order Created',
-                        matched_load_id = :load_id,
-                        request_type = 'New Booking',
-                        conversation_key = :conversation_key
-                    where id = :intake_id
-                    """,
-                    {
-                        "intake_id": int(selected_id),
-                        "load_id": load_id,
-                        "conversation_key": conversation_key or final_data.get("Booking Number"),
-                    },
-                )
-                if case_id is not None:
-                    _update_operations_case(
-                        case_id=case_id,
-                        status="Attached to Load",
-                        owner="Dispatch",
-                        priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
-                        linked_load_id=load_id,
-                        next_action=f"Load {load_id} created from PDF.",
-                    )
-                    _add_operations_case_note(case_id, f"Created load {load_id} from PDF {filename}.")
-                refresh_data()
-                st.success(f"Created load ID {load_id} from selected PDF.")
-                st.rerun()
-
-        with b3:
-            if st.button(
-                "Attach PDF",
+                "Attach Document",
                 key=f"attach_pdf_to_load_{selected_id}_{selected_index}",
                 use_container_width=True,
                 disabled=matched_load_id is None,
             ):
-                _attach_saved_pdf_to_load(int(matched_load_id), filename, file_path)
+                _attach_saved_operations_file_to_load(int(matched_load_id), filename, file_path)
                 save_load_communication(
                     matched_load_id,
                     int(selected_id),
                     conversation_key,
-                    "PDF Attachment",
+                    "Document Attachment",
                     subject,
                     sender,
-                    f"Attached PDF document from Operations Inbox: {filename}",
+                    f"Attached document from Operations Inbox: {filename}",
                     case_id=case_id,
                 )
                 if case_id is not None:
@@ -5975,49 +7304,134 @@ def _render_operations_pdf_panel(
                         owner=_safe_str(record.get("case_owner", "Dispatch")) or "Dispatch",
                         priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
                         linked_load_id=matched_load_id,
-                        next_action=f"PDF {filename} attached to load {matched_load_id}.",
+                        next_action=f"Document {filename} attached to load {matched_load_id}.",
                     )
-                st.success("PDF attached to the matched load.")
+                st.success("Document attached to the matched load.")
                 st.rerun()
 
-        with b4:
-            if st.button(
-                "Update Load",
-                key=f"update_load_from_pdf_{selected_id}_{selected_index}",
-                use_container_width=True,
-                disabled=matched_load_id is None,
-            ):
-                updates = _update_load_from_operations_pdf(
-                    int(matched_load_id),
-                    final_data,
-                    fill_blank_only=fill_blank_only,
-                )
-                if updates:
-                    _attach_saved_pdf_to_load(int(matched_load_id), filename, file_path)
-                    save_load_communication(
-                        matched_load_id,
-                        int(selected_id),
-                        conversation_key,
-                        "PDF Update",
-                        subject,
-                        sender,
-                        "Updated load fields from Operations Inbox PDF: " + ", ".join(updates.keys()),
-                        case_id=case_id,
-                    )
-                    if case_id is not None:
-                        _update_operations_case(
-                            case_id=case_id,
-                            status="Attached to Load",
-                            owner=_safe_str(record.get("case_owner", "Dispatch")) or "Dispatch",
-                            priority=_safe_str(record.get("case_priority", "Normal")) or "Normal",
-                            linked_load_id=matched_load_id,
-                            next_action="Updated load from PDF fields: " + ", ".join(updates.keys()),
-                        )
-                    refresh_data()
-                    st.success("Updated matched load fields: " + ", ".join(updates.keys()))
-                    st.rerun()
-                else:
-                    st.info("No load fields needed updating from the selected PDF.")
+
+@st.cache_data(show_spinner=False, ttl=30)
+def _load_operations_case_email_summary(case_id) -> dict:
+    case_id = _int_or_none(case_id)
+    if case_id is None:
+        return {}
+    try:
+        summary_df = read_df(
+            """
+            select
+                count(*) as total_messages,
+                max(case
+                    when coalesce(email_direction, 'inbound') = 'inbound'
+                        then coalesce(source_received_at, created_at)
+                    end) as last_customer_email_at,
+                max(case
+                    when coalesce(email_direction, 'inbound') = 'outbound'
+                        then coalesce(source_received_at, created_at)
+                    end) as last_reply_at,
+                (array_agg(coalesce(source_sender, '') order by coalesce(source_received_at, created_at) desc, id desc)
+                    filter (where coalesce(email_direction, 'inbound') = 'outbound'))[1] as last_reply_by,
+                (array_agg(coalesce(email_mailbox, '') order by coalesce(source_received_at, created_at) desc, id desc)
+                    filter (where coalesce(email_direction, 'inbound') = 'outbound'))[1] as last_reply_mailbox
+            from order_intake
+            where case_id = :case_id
+            """,
+            {"case_id": case_id},
+        )
+    except Exception:
+        return {}
+    return summary_df.iloc[0].to_dict() if not summary_df.empty else {}
+
+
+def _format_short_timestamp(value) -> str:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return parsed.strftime("%m/%d %I:%M %p")
+
+
+def _format_relative_timestamp(value) -> str:
+    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(parsed):
+        return "-"
+    delta_minutes = int(max(0, (pd.Timestamp.now(tz="UTC") - parsed).total_seconds() // 60))
+    if delta_minutes < 60:
+        return f"{delta_minutes}m ago"
+    hours = delta_minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def _format_case_sla_label(operations_case: dict) -> str:
+    status = _safe_str(operations_case.get("status", ""))
+    sla_status = _safe_str(operations_case.get("sla_status", "On Track")) or "On Track"
+    if status == "Closed":
+        return sla_status
+
+    first_response_at = _safe_str(operations_case.get("first_response_at", ""))
+    due_value = operations_case.get("resolution_due_at") if first_response_at else operations_case.get("first_response_due_at")
+    due_at = pd.to_datetime(due_value, errors="coerce", utc=True)
+    if pd.isna(due_at):
+        return sla_status
+
+    delta_seconds = int((due_at - pd.Timestamp.now(tz="UTC")).total_seconds())
+    label = "remaining" if delta_seconds >= 0 else "overdue"
+    abs_seconds = abs(delta_seconds)
+    hours = abs_seconds // 3600
+    minutes = (abs_seconds % 3600) // 60
+    if hours:
+        return f"{hours}h {minutes}m {label}"
+    return f"{minutes}m {label}"
+
+
+def _render_operations_case_summary_header(
+    *,
+    operations_case: dict,
+    record,
+    parsed: dict,
+    tokens: dict,
+    matched_load_id,
+) -> None:
+    case_id = _int_or_none(operations_case.get("id"))
+    if case_id is None:
+        return
+
+    summary = _load_operations_case_email_summary(case_id)
+    customer = (
+        _safe_str(operations_case.get("customer", ""))
+        or _safe_str(parsed.get("Customer", ""))
+        or _case_customer_from_sender(record.get("source_sender", "") if hasattr(record, "get") else "")
+    )
+    booking = _safe_str(parsed.get("Booking Number", "")) or _safe_str(tokens.get("booking_number", "")) or "Pending"
+    container = _safe_str(parsed.get("Container Number", "")) or _safe_str(tokens.get("container_number", "")) or "Pending"
+    linked_load_id = _int_or_none(operations_case.get("linked_load_id")) or _int_or_none(matched_load_id)
+    last_reply_by = _safe_str(summary.get("last_reply_by", ""))
+    last_reply_mailbox = _safe_str(summary.get("last_reply_mailbox", ""))
+    last_reply_time = _format_short_timestamp(summary.get("last_reply_at"))
+    if last_reply_by and last_reply_time:
+        reply_method = "TMS" if last_reply_mailbox.lower() == "tms" else "Yahoo Mail"
+        last_reply = f"{_case_customer_from_sender(last_reply_by)} - {last_reply_time} ({reply_method})"
+    else:
+        last_reply = "-"
+
+    st.markdown("### Operations Case Workspace")
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("Case #", _safe_str(operations_case.get("case_number", "")) or f"Case {case_id}")
+    r1c2.metric("Customer", customer or "-")
+    r1c3.metric("Booking", booking)
+    r1c4.metric("Container", container)
+
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("Load", linked_load_id or "Not Created")
+    r2c2.metric("Priority", _safe_str(operations_case.get("priority", "")) or "-")
+    r2c3.metric("Owner", _safe_str(operations_case.get("owner", "")) or "Unassigned")
+    r2c4.metric("Status", _safe_str(operations_case.get("status", "")) or "-")
+
+    r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+    r3c1.metric("Last Reply", last_reply)
+    r3c2.metric("Last Customer Email", _format_relative_timestamp(summary.get("last_customer_email_at")))
+    r3c3.metric("Total Messages", int(summary.get("total_messages", 0) or operations_case.get("message_count", 0) or 0))
+    r3c4.metric("SLA", _format_case_sla_label(operations_case))
 
 
 def _render_operations_case_panel(
@@ -6025,6 +7439,7 @@ def _render_operations_case_panel(
     selected_id: int,
     operations_case: dict,
     matched_load_id,
+    show_timeline: bool = True,
 ) -> None:
     case_id = _int_or_none(operations_case.get("id"))
     if case_id is None:
@@ -6056,6 +7471,7 @@ def _render_operations_case_panel(
             if case_status not in status_options:
                 status_options.insert(0, case_status)
             owner_options = list(OPERATIONS_CASE_OWNERS)
+            case_owner_is_known = case_owner in owner_options
             if case_owner not in owner_options:
                 owner_options.insert(0, case_owner)
             priority_options = list(OPERATIONS_CASE_PRIORITIES)
@@ -6087,6 +7503,12 @@ def _render_operations_case_panel(
                 step=1,
                 key=f"case_linked_load_{case_id}_{selected_id}",
             )
+            custom_owner = st.text_input(
+                "Custom Owner",
+                value="" if case_owner_is_known else case_owner,
+                placeholder="Optional dispatcher or manager name",
+                key=f"case_custom_owner_{case_id}_{selected_id}",
+            )
             next_action = st.text_area(
                 "Next Action",
                 value=_safe_str(operations_case.get("next_action", "")),
@@ -6094,10 +7516,11 @@ def _render_operations_case_panel(
                 key=f"case_next_action_{case_id}_{selected_id}",
             )
             if st.form_submit_button("Save Case"):
+                final_owner = _safe_str(custom_owner) or new_owner
                 _update_operations_case(
                     case_id=case_id,
                     status=new_status,
-                    owner=new_owner,
+                    owner=final_owner,
                     priority=new_priority,
                     linked_load_id=new_linked_load_id or None,
                     next_action=next_action,
@@ -6146,6 +7569,28 @@ def _render_operations_case_panel(
                 refresh_data()
                 st.rerun()
 
+        w1, w2, w3, w4 = st.columns(4)
+        with w1:
+            if st.button("Waiting Manager", key=f"case_waiting_manager_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Manager", "Waiting on manager review.")
+                refresh_data()
+                st.rerun()
+        with w2:
+            if st.button("Waiting Driver", key=f"case_waiting_driver_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Driver", "Waiting on driver update.")
+                refresh_data()
+                st.rerun()
+        with w3:
+            if st.button("Waiting Port", key=f"case_waiting_port_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Port", "Waiting on port or terminal response.")
+                refresh_data()
+                st.rerun()
+        with w4:
+            if st.button("Waiting Warehouse", key=f"case_waiting_warehouse_{case_id}_{selected_id}", use_container_width=True):
+                _set_operations_case_status(case_id, "Waiting Warehouse", "Waiting on warehouse response.")
+                refresh_data()
+                st.rerun()
+
         note_body = st.text_area(
             "Internal Note",
             value="",
@@ -6162,27 +7607,28 @@ def _render_operations_case_panel(
                 st.success("Internal note added.")
                 st.rerun()
 
-        timeline_df = _load_operations_case_timeline(case_id)
-        if timeline_df.empty:
-            st.info("Case timeline will appear after emails, notes, replies, or load actions are linked.")
-        else:
-            timeline_display = timeline_df.copy()
-            timeline_display["event_time"] = pd.to_datetime(
-                timeline_display["event_at"],
-                errors="coerce",
-            ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
-            timeline_display = timeline_display[
-                ["event_time", "event_type", "actor", "title", "details"]
-            ].rename(
-                columns={
-                    "event_time": "Time",
-                    "event_type": "Type",
-                    "actor": "Actor",
-                    "title": "Title",
-                    "details": "Details",
-                }
-            )
-            st.dataframe(timeline_display, use_container_width=True, hide_index=True)
+        if show_timeline:
+            timeline_df = _load_operations_case_timeline(case_id)
+            if timeline_df.empty:
+                st.info("Case timeline will appear after emails, notes, replies, or load actions are linked.")
+            else:
+                timeline_display = timeline_df.copy()
+                timeline_display["event_time"] = pd.to_datetime(
+                    timeline_display["event_at"],
+                    errors="coerce",
+                ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+                timeline_display = timeline_display[
+                    ["event_time", "event_type", "actor", "title", "details"]
+                ].rename(
+                    columns={
+                        "event_time": "Time",
+                        "event_type": "Type",
+                        "actor": "Actor",
+                        "title": "Title",
+                        "details": "Details",
+                    }
+                )
+                st.dataframe(timeline_display, use_container_width=True, hide_index=True)
 
         owner_history_df = _load_operations_case_owner_history(case_id)
         if not owner_history_df.empty:
@@ -6225,10 +7671,34 @@ def _render_operations_case_panel(
                     st.rerun()
                 else:
                     st.error("Could not merge the selected cases.")
-        
+
+
+def _render_ops_metric_card(label: str, value, subtext: str = "") -> None:
+    st.markdown(
+        f"""
+        <div class="ops-metric-card">
+            <div class="ops-metric-label">{escape(str(label))}</div>
+            <div class="ops-metric-value">{escape(str(value))}</div>
+            {f'<div class="ops-metric-sub">{escape(str(subtext))}</div>' if subtext else ''}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_operations_inbox() -> None:
-    st.subheader("Operations Inbox")
-    st.caption("Synchronize Inbox/Sent email, group conversations, classify requests, match loads, create bookings, create quote requests, or send replies.")
+    st.markdown(
+        """
+        <div class="ops-header">
+            <div class="ops-kicker">Operations</div>
+            <div class="ops-title">Operations Inbox</div>
+            <div class="ops-subtitle">
+                Review customer emails, verify attachments, group conversations, match loads, create orders or quotes, and send replies from one dispatch workspace.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     try:
         _ensure_operations_email_sync_schema()
     except Exception as exc:
@@ -6260,7 +7730,7 @@ def render_operations_inbox() -> None:
             if fetched == 0:
                 st.warning("Yahoo inbox connected, but no messages were returned from the recent inbox scan.")
             else:
-                pdf_note = f", updated {pdf_updated} PDF attachment(s)" if pdf_updated else ""
+                pdf_note = f", updated {pdf_updated} email attachment(s)" if pdf_updated else ""
                 inbound = int(result.get("inbound_fetched", 0))
                 outbound = int(result.get("outbound_fetched", 0))
                 threads = int(result.get("threads_synced", 0))
@@ -6271,21 +7741,36 @@ def render_operations_inbox() -> None:
                     f"threaded {threads} conversation(s), updated {cases} case(s){pdf_note}."
                 )
         else:
-            st.info("Use Sync Email Engine to import Inbox and Sent mail with Message-ID, References, thread IDs, timestamps, attachments, and deduplication.")
+            st.markdown(
+                """
+                <div class="ops-alert">
+                    Use Sync Email Engine to import Inbox and Sent mail with Message-ID, References, thread IDs, timestamps, attachments, and deduplication.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     sync_metrics = _operations_email_sync_metrics()
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Synced Inbox", int(sync_metrics.get("inbound", 0)))
-    s2.metric("Synced Sent", int(sync_metrics.get("outbound", 0)))
-    s3.metric("Email Threads", int(sync_metrics.get("threads", 0)))
-    s4.metric("Last Sync", sync_metrics.get("last_sync") or "-")
+    with s1:
+        _render_ops_metric_card("Synced Inbox", int(sync_metrics.get("inbound", 0)))
+    with s2:
+        _render_ops_metric_card("Synced Sent", int(sync_metrics.get("outbound", 0)))
+    with s3:
+        _render_ops_metric_card("Email Threads", int(sync_metrics.get("threads", 0)))
+    with s4:
+        _render_ops_metric_card("Last Sync", sync_metrics.get("last_sync") or "-")
 
     case_metrics = _operations_case_metrics()
     cm1, cm2, cm3, cm4 = st.columns(4)
-    cm1.metric("Open Cases", int(case_metrics.get("open", 0)))
-    cm2.metric("Waiting Dispatch", int(case_metrics.get("waiting_dispatch", 0)))
-    cm3.metric("Waiting Customer", int(case_metrics.get("waiting_customer", 0)))
-    cm4.metric("Closed Cases", int(case_metrics.get("closed", 0)))
+    with cm1:
+        _render_ops_metric_card("Open Cases", int(case_metrics.get("open", 0)))
+    with cm2:
+        _render_ops_metric_card("Waiting Dispatch", int(case_metrics.get("waiting_dispatch", 0)))
+    with cm3:
+        _render_ops_metric_card("Waiting Customer", int(case_metrics.get("waiting_customer", 0)))
+    with cm4:
+        _render_ops_metric_card("Closed Cases", int(case_metrics.get("closed", 0)))
             
     try:
         where_clause = _inbox_review_where_clause()
@@ -6328,10 +7813,25 @@ def render_operations_inbox() -> None:
                 .astype(str)
                 .str.strip()
         )
+    inbox_df["request_type_clean"] = inbox_df.apply(_effective_operations_request_type_for_row, axis=1)
+    inbox_df["request_type"] = inbox_df["request_type_clean"]
     inbox_df["confidence_score"] = pd.to_numeric(
         inbox_df["confidence_score"],
         errors="coerce",
     ).fillna(0).astype(int)
+    attachment_count_source = inbox_df["attachment_count"] if "attachment_count" in inbox_df.columns else pd.Series(0, index=inbox_df.index)
+    source_attachment_count_source = (
+        inbox_df["source_attachment_count"] if "source_attachment_count" in inbox_df.columns else pd.Series(0, index=inbox_df.index)
+    )
+    inbox_df["attachment_count"] = pd.to_numeric(
+        attachment_count_source,
+        errors="coerce",
+    ).fillna(0).astype(int)
+    inbox_df["source_attachment_count"] = pd.to_numeric(
+        source_attachment_count_source,
+        errors="coerce",
+    ).fillna(0).astype(int)
+    inbox_df["attachment_status"] = inbox_df.apply(_operations_attachment_status_for_row, axis=1)
 
     def extract_reference_from_text(text: str) -> str:
         tokens = _extract_reference_tokens(text)
@@ -6377,34 +7877,41 @@ def render_operations_inbox() -> None:
                 .astype(str)
                 .str.strip()
         )
-    no_matched_load = inbox_df["matched_load_id"].isna() | inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
-    needs_details_mask = (
-        no_matched_load
-        & inbox_df["confidence_score"].lt(70)
-        & inbox_df["request_type_clean"].isin([
-            "Customer Request",
-            "New Booking",
-            "Booking Update",
-            "Appointment Update",
-            "Quote Request",
-            "Cancellation",
-            "POD Request",
-            "Billing",
-            "Driver Issue",
-            "Port Issue",
-        ])
+    inbox_df["owner_label"] = inbox_df.apply(_operations_owner_label_for_row, axis=1)
+    inbox_df["priority_label"] = inbox_df.apply(_operations_priority_label_for_row, axis=1)
+    inbox_df["status_label"] = inbox_df.apply(_operations_status_label_for_row, axis=1)
+    inbox_df["work_queue"] = inbox_df.apply(_operations_work_queue_for_row, axis=1)
+    inbox_df["case_total_messages"] = pd.to_numeric(
+        inbox_df.get("case_message_count", inbox_df.get("conversation_message_count", 1)),
+        errors="coerce",
+    ).fillna(inbox_df["conversation_message_count"]).fillna(1).astype(int)
+    wait_started = pd.to_datetime(
+        inbox_df["case_customer_wait_started_at"].fillna(inbox_df["case_department_wait_started_at"])
+        if "case_customer_wait_started_at" in inbox_df.columns and "case_department_wait_started_at" in inbox_df.columns
+        else pd.Series(pd.NaT, index=inbox_df.index),
+        errors="coerce",
+        utc=True,
     )
+    now_utc = pd.Timestamp.now(tz="UTC")
+    inbox_df["waiting_hours"] = ((now_utc - wait_started).dt.total_seconds() / 3600).fillna(0).round(1)
+    inbox_df = _collapse_operations_inbox_to_cases(inbox_df)
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Open Requests", len(inbox_df))
-    m2.metric("Needs Details", int(needs_details_mask.sum()))
-    m3.metric("Customer Requests", int(inbox_df["request_type_clean"].eq("Customer Request").sum()))
-    m4.metric("Quotes", int(inbox_df["request_type_clean"].eq("Quote Request").sum()))
-    m5.metric("Waiting", int(inbox_df["review_status_clean"].eq("Waiting on Customer").sum()))
+    m1.metric("Action Required", int(inbox_df["work_queue"].eq("Action Required").sum()))
+    m2.metric("New Orders", int(inbox_df["work_queue"].eq("New Orders").sum()))
+    m3.metric("Existing Loads", int(inbox_df["work_queue"].eq("Existing Loads").sum()))
+    m4.metric("Documents", int(inbox_df["work_queue"].eq("Documents").sum()))
+    m5.metric("Waiting", int(inbox_df["work_queue"].eq("Waiting").sum()))
 
     smart_group_result = st.session_state.pop("operations_smart_group_update_result", None)
     if smart_group_result is not None:
-        st.success(f"Smart groups updated {int(smart_group_result)} item(s).")
+        if isinstance(smart_group_result, dict):
+            st.success(
+                f"Smart groups updated {int(smart_group_result.get('classified', 0))} item(s) "
+                f"and relinked {int(smart_group_result.get('cases', 0))} case record(s)."
+            )
+        else:
+            st.success(f"Smart groups updated {int(smart_group_result)} item(s).")
 
     c_update, c_note = st.columns([1, 4])
     with c_update:
@@ -6413,248 +7920,191 @@ def render_operations_inbox() -> None:
                 full_inbox_df = _load_operations_inbox_record_set(where_clause)
                 update_mask = _operations_items_needing_smart_group_update(full_inbox_df)
                 classified_count = auto_classify_open_inbox_items(full_inbox_df[update_mask].copy())
-                st.session_state["operations_smart_group_update_result"] = classified_count
+                case_relinked_count = sync_operations_case_links_for_inbox_items(full_inbox_df.copy())
+                st.session_state["operations_smart_group_update_result"] = {
+                    "classified": classified_count,
+                    "cases": case_relinked_count,
+                }
                 refresh_data()
                 st.rerun()
     with c_note:
-        st.caption("Routine inbox clicks stay fast. Use Recheck Groups when older messages need to be regrouped.")
+        st.caption("Routine inbox clicks stay fast. Use Recheck Groups when older messages need regrouping or copied emails need to be relinked to the right case.")
 
     with st.expander("Operations Inbox Process Feedback", expanded=False):
         st.markdown(
             """
-- Treat `Needs Details` as the first-response queue. Ask for booking, container, or reference before creating orders, quotes, cancellations, or POD tasks.
-- Ask frequent customers to include one identifier in the email subject line: booking number, container number, or reference number.
-- Keep `Waiting` clean by moving items there only after a reply is sent, then close or attach the request when the customer responds.
-- Use `Customer Requests` for general status questions and unclear requests so they do not inflate the new order or quote queues.
-- Review repeat vague requests weekly and turn the top missing details into a customer intake template.
+- Use `Action Required` for messages that need a dispatcher response before an order, quote, cancellation, or status update can move forward.
+- Keep `New Orders` for true new bookings or quote requests only. Customer update questions without identifiers stay in `Action Required`.
+- Use `Existing Loads` for booking updates, appointment changes, cancellations, driver issues, and port issues tied to an active order.
+- Keep PODs, delivery orders, BOLs, packing lists, IMO/hazmat files, and attachment-heavy document work in `Documents`.
+- Move replied items to `Waiting`, close non-operational mail, and review learning corrections weekly so the engine keeps improving.
             """.strip()
         )
 
-    owner_filter_options = ["All Owners"] + [owner for owner in OPERATIONS_CASE_OWNERS if owner != "Unassigned"]
-    owner_filter = st.selectbox(
-        "Owner Queue",
-        owner_filter_options,
-        index=0,
-        key="operations_owner_queue_filter",
-    )
-    if owner_filter != "All Owners" and "case_owner" in inbox_df.columns:
-        inbox_df = inbox_df[inbox_df["case_owner"].fillna("Unassigned").eq(owner_filter)].copy()
-        if inbox_df.empty:
-            st.info(f"No open Operations Inbox items assigned to {owner_filter}.")
+    st.markdown("#### Case Filters")
+    p1, p2 = st.columns([1, 2])
+    with p1:
+        perspective_filter = st.selectbox(
+            "Perspective",
+            ["Dispatch", "Operations Manager", "Billing", "Customer Service"],
+            index=0,
+            key="operations_case_perspective_filter",
+        )
+    with p2:
+        manager_focus = st.selectbox(
+            "Manager Focus",
+            ["All Open Cases", "High Priority", "Escalated / Overdue", "Waiting >24 Hours", "Unassigned"],
+            index=0,
+            key="operations_manager_focus_filter",
+            disabled=perspective_filter != "Operations Manager",
+        )
+
+    f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+    with f1:
+        search_filter = st.text_input(
+            "Search",
+            value="",
+            placeholder="Booking, container, customer, sender, subject, or reference",
+            key="operations_inbox_search_filter",
+        )
+    with f2:
+        owner_options = ["All Owners"] + sorted(
+            [value for value in inbox_df["owner_label"].dropna().astype(str).unique() if value]
+        )
+        owner_filter = st.selectbox(
+            "Owner",
+            owner_options,
+            index=0,
+            key="operations_owner_queue_filter",
+        )
+    with f3:
+        priority_options = ["All Priorities", "Critical", "High", "Medium", "Low"]
+        priority_filter = st.selectbox(
+            "Priority",
+            priority_options,
+            index=0,
+            key="operations_priority_filter",
+        )
+    with f4:
+        attachment_filter = st.selectbox(
+            "Attachments",
+            ["All Attachments", "Saved", "Mailbox", "Mentioned", "None"],
+            index=0,
+            key="operations_attachment_filter",
+        )
+
+    s1, s2 = st.columns(2)
+    with s1:
+        status_options = ["All Statuses"] + sorted(
+            [value for value in inbox_df["status_label"].dropna().astype(str).unique() if value]
+        )
+        status_filter = st.selectbox(
+            "Status",
+            status_options,
+            index=0,
+            key="operations_status_filter",
+        )
+    with s2:
+        type_options = ["All Request Types"] + sorted(
+            [value for value in inbox_df["request_type_clean"].dropna().astype(str).unique() if value]
+        )
+        request_type_filter = st.selectbox(
+            "Request Type",
+            type_options,
+            index=0,
+            key="operations_request_type_filter",
+        )
+
+    filtered_df = inbox_df.copy()
+    if perspective_filter == "Billing":
+        filtered_df = filtered_df[
+            filtered_df["owner_label"].eq("Billing") | filtered_df["request_type_clean"].eq("Billing")
+        ].copy()
+    elif perspective_filter == "Customer Service":
+        filtered_df = filtered_df[
+            filtered_df["owner_label"].eq("Customer")
+            | filtered_df["request_type_clean"].isin(["Customer Request", "Missing Information"])
+        ].copy()
+    elif perspective_filter == "Operations Manager":
+        if manager_focus == "High Priority":
+            filtered_df = filtered_df[filtered_df["priority_label"].isin(["Critical", "High"])].copy()
+        elif manager_focus == "Escalated / Overdue":
+            filtered_df = filtered_df[
+                filtered_df["priority_label"].eq("Critical")
+                | filtered_df["case_sla_status"].fillna("").astype(str).str.contains("Overdue|Warning", case=False, na=False)
+            ].copy()
+        elif manager_focus == "Waiting >24 Hours":
+            filtered_df = filtered_df[filtered_df["waiting_hours"].ge(24)].copy()
+        elif manager_focus == "Unassigned":
+            filtered_df = filtered_df[
+                filtered_df["owner_label"].isin(["", "Unassigned"])
+                | filtered_df["case_owner"].fillna("").astype(str).isin(["", "Unassigned"])
+            ].copy()
+
+    search_filter = _safe_str(search_filter).lower()
+    if search_filter:
+        searchable_columns = [
+            "id",
+            "client_name",
+            "source_sender",
+            "source_subject",
+            "raw_text_preview",
+            "reference_hint",
+            "conversation_key",
+            "email_thread_id",
+            "case_number",
+            "matched_load_id",
+            "action_required",
+        ]
+        available_search_columns = [column for column in searchable_columns if column in filtered_df.columns]
+        search_blob = filtered_df[available_search_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        search_mask = pd.Series(True, index=filtered_df.index)
+        for term in [part for part in re.split(r"\s+", search_filter) if part]:
+            search_mask &= search_blob.str.contains(re.escape(term), na=False)
+        filtered_df = filtered_df[search_mask].copy()
+    if owner_filter != "All Owners":
+        filtered_df = filtered_df[filtered_df["owner_label"].eq(owner_filter)].copy()
+    if priority_filter != "All Priorities":
+        filtered_df = filtered_df[filtered_df["priority_label"].eq(priority_filter)].copy()
+    if attachment_filter != "All Attachments":
+        if attachment_filter == "None":
+            filtered_df = filtered_df[filtered_df["attachment_status"].eq("None")].copy()
+        else:
+            filtered_df = filtered_df[filtered_df["attachment_status"].str.startswith(attachment_filter, na=False)].copy()
+    if status_filter != "All Statuses":
+        filtered_df = filtered_df[filtered_df["status_label"].eq(status_filter)].copy()
+    if request_type_filter != "All Request Types":
+        filtered_df = filtered_df[filtered_df["request_type_clean"].eq(request_type_filter)].copy()
+
+    if filtered_df.empty:
+        st.info("No Operations Inbox items match the current filters.")
 
     tab_labels = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
 
     queue_map = {
-        "All": inbox_df,
-        "Needs Details": inbox_df[needs_details_mask],
-        "Customer Requests": inbox_df[inbox_df["request_type_clean"].eq("Customer Request")],
-        "New Bookings": inbox_df[inbox_df["request_type_clean"].eq("New Booking")],
-        "Booking Updates": inbox_df[inbox_df["request_type_clean"].eq("Booking Update")],
-        "Appointments": inbox_df[inbox_df["request_type_clean"].eq("Appointment Update")],
-        "Quote Requests": inbox_df[inbox_df["request_type_clean"].eq("Quote Request")],
-        "Missing Info": inbox_df[inbox_df["request_type_clean"].eq("Missing Information")],
-        "POD Requests": inbox_df[inbox_df["request_type_clean"].eq("POD Request")],
-        "Cancellations": inbox_df[inbox_df["request_type_clean"].eq("Cancellation")],
-        "Billing": inbox_df[inbox_df["request_type_clean"].eq("Billing")],
-        "Driver Issues": inbox_df[inbox_df["request_type_clean"].eq("Driver Issue")],
-        "Port Issues": inbox_df[inbox_df["request_type_clean"].eq("Port Issue")],
-        "Spam": inbox_df[inbox_df["request_type_clean"].eq("Spam/Marketing")],
-        "Waiting": inbox_df[inbox_df["review_status_clean"].eq("Waiting on Customer")],
-        "Needs Review": inbox_df[
-            inbox_df["request_type_clean"].isin(["Needs Classification", "Other"])
-            | inbox_df["confidence_score"].fillna(0).lt(70)
-        ],
-        }
-
-    tab_display_cols = {
-        "All": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "request_type",
-            "review_status",
-            "source_subject",
-            "pdf_count",
-            "email_thread_id",
-            "matched_load_id",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Needs Details": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "request_type",
-            "source_subject",
-            "pdf_count",
-            "reference_hint",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Customer Requests": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "source_subject",
-            "pdf_count",
-            "email_thread_id",
-            "reference_hint",
-            "matched_load_id",
-            "action_required",
-        ],
-
-        "New Bookings": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "source_subject",
-            "pdf_count",
-            "reference_hint",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Booking Updates": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "source_subject",
-            "pdf_count",
-            "reference_hint",
-            "matched_load_id",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Appointments": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "reference_hint",
-            "requested_time",
-            "source_subject",
-            "pdf_count",
-            "matched_load_id",
-            "action_required",
-        ],
-
-        "Quote Requests": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "reference_hint",
-            "source_subject",
-            "pdf_count",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Missing Info": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "source_subject",
-            "pdf_count",
-            "matched_load_id",
-            "action_required",
-        ],
-
-        "POD Requests": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "source_subject",
-            "pdf_count",
-            "reference_hint",
-            "matched_load_id",
-            "action_required",
-        ],
-
-        "Cancellations": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "source_subject",
-            "pdf_count",
-            "matched_load_id",
-            "confidence_score",
-            "action_required",
-        ],
-
-        "Waiting": [
-            "id",
-            "email_received",
-            "client_name",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "source_subject",
-            "pdf_count",
-            "matched_load_id",
-            "review_status",
-            "action_required",
-        ],
-
-        "Needs Review": [
-            "id",
-            "email_received",
-            "client_name",
-            "email_direction",
-            "latest_direction",
-            "reply_status",
-            "conversation_message_count",
-            "request_type",
-            "source_sender",
-            "source_subject",
-            "pdf_count",
-            "email_thread_id",
-            "confidence_score",
-            "action_required",
-        ],
+        label: filtered_df[filtered_df["work_queue"].eq(label)]
+        for label in tab_labels
     }
 
-    case_context_cols = ["case_number", "case_status", "case_owner", "case_priority", "case_sla_status"]
-    for columns in tab_display_cols.values():
-        anchor = "client_name" if "client_name" in columns else "id"
-        insert_at = columns.index(anchor) + 1 if anchor in columns else 0
-        for case_col in reversed(case_context_cols):
-            if case_col not in columns:
-                columns.insert(insert_at, case_col)
+    shared_display_cols = [
+        "id",
+        "email_received",
+        "client_name",
+        "owner_label",
+        "priority_label",
+        "status_label",
+        "attachment_status",
+        "request_type",
+        "reply_status",
+        "case_total_messages",
+        "case_number",
+        "source_subject",
+        "reference_hint",
+        "matched_load_id",
+        "confidence_score",
+        "action_required",
+    ]
+    tab_display_cols = {label: list(shared_display_cols) for label in tab_labels}
 
     tab_titles = [
         f"{label} ({len(queue_map.get(label, pd.DataFrame()))})"
@@ -6666,7 +8116,7 @@ def render_operations_inbox() -> None:
         with queue_tab:
             tab_df = queue_map[selected_queue].copy()
             active_display_cols = [
-                c for c in tab_display_cols.get(selected_queue, tab_display_cols["All"])
+                c for c in tab_display_cols.get(selected_queue, shared_display_cols)
                 if c in tab_df.columns
             ]
             if "reference_hint" in active_display_cols:
@@ -6735,6 +8185,17 @@ def render_operations_inbox() -> None:
     subject = str(record.get("source_subject", "") or "")
     sender = str(record.get("source_sender", "") or "")
     body = str(record.get("raw_text", "") or "")
+    try:
+        body_reparsed = parse_email_text(subject, body)
+        parsed, parsed_changed = _merge_operations_body_parsed_fields(parsed, body_reparsed)
+        if parsed_changed:
+            _store_operations_parsed_data(
+                int(selected_id),
+                parsed,
+                action_required=_order_action_required_from_parsed(parsed),
+            )
+    except Exception:
+        pass
 
     classification = _operations_classification_for_review(
         record,
@@ -6790,17 +8251,28 @@ def render_operations_inbox() -> None:
             )
             st.session_state[viewed_key] = True
 
+    _render_operations_case_summary_header(
+        operations_case=operations_case,
+        record=record,
+        parsed=parsed,
+        tokens=tokens,
+        matched_load_id=matched_load_id,
+    )
+
     load_context_key = f"operations_load_context_{selected_id}_{matched_load_id or 'none'}"
     cached_load_context = st.session_state.get(load_context_key) or {}
     load_context = cached_load_context.get("load_context", {})
     load_candidates = cached_load_context.get("load_candidates", [])
 
+    st.caption("Selected email classification")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Detected Type", detected_type)
     c2.metric("Confidence", f"{confidence}%")
     c3.metric("Matched Load", matched_load_id or "-")
     c4.metric("Case", _safe_str(operations_case.get("case_number", "")) or "-")
     c5.metric("Conversation", conversation_key)
+    if classification.get("learning_applied"):
+        st.caption(classification.get("learning_reason", "Routing used recent dispatcher learning."))
 
     selected_conversation_key = _row_conversation_join_key(record)
     with st.expander("Email Synchronization Metadata", expanded=False):
@@ -6818,52 +8290,96 @@ def render_operations_inbox() -> None:
                 references = []
         st.write("**References:** " + (", ".join(references or []) if references else "-"))
 
-    with st.expander("Conversation Timeline", expanded=True):
-        timeline_df = _load_operations_conversation_timeline(selected_conversation_key)
-        if timeline_df.empty:
-            st.info("No additional messages found for this conversation yet.")
+    with st.expander("Case Conversation Timeline", expanded=True):
+        current_case_id = _int_or_none(operations_case.get("id"))
+        if current_case_id is not None:
+            timeline_df = _load_operations_case_timeline(current_case_id)
+            if timeline_df.empty:
+                st.info("No messages, notes, replies, or case events are linked yet.")
+            else:
+                timeline_df = timeline_df.copy()
+                timeline_df["event_time"] = pd.to_datetime(
+                    timeline_df["event_at"],
+                    errors="coerce",
+                ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+                display_timeline = timeline_df[
+                    [
+                        "event_time",
+                        "event_type",
+                        "actor",
+                        "title",
+                        "details",
+                    ]
+                ].rename(
+                    columns={
+                        "event_time": "Time",
+                        "event_type": "Type",
+                        "actor": "Actor",
+                        "title": "Title",
+                        "details": "Preview / Notes",
+                    }
+                )
+                latest_actor = _safe_str(timeline_df.iloc[-1].get("actor", ""))
+                latest_type = _safe_str(timeline_df.iloc[-1].get("event_type", ""))
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Messages / Events", len(timeline_df))
+                t2.metric("Latest Actor", _case_customer_from_sender(latest_actor) if latest_actor else "-")
+                t3.metric("Latest Event", latest_type or "-")
+                st.dataframe(display_timeline, use_container_width=True, hide_index=True)
         else:
-            timeline_df = timeline_df.copy()
-            timeline_df["message_time"] = pd.to_datetime(
-                timeline_df["source_received_at"].fillna(timeline_df["created_at"]),
-                errors="coerce",
-            ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
-            display_timeline = timeline_df[
-                [
-                    "message_time",
-                    "email_direction",
-                    "conversation_status",
-                    "review_status",
-                    "source_sender",
-                    "source_subject",
-                    "message_preview",
-                ]
-            ].rename(
-                columns={
-                    "message_time": "Time",
-                    "email_direction": "Direction",
-                    "conversation_status": "Thread Status",
-                    "review_status": "Request Status",
-                    "source_sender": "From",
-                    "source_subject": "Subject",
-                    "message_preview": "Preview",
-                }
-            )
-            latest_direction = _safe_str(timeline_df.iloc[-1].get("email_direction", "inbound")).title()
-            latest_status = _safe_str(timeline_df.iloc[-1].get("conversation_status", "New Conversation"))
-            t1, t2, t3 = st.columns(3)
-            t1.metric("Messages", len(timeline_df))
-            t2.metric("Latest Direction", latest_direction or "-")
-            t3.metric("Thread Status", latest_status or "-")
-            st.dataframe(display_timeline, use_container_width=True, hide_index=True)
+            timeline_df = _load_operations_conversation_timeline(selected_conversation_key)
+            unfiltered_timeline_count = len(timeline_df)
+            timeline_df = _filter_operations_timeline_for_record(timeline_df, record, tokens, subject, body)
+            if timeline_df.empty:
+                st.info("No additional messages found for this conversation yet.")
+            else:
+                timeline_df = timeline_df.copy()
+                timeline_df["message_time"] = pd.to_datetime(
+                    timeline_df["source_received_at"].fillna(timeline_df["created_at"]),
+                    errors="coerce",
+                ).dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
+                display_timeline = timeline_df[
+                    [
+                        "message_time",
+                        "email_direction",
+                        "conversation_status",
+                        "review_status",
+                        "source_sender",
+                        "source_subject",
+                        "message_preview",
+                    ]
+                ].rename(
+                    columns={
+                        "message_time": "Time",
+                        "email_direction": "Direction",
+                        "conversation_status": "Thread Status",
+                        "review_status": "Request Status",
+                        "source_sender": "From",
+                        "source_subject": "Subject",
+                        "message_preview": "Preview",
+                    }
+                )
+                latest_direction = _safe_str(timeline_df.iloc[-1].get("email_direction", "inbound")).title()
+                latest_status = _safe_str(timeline_df.iloc[-1].get("conversation_status", "New Conversation"))
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Messages", len(timeline_df))
+                t2.metric("Latest Direction", latest_direction or "-")
+                t3.metric("Thread Status", latest_status or "-")
+                if unfiltered_timeline_count > len(timeline_df):
+                    st.caption(f"Filtered {unfiltered_timeline_count - len(timeline_df)} broader thread message(s) that did not match this booking/reference/topic.")
+                st.dataframe(display_timeline, use_container_width=True, hide_index=True)
 
     _render_operations_case_panel(
         selected_id=int(selected_id),
         operations_case=operations_case,
         matched_load_id=matched_load_id,
+        show_timeline=False,
     )
 
     saved_request_type = str(record.get("request_type", "") or "").strip()
+    effective_saved_request_type = _effective_operations_request_type_for_row(record)
+    if effective_saved_request_type != saved_request_type and effective_saved_request_type in REQUEST_TYPES:
+        saved_request_type = effective_saved_request_type
     default_request_type = saved_request_type if saved_request_type in REQUEST_TYPES else detected_type
 
     request_type = st.selectbox(
@@ -6896,6 +8412,16 @@ def render_operations_inbox() -> None:
         tokens=tokens,
         matched_load_id=matched_load_id,
     )
+
+    with st.expander("Learning / Routing Notes", expanded=False):
+        st.caption("Optional notes are saved with the classification so future routing can learn by sender and topic.")
+        st.text_area(
+            "Dispatcher Learning Notes",
+            value="",
+            placeholder="Example: this sender's PRE-ALERT emails are updates for existing loads, not new bookings.",
+            height=80,
+            key=f"operations_manual_learning_notes_{selected_id}",
+        )
 
     with st.expander("Email / Request Body", expanded=True):
         st.write(f"**From:** {sender}")
@@ -7151,8 +8677,10 @@ def render_operations_inbox() -> None:
             confidence,
             selected_action_required,
         )
+        manual_feedback_notes = _safe_str(st.session_state.get(f"operations_manual_learning_notes_{selected_id}", ""))
+        ai_feedback_notes = _safe_str(st.session_state.get(f"operations_ai_feedback_notes_{selected_id}", ""))
+        feedback_notes = ai_feedback_notes or manual_feedback_notes
         if ai_suggestion and ai_suggestion.get("success"):
-            ai_feedback_notes = _safe_str(st.session_state.get(f"operations_ai_feedback_notes_{selected_id}", ""))
             ai_request_type = _safe_str(ai_suggestion.get("request_type", ""))
             ai_action_required = _safe_str(ai_suggestion.get("action_required", ""))
             if request_type != ai_request_type:
@@ -7161,18 +8689,23 @@ def render_operations_inbox() -> None:
                 correction_type = "action_corrected"
             else:
                 correction_type = "classification_confirmed"
+        else:
+            if request_type != default_request_type:
+                correction_type = "manual_classification_corrected"
+            else:
+                correction_type = "manual_classification_saved"
 
-            _save_operations_ai_feedback(
-                intake_id=int(selected_id),
-                load_id=matched_load_id,
-                source_subject=subject,
-                source_sender=sender,
-                ai_suggestion=ai_suggestion,
-                final_request_type=request_type,
-                final_action_required=selected_action_required,
-                correction_type=correction_type,
-                feedback_notes=ai_feedback_notes,
-            )
+        _save_operations_ai_feedback(
+            intake_id=int(selected_id),
+            load_id=matched_load_id,
+            source_subject=subject,
+            source_sender=sender,
+            ai_suggestion=ai_suggestion if ai_suggestion and ai_suggestion.get("success") else None,
+            final_request_type=request_type,
+            final_action_required=selected_action_required,
+            correction_type=correction_type,
+            feedback_notes=feedback_notes,
+        )
         st.success("Classification saved.")
         refresh_data()
         st.rerun()
@@ -7313,22 +8846,37 @@ def render_operations_inbox() -> None:
                     pass
                 st.error(f"Email was not sent: {exc}")
 
-    st.markdown("### Operations Actions")
+    st.markdown("### Order / Quote Actions")
+    st.caption("Use this single action area to place a new order/load, attach an update to an existing order, create a quote, cancel a matched order, or close spam/no-action email.")
 
     current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
     message_text = f"{subject or ''} {body or ''}"
-    can_create_order = request_type == "New Booking" and _has_new_order_details(message_text, parsed, tokens)
+    order_identifier = (
+        _safe_str(parsed.get("Booking Number", ""))
+        or _safe_str(tokens.get("booking_number", ""))
+        or _safe_str(parsed.get("Reference Number", ""))
+        or _safe_str(tokens.get("reference_number", ""))
+        or _safe_str(parsed.get("Container Number", ""))
+        or _safe_str(tokens.get("container_number", ""))
+    )
+    order_customer = _safe_str(parsed.get("Customer", "")) or _safe_str(sender).split("<")[0].strip()
+    can_create_order = request_type == "New Booking" and bool(order_identifier and order_customer)
     can_create_quote = request_type == "Quote Request" and _has_quote_details(message_text, parsed, tokens)
+    fill_order_blanks = st.checkbox(
+        "When updating an existing order, fill blank order fields from parsed email/document data",
+        value=True,
+        key=f"operations_update_order_fill_blanks_{selected_id}",
+    )
 
     a1, a2, a3, a4, a5 = st.columns(5)
 
     with a1:
-        if st.button("Create New Order", use_container_width=True, disabled=not can_create_order):
-            booking = parsed.get("Booking Number") or tokens.get("booking_number")
-            customer = parsed.get("Customer") or ""
+        if st.button("Create Order / Load", use_container_width=True, disabled=not can_create_order):
+            booking = _safe_str(parsed.get("Booking Number", "")) or _safe_str(tokens.get("booking_number", "")) or order_identifier
+            customer = order_customer
 
-            if not booking or not customer:
-                st.error("Booking Number and Customer are required.")
+            if not order_identifier or not customer:
+                st.error("Customer plus booking, reference, or container is required.")
             else:
                 load_id = create_load_from_intake(
                     int(selected_id),
@@ -7377,11 +8925,16 @@ def render_operations_inbox() -> None:
                     _add_operations_case_note(current_case_id, f"Created new load {load_id} from request #{selected_id}.")
 
                 refresh_data()
-                st.success(f"Created new order/load ID {load_id}.")
+                st.success(f"Created order/load ID {load_id}.")
                 st.rerun()
 
     with a2:
         if st.button("Update Existing Order", use_container_width=True, disabled=matched_load_id is None):
+            updates = _update_load_from_operations_pdf(
+                int(matched_load_id),
+                parsed,
+                fill_blank_only=fill_order_blanks,
+            )
             save_load_communication(
                 matched_load_id,
                 int(selected_id),
@@ -7410,17 +8963,23 @@ def render_operations_inbox() -> None:
                 },
             )
             if current_case_id is not None:
+                next_action = f"Request attached to load {matched_load_id}."
+                if updates:
+                    next_action += " Updated fields: " + ", ".join(updates.keys())
                 _update_operations_case(
                     case_id=current_case_id,
                     status="Attached to Load",
                     owner=_safe_str(operations_case.get("owner", "Dispatch")) or "Dispatch",
                     priority=_safe_str(operations_case.get("priority", "Normal")) or "Normal",
                     linked_load_id=matched_load_id,
-                    next_action=f"Request attached to load {matched_load_id}.",
+                    next_action=next_action,
                 )
 
             refresh_data()
-            st.success("Request attached to existing order communication history.")
+            if updates:
+                st.success("Request attached and updated fields: " + ", ".join(updates.keys()))
+            else:
+                st.success("Request attached to existing order communication history.")
             st.rerun()
 
     with a3:
@@ -7483,17 +9042,27 @@ def render_operations_inbox() -> None:
             st.rerun()
 
     with a5:
-        if st.button("Close / No Action", use_container_width=True):
+        close_label = "Close Spam" if request_type == "Spam/Marketing" else "Close / No Action"
+        if st.button(close_label, use_container_width=True):
             execute(
                 """
                 update order_intake
-                set review_status = 'Closed'
+                set review_status = 'Closed',
+                    request_type = case
+                        when :request_type = 'Spam/Marketing' then 'Spam/Marketing'
+                        else request_type
+                    end,
+                    action_required = case
+                        when :request_type = 'Spam/Marketing' then 'Closed as spam / non-operational email.'
+                        else action_required
+                    end
                 where id = :intake_id
                 """,
-                {"intake_id": int(selected_id)},
+                {"intake_id": int(selected_id), "request_type": request_type},
             )
             if current_case_id is not None:
-                _set_operations_case_status(current_case_id, "Closed", "Closed from Operations Inbox with no further action.")
+                close_note = "Closed as spam / non-operational email." if request_type == "Spam/Marketing" else "Closed from Operations Inbox with no further action."
+                _set_operations_case_status(current_case_id, "Closed", close_note)
 
             refresh_data()
             st.info("Request closed.")

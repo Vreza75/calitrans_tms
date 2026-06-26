@@ -258,3 +258,56 @@ COMPANY_NAME
 - Added a Communication Dashboard section inside Dashboard with open cases, waiting by department, average first response, cases closed, SLA compliance, owner workload, SLA watch, and shared case view.
 - Added migration tables for `operations_case_owner_history` and `operations_case_events`.
 - Added migration backfill for first-response and resolution SLA due dates on existing cases.
+
+## June 25, 2026 Operations Inbox Attachment Verification and Parsing
+
+- Updated email synchronization to capture all decoded email attachments instead of only filenames ending in `.pdf`.
+- Saved attachment metadata including filename, content type, size, file path, parse result, extracted text preview, and parsed order fields.
+- Preserved the existing PDF workflow while adding support for saved DOCX, TXT, CSV, and image attachments.
+- Updated duplicate/skipped email backfill so existing inbox records can receive newly discovered attachments when Yahoo returns the message again.
+- Updated the Inbox document panel to show all saved attachments, download them, preview PDFs/images, and parse supported documents for order fields.
+- Added manual upload for PDF, DOCX, TXT, CSV, PNG, JPG, and JPEG inside an Operations Inbox request.
+- Improved email body parsing for drayage requests with unlabeled references, `1 x40` size text, hazmat/IMO notes, loading-ready dates, and cutoff dates.
+- Added `attachment_count` beside `pdf_count` in Operations Inbox queues.
+
+## June 25, 2026 Attachment Recovery and Corrected-Container Parsing
+
+- Added a targeted `Rescan This Email for Attachments` action inside each Operations Inbox request when the email body mentions attached documents but no files are saved.
+- Made the rescan look up the exact Message-ID first, then fall back to the broader Operations mailbox scan if needed.
+- Added attachment handling for nested/forwarded email structures while preventing duplicate saved files.
+- Auto-reparses the email body when opening a request and saves improved fields back to the inbox record.
+- Updated parser logic for customer corrections such as `container TGCU5422440 instead of ECMU5364722`, so the corrected container is used for load matching and order creation.
+- Extracts reference numbers from subjects like `129693074 / ECMU5364722` and recognizes Flat World / `@flatworldgs.com` as `Flat World Global Logistics`.
+
+## June 25, 2026 Operations Inbox Flow Cleanup
+
+- Added a visible `attachment_status` queue column showing `Saved`, `Mailbox`, `Mentioned`, or `None` so dispatch can audit attachment handling without opening each request.
+- Tightened New Booking classification so informational replies such as hours, FYI notes, corrections, and pre-alert updates route to Booking Updates or Customer Requests unless they include clear order-placement language.
+- Updated `Recheck Groups` so obvious informational New Booking rows can be corrected even when they previously had higher confidence.
+- Filtered Conversation Timeline rows by booking, container, reference, matched load, or topic tokens so broad threads do not mix unrelated orders.
+- Simplified the document panel to review/import/attach documents only; order creation and updates now happen in the single `Order / Quote Actions` area.
+- Updated `Update Existing Order` to attach the email and optionally fill blank order fields from parsed email/document data.
+
+## June 25, 2026 Operations Inbox UI and Query Fix
+
+- Fixed the Operations Inbox load error caused by an unescaped `_email_sync` JSON path in the inbox query.
+- Reworked the Operations Inbox header, sync notice, and KPI metrics into a cleaner dispatch-console layout.
+- Normalized fonts, button sizes, tab sizing, expander borders, dataframe borders, and metric card sizing for a more professional TMS feel.
+- Removed the old negative banner margin and reduced oversized rounded/shadowed styling that made the page feel cramped.
+
+## June 26, 2026 Operations Manager Queue Workflow
+
+- Replaced the long email-type tab list with seven dispatcher action queues: `Action Required`, `New Orders`, `Existing Loads`, `Waiting`, `Documents`, `Billing`, and `Review`.
+- Moved Missing Info into a status label instead of a standalone tab, grouped POD/document work under `Documents`, grouped driver/port work under `Existing Loads`, and auto-closes Spam/Marketing during sync or regrouping.
+- Added stronger inbox filters for search, owner, priority, status, request type, and attachment status.
+- Added normalized queue columns for owner, priority, status, attachment state, case number, reply status, reference, matched load, confidence, and action guidance.
+- Updated classification learning so manual dispatcher saves are stored even when AI Assist is not used, and future routing can apply recent corrections by sender/topic pattern.
+
+## June 26, 2026 Case-Centric Operations Workspace
+
+- Strengthened Operations Case matching so copied or related emails can attach to the same open case by linked load, booking, container, reference, normalized subject, thread/conversation key, and sender domain.
+- Collapsed Operations Inbox display to one visible row per Operations Case instead of one row per copied email, while still preserving every email inside the case timeline.
+- Added case perspectives and manager focus filters for Dispatch, Operations Manager, Billing, Customer Service, High Priority, Escalated/Overdue, Waiting over 24 hours, and Unassigned cases.
+- Added a case-first review header showing case number, customer, booking, container, linked load, priority, owner, status, last reply, last customer email, total messages, and SLA timing.
+- Changed the review timeline to show the full Operations Case conversation and activity stream, including inbound emails, synced replies, internal notes, load actions, and system events.
+- Added custom owner support and quick waiting statuses for Manager, Driver, Port, and Warehouse so cases can show who or what the operation is waiting on.
