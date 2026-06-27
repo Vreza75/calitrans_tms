@@ -14,6 +14,32 @@ import smtplib
 import zipfile
 import xml.etree.ElementTree as ET
 
+
+def _load_local_env_file() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if value and os.getenv(key) in [None, ""]:
+            os.environ[key] = value
+
+
+_load_local_env_file()
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.message import EmailMessage
@@ -22,10 +48,10 @@ import pandas as pd
 import streamlit as st
 
 from admin_pages import render_master_data_admin
-from config import ACTIVE_STATUSES, APP_NAME, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS
+from config import ACTIVE_STATUSES, APP_NAME, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
 from db_client import DispatchDatabaseClient, execute, read_df
 import email_client as _email_client
-from email_parser import parse_email_text
+from email_parser import extract_latest_email_body, parse_email_text
 from operations_ai import (
     generate_operations_ai_suggestion,
     is_operations_ai_auto_classify_enabled,
@@ -64,13 +90,25 @@ st.set_page_config(
 
 
 LOAD_STATUS_FLOW = [
+    "New Email",
+    "Needs Review",
+    "Order Created",
     "New",
     "Hold/Need Info",
+    "Booking Verified",
+    "Port Verified",
+    "Ready for Appointment / PIN",
+    "Ready for Port PIN",
+    "PIN Received",
     "Awaiting Appointment",
     "Ready to Dispatch",
+    "Driver Assigned",
     "Assigned",
+    "Dispatched",
     "En Route to Pickup",
+    "At Port",
     "At Pickup",
+    "Loaded / Picked Up",
     "Loaded",
     "En Route To Delivery",
     "Delivered",
@@ -83,11 +121,33 @@ LOAD_STATUS_FLOW = [
     "Cancelled",
 ]
 
+ORDER_MANAGEMENT_STATUSES = [
+    "New",
+    "Hold/Need Info",
+    "Booking Verified",
+    "Cancelled",
+]
+
+ORDER_MANAGEMENT_STATUS_LABELS = {
+    "New": "New",
+    "Hold/Need Info": "Missing Info",
+    "Booking Verified": "Booking Verified",
+    "Cancelled": "Cancel",
+}
+
 DISPATCH_BOARD_STATUSES = [
+    "Port Verified",
+    "Ready for Appointment / PIN",
+    "Ready for Port PIN",
+    "PIN Received",
     "Ready to Dispatch",
+    "Driver Assigned",
     "Assigned",
+    "Dispatched",
     "En Route to Pickup",
+    "At Port",
     "At Pickup",
+    "Loaded / Picked Up",
     "Loaded",
     "En Route To Delivery",
     "Delivered",
@@ -96,10 +156,137 @@ DISPATCH_BOARD_STATUSES = [
 
 LOAD_TYPE_TABS = ["Import", "Export", "Export Local", "Import Local"]
 
+DISPATCH_MOVE_TYPES = LOAD_TYPE_TABS + ["Other"]
+
+DISPATCH_ACTION_WORKFLOWS = {
+    "Import": {
+        "Verification": [
+            ("new_orders", "New Orders"),
+            ("needs_verification", "Needs Verification"),
+            ("documents", "Documents"),
+        ],
+        "Planning": [
+            ("sync_port", "Sync Port Data"),
+            ("appointment_needed", "Appointment / PIN"),
+            ("assign_driver", "Assign Driver"),
+            ("send_packet", "Send Packet"),
+        ],
+        "Execution": [
+            ("enroute_pickup", "Enroute Port"),
+            ("at_port", "At Port"),
+            ("loaded", "Loaded"),
+            ("enroute_delivery", "Enroute Warehouse"),
+        ],
+        "Completion": [
+            ("delivered", "Delivered"),
+            ("empty_return", "Empty Return"),
+            ("ready_billing", "Ready for Billing"),
+            ("completed", "Completed"),
+        ],
+    },
+    "Export": {
+        "Verification": [
+            ("new_orders", "New Orders"),
+            ("needs_verification", "Needs Verification"),
+            ("documents", "Documents"),
+        ],
+        "Planning": [
+            ("sync_port", "Sync Booking / Terminal"),
+            ("appointment_needed", "Empty / Port Appointment"),
+            ("assign_driver", "Assign Driver"),
+            ("send_packet", "Send Packet"),
+        ],
+        "Execution": [
+            ("enroute_pickup", "Enroute Pickup"),
+            ("at_pickup", "At Empty Yard / Shipper"),
+            ("loaded", "Loaded"),
+            ("enroute_delivery", "Enroute Port"),
+            ("at_port", "At Port"),
+        ],
+        "Completion": [
+            ("delivered", "Delivered to Port"),
+            ("empty_return", "Chassis Return"),
+            ("ready_billing", "Ready for Billing"),
+            ("completed", "Completed"),
+        ],
+    },
+    "Import Local": {
+        "Verification": [
+            ("new_orders", "New Orders"),
+            ("needs_verification", "Needs Verification"),
+            ("documents", "Documents"),
+        ],
+        "Planning": [
+            ("assign_driver", "Assign Driver"),
+            ("send_packet", "Send Packet"),
+        ],
+        "Execution": [
+            ("enroute_pickup", "Enroute Pickup"),
+            ("at_pickup", "At Pickup"),
+            ("loaded", "Loaded"),
+            ("enroute_delivery", "Enroute Delivery"),
+        ],
+        "Completion": [
+            ("delivered", "Delivered"),
+            ("ready_billing", "Ready for Billing"),
+            ("completed", "Completed"),
+        ],
+    },
+    "Export Local": {
+        "Verification": [
+            ("new_orders", "New Orders"),
+            ("needs_verification", "Needs Verification"),
+            ("documents", "Documents"),
+        ],
+        "Planning": [
+            ("assign_driver", "Assign Driver"),
+            ("appointment_needed", "Pickup Empty"),
+            ("send_packet", "Send Packet"),
+        ],
+        "Execution": [
+            ("enroute_pickup", "Enroute Customer"),
+            ("at_pickup", "At Customer"),
+            ("loaded", "Loaded"),
+            ("enroute_delivery", "Enroute Delivery"),
+        ],
+        "Completion": [
+            ("delivered", "Delivered"),
+            ("ready_billing", "Ready for Billing"),
+            ("completed", "Completed"),
+        ],
+    },
+    "Other": {
+        "Verification": [
+            ("new_orders", "New Orders"),
+            ("needs_verification", "Needs Verification"),
+            ("documents", "Documents"),
+        ],
+        "Planning": [
+            ("assign_driver", "Assign Driver"),
+            ("send_packet", "Send Packet"),
+        ],
+        "Execution": [
+            ("enroute_pickup", "Enroute Pickup"),
+            ("at_pickup", "At Pickup"),
+            ("loaded", "Loaded"),
+            ("enroute_delivery", "Enroute Delivery"),
+        ],
+        "Completion": [
+            ("delivered", "Delivered"),
+            ("ready_billing", "Ready for Billing"),
+            ("completed", "Completed"),
+        ],
+    },
+}
+
 ACTIVE_DRIVER_STATUSES = [
+    "Driver Assigned",
     "Assigned",
+    "Dispatched",
     "En Route to Pickup",
+    "At Port",
     "At Pickup",
+    "Loaded / Picked Up",
     "Loaded",
     "En Route To Delivery",
     "Returning Empty",
@@ -168,6 +355,7 @@ LOAD_SEARCH_COLUMNS = [
 NAVIGATION_SECTIONS = [
     "Operations Inbox",
     "Orders/Load Management",
+    "Active Status",
     "Dispatch Board",
     "Calendar View",
     "Documents",
@@ -182,6 +370,7 @@ NAVIGATION_SECTIONS = [
 LOAD_DATA_SECTIONS = {
     "Dashboard",
     "Orders/Load Management",
+    "Active Status",
     "Dispatch Board",
     "Calendar View",
     "Documents",
@@ -189,6 +378,8 @@ LOAD_DATA_SECTIONS = {
     "Port Houston Integration",
     "Validation",
 }
+
+STATUS_LEGEND_SECTIONS = {"Active Status", "Dispatch Board", "Calendar View"}
 
 
 def load_css() -> None:
@@ -545,13 +736,25 @@ def show_header() -> None:
 
 
 STATUS_COLORS = {
+    "New Email": "#f8fafc",
+    "Needs Review": "#fef3c7",
+    "Order Created": "#e0f2fe",
     "New": "#f8fafc",
     "Hold/Need Info": "#fecaca",
+    "Booking Verified": "#dbeafe",
+    "Port Verified": "#c7d2fe",
+    "Ready for Appointment / PIN": "#ddd6fe",
+    "Ready for Port PIN": "#ddd6fe",
+    "PIN Received": "#bfdbfe",
     "Awaiting Appointment": "#fdba74",
     "Ready to Dispatch": "#bbf7d0",
+    "Driver Assigned": "#dcfce7",
     "Assigned": "#dcfce7",
+    "Dispatched": "#ccfbf1",
     "En Route to Pickup": "#bef264",
+    "At Port": "#fde68a",
     "At Pickup": "#fde047",
+    "Loaded / Picked Up": "#a5b4fc",
     "Loaded": "#a5b4fc",
     "En Route To Delivery": "#5eead4",
     "Delivered": "#93c5fd",
@@ -565,13 +768,25 @@ STATUS_COLORS = {
 }
 
 STATUS_MEANINGS = {
+    "New Email": "Email received but not converted to order yet",
+    "Needs Review": "Needs dispatcher or manager review before order work",
+    "Order Created": "Order/load created from intake",
     "New": "New confirmed load, not dispatched yet",
     "Hold/Need Info": "Issue or missing information; dispatcher action required",
+    "Booking Verified": "Core order information verified",
+    "Port Verified": "Port Houston/container/booking data checked",
+    "Ready for Appointment / PIN": "Ready to request port appointment or PIN",
+    "Ready for Port PIN": "Ready to request port appointment or PIN",
+    "PIN Received": "PIN or gate appointment confirmation is ready",
     "Awaiting Appointment": "Booking confirmed but waiting for pickup or delivery appointment",
-    "Ready to Dispatch": "Ready/green light to assign driver and truck",
+    "Ready to Dispatch": "Driver, truck, port, and PIN/appointment are ready for dispatch packet",
+    "Driver Assigned": "Driver assigned; confirm truck, PIN/appointment, and packet",
     "Assigned": "Driver and truck assigned",
+    "Dispatched": "Driver has been dispatched",
     "En Route to Pickup": "Driver moving toward pickup or terminal",
+    "At Port": "Driver is at port or terminal",
     "At Pickup": "Driver checked in or waiting at pickup",
+    "Loaded / Picked Up": "Container or freight picked up",
     "Loaded": "Container or freight loaded",
     "En Route To Delivery": "Driver moving toward delivery",
     "Delivered": "Delivered; POD or next billing step needed",
@@ -586,11 +801,12 @@ STATUS_MEANINGS = {
 
 
 STATUS_LEGEND_GROUPS = {
-    "Ready / Active": ["Ready to Dispatch", "Assigned", "En Route to Pickup", "En Route To Delivery", "Ready for ProfitTools"],
-    "Pickup / Loading": ["At Pickup", "Loaded"],
+    "Intake / Verification": ["New Email", "Needs Review", "Order Created", "New", "Hold/Need Info", "Booking Verified", "Port Verified"],
+    "Ready / Active": ["Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch", "Driver Assigned", "Assigned", "Dispatched", "En Route to Pickup", "En Route To Delivery", "Ready for ProfitTools"],
+    "Pickup / Loading": ["At Port", "At Pickup", "Loaded / Picked Up", "Loaded"],
     "Delivered / Return": ["Delivered", "Returning Empty", "POD Received"],
     "Issues / Stops": ["Hold/Need Info", "Awaiting Appointment", "Cancelled"],
-    "Billing / Closed": ["Exported to ProfitTools", "Invoiced", "Closed", "New"],
+    "Billing / Closed": ["Exported to ProfitTools", "Invoiced", "Closed"],
 }
 
 
@@ -601,13 +817,25 @@ def _get_status_color(status: str) -> str:
 
 def _get_status_border_color(status: str) -> str:
     border_colors = {
+        "New Email": "#94a3b8",
+        "Needs Review": "#d97706",
+        "Order Created": "#0284c7",
         "New": "#94a3b8",
         "Hold/Need Info": "#dc2626",
+        "Booking Verified": "#2563eb",
+        "Port Verified": "#4f46e5",
+        "Ready for Appointment / PIN": "#7c3aed",
+        "Ready for Port PIN": "#7c3aed",
+        "PIN Received": "#1d4ed8",
         "Awaiting Appointment": "#ea580c",
         "Ready to Dispatch": "#16a34a",
+        "Driver Assigned": "#22c55e",
         "Assigned": "#22c55e",
+        "Dispatched": "#14b8a6",
         "En Route to Pickup": "#65a30d",
+        "At Port": "#ca8a04",
         "At Pickup": "#ca8a04",
+        "Loaded / Picked Up": "#4f46e5",
         "Loaded": "#4f46e5",
         "En Route To Delivery": "#0d9488",
         "Delivered": "#2563eb",
@@ -663,8 +891,8 @@ def show_kpis(df: pd.DataFrame) -> None:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Loads", len(open_loads))
-    c2.metric("Ready to Dispatch", int(df["Status"].eq("Ready to Dispatch").sum()))
-    c3.metric("On Driver", int(df["Status"].isin(["Assigned", "En Route to Pickup", "At Pickup", "Loaded", "En Route To Delivery"]).sum()))
+    c2.metric("Ready to Dispatch", int(df["Status"].isin(["PIN Received", "Ready to Dispatch"]).sum()))
+    c3.metric("On Driver", int(df["Status"].isin(ACTIVE_DRIVER_STATUSES).sum()))
     c4.metric("LFD Risk", len(lfd_risk))
     c5.metric("Late Deliveries", len(late))
 
@@ -756,7 +984,7 @@ def render_dashboard(df: pd.DataFrame) -> None:
     total_drivers = max(all_drivers, active_drivers, 1)
     driver_utilization = int(round((active_drivers / total_drivers) * 100))
 
-    ready_to_dispatch = int(open_df["Status"].eq("Ready to Dispatch").sum())
+    ready_to_dispatch = int(open_df["Status"].isin(["PIN Received", "Ready to Dispatch"]).sum())
     on_driver = int(open_df["Status"].isin(ACTIVE_DRIVER_STATUSES).sum())
     delivered_today = int(today_df["Status"].isin(["Delivered", "POD Received", "Ready for ProfitTools"]).sum())
     ready_for_billing = int(open_df["Status"].isin(["POD Received", "Ready for ProfitTools"]).sum())
@@ -913,29 +1141,50 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
     st.markdown("### Exceptions / Needs Attention")
 
-    exceptions = {
-        "Unassigned Ready Loads": int(
-            (
-                open_df["Status"].eq("Ready to Dispatch")
-                & open_df["Driver Name"].astype(str).str.strip().isin(["", "None", "nan", "Unassigned"])
-            ).sum()
-        ),
-        "Missing Container Number": int(
-            open_df["Container Number"].astype(str).str.strip().isin(["", "None", "nan"]).sum()
-        ),
-        "Missing Driver": int(
-            open_df["Driver Name"].astype(str).str.strip().isin(["", "None", "nan", "Unassigned"]).sum()
-        ),
-        "Hold / Need Info": int(open_df["Status"].eq("Hold/Need Info").sum()),
-        "Delivered / POD Needed": int(open_df["Status"].eq("Delivered").sum()),
-        "Ready for Billing": ready_for_billing,
-    }
-
+    exceptions = _load_exception_summary(open_df)
     exception_df = pd.DataFrame(
         [{"Issue": issue, "Count": count} for issue, count in exceptions.items()]
     )
+    exception_total = int(exception_df["Count"].sum()) if not exception_df.empty else 0
+    if exception_total:
+        st.error(f"{exception_total} exception alert(s) need attention before the work is clean.")
+    else:
+        st.success("No major operational exceptions are currently flagged.")
 
     st.dataframe(exception_df, use_container_width=True, hide_index=True)
+
+    exception_loads = open_df.copy()
+    if not exception_loads.empty:
+        readiness_rows = exception_loads.apply(lambda row: _load_readiness_details(row, include_documents=False), axis=1)
+        exception_loads["Readiness %"] = readiness_rows.apply(lambda details: int(details.get("score", 0)))
+        exception_loads["Next Action"] = readiness_rows.apply(lambda details: details.get("next_action", ""))
+        exception_loads["Exceptions"] = readiness_rows.apply(lambda details: ", ".join(details.get("exceptions", [])))
+        exception_loads = exception_loads[exception_loads["Exceptions"].astype(str).str.strip().ne("")].copy()
+        if not exception_loads.empty:
+            st.markdown("#### Exception Loads")
+            exception_columns = [
+                "_row_id",
+                "TYPE",
+                "Status",
+                "Readiness %",
+                "Next Action",
+                "Exceptions",
+                "Booking Number",
+                "Container Number",
+                "Customer",
+                "Port",
+                "Warehouse",
+                "LFD",
+                "Driver Name",
+            ]
+            exception_cols = [column for column in exception_columns if column in exception_loads.columns]
+            styled_exceptions = (
+                exception_loads.sort_values(["Status", "LFD", "_row_id"], ascending=[True, True, False])[exception_cols]
+                .head(40)
+                .style
+                .apply(_status_row_style, axis=1)
+            )
+            st.dataframe(styled_exceptions, use_container_width=True, hide_index=True)
 
     st.divider()
     render_communication_dashboard()
@@ -1038,8 +1287,8 @@ def _render_booking_verification_actions(verification_df: pd.DataFrame) -> None:
         return
 
     st.divider()
-    st.markdown("### Booking Final Check / Move to Dispatch")
-    st.caption("Use this section as the last office check before the booking becomes Ready to Dispatch.")
+    st.markdown("### Booking Final Check")
+    st.caption("Use this section as the last office check before the order becomes Booking Verified. Port sync, PIN, driver assignment, and dispatch packet happen in the load workspace.")
 
     labels = [
         f"{row['Booking Number']} | {row.get('Customer', '')} | {row.get('Readiness %', 0)}% ready | row {int(row['_row_id'])}"
@@ -1112,19 +1361,6 @@ def _render_booking_verification_actions(verification_df: pd.DataFrame) -> None:
             st.rerun()
 
     with a2:
-        if st.button("Awaiting Appointment", key=f"mark_appt_{selected_row_id}", use_container_width=True):
-            DispatchDatabaseClient().update_row_fields(
-                selected_row_id,
-                {
-                    "Status": "Awaiting Appointment",
-                    "Dispatcher Notes": action_note or "Waiting for appointment confirmation.",
-                },
-            )
-            refresh_data()
-            st.success("Booking marked Awaiting Appointment.")
-            st.rerun()
-
-    with a3:
         if st.button("Save Verification Note", key=f"save_verify_note_{selected_row_id}", use_container_width=True):
             DispatchDatabaseClient().update_row_fields(
                 selected_row_id,
@@ -1134,28 +1370,38 @@ def _render_booking_verification_actions(verification_df: pd.DataFrame) -> None:
             st.success("Verification note saved.")
             st.rerun()
 
-    with a4:
+    with a3:
         disabled = readiness_score < 100
         if st.button(
-            "Move to Dispatch",
-            key=f"move_to_dispatch_{selected_row_id}",
+            "Mark Booking Verified",
+            key=f"mark_booking_verified_{selected_row_id}",
             use_container_width=True,
             disabled=disabled,
-            help="Requires 100% readiness. Sets status to Ready to Dispatch.",
+            help="Requires 100% booking completeness. The next action will be Port Houston verification.",
         ):
             DispatchDatabaseClient().update_row_fields(
                 selected_row_id,
                 {
-                    "Status": "Ready to Dispatch",
-                    "Dispatcher Notes": action_note or "Booking verified and moved to dispatch.",
+                    "Status": "Booking Verified",
+                    "Dispatcher Notes": action_note or "Booking information verified. Next action: verify booking with Port Houston.",
                 },
             )
             refresh_data()
-            st.success("Booking moved to Dispatch Board as Ready to Dispatch.")
+            st.success("Booking marked verified. Open the load workspace for Port Sync / PIN.")
+            st.rerun()
+
+    with a4:
+        if st.button("Cancel Booking", key=f"verification_cancel_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {"Status": "Cancelled", "Dispatcher Notes": action_note or "Booking cancelled during review."},
+            )
+            refresh_data()
+            st.error("Booking cancelled.")
             st.rerun()
 
     if readiness_score < 100:
-        st.info("Move to Dispatch is disabled until all required booking fields are complete.")
+        st.info("Mark Booking Verified is disabled until all required booking fields are complete.")
 
 def _parse_date_or_none(value):
     parsed = pd.to_datetime(value, errors="coerce")
@@ -1181,10 +1427,12 @@ REQUEST_TYPES = [
     "Missing Information",
     "Cancellation",
     "Billing",
+    "Business Communication",
     "Driver Issue",
     "Port Issue",
     "Customer Request",
     "POD Request",
+    "No Action / FYI",
     "Spam/Marketing",
     "Other",
 ]
@@ -1211,8 +1459,91 @@ DEFAULT_OPERATIONS_QUEUE_ORDER = [
     "Waiting",
     "Documents",
     "Billing",
+    "Business",
+    "Archive",
     "Review",
 ]
+
+OPERATIONS_CONTROL_LEVELS = [
+    "Level 1 - Operational Cases",
+    "Level 2 - Business Communications",
+    "Level 3 - No Action / Archive",
+    "Needs Review",
+]
+
+OPERATIONS_CONTROL_LEVEL_DESCRIPTIONS = {
+    "Level 1 - Operational Cases": "Shipment, load, appointment, driver, port, document, and customer work that should move through dispatch.",
+    "Level 2 - Business Communications": "Important company communications for accounting, management, sales, safety, vendors, or administration.",
+    "Level 3 - No Action / Archive": "FYI, marketing, newsletters, duplicate, spam, and other messages that should not become dispatcher work.",
+    "Needs Review": "Low-confidence or unclear messages that need a person to choose Operational, Business, Archive, or Spam once.",
+}
+
+OPERATIONAL_REQUEST_TYPES = {
+    "New Booking",
+    "Booking Update",
+    "Appointment Update",
+    "Quote Request",
+    "Missing Information",
+    "Cancellation",
+    "Driver Issue",
+    "Port Issue",
+    "Customer Request",
+    "POD Request",
+}
+
+BUSINESS_REQUEST_TYPES = {"Billing", "Business Communication"}
+NO_ACTION_REQUEST_TYPES = {"No Action / FYI", "Spam/Marketing"}
+
+BUSINESS_COMMUNICATION_TERMS = [
+    "insurance",
+    "renewal",
+    "contract",
+    "agreement",
+    "legal",
+    "attorney",
+    "claim",
+    "bank",
+    "loan",
+    "utility",
+    "vendor",
+    "supplier",
+    "equipment purchase",
+    "software",
+    "it support",
+    "password",
+    "recruiting",
+    "resume",
+    "candidate",
+    "employment",
+    "hr",
+    "human resources",
+    "new customer inquiry",
+    "sales lead",
+    "credit application",
+]
+
+NO_ACTION_COMMUNICATION_TERMS = [
+    "advertisement",
+    "newsletter",
+    "unsubscribe",
+    "promotion",
+    "webinar",
+    "container sales",
+    "equipment marketing",
+    "holiday notice",
+    "office closed",
+    "for your records only",
+    "no action required",
+    "do not reply",
+]
+
+VIP_OPERATIONS_DOMAINS = {
+    "msc.com",
+    "maersk.com",
+    "hapag-lloyd.com",
+    "evergreen-shipping.com",
+    "porthouston.com",
+}
 
 OPERATIONS_CASE_STATUSES = [
     "New",
@@ -1273,6 +1604,7 @@ def _extract_reference_tokens(text: str) -> dict:
     subject_pair_match = re.search(r"\b(\d{5,})\s*/\s*([A-Z]{4}\d{7})\b", text, re.I)
     booking_match = (
         re.search(r"\b(?:booking|bkg|bk)\s*(?:number|no\.?|#)?\s*[:#-]\s*([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
+        or re.search(r"\bbooking\s+(?:confirmation|ref(?:erence)?|number|no\.?)\b[^A-Z0-9]{0,20}([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
         or re.search(r"\b(?:IMP|EXP|IML|EXL)[-\s]?[A-Z0-9-]{4,}\b", text, re.I)
         or re.search(r"\b(?:MAEU|ONEY|COSU|ZIMU|HLCU|MSCU|OOLU|CMDU|EGLV|YMLU|HMMU|SUDU)[A-Z0-9-]{4,}\b", text, re.I)
     )
@@ -1309,6 +1641,11 @@ def _extract_reference_tokens(text: str) -> dict:
 
 
 APPOINTMENT_INTENT_TERMS = [
+    "have the container",
+    "please have the container",
+    "deliver at",
+    "delivery time",
+    "pickup time",
     "can we load",
     "load at",
     "load on",
@@ -1356,6 +1693,8 @@ QUOTE_INTENT_TERMS = [
 ]
 
 UPDATE_INTENT_TERMS = [
+    "please have the container",
+    "requested time",
     "any update",
     "status update",
     "please update",
@@ -1435,6 +1774,9 @@ NEW_ORDER_INTENT_TERMS = [
     "bol",
     "attached order",
     "attached load",
+    "following shipment",
+    "shipment details",
+    "truckload details",
     "please book",
     "nuevo booking",
     "nueva carga",
@@ -1456,6 +1798,9 @@ ORDER_PLACEMENT_TERMS = [
     "please pickup",
     "please deliver",
     "need drayage",
+    "following shipment",
+    "shipment details",
+    "truckload details",
     "drayage for the booking",
     "drayage for booking",
     "set up this load",
@@ -1610,6 +1955,10 @@ def _subject_is_reply(subject: str) -> bool:
 def _is_information_update(text: str) -> bool:
     lowered = str(text or "").lower()
     if _contains_any(lowered, INFORMATION_UPDATE_TERMS):
+        return True
+    if re.search(r"\bplease\s+have\b.{0,80}\b(?:container|load|truck)\b", lowered, re.I):
+        return True
+    if re.search(r"\b(?:about|around|at|by)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:-|to)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", lowered, re.I):
         return True
     return bool(re.search(r"\b(?:please\s+note|note)\b.{0,80}\b(?:hours?|schedule|address|cutoff|lfd)\b", lowered, re.I))
 
@@ -2022,11 +2371,6 @@ def update_intake_classification(
             "action_required": action_required,
         },
     )
-    try:
-        _sync_operations_case_for_intake_id(intake_id)
-    except Exception:
-        pass
-
 
 def save_load_communication(
     load_id,
@@ -2147,6 +2491,10 @@ OPERATIONS_ORDER_FIELDS = [
     "Delivery Need Date",
     "Document Cutoff",
     "LFD",
+    "Contact Name",
+    "Contact Email",
+    "Contact Phone",
+    "Contact Company",
     "Dispatcher Notes",
 ]
 
@@ -2326,10 +2674,15 @@ def _merge_operations_order_fields(body_parsed: dict, pdf_parsed: dict) -> tuple
     for field in OPERATIONS_ORDER_FIELDS:
         body_value = _safe_str(body_parsed.get(field, ""))
         pdf_value = _safe_str(pdf_parsed.get(field, ""))
-        final_value = pdf_value or body_value
+        if field == "Dispatcher Notes" and body_value and pdf_value:
+            final_value = body_value if pdf_value in body_value else f"{body_value}\n{pdf_value}"
+        else:
+            final_value = pdf_value or body_value
         final_data[field] = final_value
 
-        if body_value and pdf_value and body_value.lower() != pdf_value.lower():
+        if field == "Dispatcher Notes" and body_value and pdf_value:
+            status = "Combined"
+        elif body_value and pdf_value and body_value.lower() != pdf_value.lower():
             status = "Review mismatch"
             conflicts.append(field)
         elif final_value:
@@ -2392,11 +2745,6 @@ def _store_operations_parsed_data(intake_id: int, parsed_data: dict, action_requ
             "action_required": action_required,
         },
     )
-    try:
-        _sync_operations_case_for_intake_id(intake_id)
-    except Exception:
-        pass
-
 
 @st.cache_data(show_spinner=False, ttl=900)
 def _read_operations_pdf_file(file_path: str, modified_ns: int) -> bytes:
@@ -2777,7 +3125,11 @@ def _operations_items_needing_smart_group_update(inbox_df: pd.DataFrame) -> pd.S
     confidence = pd.to_numeric(inbox_df["confidence_score"], errors="coerce").fillna(0)
     has_match = inbox_df["matched_load_id"].notna() & ~inbox_df["matched_load_id"].astype(str).isin(["", "nan", "None"])
     subject_series = inbox_df["source_subject"].fillna("").astype(str) if "source_subject" in inbox_df.columns else pd.Series("", index=inbox_df.index)
-    body_series = inbox_df["raw_text"].fillna("").astype(str) if "raw_text" in inbox_df.columns else pd.Series("", index=inbox_df.index)
+    body_series = (
+        inbox_df["raw_text"].fillna("").astype(str).apply(extract_latest_email_body)
+        if "raw_text" in inbox_df.columns
+        else pd.Series("", index=inbox_df.index)
+    )
     message_series = subject_series + "\n" + body_series
     obvious_info_new_booking = current_type.eq("New Booking") & message_series.apply(
         lambda value: _is_information_update(value) and not _has_order_placement_signal(value)
@@ -3482,9 +3834,10 @@ def _get_or_create_operations_case(
 ) -> dict:
     _ensure_operations_case_schema()
     conversation_key = _safe_str(conversation_key)
+    body = extract_latest_email_body(body) or body
     parsed_for_identity = {}
     try:
-        parsed_for_identity = parse_email_text(subject, body)
+        parsed_for_identity = parse_email_text(subject, body, sender)
     except Exception:
         parsed_for_identity = {}
     existing_case = _find_existing_operations_case_for_message(
@@ -4437,8 +4790,17 @@ def _merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict]) 
     for attachment in saved_attachments:
         attachment_parsed = attachment.get("parsed_data") or {}
         for field in OPERATIONS_ORDER_FIELDS:
-            if _safe_str(attachment_parsed.get(field, "")) and not _safe_str(updated.get(field, "")):
-                updated[field] = _safe_str(attachment_parsed.get(field, ""))
+            attachment_value = _safe_str(attachment_parsed.get(field, ""))
+            if not attachment_value:
+                continue
+            if field == "Dispatcher Notes":
+                existing_value = _safe_str(updated.get(field, ""))
+                if existing_value and attachment_value not in existing_value:
+                    updated[field] = f"{existing_value}\n{attachment_value}"
+                elif not existing_value:
+                    updated[field] = attachment_value
+            elif not _safe_str(updated.get(field, "")):
+                updated[field] = attachment_value
     if saved_attachments:
         updated[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
         pdf_attachments = [
@@ -4782,8 +5144,10 @@ def _operations_work_queue_for_row(row) -> str:
     confidence = int(float(row.get("confidence_score", 0) or 0)) if hasattr(row, "get") else 0
     has_match = _operations_has_matched_load(row)
 
-    if request_type == "Spam/Marketing":
-        return "Review"
+    if request_type in {"No Action / FYI", "Spam/Marketing"}:
+        return "Archive"
+    if request_type == "Business Communication":
+        return "Business"
     if status_label.startswith("Waiting") or review_status in {"Waiting on Customer", "Waiting Customer"}:
         return "Waiting"
     if request_type == "Billing" or _operations_owner_label_for_row(row) == "Billing":
@@ -4805,6 +5169,238 @@ def _operations_work_queue_for_row(row) -> str:
     if request_type in {"Customer Request", "Missing Information"}:
         return "Action Required"
     return "Action Required"
+
+
+def _operations_sender_is_vip(row) -> bool:
+    sender = _extract_email_address(_safe_str(row.get("source_sender", "") if hasattr(row, "get") else "")).lower()
+    if not sender or "@" not in sender:
+        return False
+    domain = sender.rsplit("@", 1)[-1]
+    return any(domain == vip_domain or domain.endswith(f".{vip_domain}") for vip_domain in VIP_OPERATIONS_DOMAINS)
+
+
+def _operations_parsed_for_row(row) -> dict:
+    return _coerce_json_dict(row.get("parsed_data") if hasattr(row, "get") else {})
+
+
+def _operations_reference_tokens_for_row(row) -> dict:
+    parsed = _operations_parsed_for_row(row)
+    return _extract_reference_tokens(
+        "\n".join(
+            [
+                _safe_str(row.get("source_subject", "") if hasattr(row, "get") else ""),
+                _safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else ""),
+                _safe_str(parsed),
+            ]
+        )
+    )
+
+
+def _operations_parsed_hint(row, field: str, fallback: str = "") -> str:
+    parsed = _operations_parsed_for_row(row)
+    value = _safe_str(parsed.get(field, ""))
+    return value or fallback
+
+
+def _operations_identifier_hints_for_row(row) -> dict:
+    parsed = _operations_parsed_for_row(row)
+    tokens = _operations_reference_tokens_for_row(row)
+    return {
+        "booking": _safe_str(parsed.get("Booking Number", "")) or tokens.get("booking_number", ""),
+        "container": _safe_str(parsed.get("Container Number", "")) or tokens.get("container_number", ""),
+        "reference": _safe_str(parsed.get("Reference Number", "")) or tokens.get("reference_number", ""),
+        "customer": (
+            _safe_str(parsed.get("Customer", ""))
+            or _safe_str(row.get("case_customer", "") if hasattr(row, "get") else "")
+            or _safe_str(row.get("client_name", "") if hasattr(row, "get") else "")
+        ),
+        "warehouse": _safe_str(parsed.get("Warehouse", "")) or _safe_str(parsed.get("Address", "")),
+        "port": _safe_str(parsed.get("Port", "")),
+        "delivery": _safe_str(parsed.get("Delivery Need Date", "")) or _safe_str(parsed.get("LFD", "")),
+    }
+
+
+def _operations_has_shipment_signal(row) -> bool:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    if _operations_has_matched_load(row) or request_type in OPERATIONAL_REQUEST_TYPES:
+        return True
+    parsed = _operations_parsed_for_row(row)
+    tokens = _operations_reference_tokens_for_row(row)
+    return _has_reference_details(tokens, parsed) or _operations_document_signal_for_row(row)
+
+
+def _operations_can_open_case(row, request_type: str = "") -> bool:
+    level = _safe_str(row.get("control_level", "") if hasattr(row, "get") else "")
+    request_type = _safe_str(request_type) or _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    if level != "Level 1 - Operational Cases":
+        return False
+    if request_type in NO_ACTION_REQUEST_TYPES or request_type in BUSINESS_REQUEST_TYPES:
+        return False
+    return request_type in OPERATIONAL_REQUEST_TYPES or _operations_has_shipment_signal(row)
+
+
+def _operations_control_level_for_row(row) -> str:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    confidence = int(float(row.get("confidence_score", 0) or 0)) if hasattr(row, "get") else 0
+    text = _operations_row_text(row).lower()
+    is_vip = _operations_sender_is_vip(row)
+    has_shipment_signal = _operations_has_shipment_signal(row)
+    owner = _operations_owner_label_for_row(row)
+
+    if request_type in NO_ACTION_REQUEST_TYPES:
+        return "Level 3 - No Action / Archive"
+    if _contains_any(text, NO_ACTION_COMMUNICATION_TERMS + SPAM_MARKETING_TERMS) and not is_vip and not has_shipment_signal:
+        return "Level 3 - No Action / Archive"
+
+    if request_type in {"", "Other", "Needs Classification"} or confidence < 50:
+        return "Needs Review"
+
+    if request_type in BUSINESS_REQUEST_TYPES:
+        return "Level 2 - Business Communications"
+    if owner in {"Billing", "Manager", "Safety"} and not has_shipment_signal:
+        return "Level 2 - Business Communications"
+    if _contains_any(text, BUSINESS_COMMUNICATION_TERMS) and not has_shipment_signal:
+        return "Level 2 - Business Communications"
+
+    return "Level 1 - Operational Cases"
+
+
+def _operations_department_lane_for_row(row) -> str:
+    level = _safe_str(row.get("control_level", "") if hasattr(row, "get") else "") or _operations_control_level_for_row(row)
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    text = _operations_row_text(row).lower()
+    owner = _operations_owner_label_for_row(row)
+
+    if level == "Needs Review":
+        return "Human Review"
+    if level == "Level 3 - No Action / Archive":
+        if request_type == "Spam/Marketing" or _contains_any(text, SPAM_MARKETING_TERMS):
+            return "Spam"
+        if "duplicate" in text:
+            return "Duplicates"
+        return "Archive / FYI"
+    if level == "Level 2 - Business Communications":
+        if request_type == "Billing" or _contains_any(text, BILLING_TERMS):
+            return "Accounting"
+        if any(term in text for term in ["insurance", "legal", "contract", "agreement", "claim", "bank", "utility"]):
+            return "Management"
+        if any(term in text for term in ["recruiting", "resume", "candidate", "employment", "hr", "human resources"]):
+            return "Management"
+        if any(term in text for term in ["new customer inquiry", "sales lead", "credit application"]):
+            return "Sales"
+        if any(term in text for term in ["vendor", "supplier", "software", "it support", "password"]):
+            return "Management"
+        return owner if owner not in {"Dispatch", "Customer", "Driver", "Port", "Warehouse"} else "Management"
+
+    if request_type == "Billing" or owner == "Billing":
+        return "Accounting"
+    if owner in {"Driver", "Port", "Warehouse"}:
+        return "Dispatch"
+    if owner == "Customer":
+        return "Customer Service"
+    if owner in {"Operations", "Manager"}:
+        return "Operations"
+    return "Dispatch"
+
+
+def _operations_confidence_label(score) -> str:
+    try:
+        score_int = int(float(score or 0))
+    except Exception:
+        score_int = 0
+    if score_int >= 80:
+        return "High Match"
+    if score_int >= 60:
+        return "Medium Match"
+    return "Unknown"
+
+
+def _operations_work_item_for_row(row) -> str:
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    work_queue = _safe_str(row.get("work_queue", "") if hasattr(row, "get") else "")
+    if request_type == "New Booking":
+        return "Create Order"
+    if request_type == "Quote Request":
+        return "Create Quote"
+    if request_type == "Appointment Update":
+        return "Appointment"
+    if request_type == "Booking Update":
+        return "Booking Revision"
+    if request_type == "Cancellation":
+        return "Cancel Booking"
+    if request_type == "POD Request":
+        return "POD / Documents"
+    if request_type == "Billing":
+        return "Billing Case"
+    if request_type == "Business Communication":
+        return "Business Case"
+    if request_type in NO_ACTION_REQUEST_TYPES:
+        return "Archive"
+    if work_queue:
+        return work_queue
+    return request_type or "Review"
+
+
+def _operations_recommended_action_for_row(row) -> str:
+    level = _safe_str(row.get("control_level", "") if hasattr(row, "get") else "") or _operations_control_level_for_row(row)
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    work_queue = _safe_str(row.get("work_queue", "") if hasattr(row, "get") else "")
+    has_match = _operations_has_matched_load(row)
+
+    if level == "Needs Review":
+        return "Classify"
+    if level == "Level 3 - No Action / Archive":
+        return "Archive / Close"
+    if level == "Level 2 - Business Communications":
+        lane = _operations_department_lane_for_row(row)
+        return f"Route to {lane}"
+    if request_type == "New Booking":
+        return "Create Order"
+    if request_type == "Quote Request":
+        return "Create Quote"
+    if has_match:
+        return "Attach / Update Load"
+    if work_queue == "Documents":
+        return "Review Documents"
+    if request_type == "Missing Information":
+        return "Reply for Details"
+    return "Review Case"
+
+
+def _operations_control_reason_for_row(row) -> str:
+    level = _safe_str(row.get("control_level", "") if hasattr(row, "get") else "") or _operations_control_level_for_row(row)
+    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
+    confidence_label = _operations_confidence_label(row.get("confidence_score", 0) if hasattr(row, "get") else 0)
+
+    if level == "Needs Review":
+        return f"{confidence_label}; needs human routing"
+    if level == "Level 2 - Business Communications":
+        return f"{request_type or 'Business'} routed by department"
+    if level == "Level 3 - No Action / Archive":
+        return f"{request_type or 'FYI'} should not become dispatcher work"
+    return f"{request_type or 'Operational'} work item"
+
+
+def _operations_queue_labels_for_level(level: str, level_df: pd.DataFrame) -> list[str]:
+    if level == "Level 1 - Operational Cases":
+        return ["Action Required", "New Orders", "Existing Loads", "Waiting", "Documents"]
+    if level == "Level 2 - Business Communications":
+        preferred = ["Accounting", "Management", "Sales", "Safety", "Customer Service"]
+        dynamic = sorted([value for value in level_df.get("department_lane", pd.Series(dtype=str)).dropna().astype(str).unique() if value])
+        return [label for label in preferred if label in dynamic] + [label for label in dynamic if label not in preferred] or ["Business"]
+    if level == "Level 3 - No Action / Archive":
+        preferred = ["Archive / FYI", "Spam", "Duplicates"]
+        dynamic = sorted([value for value in level_df.get("department_lane", pd.Series(dtype=str)).dropna().astype(str).unique() if value])
+        return [label for label in preferred if label in dynamic] + [label for label in dynamic if label not in preferred] or ["Archive / FYI"]
+    return ["Needs Review"]
+
+
+def _operations_queue_mask_for_level(level_df: pd.DataFrame, level: str, queue_label: str) -> pd.Series:
+    if level == "Level 1 - Operational Cases":
+        return level_df["work_queue"].eq(queue_label)
+    if level in {"Level 2 - Business Communications", "Level 3 - No Action / Archive"}:
+        return level_df["department_lane"].eq(queue_label)
+    return pd.Series(True, index=level_df.index)
 
 
 def _collapse_operations_inbox_to_cases(inbox_df: pd.DataFrame) -> pd.DataFrame:
@@ -5010,6 +5606,12 @@ def _action_required_for_request(
             return "Billing question needs booking, invoice, container, or reference before billing can respond."
         return "Billing request matched to a load; review invoice/POD status and route to Billing."
 
+    if request_type == "Business Communication":
+        return "Route to the responsible business department and keep it out of dispatcher load queues."
+
+    if request_type == "No Action / FYI":
+        return "No shipment action needed. Archive after review so the message remains searchable."
+
     if request_type == "Driver Issue":
         if matched_load_id is None:
             return "Driver issue needs booking, container, truck, or reference before dispatch can resolve it."
@@ -5074,6 +5676,9 @@ def _classification_confidence(
 
     if request_type == "Spam/Marketing":
         return 90
+
+    if request_type in {"Business Communication", "No Action / FYI"}:
+        return 80
 
     return max(match_confidence, 50)
 
@@ -5973,6 +6578,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         subject = str(item.get("subject", "") or "")
         sender = str(item.get("from", "") or "")
         body = str(item.get("body", "") or "")
+        latest_body = extract_latest_email_body(body)
         message_id = str(item.get("message_id", "") or item.get("id", "") or "")
         received_at = item.get("received_at")
         metadata = _email_sync_metadata(item)
@@ -6012,26 +6618,8 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             existing_record = _find_existing_operations_email_record(message_id, subject, sender, received_at)
         if existing_record:
             _update_existing_operations_email_sync_metadata(existing_record, item, message_id)
-            existing_case = _get_or_create_operations_case(
-                conversation_key=thread_conversation_key or _safe_str(existing_record.get("conversation_key", "")),
-                subject=subject or _safe_str(existing_record.get("source_subject", "")),
-                sender=sender or _safe_str(existing_record.get("source_sender", "")),
-                request_type=_safe_str(existing_record.get("request_type", "")) or "Customer Request",
-                matched_load_id=existing_record.get("matched_load_id"),
-                direction=direction,
-                next_action=_safe_str(existing_record.get("action_required", "")),
-                body=body or _safe_str(existing_record.get("raw_text", "")),
-            )
-            existing_case_id = _int_or_none(existing_case.get("id"))
+            existing_case_id = _int_or_none(existing_record.get("case_id"))
             if existing_case_id is not None:
-                execute(
-                    """
-                    update order_intake
-                    set case_id = :case_id
-                    where id = :intake_id
-                    """,
-                    {"case_id": existing_case_id, "intake_id": int(existing_record["id"])},
-                )
                 cases_touched.add(existing_case_id)
                 _sync_operations_case_summary(existing_case_id)
             _sync_conversation_status(thread_conversation_key or _safe_str(existing_record.get("conversation_key", "")))
@@ -6044,7 +6632,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             continue
 
         try:
-            body_parsed = parse_email_text(subject, body)
+            body_parsed = parse_email_text(subject, latest_body or body, _safe_str(item.get("from", "")))
         except Exception:
             body_parsed = {}
 
@@ -6104,7 +6692,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
         else:
             classification = _build_operations_email_classification(
                 subject,
-                body,
+                latest_body or body,
                 parsed,
                 fallback_key=thread_conversation_key or f"email-{imported + 1}",
                 sender=sender,
@@ -6129,9 +6717,9 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             ai_suggestion = generate_operations_ai_suggestion(
                 subject=subject,
                 sender=sender,
-                body=body,
+                body=latest_body or body,
                 parsed=parsed,
-                rule_classification=_operations_ai_rule_context(classification, parsed, subject, body),
+                rule_classification=_operations_ai_rule_context(classification, parsed, subject, latest_body or body),
                 load_context=load_context,
                 load_candidates=load_candidates,
                 feedback_examples=_recent_operations_ai_feedback_examples(),
@@ -6143,18 +6731,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             classification["conversation_key"] = thread_conversation_key
 
         operations_case = {}
-        if not (direction == "inbound" and classification.get("request_type") == "Spam/Marketing"):
-            operations_case = _get_or_create_operations_case(
-                conversation_key=classification["conversation_key"] or thread_conversation_key,
-                subject=subject,
-                sender=sender,
-                request_type=classification["request_type"],
-                matched_load_id=classification["matched_load_id"],
-                direction=direction,
-                next_action=classification["action_required"],
-                body=body,
-            )
-        case_id = _int_or_none(operations_case.get("id"))
+        case_id = None
 
         execute(
             """
@@ -6229,7 +6806,7 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
                 "filename": saved_attachments[0].get("filename") if saved_attachments else None,
                 "file_path": saved_attachments[0].get("file_path") if saved_attachments else None,
                 "parsed_data": _json_dump(parsed),
-                "raw_text": body,
+                "raw_text": latest_body or body,
                 "intake_status": intake_status,
                 "review_status": review_status,
                 "request_type": classification["request_type"],
@@ -6716,6 +7293,7 @@ def _insert_operations_thread_reply_record(
     conversation_key: str,
     matched_load_id,
     case_id=None,
+    create_case_if_missing: bool = False,
 ) -> None:
     source_message_id = _safe_str(record.get("source_message_id", "")) if hasattr(record, "get") else ""
     email_thread_id = _safe_str(record.get("email_thread_id", "")) if hasattr(record, "get") else ""
@@ -6723,7 +7301,7 @@ def _insert_operations_thread_reply_record(
     outbound_message_id = f"tms-reply-{intake_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     references = [value for value in [source_message_id, email_thread_id] if value]
     case_id = _int_or_none(case_id)
-    if case_id is None:
+    if case_id is None and create_case_if_missing:
         operations_case = _get_or_create_operations_case(
             conversation_key=conversation_key,
             subject=reply_subject,
@@ -6866,6 +7444,8 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
         existing_confidence = pd.to_numeric(row.get("confidence_score", 0), errors="coerce")
         if pd.isna(existing_confidence):
             existing_confidence = 0
+        subject_for_classification = _safe_str(row.get("source_subject", ""))
+        latest_text_for_classification = extract_latest_email_body(_safe_str(row.get("raw_text", ""))) or _safe_str(row.get("raw_text", ""))
 
         current_is_action_type = current_type in [
             "New Booking",
@@ -6882,16 +7462,16 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
         needs_correction_check = current_is_action_type and not existing_has_match and existing_confidence < 70
         obvious_info_new_booking = (
             current_type == "New Booking"
-            and _is_information_update(f"{row.get('source_subject', '')}\n{row.get('raw_text', '')}")
-            and not _has_order_placement_signal(f"{row.get('source_subject', '')}\n{row.get('raw_text', '')}")
+            and _is_information_update(f"{subject_for_classification}\n{latest_text_for_classification}")
+            and not _has_order_placement_signal(f"{subject_for_classification}\n{latest_text_for_classification}")
         )
 
         if not needs_classification and not needs_correction_check and not obvious_info_new_booking:
             continue
 
         intake_id = int(row["id"])
-        subject = str(row.get("source_subject", "") or "")
-        body = str(row.get("raw_text", "") or "")
+        subject = subject_for_classification
+        body = latest_text_for_classification
         parsed = _coerce_json_dict(row.get("parsed_data"))
 
         classification = _build_operations_email_classification(
@@ -6967,11 +7547,13 @@ OPERATIONS_LOAD_UPDATE_FIELD_TO_DB = {
 
 
 def _order_action_required_from_parsed(parsed: dict) -> str:
-    missing = [
-        field
-        for field in ["Booking Number", "Customer", "Warehouse"]
-        if not _safe_str(parsed.get(field, ""))
-    ]
+    missing = []
+    if not (_safe_str(parsed.get("Booking Number", "")) or _safe_str(parsed.get("Reference Number", ""))):
+        missing.append("Booking or Reference Number")
+    if not _safe_str(parsed.get("Customer", "")):
+        missing.append("Customer")
+    if not (_safe_str(parsed.get("Warehouse", "")) or _safe_str(parsed.get("Address", ""))):
+        missing.append("Warehouse or Address")
     if missing:
         return "Missing order details: " + ", ".join(missing)
     return "PDF and email data ready for order review."
@@ -7021,11 +7603,6 @@ def _save_pdf_data_to_operations_request(
             "action_required": action_required,
         },
     )
-    try:
-        _sync_operations_case_for_intake_id(intake_id)
-    except Exception:
-        pass
-
 
 def _attach_saved_operations_file_to_load(load_id: int, filename: str, file_path: str, source: str = "operations_inbox_attachment") -> None:
     document_type = "load_order" if _safe_str(filename).lower().endswith(".pdf") else "operations_attachment"
@@ -7114,13 +7691,6 @@ def _import_uploaded_operations_attachment(intake_id: int, parsed: dict, uploade
             "action_required": _order_action_required_from_parsed(updated_parsed),
         },
     )
-    try:
-        case = _sync_operations_case_for_intake_id(intake_id)
-        if case:
-            _add_operations_case_note(case.get("id"), f"Imported attachment {attachment.get('filename')}.")
-    except Exception:
-        pass
-
     return attachment
 
 
@@ -7278,7 +7848,7 @@ def _render_operations_pdf_panel(
             st.warning(f"Document text parse needs review: {parse_error}")
 
         try:
-            body_parsed = parse_email_text(subject, body)
+            body_parsed = parse_email_text(subject, body, sender)
         except Exception:
             body_parsed = {}
 
@@ -7745,9 +8315,9 @@ def render_operations_inbox() -> None:
         """
         <div class="ops-header">
             <div class="ops-kicker">Operations</div>
-            <div class="ops-title">Operations Inbox</div>
+            <div class="ops-title">Operations Control Center</div>
             <div class="ops-subtitle">
-                Review customer emails, verify attachments, group conversations, match loads, create orders or quotes, and send replies from one dispatch workspace.
+                Manage work, not just email: triage operational cases, business communications, and archive/no-action messages from one dispatch workspace.
             </div>
         </div>
         """,
@@ -7757,6 +8327,7 @@ def render_operations_inbox() -> None:
         _ensure_operations_email_sync_schema()
     except Exception as exc:
         st.warning(f"Email sync schema is not ready yet: {exc}")
+        st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
 
     c1, c2, c3 = st.columns([1, 1, 3])
 
@@ -7836,6 +8407,7 @@ def render_operations_inbox() -> None:
         inbox_df = _load_operations_inbox_df(where_clause)
     except Exception as exc:
         st.error(f"Could not load Operations Inbox: {exc}")
+        st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
         st.info("If this is the first time using Operations Inbox email, run database/operations_email_workflow_migration.sql in Supabase.")
         return
 
@@ -7843,6 +8415,9 @@ def render_operations_inbox() -> None:
         st.success("No open customer requests.")
         _render_no_open_inbox_explanation()
         return
+
+    if "raw_text_preview" in inbox_df.columns:
+        inbox_df["raw_text_preview"] = inbox_df["raw_text_preview"].fillna("").astype(str).apply(extract_latest_email_body)
 
     inbox_df["conversation_join_key"] = inbox_df.apply(_row_conversation_join_key, axis=1)
     conversation_summary = _load_operations_conversation_summary_df()
@@ -7903,6 +8478,13 @@ def render_operations_inbox() -> None:
 
     def extract_requested_time(text: str) -> str:
         text = str(text)
+        range_match = re.search(
+            r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:-|to)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+            text,
+            re.I,
+        )
+        if range_match:
+            return _safe_str(range_match.group(1))
         match = re.search(r"\b(?:at\s*)?(\d{3,4})\s*(?:on\s*)?(\d{1,2}/\d{1,2})?\b", text, re.I)
         if match:
             time_part = match.group(1)
@@ -7954,20 +8536,50 @@ def render_operations_inbox() -> None:
     now_utc = pd.Timestamp.now(tz="UTC")
     inbox_df["waiting_hours"] = ((now_utc - wait_started).dt.total_seconds() / 3600).fillna(0).round(1)
     inbox_df = _collapse_operations_inbox_to_cases(inbox_df)
+    if not inbox_df.empty:
+        inbox_df["control_level"] = inbox_df.apply(_operations_control_level_for_row, axis=1)
+        inbox_df["department_lane"] = inbox_df.apply(_operations_department_lane_for_row, axis=1)
+        inbox_df["work_item"] = inbox_df.apply(_operations_work_item_for_row, axis=1)
+        inbox_df["recommended_action"] = inbox_df.apply(_operations_recommended_action_for_row, axis=1)
+        inbox_df["control_reason"] = inbox_df.apply(_operations_control_reason_for_row, axis=1)
+        inbox_df["confidence_label"] = inbox_df["confidence_score"].apply(_operations_confidence_label)
+        identifier_hints = inbox_df.apply(_operations_identifier_hints_for_row, axis=1)
+        inbox_df["booking_hint"] = identifier_hints.apply(lambda value: value.get("booking", "") if isinstance(value, dict) else "")
+        inbox_df["container_hint"] = identifier_hints.apply(lambda value: value.get("container", "") if isinstance(value, dict) else "")
+        inbox_df["customer_hint"] = identifier_hints.apply(lambda value: value.get("customer", "") if isinstance(value, dict) else "")
+        inbox_df["warehouse_hint"] = identifier_hints.apply(lambda value: value.get("warehouse", "") if isinstance(value, dict) else "")
+        inbox_df["port_hint"] = identifier_hints.apply(lambda value: value.get("port", "") if isinstance(value, dict) else "")
+        inbox_df["delivery_hint"] = identifier_hints.apply(lambda value: value.get("delivery", "") if isinstance(value, dict) else "")
+        inbox_df["load_hint"] = inbox_df["matched_load_id"].fillna("").astype(str).replace({"nan": "", "None": ""})
 
+    st.markdown("#### Control Center Snapshot")
+    level_counts = inbox_df["control_level"].value_counts() if "control_level" in inbox_df.columns else pd.Series(dtype=int)
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Action Required", int(inbox_df["work_queue"].eq("Action Required").sum()))
-    m2.metric("New Orders", int(inbox_df["work_queue"].eq("New Orders").sum()))
-    m3.metric("Existing Loads", int(inbox_df["work_queue"].eq("Existing Loads").sum()))
-    m4.metric("Documents", int(inbox_df["work_queue"].eq("Documents").sum()))
-    m5.metric("Waiting", int(inbox_df["work_queue"].eq("Waiting").sum()))
+    with m1:
+        _render_ops_metric_card("Operational Cases", int(level_counts.get("Level 1 - Operational Cases", 0)), "Level 1")
+    with m2:
+        _render_ops_metric_card("Business Work", int(level_counts.get("Level 2 - Business Communications", 0)), "Level 2")
+    with m3:
+        _render_ops_metric_card("Archive / No Action", int(level_counts.get("Level 3 - No Action / Archive", 0)), "Level 3")
+    with m4:
+        _render_ops_metric_card("Needs Review", int(level_counts.get("Needs Review", 0)), "Human decision")
+    with m5:
+        _render_ops_metric_card("Critical", int(inbox_df["priority_label"].eq("Critical").sum()), "Escalations")
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Action Required", int(inbox_df["work_queue"].eq("Action Required").sum()))
+    k2.metric("New Orders", int(inbox_df["work_queue"].eq("New Orders").sum()))
+    k3.metric("Existing Loads", int(inbox_df["work_queue"].eq("Existing Loads").sum()))
+    k4.metric("Documents", int(inbox_df["work_queue"].eq("Documents").sum()))
+    k5.metric("Waiting", int(inbox_df["work_queue"].eq("Waiting").sum()))
+    k6.metric("Billing / Business", int(inbox_df["control_level"].eq("Level 2 - Business Communications").sum()))
 
     smart_group_result = st.session_state.pop("operations_smart_group_update_result", None)
     if smart_group_result is not None:
         if isinstance(smart_group_result, dict):
             st.success(
                 f"Smart groups updated {int(smart_group_result.get('classified', 0))} item(s) "
-                f"and relinked {int(smart_group_result.get('cases', 0))} case record(s)."
+                f"without opening new case records."
             )
         else:
             st.success(f"Smart groups updated {int(smart_group_result)} item(s).")
@@ -7979,33 +8591,32 @@ def render_operations_inbox() -> None:
                 full_inbox_df = _load_operations_inbox_record_set(where_clause)
                 update_mask = _operations_items_needing_smart_group_update(full_inbox_df)
                 classified_count = auto_classify_open_inbox_items(full_inbox_df[update_mask].copy())
-                case_relinked_count = sync_operations_case_links_for_inbox_items(full_inbox_df.copy())
                 st.session_state["operations_smart_group_update_result"] = {
                     "classified": classified_count,
-                    "cases": case_relinked_count,
+                    "cases": 0,
                 }
                 refresh_data()
                 st.rerun()
     with c_note:
-        st.caption("Routine inbox clicks stay fast. Use Recheck Groups when older messages need regrouping or copied emails need to be relinked to the right case.")
+        st.caption("Routine inbox clicks stay fast. Use Recheck Groups when older messages need regrouping; it will not open Operations Cases.")
 
     with st.expander("Operations Inbox Process Feedback", expanded=False):
         st.markdown(
             """
-- Use `Action Required` for messages that need a dispatcher response before an order, quote, cancellation, or status update can move forward.
-- Keep `New Orders` for true new bookings or quote requests only. Customer update questions without identifiers stay in `Action Required`.
-- Use `Existing Loads` for booking updates, appointment changes, cancellations, driver issues, and port issues tied to an active order.
-- Keep PODs, delivery orders, BOLs, packing lists, IMO/hazmat files, and attachment-heavy document work in `Documents`.
-- Move replied items to `Waiting`, close non-operational mail, and review learning corrections weekly so the engine keeps improving.
+- Level 1 is dispatcher work: new bookings, booking revisions, appointment changes, driver issues, port issues, PODs, documents, and customer load questions.
+- Level 2 is important business communication: billing, insurance, legal, vendor, sales, HR, safety, and management work that should not distract dispatch.
+- Level 3 is no-action or archive work: spam, marketing, newsletters, duplicates, FYI messages, and other mail that should stay searchable but not become a load.
+- `Needs Review` is only for uncertainty. Once a dispatcher classifies a sender/topic, future messages should route faster.
+- Select any row to open the case, timeline, parsed details, documents, reply tools, and order/quote actions.
             """.strip()
         )
 
-    st.markdown("#### Case Filters")
+    st.markdown("#### Control Filters")
     p1, p2 = st.columns([1, 2])
     with p1:
         perspective_filter = st.selectbox(
             "Perspective",
-            ["Dispatch", "Operations Manager", "Billing", "Customer Service"],
+            ["Operations Control Center", "Dispatch", "Accounting", "Management", "Customer Service"],
             index=0,
             key="operations_case_perspective_filter",
         )
@@ -8015,7 +8626,7 @@ def render_operations_inbox() -> None:
             ["All Open Cases", "High Priority", "Escalated / Overdue", "Waiting >24 Hours", "Unassigned"],
             index=0,
             key="operations_manager_focus_filter",
-            disabled=perspective_filter != "Operations Manager",
+            disabled=perspective_filter != "Management",
         )
 
     f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
@@ -8027,11 +8638,18 @@ def render_operations_inbox() -> None:
             key="operations_inbox_search_filter",
         )
     with f2:
+        owner_values = pd.concat(
+            [
+                inbox_df["owner_label"].dropna().astype(str),
+                inbox_df["department_lane"].dropna().astype(str),
+            ],
+            ignore_index=True,
+        )
         owner_options = ["All Owners"] + sorted(
-            [value for value in inbox_df["owner_label"].dropna().astype(str).unique() if value]
+            [value for value in owner_values.unique() if value]
         )
         owner_filter = st.selectbox(
-            "Owner",
+            "Owner / Department",
             owner_options,
             index=0,
             key="operations_owner_queue_filter",
@@ -8075,16 +8693,24 @@ def render_operations_inbox() -> None:
         )
 
     filtered_df = inbox_df.copy()
-    if perspective_filter == "Billing":
+    if perspective_filter == "Dispatch":
         filtered_df = filtered_df[
-            filtered_df["owner_label"].eq("Billing") | filtered_df["request_type_clean"].eq("Billing")
+            filtered_df["control_level"].isin(["Level 1 - Operational Cases", "Needs Review"])
+            & filtered_df["department_lane"].isin(["Dispatch", "Operations", "Customer Service", "Human Review"])
+        ].copy()
+    elif perspective_filter == "Accounting":
+        filtered_df = filtered_df[
+            filtered_df["department_lane"].eq("Accounting")
+            | filtered_df["owner_label"].eq("Billing")
+            | filtered_df["request_type_clean"].eq("Billing")
         ].copy()
     elif perspective_filter == "Customer Service":
         filtered_df = filtered_df[
-            filtered_df["owner_label"].eq("Customer")
+            filtered_df["department_lane"].eq("Customer Service")
+            | filtered_df["owner_label"].eq("Customer")
             | filtered_df["request_type_clean"].isin(["Customer Request", "Missing Information"])
         ].copy()
-    elif perspective_filter == "Operations Manager":
+    elif perspective_filter == "Management":
         if manager_focus == "High Priority":
             filtered_df = filtered_df[filtered_df["priority_label"].isin(["Critical", "High"])].copy()
         elif manager_focus == "Escalated / Overdue":
@@ -8104,11 +8730,22 @@ def render_operations_inbox() -> None:
     if search_filter:
         searchable_columns = [
             "id",
+            "control_level",
+            "department_lane",
+            "work_queue",
+            "work_item",
+            "recommended_action",
             "client_name",
+            "customer_hint",
+            "booking_hint",
+            "container_hint",
             "source_sender",
             "source_subject",
             "raw_text_preview",
             "reference_hint",
+            "warehouse_hint",
+            "port_hint",
+            "delivery_hint",
             "conversation_key",
             "email_thread_id",
             "case_number",
@@ -8122,7 +8759,9 @@ def render_operations_inbox() -> None:
             search_mask &= search_blob.str.contains(re.escape(term), na=False)
         filtered_df = filtered_df[search_mask].copy()
     if owner_filter != "All Owners":
-        filtered_df = filtered_df[filtered_df["owner_label"].eq(owner_filter)].copy()
+        filtered_df = filtered_df[
+            filtered_df["owner_label"].eq(owner_filter) | filtered_df["department_lane"].eq(owner_filter)
+        ].copy()
     if priority_filter != "All Priorities":
         filtered_df = filtered_df[filtered_df["priority_label"].eq(priority_filter)].copy()
     if attachment_filter != "All Attachments":
@@ -8138,87 +8777,134 @@ def render_operations_inbox() -> None:
     if filtered_df.empty:
         st.info("No Operations Inbox items match the current filters.")
 
-    tab_labels = list(DEFAULT_OPERATIONS_QUEUE_ORDER)
-
-    queue_map = {
-        label: filtered_df[filtered_df["work_queue"].eq(label)]
-        for label in tab_labels
+    display_column_labels = {
+        "id": "Request",
+        "email_received": "Received",
+        "department_lane": "Department",
+        "work_queue": "Queue",
+        "work_item": "Work Item",
+        "recommended_action": "Next Action",
+        "priority_label": "Priority",
+        "status_label": "Status",
+        "confidence_label": "AI Match",
+        "customer_hint": "Customer",
+        "booking_hint": "Booking",
+        "container_hint": "Container",
+        "reference_hint": "Reference",
+        "warehouse_hint": "Warehouse",
+        "port_hint": "Port",
+        "delivery_hint": "Need / LFD",
+        "attachment_status": "Files",
+        "reply_status": "Thread",
+        "case_total_messages": "Msgs",
+        "case_number": "Case",
+        "load_hint": "Load",
+        "source_subject": "Subject",
+        "action_required": "Action Detail",
+        "control_reason": "Routing Reason",
     }
-
     shared_display_cols = [
         "id",
         "email_received",
-        "client_name",
-        "owner_label",
+        "department_lane",
+        "work_queue",
+        "work_item",
+        "recommended_action",
         "priority_label",
         "status_label",
-        "attachment_status",
-        "request_type",
-        "reply_status",
-        "case_total_messages",
-        "case_number",
-        "source_subject",
+        "confidence_label",
+        "customer_hint",
+        "booking_hint",
+        "container_hint",
         "reference_hint",
-        "matched_load_id",
-        "confidence_score",
+        "warehouse_hint",
+        "port_hint",
+        "delivery_hint",
+        "attachment_status",
+        "case_number",
+        "load_hint",
+        "source_subject",
         "action_required",
     ]
-    tab_display_cols = {label: list(shared_display_cols) for label in tab_labels}
 
-    tab_titles = [
-        f"{label} ({len(queue_map.get(label, pd.DataFrame()))})"
-        for label in tab_labels
-    ]
-    queue_tabs = st.tabs(tab_titles)
+    level_titles = {
+        level: f"{level} ({int(filtered_df['control_level'].eq(level).sum())})"
+        for level in OPERATIONS_CONTROL_LEVELS
+    }
+    level_label_to_value = {label: level for level, label in level_titles.items()}
+    selected_level_label = st.radio(
+        "Work Level",
+        list(level_label_to_value.keys()),
+        horizontal=True,
+        key="operations_active_work_level",
+        label_visibility="collapsed",
+    )
+    selected_level = level_label_to_value[selected_level_label]
+    level_df = filtered_df[filtered_df["control_level"].eq(selected_level)].copy()
+    st.caption(OPERATIONS_CONTROL_LEVEL_DESCRIPTIONS.get(selected_level, ""))
 
-    for selected_queue, queue_tab in zip(tab_labels, queue_tabs):
-        with queue_tab:
-            tab_df = queue_map[selected_queue].copy()
-            active_display_cols = [
-                c for c in tab_display_cols.get(selected_queue, shared_display_cols)
-                if c in tab_df.columns
-            ]
-            if "reference_hint" in active_display_cols:
-                blank_reference = tab_df["reference_hint"].fillna("").astype(str).str.strip().eq("")
-                if blank_reference.any():
-                    preview = tab_df["raw_text_preview"] if "raw_text_preview" in tab_df.columns else ""
-                    tab_df.loc[blank_reference, "reference_hint"] = (
-                        tab_df.loc[blank_reference, "source_subject"].fillna("")
-                        + " "
-                        + pd.Series(preview, index=tab_df.index).fillna("")
-                    ).apply(extract_reference_from_text)
-            if "requested_time" in active_display_cols:
-                if "raw_text_preview" in tab_df.columns:
-                    tab_df["requested_time"] = tab_df["raw_text_preview"].fillna("").apply(extract_requested_time)
-                else:
-                    tab_df["requested_time"] = tab_df["source_subject"].fillna("").apply(extract_requested_time)
+    visible_review_ids: set[int] = set()
+    selected_queue = ""
 
-            st.caption(f"{len(tab_df)} item(s)")
-
-            if tab_df.empty:
-                st.info(f"No {selected_queue.lower()} items.")
+    if level_df.empty:
+        st.info(f"No {selected_level.lower()} work items match the current filters.")
+    else:
+        queue_labels = _operations_queue_labels_for_level(selected_level, level_df)
+        queue_titles = {
+            label: f"{label} ({int(_operations_queue_mask_for_level(level_df, selected_level, label).sum())})"
+            for label in queue_labels
+        }
+        queue_label_to_value = {title: label for label, title in queue_titles.items()}
+        selected_queue_label = st.radio(
+            "Queue",
+            list(queue_label_to_value.keys()),
+            horizontal=True,
+            key=f"operations_active_queue_{re.sub(r'[^a-z0-9]+', '_', selected_level.lower()).strip('_')}",
+            label_visibility="collapsed",
+        )
+        selected_queue = queue_label_to_value[selected_queue_label]
+        tab_df = level_df[_operations_queue_mask_for_level(level_df, selected_level, selected_queue)].copy()
+        visible_review_ids = set(tab_df["id"].dropna().astype(int).tolist()) if "id" in tab_df.columns else set()
+        active_display_cols = [column for column in shared_display_cols if column in tab_df.columns]
+        if selected_level != "Level 1 - Operational Cases":
+            active_display_cols = [column for column in active_display_cols if column not in {"case_number", "load_hint"}]
+        if "reference_hint" in active_display_cols:
+            blank_reference = tab_df["reference_hint"].fillna("").astype(str).str.strip().eq("")
+            if blank_reference.any():
+                preview = tab_df["raw_text_preview"] if "raw_text_preview" in tab_df.columns else ""
+                tab_df.loc[blank_reference, "reference_hint"] = (
+                    tab_df.loc[blank_reference, "source_subject"].fillna("")
+                    + " "
+                    + pd.Series(preview, index=tab_df.index).fillna("")
+                ).apply(extract_reference_from_text)
+        if "requested_time" in active_display_cols:
+            if "raw_text_preview" in tab_df.columns:
+                tab_df["requested_time"] = tab_df["raw_text_preview"].fillna("").apply(extract_requested_time)
             else:
-                event = st.dataframe(
-                    tab_df[active_display_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    selection_mode="single-row",
-                    on_select="rerun",
-                    key=f"operations_inbox_table_{selected_queue}",
-                )
+                tab_df["requested_time"] = tab_df["source_subject"].fillna("").apply(extract_requested_time)
 
-                selected_rows = event.selection.rows
-                if selected_rows:
-                    row_id = int(tab_df.iloc[selected_rows[0]]["id"])
+        st.caption(f"{len(tab_df)} work item(s)")
 
-                    if st.button(
-                        f"Open Request #{row_id}",
-                        key=f"open_request_{selected_queue}_{row_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state["selected_operations_request_id"] = row_id
-                        st.session_state["selected_operations_tab"] = selected_queue
-                        st.rerun()
+        if tab_df.empty:
+            st.info(f"No {selected_queue.lower()} work items.")
+        else:
+            display_df = tab_df[active_display_cols].rename(columns=display_column_labels)
+            safe_level = re.sub(r"[^a-z0-9]+", "_", selected_level.lower()).strip("_")
+            safe_queue = re.sub(r"[^a-z0-9]+", "_", selected_queue.lower()).strip("_")
+            event = st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=f"operations_control_table_{safe_level}_{safe_queue}",
+            )
+
+            selected_rows = event.selection.rows
+            if selected_rows:
+                row_id = int(tab_df.iloc[selected_rows[0]]["id"])
+                st.session_state["selected_operations_request_id"] = row_id
+                st.session_state["selected_operations_tab"] = f"{selected_level} / {selected_queue}"
 
     st.divider()
 
@@ -8226,8 +8912,14 @@ def render_operations_inbox() -> None:
     selected_tab_name = st.session_state.get("selected_operations_tab")
 
     if selected_id is None:
-        st.info("Select a row, then click Open Request.")
+        st.info("Select a work item row to review the email, routing, reply options, and available actions.")
         return
+
+    if int(selected_id) not in visible_review_ids:
+        st.info("Select a work item row in the current queue to review it.")
+        return
+
+    selected_tab_name = f"{selected_level} / {selected_queue}" if selected_queue else selected_level
 
     record_df = _load_operations_inbox_record(int(selected_id))
 
@@ -8235,17 +8927,28 @@ def render_operations_inbox() -> None:
         st.warning("Selected request was not found.")
         return
 
-    st.markdown(f"### Review Customer Request - {selected_tab_name} - Request #{selected_id}")
+    st.markdown(f"### Review Work Item - {selected_tab_name} - Request #{selected_id}")
     st.divider()
 
     record = record_df.iloc[0]
     parsed = _coerce_json_dict(record.get("parsed_data"))
+    record["request_type_clean"] = _effective_operations_request_type_for_row(record)
+    record["review_status_clean"] = _safe_str(record.get("review_status", "Open")) or "Open"
+    record["owner_label"] = _operations_owner_label_for_row(record)
+    record["priority_label"] = _operations_priority_label_for_row(record)
+    record["status_label"] = _operations_status_label_for_row(record)
+    record["work_queue"] = _operations_work_queue_for_row(record)
+    record["control_level"] = _operations_control_level_for_row(record)
+    record["department_lane"] = _operations_department_lane_for_row(record)
+    record["work_item"] = _operations_work_item_for_row(record)
+    record["recommended_action"] = _operations_recommended_action_for_row(record)
 
     subject = str(record.get("source_subject", "") or "")
     sender = str(record.get("source_sender", "") or "")
     body = str(record.get("raw_text", "") or "")
+    body = extract_latest_email_body(body) or body
     try:
-        body_reparsed = parse_email_text(subject, body)
+        body_reparsed = parse_email_text(subject, body, sender)
         parsed, parsed_changed = _merge_operations_body_parsed_fields(parsed, body_reparsed)
         if parsed_changed:
             _store_operations_parsed_data(
@@ -8277,9 +8980,22 @@ def render_operations_inbox() -> None:
         except Exception:
             pass
 
-    operations_case = _load_operations_case_by_id(record.get("case_id"))
-    if not operations_case:
-        operations_case = _sync_operations_case_for_intake_record(record)
+    can_open_operations_case = _operations_can_open_case(record, detected_type)
+    operations_case = _load_operations_case_by_id(record.get("case_id")) if can_open_operations_case else {}
+    if not can_open_operations_case:
+        for record_field in [
+            "case_id",
+            "case_number",
+            "case_status",
+            "case_owner",
+            "case_priority",
+            "case_linked_load_id",
+            "case_next_action",
+            "case_sla_status",
+            "case_first_response_due_at",
+            "case_resolution_due_at",
+        ]:
+            record[record_field] = None
     if operations_case:
         for case_field, record_field in [
             ("id", "case_id"),
@@ -8310,28 +9026,50 @@ def render_operations_inbox() -> None:
             )
             st.session_state[viewed_key] = True
 
-    _render_operations_case_summary_header(
-        operations_case=operations_case,
-        record=record,
-        parsed=parsed,
-        tokens=tokens,
-        matched_load_id=matched_load_id,
-    )
-
     load_context_key = f"operations_load_context_{selected_id}_{matched_load_id or 'none'}"
     cached_load_context = st.session_state.get(load_context_key) or {}
     load_context = cached_load_context.get("load_context", {})
     load_candidates = cached_load_context.get("load_candidates", [])
 
     st.caption("Selected email classification")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Detected Type", detected_type)
-    c2.metric("Confidence", f"{confidence}%")
-    c3.metric("Matched Load", matched_load_id or "-")
-    c4.metric("Case", _safe_str(operations_case.get("case_number", "")) or "-")
-    c5.metric("Conversation", conversation_key)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Work Level", _safe_str(record.get("control_level", "")).replace("Level ", "L") or "-")
+    c2.metric("Department", _safe_str(record.get("department_lane", "")) or "-")
+    c3.metric("Detected Type", detected_type)
+    c4.metric("AI Match", _operations_confidence_label(confidence), f"{confidence}%")
+    c5.metric("Matched Load", matched_load_id or "-")
+    c6.metric("Case", _safe_str(operations_case.get("case_number", "")) if operations_case else "-")
+    st.caption(f"Conversation: {conversation_key}")
     if classification.get("learning_applied"):
         st.caption(classification.get("learning_reason", "Routing used recent dispatcher learning."))
+
+    if can_open_operations_case:
+        if operations_case:
+            _render_operations_case_summary_header(
+                operations_case=operations_case,
+                record=record,
+                parsed=parsed,
+                tokens=tokens,
+                matched_load_id=matched_load_id,
+            )
+        else:
+            st.info("No Operations Case is open for this order email yet. Open one only when this needs managed order follow-up.")
+            if st.button("Open Operations Case", key=f"open_operations_case_{selected_id}", use_container_width=True):
+                created_case = _sync_operations_case_for_intake_record(record)
+                created_case_id = _int_or_none(created_case.get("id"))
+                if created_case_id is not None:
+                    _log_operations_case_event(
+                        created_case_id,
+                        "opened",
+                        "Operations Case opened",
+                        f"Dispatcher opened a case from Operations request #{selected_id}.",
+                        actor="dispatcher",
+                    )
+                refresh_data()
+                st.success("Operations Case opened for this order email.")
+                st.rerun()
+    else:
+        st.info("This work item is for email review, routing, reply, and learning only. No Operations Case is opened for this level.")
 
     selected_conversation_key = _row_conversation_join_key(record)
     with st.expander("Email Synchronization Metadata", expanded=False):
@@ -8349,7 +9087,8 @@ def render_operations_inbox() -> None:
                 references = []
         st.write("**References:** " + (", ".join(references or []) if references else "-"))
 
-    with st.expander("Case Conversation Timeline", expanded=True):
+    timeline_title = "Case Conversation Timeline" if operations_case else "Email Conversation Timeline"
+    with st.expander(timeline_title, expanded=True):
         current_case_id = _int_or_none(operations_case.get("id"))
         if current_case_id is not None:
             timeline_df = _load_operations_case_timeline(current_case_id)
@@ -8428,12 +9167,13 @@ def render_operations_inbox() -> None:
                     st.caption(f"Filtered {unfiltered_timeline_count - len(timeline_df)} broader thread message(s) that did not match this booking/reference/topic.")
                 st.dataframe(display_timeline, use_container_width=True, hide_index=True)
 
-    _render_operations_case_panel(
-        selected_id=int(selected_id),
-        operations_case=operations_case,
-        matched_load_id=matched_load_id,
-        show_timeline=False,
-    )
+    if operations_case:
+        _render_operations_case_panel(
+            selected_id=int(selected_id),
+            operations_case=operations_case,
+            matched_load_id=matched_load_id,
+            show_timeline=False,
+        )
 
     saved_request_type = str(record.get("request_type", "") or "").strip()
     effective_saved_request_type = _effective_operations_request_type_for_row(record)
@@ -8769,7 +9509,7 @@ def render_operations_inbox() -> None:
         refresh_data()
         st.rerun()
 
-    st.markdown("### Case Action Center")
+    st.markdown("### Email Action Center")
     ai_reply_body = ""
     if ai_suggestion and ai_suggestion.get("success"):
         ai_reply_language = _safe_str(ai_suggestion.get("response_language", ""))
@@ -8939,8 +9679,81 @@ def render_operations_inbox() -> None:
                     pass
                 st.error(f"Email was not sent: {exc}")
 
-    st.markdown("### Order / Quote Actions")
-    st.caption("Use this single action area to place a new order/load, attach an update to an existing order, create a quote, cancel a matched order, or close spam/no-action email.")
+    if not can_open_operations_case:
+        st.markdown("### Routing Actions")
+        action_record = record.copy()
+        action_record["request_type_clean"] = request_type
+        action_record["control_level"] = _operations_control_level_for_row(action_record)
+        action_record["department_lane"] = _operations_department_lane_for_row(action_record)
+        selected_control_level = _safe_str(action_record.get("control_level", ""))
+        selected_department_lane = _safe_str(action_record.get("department_lane", ""))
+        can_route_business = selected_control_level == "Level 2 - Business Communications" or request_type in BUSINESS_REQUEST_TYPES
+
+        route_cols = st.columns(3)
+        with route_cols[0]:
+            if st.button("Route Business Email", use_container_width=True, disabled=not can_route_business):
+                business_lane = selected_department_lane or "Management"
+                business_request_type = "Billing" if business_lane == "Accounting" else "Business Communication"
+                business_note = f"Business communication routed to {business_lane}."
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Open',
+                        request_type = :request_type,
+                        action_required = :action_required,
+                        conversation_key = :conversation_key
+                    where id = :intake_id
+                    """,
+                    {
+                        "intake_id": int(selected_id),
+                        "request_type": business_request_type,
+                        "action_required": business_note,
+                        "conversation_key": conversation_key,
+                    },
+                )
+                refresh_data()
+                st.success(business_note)
+                st.rerun()
+        with route_cols[1]:
+            close_label = "Archive / No Action" if selected_control_level == "Level 3 - No Action / Archive" else "Close / No Action"
+            if st.button(close_label, use_container_width=True):
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Closed',
+                        request_type = case
+                            when :control_level = 'Level 3 - No Action / Archive' then 'No Action / FYI'
+                            else request_type
+                        end,
+                        action_required = case
+                            when :control_level = 'Level 3 - No Action / Archive' then 'Archived as no-action / FYI email.'
+                            else coalesce(nullif(action_required, ''), 'Closed from email review.')
+                        end
+                    where id = :intake_id
+                    """,
+                    {"intake_id": int(selected_id), "control_level": selected_control_level},
+                )
+                refresh_data()
+                st.info("Request closed.")
+                st.rerun()
+        with route_cols[2]:
+            if st.button("Keep for Review", use_container_width=True):
+                execute(
+                    """
+                    update order_intake
+                    set review_status = 'Open',
+                        action_required = coalesce(nullif(action_required, ''), 'Dispatcher review required.')
+                    where id = :intake_id
+                    """,
+                    {"intake_id": int(selected_id)},
+                )
+                refresh_data()
+                st.success("Request kept in review.")
+                st.rerun()
+        return
+
+    st.markdown("### Work Item Actions")
+    st.caption("Create or update shipment work for Level 1, route business communication for Level 2, or close archive/no-action messages for Level 3.")
 
     current_case_id = _int_or_none(record.get("case_id")) or _int_or_none(operations_case.get("id"))
     message_text = f"{subject or ''} {body or ''}"
@@ -8953,7 +9766,10 @@ def render_operations_inbox() -> None:
         or _safe_str(tokens.get("container_number", ""))
     )
     order_customer = _safe_str(parsed.get("Customer", "")) or _safe_str(sender).split("<")[0].strip()
-    can_create_order = request_type == "New Booking" and bool(order_identifier and order_customer)
+    parsed_has_new_order_details = _has_new_order_details(message_text, parsed, tokens)
+    can_create_order = bool(order_identifier and order_customer) and (
+        request_type == "New Booking" or parsed_has_new_order_details
+    )
     can_create_quote = request_type == "Quote Request" and _has_quote_details(message_text, parsed, tokens)
     fill_order_blanks = st.checkbox(
         "When updating an existing order, fill blank order fields from parsed email/document data",
@@ -8961,12 +9777,24 @@ def render_operations_inbox() -> None:
         key=f"operations_update_order_fill_blanks_{selected_id}",
     )
 
-    a1, a2, a3, a4, a5 = st.columns(5)
+    action_record = record.copy()
+    action_record["request_type_clean"] = request_type
+    action_record["control_level"] = _operations_control_level_for_row(action_record)
+    action_record["department_lane"] = _operations_department_lane_for_row(action_record)
+    selected_control_level = _safe_str(action_record.get("control_level", ""))
+    selected_department_lane = _safe_str(action_record.get("department_lane", ""))
+    can_route_business = selected_control_level == "Level 2 - Business Communications" or request_type in BUSINESS_REQUEST_TYPES
+
+    a1, a2, a3, a4, a5, a6 = st.columns(6)
 
     with a1:
         if st.button("Create Order / Load", use_container_width=True, disabled=not can_create_order):
             booking = _safe_str(parsed.get("Booking Number", "")) or _safe_str(tokens.get("booking_number", "")) or order_identifier
             customer = order_customer
+            parsed_notes = _safe_str(parsed.get("Dispatcher Notes", ""))
+            creation_notes = f"Created from Operations Inbox request #{selected_id}"
+            if parsed_notes:
+                creation_notes = f"{creation_notes}\n{parsed_notes}"
 
             if not order_identifier or not customer:
                 st.error("Customer plus booking, reference, or container is required.")
@@ -8980,14 +9808,14 @@ def render_operations_inbox() -> None:
                         "Customer": customer,
                         "Container Number": parsed.get("Container Number") or tokens.get("container_number"),
                         "Port": parsed.get("Port", ""),
-                        "Warehouse": parsed.get("Warehouse", ""),
+                        "Warehouse": parsed.get("Warehouse", "") or parsed.get("Address", ""),
                         "Address": parsed.get("Address", ""),
                         "Document Cutoff": parsed.get("Document Cutoff", ""),
                         "Delivery Need Date": parsed.get("Delivery Need Date", ""),
                         "LFD": parsed.get("LFD", ""),
                         "Size": parsed.get("Size", ""),
                         "Status": "New",
-                        "Dispatcher Notes": f"Created from Operations Inbox request #{selected_id}",
+                        "Dispatcher Notes": creation_notes,
                     },
                 )
 
@@ -9135,7 +9963,51 @@ def render_operations_inbox() -> None:
             st.rerun()
 
     with a5:
-        close_label = "Close Spam" if request_type == "Spam/Marketing" else "Close / No Action"
+        if st.button("Route Business Case", use_container_width=True, disabled=not can_route_business):
+            business_lane = selected_department_lane or "Management"
+            business_request_type = "Billing" if business_lane == "Accounting" else "Business Communication"
+            business_owner = {
+                "Accounting": "Billing",
+                "Management": "Manager",
+                "Sales": "Customer Service",
+                "Safety": "Safety",
+                "Customer Service": "Customer Service",
+            }.get(business_lane, "Manager")
+            business_note = f"Business communication routed to {business_lane}."
+
+            execute(
+                """
+                update order_intake
+                set review_status = 'Open',
+                    request_type = :request_type,
+                    action_required = :action_required,
+                    conversation_key = :conversation_key
+                where id = :intake_id
+                """,
+                {
+                    "intake_id": int(selected_id),
+                    "request_type": business_request_type,
+                    "action_required": business_note,
+                    "conversation_key": conversation_key,
+                },
+            )
+            if current_case_id is not None:
+                _update_operations_case(
+                    case_id=current_case_id,
+                    status="Waiting Billing" if business_owner == "Billing" else "In Review",
+                    owner=business_owner,
+                    priority=_safe_str(operations_case.get("priority", "Normal")) or "Normal",
+                    linked_load_id=matched_load_id,
+                    next_action=business_note,
+                )
+                _add_operations_case_note(current_case_id, business_note)
+
+            refresh_data()
+            st.success(business_note)
+            st.rerun()
+
+    with a6:
+        close_label = "Close Spam" if request_type == "Spam/Marketing" else "Archive / No Action" if selected_control_level == "Level 3 - No Action / Archive" else "Close / No Action"
         if st.button(close_label, use_container_width=True):
             execute(
                 """
@@ -9143,18 +10015,26 @@ def render_operations_inbox() -> None:
                 set review_status = 'Closed',
                     request_type = case
                         when :request_type = 'Spam/Marketing' then 'Spam/Marketing'
+                        when :control_level = 'Level 3 - No Action / Archive' then 'No Action / FYI'
                         else request_type
                     end,
                     action_required = case
                         when :request_type = 'Spam/Marketing' then 'Closed as spam / non-operational email.'
+                        when :control_level = 'Level 3 - No Action / Archive' then 'Archived as no-action / FYI email.'
                         else action_required
                     end
                 where id = :intake_id
                 """,
-                {"intake_id": int(selected_id), "request_type": request_type},
+                {"intake_id": int(selected_id), "request_type": request_type, "control_level": selected_control_level},
             )
             if current_case_id is not None:
-                close_note = "Closed as spam / non-operational email." if request_type == "Spam/Marketing" else "Closed from Operations Inbox with no further action."
+                close_note = (
+                    "Closed as spam / non-operational email."
+                    if request_type == "Spam/Marketing"
+                    else "Archived as no-action / FYI email."
+                    if selected_control_level == "Level 3 - No Action / Archive"
+                    else "Closed from Operations Inbox with no further action."
+                )
                 _set_operations_case_status(current_case_id, "Closed", close_note)
 
             refresh_data()
@@ -9162,9 +10042,9 @@ def render_operations_inbox() -> None:
             st.rerun()  
 def render_booking_review(df: pd.DataFrame) -> None:
     st.markdown("### Booking Review")
-    st.caption("Complete missing booking information here. Ready bookings move to Dispatch Board.")
+    st.caption("Complete missing booking information here. Verified bookings move to the load workspace for Port Sync / PIN.")
 
-    review_statuses = ["New", "Hold/Need Info", "Awaiting Appointment"]
+    review_statuses = ["New", "Hold/Need Info", "Booking Verified"]
     review_df = df[df["Status"].isin(review_statuses)].copy()
     review_df = _add_booking_verification_columns(review_df)
 
@@ -9175,17 +10055,17 @@ def render_booking_review(df: pd.DataFrame) -> None:
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Needs Review", int(review_df["Status"].eq("New").sum()))
     k2.metric("Missing Info", int(review_df["Status"].eq("Hold/Need Info").sum()))
-    k3.metric("Awaiting Appointment", int(review_df["Status"].eq("Awaiting Appointment").sum()))
-    k4.metric("Ready", int(review_df["Readiness %"].eq(100).sum()))
+    k3.metric("Booking Verified", int(review_df["Status"].eq("Booking Verified").sum()))
+    k4.metric("Complete", int(review_df["Readiness %"].eq(100).sum()))
 
     q1, q2, q3, q4 = st.tabs(
-        ["Needs Review", "Missing Information", "Awaiting Appointment", "All Review"]
+        ["New Orders", "Missing Information", "Booking Verified", "All Review"]
     )
 
     with q1:
         _render_booking_verification_table(
             review_df[review_df["Status"].eq("New")].copy(),
-            "Needs Review",
+            "New Orders",
         )
 
     with q2:
@@ -9194,8 +10074,8 @@ def render_booking_review(df: pd.DataFrame) -> None:
 
     with q3:
         _render_booking_verification_table(
-            review_df[review_df["Status"].eq("Awaiting Appointment")].copy(),
-            "Awaiting Appointment",
+            review_df[review_df["Status"].eq("Booking Verified")].copy(),
+            "Booking Verified",
         )
 
     with q4:
@@ -9268,14 +10148,17 @@ def render_booking_review(df: pd.DataFrame) -> None:
             )
 
         with c3:
+            review_status_options = list(ORDER_MANAGEMENT_STATUSES)
+            current_review_status = _safe_str(selected_load.get("Status", "New"))
+            if current_review_status and current_review_status not in review_status_options:
+                review_status_options.insert(0, current_review_status)
             status = st.selectbox(
                 "Review Status",
-                ["New", "Hold/Need Info", "Awaiting Appointment", "Ready to Dispatch"],
-                index=["New", "Hold/Need Info", "Awaiting Appointment", "Ready to Dispatch"].index(
-                    _safe_str(selected_load.get("Status", "New"))
-                )
-                if _safe_str(selected_load.get("Status", "New")) in ["New", "Hold/Need Info", "Awaiting Appointment", "Ready to Dispatch"]
+                review_status_options,
+                index=review_status_options.index(current_review_status)
+                if current_review_status in review_status_options
                 else 0,
+                format_func=lambda value: ORDER_MANAGEMENT_STATUS_LABELS.get(value, value),
             )
             driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")))
             truck = st.text_input("Truck Assigned", value=_safe_str(selected_load.get("Truck Assigned", "")))
@@ -9332,35 +10215,32 @@ def render_booking_review(df: pd.DataFrame) -> None:
             st.rerun()
 
     with a2:
-        if st.button("Awaiting Appointment", key=f"review_appt_{selected_row_id}", use_container_width=True):
-            DispatchDatabaseClient().update_row_fields(
-                selected_row_id,
-                {
-                    "Status": "Awaiting Appointment",
-                    "Dispatcher Notes": "Waiting for pickup/delivery appointment confirmation.",
-                },
-            )
-            refresh_data()
-            st.warning("Booking marked Awaiting Appointment.")
-            st.rerun()
-
-    with a3:
         ready_disabled = readiness_score < 100
         if st.button(
-            "Move To Dispatch",
-            key=f"review_ready_dispatch_{selected_row_id}",
+            "Mark Booking Verified",
+            key=f"review_booking_verified_{selected_row_id}",
             use_container_width=True,
             disabled=ready_disabled,
         ):
             DispatchDatabaseClient().update_row_fields(
                 selected_row_id,
                 {
-                    "Status": "Ready to Dispatch",
-                    "Dispatcher Notes": "Booking completed and moved to dispatch.",
+                    "Status": "Booking Verified",
+                    "Dispatcher Notes": "Booking completed and verified. Next action: verify booking with Port Houston.",
                 },
             )
             refresh_data()
-            st.success("Booking moved to Dispatch Board.")
+            st.success("Booking marked verified. Open the load workspace for Port Sync / PIN.")
+            st.rerun()
+
+    with a3:
+        if st.button("Save Notes", key=f"review_save_notes_{selected_row_id}", use_container_width=True):
+            DispatchDatabaseClient().update_row_fields(
+                selected_row_id,
+                {"Dispatcher Notes": notes.strip()},
+            )
+            refresh_data()
+            st.success("Booking notes saved.")
             st.rerun()
 
     with a4:
@@ -9374,7 +10254,7 @@ def render_booking_review(df: pd.DataFrame) -> None:
             st.rerun()
 
     if readiness_score < 100:
-        st.info("Move To Dispatch is disabled until all required fields are complete.")
+        st.info("Mark Booking Verified is disabled until all required fields are complete.")
 
 def _get_selected_dispatch_load(df: pd.DataFrame):
     selected_id = st.session_state.get("selected_dispatch_load_id")
@@ -9438,6 +10318,332 @@ def _read_documents_for_load(load_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _load_status_rank(status: str) -> int:
+    status = _safe_str(status)
+    try:
+        return LOAD_STATUS_FLOW.index(status)
+    except ValueError:
+        return -1
+
+
+def _status_at_or_after(status: str, milestone: str) -> bool:
+    status_rank = _load_status_rank(status)
+    milestone_rank = _load_status_rank(milestone)
+    return status_rank >= milestone_rank >= 0
+
+
+def _load_has_driver(load) -> bool:
+    return bool(_first_present(load, ["Driver Name", "driver_name"], ""))
+
+
+def _load_has_truck(load) -> bool:
+    return bool(_first_present(load, ["Truck Assigned", "truck_assigned"], ""))
+
+
+def _load_has_pin_or_appointment(load) -> bool:
+    status = _first_present(load, ["Status", "status"], "")
+    if _status_at_or_after(status, "PIN Received"):
+        return True
+    notes = _first_present(load, ["Dispatcher Notes", "dispatcher_notes"], "").lower()
+    return bool(
+        _first_present(
+            load,
+            [
+                "pickup_appointment",
+                "Pickup Appointment",
+                "delivery_appointment",
+                "Delivery Appointment",
+                "pickup_reference",
+                "Pickup Reference",
+                "delivery_reference",
+                "Delivery Reference",
+            ],
+            "",
+        )
+        or "pin received" in notes
+        or "appointment confirmation" in notes
+        or "express pass" in notes
+    )
+
+
+def _load_port_verified(load) -> bool:
+    status = _first_present(load, ["Status", "status"], "")
+    if _status_at_or_after(status, "Port Verified"):
+        return True
+    notes = _first_present(load, ["Dispatcher Notes", "dispatcher_notes"], "").lower()
+    return bool(
+        _first_present(load, ["terminal", "Terminal", "empty_return_location", "Empty Return Location", "current_location"], "")
+        or "port houston evp update" in notes
+        or "container lookup complete" in notes
+        or "booking lookup complete" in notes
+    )
+
+
+def _load_document_count(load_id: int | None, documents_df: pd.DataFrame | None = None) -> int:
+    if documents_df is not None:
+        return len(documents_df)
+    if load_id is None:
+        return 0
+    return len(_read_documents_for_load(int(load_id)))
+
+
+def _load_readiness_details(load, documents_df: pd.DataFrame | None = None, include_documents: bool = True) -> dict:
+    status = _first_present(load, ["Status", "status"], "New")
+    move_type = _normalize_load_type(load)
+    requires_port = _load_requires_port_type(move_type)
+    load_id = _int_or_none(load.get("_row_id") if hasattr(load, "get") else None)
+    has_docs = _load_document_count(load_id, documents_df) > 0 if include_documents else True
+    has_driver = _load_has_driver(load)
+    has_truck = _load_has_truck(load)
+    has_pin = _load_has_pin_or_appointment(load)
+    port_verified = _load_port_verified(load) if requires_port else True
+
+    checks = [
+        ("Customer", bool(_first_present(load, ["Customer", "customer"], ""))),
+        ("Order / booking #", bool(_first_present(load, ["Booking Number", "booking_number", "Reference Number", "Load ID"], ""))),
+        ("Container #", bool(_first_present(load, ["Container Number", "container_number"], ""))),
+        ("Warehouse", bool(_first_present(load, ["Warehouse", "warehouse"], ""))),
+        ("Delivery need date", bool(_first_present(load, ["Delivery Need Date", "delivery_need_date"], ""))),
+        ("Size", bool(_first_present(load, ["Size", "size"], ""))),
+        ("Import / Export / Local", bool(_first_present(load, ["TYPE", "type"], ""))),
+    ]
+    if requires_port:
+        checks.extend(
+            [
+                ("Steamship line", bool(_first_present(load, ["steamship_line", "Steamship Line"], ""))),
+                ("Port / terminal", bool(_first_present(load, ["Port", "port", "terminal", "Terminal"], ""))),
+            ]
+        )
+    if include_documents:
+        checks.append(("Documents attached", has_docs))
+    if requires_port:
+        checks.append(("Port verified", port_verified))
+    checks.extend([("Driver assigned", has_driver), ("Truck assigned", has_truck)])
+    if requires_port:
+        checks.append(("PIN / appointment", has_pin))
+
+    missing = [label for label, is_ready in checks if not is_ready]
+    completed = len(checks) - len(missing)
+    score = int(round((completed / len(checks)) * 100)) if checks else 0
+
+    exceptions = []
+    lfd_date = pd.to_datetime(_first_present(load, ["LFD", "lfd"], ""), errors="coerce")
+    delivery_date = pd.to_datetime(_first_present(load, ["Delivery Need Date", "delivery_need_date"], ""), errors="coerce")
+    today = pd.Timestamp(date.today()).normalize()
+    if pd.notna(lfd_date) and lfd_date.normalize() <= today and status not in ["Delivered", "POD Received", "Ready for ProfitTools", "Invoiced", "Closed", "Cancelled"]:
+        exceptions.append("LFD today")
+    if pd.notna(delivery_date) and delivery_date.normalize() < today and status not in ["Delivered", "POD Received", "Ready for ProfitTools", "Invoiced", "Closed", "Cancelled"]:
+        exceptions.append("Late appointment")
+    if status in ["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch", "Driver Assigned", "Assigned"] and not has_driver:
+        exceptions.append("No driver assigned")
+    if requires_port and status in ["Ready for Appointment / PIN", "Ready for Port PIN", "Ready to Dispatch", "Driver Assigned", "Assigned"] and not has_pin:
+        exceptions.append("No PIN / appointment")
+    if status in ["Delivered"] and not has_docs:
+        exceptions.append("No POD")
+    notes = _first_present(load, ["Dispatcher Notes", "dispatcher_notes"], "").lower()
+    if requires_port and any(term in notes for term in ["hold", "customs hold", "line hold", "exam", "x-ray"]):
+        exceptions.append("Container hold")
+
+    verification_missing = [
+        "Customer",
+        "Order / booking #",
+        "Container #",
+        "Warehouse",
+        "Delivery need date",
+        "Size",
+        "Import / Export / Local",
+    ]
+    if requires_port:
+        verification_missing.extend(["Steamship line", "Port / terminal"])
+
+    if any(item in missing for item in verification_missing):
+        next_action = "Complete missing order details"
+    elif "Documents attached" in missing:
+        next_action = "Attach load documents"
+    elif not _status_at_or_after(status, "Booking Verified"):
+        next_action = "Verify booking"
+    elif requires_port and not port_verified:
+        next_action = "Verify booking with Port Houston"
+    elif not has_driver or not has_truck:
+        next_action = "Assign driver and truck"
+    elif requires_port and not has_pin:
+        next_action = "Request PIN / appointment"
+    elif status in ["PIN Received", "Driver Assigned", "Assigned", "Ready to Dispatch"]:
+        next_action = "Send dispatch packet"
+    elif status == "Delivered":
+        next_action = "Upload POD"
+    elif status in ["POD Received", "Ready for ProfitTools"]:
+        next_action = "Move to billing"
+    else:
+        next_action = _next_status_goal(status)
+
+    return {
+        "score": score,
+        "missing": missing,
+        "next_action": next_action,
+        "exceptions": exceptions,
+        "port_verified": port_verified,
+        "pin_ready": has_pin,
+        "requires_port": requires_port,
+        "move_type": move_type,
+        "dispatchable": not missing and port_verified and has_driver and has_truck and (has_pin or not requires_port),
+    }
+
+
+def _readiness_label(details: dict) -> str:
+    missing = details.get("missing") or []
+    if not missing:
+        return f"{details.get('score', 0)}% Ready"
+    return f"{details.get('score', 0)}% Ready - Missing: {', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}"
+
+
+def _load_department_queue(load) -> str:
+    status = _first_present(load, ["Status", "status"], "New")
+    readiness = _load_readiness_details(load, include_documents=False)
+    exceptions = readiness.get("exceptions") or []
+    if status in ["POD Received", "Ready for ProfitTools"]:
+        return "Accounting - Ready for ProfitTools"
+    if status in ["Invoiced", "Closed"]:
+        return "Accounting - Closed / Invoiced"
+    if any(term in _first_present(load, ["Dispatcher Notes", "dispatcher_notes"], "").lower() for term in ["detention", "demurrage", "invoice", "billing"]):
+        return "Accounting - Detention / Demurrage"
+    if not _load_has_driver(load) and status in ["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch"]:
+        return "Manager - Unassigned"
+    if exceptions:
+        return "Manager - Critical / Exceptions"
+    if status in ["New", "Order Created", "Needs Review"]:
+        return "Dispatcher - New Orders"
+    if status in ["Hold/Need Info"]:
+        return "Dispatcher - Need Info"
+    if status in ["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN"]:
+        return "Dispatcher - Ready for PIN"
+    if status in ["PIN Received", "Ready to Dispatch"]:
+        return "Dispatcher - Ready to Dispatch"
+    if status in ACTIVE_DRIVER_STATUSES or status in ["At Port", "Loaded / Picked Up", "Delivered"]:
+        return "Dispatcher - Active Loads"
+    return "Dispatcher - Exceptions"
+
+
+def _load_exception_summary(df: pd.DataFrame) -> dict[str, int]:
+    work_df = df.copy()
+    if work_df.empty or "Status" not in work_df.columns:
+        return {}
+    open_df = work_df[~work_df["Status"].isin(CLOSED_STATUSES)].copy()
+    open_df["Dispatch Move Type"] = open_df.get("TYPE", pd.Series("", index=open_df.index)).apply(_normalize_load_type_value)
+    port_required = open_df["Dispatch Move Type"].isin(["Import", "Export"])
+    today = pd.Timestamp(date.today()).normalize()
+    lfd_dates = pd.to_datetime(open_df.get("LFD", ""), errors="coerce")
+    delivery_dates = pd.to_datetime(open_df.get("Delivery Need Date", ""), errors="coerce")
+    no_driver_statuses = ["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch"]
+    notes = open_df.get("Dispatcher Notes", pd.Series("", index=open_df.index)).fillna("").astype(str).str.lower()
+    no_driver_mask = open_df["Status"].isin(no_driver_statuses) & open_df["Driver Name"].astype(str).str.strip().isin(["", "None", "nan", "Unassigned"])
+    no_pin_mask = (
+        port_required
+        & open_df["Status"].isin(["Ready for Appointment / PIN", "Ready for Port PIN", "Ready to Dispatch", "Driver Assigned", "Assigned"])
+        & ~open_df.apply(_load_has_pin_or_appointment, axis=1)
+    )
+    port_hold_mask = port_required & notes.str.contains("customs hold|line hold|x-ray|exam|hold", regex=True, na=False)
+    return {
+        "LFD today": int((lfd_dates.notna() & lfd_dates.dt.normalize().le(today) & ~open_df["Status"].isin(["Delivered", "POD Received", "Ready for ProfitTools"])).sum()),
+        "Late appointment": int((delivery_dates.notna() & delivery_dates.dt.normalize().lt(today) & ~open_df["Status"].isin(["Delivered", "POD Received", "Ready for ProfitTools", "Invoiced", "Closed", "Cancelled"])).sum()),
+        "No driver assigned": int(no_driver_mask.sum()),
+        "Waiting driver": int(no_driver_mask.sum()),
+        "No PIN": int(no_pin_mask.sum()),
+        "Appointment missing": int((port_required & open_df["Status"].isin(["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN"]) & ~open_df.apply(_load_has_pin_or_appointment, axis=1)).sum()),
+        "Customer waiting": int(open_df["Status"].eq("Hold/Need Info").sum()),
+        "Container hold": int(port_hold_mask.sum()),
+        "Port hold": int(port_hold_mask.sum()),
+        "No POD": int(open_df["Status"].eq("Delivered").sum()),
+        "Ready for billing": int(open_df["Status"].isin(["POD Received", "Ready for ProfitTools"]).sum()),
+    }
+
+
+def _dispatch_workflow_for_type(move_type: str) -> dict:
+    normalized_type = _normalize_load_type_value(move_type)
+    return DISPATCH_ACTION_WORKFLOWS.get(normalized_type, DISPATCH_ACTION_WORKFLOWS["Other"])
+
+
+def _dispatch_action_labels(move_type: str) -> dict[str, tuple[str, str, int, int]]:
+    labels = {}
+    workflow = _dispatch_workflow_for_type(move_type)
+    for lane_idx, (lane_name, actions) in enumerate(workflow.items()):
+        for action_idx, (action_key, action_label) in enumerate(actions):
+            labels[action_key] = (lane_name, action_label, lane_idx, action_idx)
+    return labels
+
+
+def _dispatch_action_metadata(load, readiness: dict | None = None) -> dict:
+    status = _first_present(load, ["Status", "status"], "New")
+    move_type = _normalize_load_type(load)
+    requires_port = _load_requires_port_type(move_type)
+    readiness = readiness or _load_readiness_details(load, include_documents=False)
+    labels = _dispatch_action_labels(move_type)
+
+    def choose(action_key: str, fallback_lane: str, hint: str) -> dict:
+        if action_key not in labels:
+            workflow = _dispatch_workflow_for_type(move_type)
+            fallback_actions = workflow.get(fallback_lane) or next(iter(workflow.values()))
+            action_key = fallback_actions[0][0]
+        lane_name, action_label, lane_idx, action_idx = labels[action_key]
+        return {
+            "lane": lane_name,
+            "action": action_key,
+            "label": action_label,
+            "hint": hint,
+            "lane_sort": lane_idx,
+            "action_sort": action_idx,
+        }
+
+    missing = set(readiness.get("missing") or [])
+    verification_missing = missing - {"Documents attached", "Port verified", "Driver assigned", "Truck assigned", "PIN / appointment"}
+    has_driver = _load_has_driver(load)
+    has_truck = _load_has_truck(load)
+    has_pin = _load_has_pin_or_appointment(load)
+    port_verified = bool(readiness.get("port_verified", True))
+
+    if status in ["Closed", "Invoiced", "Exported to ProfitTools"]:
+        return choose("completed", "Completion", "Load complete or exported.")
+    if status in ["Cancelled"]:
+        return choose("completed", "Completion", "Cancelled load.")
+    if status in ["POD Received", "Ready for ProfitTools"]:
+        return choose("ready_billing", "Completion", "Move to billing / ProfitTools.")
+    if status == "Delivered":
+        return choose("delivered", "Completion", "Collect POD and clear billing handoff.")
+    if status == "Returning Empty":
+        return choose("empty_return", "Completion", "Confirm empty or chassis return.")
+
+    if status in ["New Email", "Order Created", "New"]:
+        return choose("new_orders", "Verification", "Review order and confirm core details.")
+    if status in ["Needs Review", "Hold/Need Info"] or verification_missing:
+        return choose("needs_verification", "Verification", "Fix missing or questionable load details.")
+    if "Documents attached" in missing:
+        return choose("documents", "Verification", "Attach or review required load documents.")
+
+    if requires_port and not port_verified:
+        return choose("sync_port", "Planning", "Sync Port Houston data before dispatch.")
+    if not has_driver or not has_truck:
+        return choose("assign_driver", "Planning", "Assign driver, truck, and chassis.")
+    if requires_port and not has_pin:
+        return choose("appointment_needed", "Planning", "Book appointment or request PIN before dispatch.")
+    if move_type == "Export Local" and status in ["Booking Verified", "Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch", "Driver Assigned", "Assigned"]:
+        return choose("appointment_needed", "Planning", "Confirm empty pickup before sending the final packet.")
+    if status in ["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN", "PIN Received", "Ready to Dispatch", "Driver Assigned", "Assigned"]:
+        return choose("send_packet", "Planning", "Send dispatch packet when load is ready.")
+
+    if status in ["Dispatched", "En Route to Pickup"]:
+        return choose("enroute_pickup", "Execution", "Track movement toward pickup.")
+    if status == "At Port":
+        return choose("at_port", "Execution", "Track terminal activity.")
+    if status == "At Pickup":
+        return choose("at_pickup", "Execution", "Track pickup / customer arrival.")
+    if status in ["Loaded / Picked Up", "Loaded"]:
+        return choose("loaded", "Execution", "Track load after pickup.")
+    if status == "En Route To Delivery":
+        return choose("enroute_delivery", "Execution", "Track delivery ETA.")
+
+    return choose("needs_verification", "Verification", "Review load status and next step.")
+
+
 def _update_load_extra_fields(load_id: int, current_location: str, eta_value, live_load_status: str, live_unload_status: str) -> None:
     execute(
         """
@@ -9477,14 +10683,7 @@ def _insert_dispatch_message(load_id: int, message_type: str, direction: str, re
 
 
 def _get_app_setting(name: str, default=None):
-    """Read from Streamlit secrets first, then environment variables."""
-    try:
-        value = st.secrets.get(name)
-        if value not in [None, ""]:
-            return value
-    except Exception:
-        pass
-    return os.getenv(name, default)
+    return get_secret(name, default)
 
 
 def _get_first_app_setting(names: list[str], default=None):
@@ -9501,10 +10700,48 @@ OPERATIONS_REPLY_MAILBOXES = [
     "accounting@calitranscorp.com",
 ]
 
+NAMED_EMAIL_ACCOUNTS = {
+    "DISPATCH": "dispatch@calitranscorp.com",
+    "MARGIE": "margiea@calitranscorp.com",
+    "ACCOUNTING": "accounting@calitranscorp.com",
+}
+
 
 def _setting_suffix_for_email(email_address: str) -> str:
     local_part = _safe_str(email_address).split("@", 1)[0]
     return re.sub(r"[^A-Za-z0-9]+", "_", local_part).strip("_").upper()
+
+
+def _unique_setting_names(names: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for name in names:
+        name = _safe_str(name)
+        normalized = name.upper()
+        if not name or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(name)
+    return result
+
+
+def _email_account_aliases(email_address: str) -> list[str]:
+    normalized_email = _safe_str(email_address).lower()
+    aliases = [_setting_suffix_for_email(email_address)]
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = _get_first_app_setting(
+            [f"{alias}_YAHOO_EMAIL", f"{alias}_EMAIL", f"YAHOO_EMAIL_{alias}"],
+            default_email,
+        )
+        if normalized_email == _safe_str(configured_email).lower():
+            aliases.append(alias)
+            if alias == "MARGIE":
+                aliases.append("MARGIEA")
+    return _unique_setting_names(aliases)
+
+
+def _setting_candidates_for_aliases(aliases: list[str], templates: list[str]) -> list[str]:
+    return _unique_setting_names([template.format(alias=alias) for alias in aliases for template in templates])
 
 
 def _split_email_list(value: str) -> list[str]:
@@ -9518,6 +10755,13 @@ def _operations_reply_sender_options() -> list[str]:
             ",".join(OPERATIONS_REPLY_MAILBOXES),
         )
     )
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = _get_first_app_setting(
+            [f"{alias}_YAHOO_EMAIL", f"{alias}_EMAIL", f"YAHOO_EMAIL_{alias}"],
+            default_email,
+        )
+        if configured_email not in configured:
+            configured.append(configured_email)
     for email_address in OPERATIONS_REPLY_MAILBOXES:
         if email_address not in configured:
             configured.append(email_address)
@@ -9574,16 +10818,38 @@ def _reply_all_cc_from_record(parsed: dict, reply_from: str, reply_to: str) -> s
 
 
 def _smtp_credentials_for_sender(from_email: str) -> tuple[str, str, str]:
-    smtp_user_default = _get_first_app_setting(["SMTP_USER", "YAHOO_EMAIL", "EMAIL_ADDRESS"])
-    smtp_password_default = _get_first_app_setting(["SMTP_PASSWORD", "YAHOO_APP_PASSWORD", "EMAIL_APP_PASSWORD"])
+    smtp_user_default = _get_first_app_setting(["SMTP_USER", "DISPATCH_YAHOO_EMAIL", "YAHOO_EMAIL", "EMAIL_ADDRESS"])
+    smtp_password_default = _get_first_app_setting(
+        ["SMTP_PASSWORD", "DISPATCH_YAHOO_APP_PASSWORD", "YAHOO_APP_PASSWORD", "EMAIL_APP_PASSWORD"]
+    )
     from_email = _safe_str(from_email) or _get_first_app_setting(["DISPATCH_EMAIL", "YAHOO_EMAIL", "EMAIL_ADDRESS"], smtp_user_default)
-    suffix = _setting_suffix_for_email(from_email)
+    aliases = _email_account_aliases(from_email)
     smtp_user = _get_first_app_setting(
-        [f"SMTP_USER_{suffix}", f"YAHOO_EMAIL_{suffix}", f"EMAIL_ADDRESS_{suffix}"],
+        _setting_candidates_for_aliases(
+            aliases,
+            [
+                "{alias}_SMTP_USER",
+                "{alias}_YAHOO_EMAIL",
+                "{alias}_EMAIL_ADDRESS",
+                "SMTP_USER_{alias}",
+                "YAHOO_EMAIL_{alias}",
+                "EMAIL_ADDRESS_{alias}",
+            ],
+        ),
         from_email or smtp_user_default,
     )
     smtp_password = _get_first_app_setting(
-        [f"SMTP_PASSWORD_{suffix}", f"YAHOO_APP_PASSWORD_{suffix}", f"EMAIL_APP_PASSWORD_{suffix}"],
+        _setting_candidates_for_aliases(
+            aliases,
+            [
+                "{alias}_SMTP_PASSWORD",
+                "{alias}_YAHOO_APP_PASSWORD",
+                "{alias}_EMAIL_APP_PASSWORD",
+                "SMTP_PASSWORD_{alias}",
+                "YAHOO_APP_PASSWORD_{alias}",
+                "EMAIL_APP_PASSWORD_{alias}",
+            ],
+        ),
         smtp_password_default if _safe_str(smtp_user).lower() == _safe_str(smtp_user_default).lower() else None,
     )
     return from_email, smtp_user, smtp_password
@@ -9599,6 +10865,34 @@ def _first_present(load, keys: list[str], fallback: str = "") -> str:
         if value_str and value_str.lower() not in {"nan", "none", "nat", "null", "-"}:
             return value_str
     return fallback
+
+
+def _normalize_load_type_value(value: str) -> str:
+    text = _safe_str(value)
+    lower = re.sub(r"\s+", " ", text.replace("_", " ").replace("-", " ")).strip().lower()
+    if not lower:
+        return "Other"
+    is_local = "local" in lower
+    if "export" in lower:
+        return "Export Local" if is_local else "Export"
+    if "import" in lower:
+        return "Import Local" if is_local else "Import"
+    for load_type in LOAD_TYPE_TABS:
+        if lower == load_type.lower():
+            return load_type
+    return "Other"
+
+
+def _normalize_load_type(load) -> str:
+    return _normalize_load_type_value(_first_present(load, ["TYPE", "type", "Load Type", "load_type"], ""))
+
+
+def _load_requires_port_type(move_type: str) -> bool:
+    return _normalize_load_type_value(move_type) in {"Import", "Export"}
+
+
+def _load_requires_port(load) -> bool:
+    return _load_requires_port_type(_normalize_load_type(load))
 
 
 def _customer_email_for_load(load) -> str:
@@ -9639,6 +10933,23 @@ def _eta_to_next_goal(load, new_status: str) -> str:
             return eta_value
 
     return "ETA pending dispatch update"
+
+
+def _load_pin_display(load) -> str:
+    return _first_present(
+        load,
+        [
+            "pickup_reference",
+            "Pickup Reference",
+            "delivery_reference",
+            "Delivery Reference",
+            "pickup_appointment",
+            "Pickup Appointment",
+            "delivery_appointment",
+            "Delivery Appointment",
+        ],
+        "-",
+    )
 
 
 def _build_customer_status_email(load, old_status: str, new_status: str, note: str = "") -> tuple[str, str]:
@@ -9773,13 +11084,20 @@ def _generate_driver_dispatch_message(selected_load) -> str:
     booking = _clean_display_value(selected_load.get("Booking Number", ""))
     container = _clean_display_value(selected_load.get("Container Number", ""))
     customer = _clean_display_value(selected_load.get("Customer", ""))
-    pickup = _clean_display_value(selected_load.get("Port", ""))
+    pickup = _clean_display_value(selected_load.get("Port", "") or selected_load.get("terminal", ""))
+    terminal = _clean_display_value(selected_load.get("terminal", "") or selected_load.get("Port", ""))
     delivery = _clean_display_value(selected_load.get("Warehouse", ""))
     address = _clean_display_value(selected_load.get("Address", ""))
     delivery_need = _clean_display_value(selected_load.get("Delivery Need Date", ""))
     lfd = _clean_display_value(selected_load.get("LFD", ""))
     chassis = _clean_display_value(selected_load.get("Chassis", ""))
+    chassis_provider = _clean_display_value(selected_load.get("chassis_provider", ""), "")
     size = _clean_display_value(selected_load.get("Size", ""))
+    pickup_appt = _clean_display_value(selected_load.get("pickup_appointment", ""), "")
+    delivery_appt = _clean_display_value(selected_load.get("delivery_appointment", ""), "")
+    empty_return = _clean_display_value(selected_load.get("empty_return_location", ""), "")
+    empty_return_date = _clean_display_value(selected_load.get("empty_return_date", ""), "")
+    pin_or_appt = _load_pin_display(selected_load)
     notes = _clean_display_value(selected_load.get("Dispatcher Notes", ""), "")
 
     message = f"""LOAD ASSIGNMENT
@@ -9789,16 +11107,23 @@ Container: {container}
 Customer: {customer}
 Size: {size}
 
-Pickup / Terminal:
-{pickup}
+TERMINAL / PICKUP
+Terminal: {terminal}
+Pickup Location: {pickup}
+PIN / Appointment: {pin_or_appt}
+Pickup Appointment: {pickup_appt or "-"}
 
-Delivery:
-{delivery}
-{address}
+DELIVERY
+Warehouse: {delivery}
+Address: {address}
+Delivery Appointment: {delivery_appt or "-"}
 
 Delivery Need Date: {delivery_need}
 LFD: {lfd}
 Chassis: {chassis}
+Chassis Provider: {chassis_provider or "-"}
+Empty Return: {empty_return or "-"}
+Empty Return Date: {empty_return_date or "-"}
 
 Instructions:
 {notes if notes else "Please confirm when en route, at pickup, loaded, delivered, and empty returned."}
@@ -9831,20 +11156,30 @@ def render_dispatch_workspace(selected_load) -> None:
     booking = str(selected_load.get("Booking Number", "") or "")
     container = str(selected_load.get("Container Number", "") or "-")
     customer = str(selected_load.get("Customer", "") or "-")
+    load_documents_df = _read_documents_for_load(load_id)
+    readiness = _load_readiness_details(selected_load, documents_df=load_documents_df)
 
     st.markdown("---")
     st.markdown(f"## Load Workspace: {booking}")
     st.caption(f"{customer} · Container {container}")
 
-    top = st.columns(5)
+    top = st.columns(6)
     top[0].metric("Status", str(selected_load.get("Status", "") or "-"))
-    top[1].metric("Driver", str(selected_load.get("Driver Name", "") or "Unassigned"))
-    top[2].metric("Truck", str(selected_load.get("Truck Assigned", "") or "-"))
-    top[3].metric("Delivery Need", str(selected_load.get("Delivery Need Date", "") or "-"))
-    top[4].metric("LFD", str(selected_load.get("LFD", "") or "-"))
+    top[1].metric("Readiness", f"{readiness['score']}%")
+    top[2].metric("Next Action", readiness["next_action"])
+    top[3].metric("Driver", str(selected_load.get("Driver Name", "") or "Unassigned"))
+    top[4].metric("Truck", str(selected_load.get("Truck Assigned", "") or "-"))
+    top[5].metric("LFD", str(selected_load.get("LFD", "") or "-"))
 
-    dispatch_tab, status_tab, timeline_tab, driver_tab, customer_tab, docs_tab, billing_tab = st.tabs(
-        ["Dispatch Details", "Status Update", "Timeline", "Driver Notes/Text", "Customer Notes", "Documents", "Billing"]
+    if readiness["missing"]:
+        st.warning("Missing before dispatch: " + ", ".join(readiness["missing"]))
+    else:
+        st.success("Load readiness checklist is complete.")
+    if readiness["exceptions"]:
+        st.error("Exceptions: " + ", ".join(readiness["exceptions"]))
+
+    dispatch_tab, port_tab, status_tab, timeline_tab, driver_tab, customer_tab, docs_tab, billing_tab = st.tabs(
+        ["Dispatch Details", "Port Sync / PIN", "Status Update", "Timeline", "Driver Notes/Text", "Customer Notes", "Documents", "Billing"]
     )
 
     with dispatch_tab:
@@ -9894,6 +11229,9 @@ def render_dispatch_workspace(selected_load) -> None:
             refresh_data()
             st.rerun()
 
+    with port_tab:
+        _render_load_port_houston_panel(selected_load, readiness)
+
     with status_tab:
         st.markdown("### Status Update")
         c1, c2, c3, c4 = st.columns(4)
@@ -9913,6 +11251,13 @@ def render_dispatch_workspace(selected_load) -> None:
         note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120)
 
         if st.button("Save Status Update", key=f"save_status_{load_id}"):
+            if (
+                new_status in ["Ready to Dispatch", "Dispatched"]
+                and new_status != current_status
+                and not readiness.get("dispatchable")
+            ):
+                st.error("This load cannot be marked Ready to Dispatch or Dispatched until order details, port verification, driver, truck, and PIN/appointment are complete.")
+                return
             updates = {}
             if new_status != current_status:
                 updates["Status"] = new_status
@@ -9985,6 +11330,9 @@ def render_dispatch_workspace(selected_load) -> None:
         st.markdown("#### Generated Dispatch Message")
 
         generated_message = _generate_driver_dispatch_message(selected_load)
+        packet_ready = bool(readiness.get("dispatchable"))
+        if not packet_ready:
+            st.warning("Driver packet is locked until customer/order, port verification, driver, truck, and PIN/appointment are complete.")
 
         edited_message = st.text_area(
             "Dispatch Message",
@@ -9996,7 +11344,12 @@ def render_dispatch_workspace(selected_load) -> None:
         action_cols = st.columns(4)
 
         with action_cols[0]:
-            if st.button("Save Message", key=f"save_generated_driver_msg_{load_id}", use_container_width=True):
+            if st.button(
+                "Save Message",
+                key=f"save_generated_driver_msg_{load_id}",
+                use_container_width=True,
+                disabled=not packet_ready,
+            ):
                 _insert_dispatch_message(
                     load_id,
                     "driver_dispatch_message",
@@ -10015,10 +11368,16 @@ def render_dispatch_workspace(selected_load) -> None:
                 mime="text/plain",
                 key=f"download_dispatch_msg_{load_id}",
                 use_container_width=True,
+                disabled=not packet_ready,
             )
 
         with action_cols[2]:
-            if st.button("Copy/Paste Ready", key=f"copy_ready_{load_id}", use_container_width=True):
+            if st.button(
+                "Copy/Paste Ready",
+                key=f"copy_ready_{load_id}",
+                use_container_width=True,
+                disabled=not packet_ready,
+            ):
                 _insert_dispatch_message(
                     load_id,
                     "driver_dispatch_message_copy_ready",
@@ -10040,15 +11399,36 @@ def render_dispatch_workspace(selected_load) -> None:
         st.markdown("#### Quick Driver Status Updates")
         st.caption("These buttons update load status and create a communication log entry.")
 
-        quick_statuses = [
-            ("En Route to Pickup", "Driver en route to pickup/terminal."),
-            ("At Pickup", "Driver arrived at pickup/terminal."),
-            ("Loaded", "Container/load picked up and loaded."),
-            ("En Route To Delivery", "Driver en route to delivery."),
-            ("Delivered", "Delivery completed. Awaiting POD if not received."),
-            ("Returning Empty", "Driver returning empty container/chassis."),
-            ("POD Received", "POD received and saved for billing."),
-        ]
+        move_type = _normalize_load_type(selected_load)
+        if move_type == "Import":
+            quick_statuses = [
+                ("En Route to Pickup", "Driver en route to port/terminal."),
+                ("At Port", "Driver arrived at terminal."),
+                ("Loaded", "Container picked up and loaded."),
+                ("En Route To Delivery", "Driver en route to warehouse/customer."),
+                ("Delivered", "Delivery completed. Awaiting POD if not received."),
+                ("Returning Empty", "Driver returning empty container/chassis."),
+                ("POD Received", "POD received and saved for billing."),
+            ]
+        elif move_type == "Export":
+            quick_statuses = [
+                ("En Route to Pickup", "Driver en route to empty yard or shipper."),
+                ("At Pickup", "Driver arrived at empty yard or shipper."),
+                ("Loaded", "Export load picked up and loaded."),
+                ("En Route To Delivery", "Driver en route to port."),
+                ("At Port", "Driver arrived at terminal."),
+                ("Delivered", "Export delivered to port. Awaiting POD if not received."),
+                ("POD Received", "POD received and saved for billing."),
+            ]
+        else:
+            quick_statuses = [
+                ("En Route to Pickup", "Driver en route to pickup."),
+                ("At Pickup", "Driver arrived at pickup."),
+                ("Loaded", "Load picked up and loaded."),
+                ("En Route To Delivery", "Driver en route to delivery."),
+                ("Delivered", "Delivery completed. Awaiting POD if not received."),
+                ("POD Received", "POD received and saved for billing."),
+            ]
 
         quick_cols = st.columns(4)
         for idx, (status_label, default_note) in enumerate(quick_statuses):
@@ -10396,150 +11776,450 @@ def render_dispatch_board(df: pd.DataFrame) -> None:
             open_load_workspace_dialog(selected_load)
 
 
+def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str) -> None:
+    row_id = _int_or_none(row.get("_row_id")) or 0
+    status = _clean_display_value(row.get("Status", ""), "New")
+    move_type = _clean_display_value(row.get("Dispatch Move Type", ""), _normalize_load_type(row))
+    booking = _clean_display_value(row.get("Booking Number", ""), "-")
+    load_ref = _clean_display_value(row.get("Load ID", ""), "-")
+    container = _clean_display_value(row.get("Container Number", ""), "-")
+    customer = _clean_display_value(row.get("Customer", ""), "-")
+    pickup = _clean_display_value(row.get("Port", ""), "Pickup pending")
+    delivery = _clean_display_value(row.get("Warehouse", ""), "Delivery pending")
+    driver = _clean_display_value(row.get("Driver Name", ""), "Unassigned")
+    truck = _clean_display_value(row.get("Truck Assigned", ""), "-")
+    need_date = _clean_display_value(row.get("Delivery Need Date", ""), "-")
+    lfd = _clean_display_value(row.get("LFD", ""), "-")
+    readiness = int(row.get("Readiness %", 0) or 0)
+    next_action = _clean_display_value(row.get("Next Action", ""), action_label)
+    exceptions = [item.strip() for item in _safe_str(row.get("Exceptions", "")).split(",") if item.strip()]
+
+    status_color = _get_status_color(status)
+    border_color = _get_status_border_color(status)
+    exception_html = "".join(
+        f'<span style="display:inline-block;background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:999px;padding:2px 6px;margin:2px 4px 0 0;font-size:10px;font-weight:700;">{escape(item)}</span>'
+        for item in exceptions[:3]
+    )
+    if len(exceptions) > 3:
+        exception_html += f'<span style="font-size:10px;color:#991b1b;">+{len(exceptions) - 3} more</span>'
+
+    st.markdown(
+        f"""
+        <div style="
+            background:{status_color};
+            border:1px solid #cbd5e1;
+            border-left:5px solid {border_color};
+            border-radius:8px;
+            padding:8px;
+            margin-bottom:6px;
+            min-height:178px;
+            box-shadow:0 1px 2px rgba(15,23,42,.06);
+        ">
+            <div style="font-size:10px;font-weight:800;color:#334155;text-transform:uppercase;">{escape(action_label)}</div>
+            <div style="font-size:13px;font-weight:800;color:#0f172a;line-height:1.2;margin-top:3px;">{escape(booking)}</div>
+            <div style="font-size:11px;color:#334155;line-height:1.25;">{escape(container)} | {escape(customer)}</div>
+            <div style="font-size:10px;color:#475569;margin-top:5px;">{escape(move_type)} | {escape(status)}</div>
+            <div style="height:6px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin:7px 0 4px 0;">
+                <div style="height:6px;width:{max(0, min(readiness, 100))}%;background:{border_color};"></div>
+            </div>
+            <div style="font-size:10px;color:#475569;">{readiness}% ready | {escape(next_action)}</div>
+            <div style="font-size:10px;color:#475569;margin-top:6px;">
+                <b>From:</b> {escape(pickup)}<br>
+                <b>To:</b> {escape(delivery)}
+            </div>
+            <div style="font-size:10px;color:#475569;margin-top:6px;">
+                <b>Driver:</b> {escape(driver)} | <b>Truck:</b> {escape(truck)}<br>
+                <b>Need:</b> {escape(need_date)} | <b>LFD:</b> {escape(lfd)}
+            </div>
+            <div style="margin-top:5px;">{exception_html}</div>
+            <div style="font-size:9px;color:#64748b;margin-top:5px;">Load {escape(load_ref)} | Row {row_id}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("Work Load", key=f"dispatch_card_{card_key_prefix}_{row_id}", use_container_width=True):
+        st.session_state["dispatch_board_selected_row_id"] = row_id
+        st.rerun()
+
+
 def render_dispatch_board_focused(df: pd.DataFrame) -> None:
     st.subheader("Dispatch Board")
-    st.caption("Live dispatch, tomorrow planning, and future pipeline.")
+    st.caption("Action board by move type. Port/PIN work appears only for port imports and exports.")
+
+    if df.empty:
+        st.info("No load data is available for Dispatch Board.")
+        return
 
     board_df = df.copy()
+    board_df["Status"] = board_df.get("Status", pd.Series("New", index=board_df.index)).fillna("New").astype(str).str.strip()
+    board_df["TYPE"] = board_df.get("TYPE", pd.Series("", index=board_df.index)).fillna("").astype(str).str.strip()
+    board_df["Dispatch Move Type"] = board_df["TYPE"].apply(_normalize_load_type_value)
     board_df["Delivery Date Parsed"] = pd.to_datetime(
-        board_df["Delivery Need Date"].astype(str).str.strip(),
+        board_df.get("Delivery Need Date", pd.Series("", index=board_df.index)).astype(str).str.strip(),
         errors="coerce",
     )
+    board_df["LFD Parsed"] = pd.to_datetime(
+        board_df.get("LFD", pd.Series("", index=board_df.index)).astype(str).str.strip(),
+        errors="coerce",
+    )
+
+    readiness_rows = []
+    action_rows = []
+    for _, row in board_df.iterrows():
+        readiness = _load_readiness_details(row, include_documents=False)
+        action = _dispatch_action_metadata(row, readiness)
+        readiness_rows.append(readiness)
+        action_rows.append(action)
+
+    board_df["Readiness %"] = [int(item.get("score", 0)) for item in readiness_rows]
+    board_df["Next Action"] = [item.get("next_action", "") for item in readiness_rows]
+    board_df["Exceptions"] = [", ".join(item.get("exceptions", [])) for item in readiness_rows]
+    board_df["Dispatch Lane"] = [item.get("lane", "") for item in action_rows]
+    board_df["Dispatch Action"] = [item.get("action", "") for item in action_rows]
+    board_df["Dispatch Action Label"] = [item.get("label", "") for item in action_rows]
+    board_df["Dispatch Hint"] = [item.get("hint", "") for item in action_rows]
+    board_df["Dispatch Lane Sort"] = [int(item.get("lane_sort", 0)) for item in action_rows]
+    board_df["Dispatch Action Sort"] = [int(item.get("action_sort", 0)) for item in action_rows]
+    board_df["Exception Count"] = board_df["Exceptions"].apply(lambda value: len([item for item in _safe_str(value).split(",") if item.strip()]))
 
     today = pd.Timestamp(date.today()).normalize()
     tomorrow = today + pd.Timedelta(days=1)
 
-    live_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().eq(today)
-        & board_df["Status"].isin(DISPATCH_BOARD_STATUSES)
-    ].copy()
-    tomorrow_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().eq(tomorrow)
-        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
-    ].copy()
-    future_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().gt(tomorrow)
-        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
-    ].copy()
+    controls = st.columns([1.3, 1.3, 1, 2.4])
+    with controls[0]:
+        selected_scope = st.radio(
+            "Board Scope",
+            ["All Active", "Due Today / Late", "Tomorrow", "Future Pipeline"],
+            horizontal=False,
+            key="dispatch_board_scope",
+        )
+    type_counts = board_df["Dispatch Move Type"].value_counts().to_dict()
+    type_options = [move_type for move_type in DISPATCH_MOVE_TYPES if move_type == "Other" or type_counts.get(move_type, 0) > 0]
+    if not type_options:
+        type_options = DISPATCH_MOVE_TYPES
+    with controls[1]:
+        type_key = f"dispatch_board_move_type_{selected_scope}"
+        if st.session_state.get(type_key) not in [None, *type_options]:
+            st.session_state[type_key] = type_options[0]
+        selected_type = st.radio(
+            "Move Type",
+            type_options,
+            horizontal=False,
+            key=type_key,
+            format_func=lambda value: f"{value} ({type_counts.get(value, 0)})",
+        )
+    with controls[2]:
+        exception_only = st.checkbox("Exceptions only", value=False, key="dispatch_board_exception_only")
+    with controls[3]:
+        search_filter = st.text_input(
+            "Search",
+            value="",
+            placeholder="Booking, load, container, customer, driver, truck, port, warehouse",
+            key="dispatch_board_search",
+        )
 
-    selected_view = st.radio(
-        "Dispatch View",
-        ["Live Dispatch", "Tomorrow Planning", "Future Pipeline"],
-        horizontal=True,
-        key="dispatch_board_view",
-    )
-    type_value = st.radio(
-        "Load Type",
-        LOAD_TYPE_TABS,
-        horizontal=True,
-        key=f"dispatch_board_type_{selected_view}",
-    )
+    scope_df = board_df[~board_df["Status"].isin(CLOSED_STATUSES)].copy()
+    if selected_scope == "Due Today / Late":
+        scope_df = scope_df[
+            scope_df["Delivery Date Parsed"].notna()
+            & scope_df["Delivery Date Parsed"].dt.normalize().le(today)
+        ].copy()
+    elif selected_scope == "Tomorrow":
+        scope_df = scope_df[
+            scope_df["Delivery Date Parsed"].notna()
+            & scope_df["Delivery Date Parsed"].dt.normalize().eq(tomorrow)
+        ].copy()
+    elif selected_scope == "Future Pipeline":
+        scope_df = scope_df[
+            scope_df["Delivery Date Parsed"].notna()
+            & scope_df["Delivery Date Parsed"].dt.normalize().gt(tomorrow)
+        ].copy()
 
-    if selected_view == "Live Dispatch":
-        type_df = live_df[live_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
-        st.markdown("### Live Dispatch")
-        st.caption(f"{len(type_df)} active {type_value} load(s) today")
+    scope_df = scope_df[scope_df["Dispatch Move Type"].eq(selected_type)].copy()
 
-        status_cols = st.columns(len(DISPATCH_BOARD_STATUSES), gap="small")
-        for idx, status in enumerate(DISPATCH_BOARD_STATUSES):
-            with status_cols[idx]:
-                status_df = type_df[type_df["Status"].astype(str).str.strip().eq(status)].copy()
-                st.markdown(
-                    f"""
-                    <div style="
-                        text-align:center;
-                        font-weight:800;
-                        background:#f1f5f9;
-                        border:1px solid #cbd5e1;
-                        border-radius:10px;
-                        padding:8px;
-                        margin-bottom:8px;
-                    ">
-                        {status}<br>
-                        <span style="font-size:18px;">{len(status_df)}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if status_df.empty:
-                    st.caption("No loads")
-                else:
-                    for _, row in status_df.head(30).iterrows():
-                        render_load_card(row)
+    if exception_only:
+        scope_df = scope_df[scope_df["Exception Count"].gt(0)].copy()
 
-    elif selected_view == "Tomorrow Planning":
-        type_df = tomorrow_df[tomorrow_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
-        st.markdown("### Tomorrow Planning")
+    search_filter = _safe_str(search_filter).lower()
+    if search_filter:
+        searchable_columns = [
+            "Booking Number",
+            "Load ID",
+            "Reference Number",
+            "Container Number",
+            "Customer",
+            "Port",
+            "Warehouse",
+            "Address",
+            "Driver Name",
+            "Truck Assigned",
+            "Chassis",
+            "Status",
+            "Dispatch Action Label",
+            "Next Action",
+            "Dispatcher Notes",
+        ]
+        available_columns = [column for column in searchable_columns if column in scope_df.columns]
+        search_blob = scope_df[available_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        for term in [part for part in re.split(r"\s+", search_filter) if part]:
+            mask = search_blob.str.contains(re.escape(term), na=False)
+            scope_df = scope_df[mask].copy()
+            search_blob = search_blob[mask]
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Tomorrow Loads", len(tomorrow_df))
-        k2.metric("Assigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().ne("").sum()))
-        k3.metric("Unassigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().isin(["", "nan", "None", "Unassigned"]).sum()))
-        k4.metric("Needs Info", int(tomorrow_df["Status"].eq("Hold/Need Info").sum()))
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Visible Loads", len(scope_df))
+    metric_cols[1].metric("Verification", int(scope_df["Dispatch Lane"].eq("Verification").sum()))
+    metric_cols[2].metric("Planning", int(scope_df["Dispatch Lane"].eq("Planning").sum()))
+    metric_cols[3].metric("Execution", int(scope_df["Dispatch Lane"].eq("Execution").sum()))
+    metric_cols[4].metric("Exceptions", int(scope_df["Exception Count"].gt(0).sum()))
+    metric_cols[5].metric("Billing Ready", int(scope_df["Status"].isin(["POD Received", "Ready for ProfitTools"]).sum()))
 
-        st.markdown(f"#### {type_value} - Tomorrow")
-        st.caption(f"{len(type_df)} planned load(s)")
-        if type_df.empty:
-            st.info(f"No {type_value} loads planned for tomorrow.")
-        else:
-            columns = [
-                "_row_id",
-                "TYPE",
-                "Booking Number",
-                "Load ID",
-                "Customer",
-                "Container Number",
-                "Warehouse",
-                "Delivery Need Date",
-                "LFD",
-                "Status",
-                "Driver Name",
-                "Truck Assigned",
-                "Chassis",
-                "Dispatcher Notes",
-            ]
-            display_cols = [c for c in columns if c in type_df.columns]
-            styled = (
-                type_df.sort_values(["Status", "Delivery Need Date"], ascending=[True, True])[display_cols]
-                .style
-                .apply(_status_row_style, axis=1)
-            )
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+    exception_counts = _load_exception_summary(scope_df)
+    exception_labels = ["Late appointment", "No PIN", "Customer waiting", "Waiting driver", "Port hold", "Ready for billing"]
+    exception_cols = st.columns(len(exception_labels))
+    for idx, label in enumerate(exception_labels):
+        exception_cols[idx].metric(label, int(exception_counts.get(label, 0)))
 
+    if scope_df.empty:
+        st.info(f"No {selected_type} loads match the current Dispatch Board filters.")
     else:
-        type_df = future_df[future_df["TYPE"].astype(str).str.strip().eq(type_value)].copy()
-        st.markdown("### Future Pipeline")
-        st.markdown(f"#### {type_value} - Future")
-        st.caption(f"{len(type_df)} upcoming load(s)")
-        if type_df.empty:
-            st.info(f"No future {type_value} loads found.")
-        else:
-            columns = [
-                "_row_id",
-                "TYPE",
-                "Booking Number",
-                "Load ID",
-                "Customer",
-                "Container Number",
-                "Port",
-                "Warehouse",
-                "Delivery Need Date",
-                "LFD",
-                "Status",
-                "Driver Name",
-                "Dispatcher Notes",
-            ]
-            display_cols = [c for c in columns if c in type_df.columns]
-            st.dataframe(
-                type_df.sort_values("Delivery Need Date")[display_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
+        workflow = _dispatch_workflow_for_type(selected_type)
+        sorted_df = scope_df.sort_values(
+            ["Dispatch Lane Sort", "Dispatch Action Sort", "Exception Count", "Delivery Date Parsed", "LFD Parsed", "_row_id"],
+            ascending=[True, True, False, True, True, True],
+            na_position="last",
+        )
+        for lane_name, actions in workflow.items():
+            lane_df = sorted_df[sorted_df["Dispatch Lane"].eq(lane_name)].copy()
+            st.markdown(f"### {lane_name}")
+            lane_cols = st.columns(len(actions), gap="small")
+            for idx, (action_key, action_label) in enumerate(actions):
+                with lane_cols[idx]:
+                    action_df = lane_df[lane_df["Dispatch Action"].eq(action_key)].copy()
+                    st.markdown(
+                        f"""
+                        <div style="
+                            background:#f8fafc;
+                            border:1px solid #cbd5e1;
+                            border-radius:8px;
+                            padding:8px;
+                            margin-bottom:8px;
+                            text-align:center;
+                            min-height:58px;
+                        ">
+                            <div style="font-size:12px;font-weight:800;color:#0f172a;">{escape(action_label)}</div>
+                            <div style="font-size:20px;font-weight:900;color:#0f172a;">{len(action_df)}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if action_df.empty:
+                        st.caption("No loads")
+                    else:
+                        for card_idx, (_, row) in enumerate(action_df.head(30).iterrows()):
+                            _render_dispatch_action_card(row, action_label, f"{lane_name}_{action_key}_{card_idx}")
 
-    if st.session_state.get("show_load_workspace_dialog"):
-        selected_load = _get_selected_dispatch_load(df)
-        if selected_load is not None:
-            open_load_workspace_dialog(selected_load)
+    selected_row_id = st.session_state.get("dispatch_board_selected_row_id")
+    if selected_row_id is None:
+        st.caption("Open any load card to review dispatch details, sync port data, request PIN, update status, or send the driver packet.")
+        return
+
+    selected_df = board_df[board_df["_row_id"].astype(int).eq(int(selected_row_id))].copy() if "_row_id" in board_df.columns else pd.DataFrame()
+    if selected_df.empty:
+        st.warning("The selected load is no longer available.")
+        if st.button("Clear Dispatch Selection", use_container_width=True):
+            st.session_state.pop("dispatch_board_selected_row_id", None)
+            st.rerun()
+        return
+
+    clear_cols = st.columns([4, 1])
+    with clear_cols[0]:
+        st.markdown("### Selected Load")
+    with clear_cols[1]:
+        if st.button("Clear Selection", key="clear_dispatch_board_selection", use_container_width=True):
+            st.session_state.pop("dispatch_board_selected_row_id", None)
+            st.rerun()
+    render_dispatch_workspace(selected_df.iloc[0])
+
+
+def render_active_status_view(df: pd.DataFrame) -> None:
+    st.subheader("Active Status")
+    st.caption("Quick dispatcher and manager list of current load statuses. Select a row to open dispatch details and update the load.")
+
+    work_df = df.copy()
+    if work_df.empty:
+        st.info("No load data is available.")
+        return
+
+    if "Status" not in work_df.columns:
+        st.warning("Status data is not available for the active status view.")
+        return
+
+    work_df["Status"] = work_df["Status"].astype(str).str.strip()
+    work_df["TYPE"] = work_df.get("TYPE", pd.Series("", index=work_df.index)).astype(str).str.strip()
+    readiness_details = work_df.apply(lambda row: _load_readiness_details(row, include_documents=False), axis=1)
+    work_df["Readiness %"] = readiness_details.apply(lambda details: int(details.get("score", 0)))
+    work_df["Next Action"] = readiness_details.apply(lambda details: details.get("next_action", ""))
+    work_df["Exceptions"] = readiness_details.apply(lambda details: ", ".join(details.get("exceptions", [])))
+    work_df["Department Queue"] = work_df.apply(_load_department_queue, axis=1)
+    active_statuses = [status for status in LOAD_STATUS_FLOW if status not in CLOSED_STATUSES]
+
+    filter_cols = st.columns([1, 1, 1, 1.2, 2])
+    with filter_cols[0]:
+        type_filter = st.selectbox(
+            "Load Type",
+            ["All Types"] + LOAD_TYPE_TABS,
+            index=0,
+            key="active_status_type_filter",
+        )
+    with filter_cols[1]:
+        include_closed = st.checkbox(
+            "Include closed",
+            value=False,
+            key="active_status_include_closed",
+        )
+    with filter_cols[2]:
+        queue_options = ["All Queues"] + sorted([queue for queue in work_df["Department Queue"].dropna().astype(str).unique() if queue])
+        queue_filter = st.selectbox(
+            "Department Queue",
+            queue_options,
+            index=0,
+            key="active_status_queue_filter",
+        )
+    with filter_cols[3]:
+        status_options = ["All Current Statuses"] + (LOAD_STATUS_FLOW if include_closed else active_statuses)
+        status_filter = st.selectbox(
+            "Status",
+            status_options,
+            index=0,
+            key="active_status_status_filter",
+        )
+    with filter_cols[4]:
+        search_filter = st.text_input(
+            "Search",
+            value="",
+            placeholder="Booking, load, container, customer, driver, truck, port, warehouse",
+            key="active_status_search_filter",
+        )
+
+    if not include_closed:
+        work_df = work_df[~work_df["Status"].isin(CLOSED_STATUSES)].copy()
+    if type_filter != "All Types":
+        work_df = work_df[work_df["TYPE"].eq(type_filter)].copy()
+    if queue_filter != "All Queues":
+        work_df = work_df[work_df["Department Queue"].eq(queue_filter)].copy()
+    if status_filter != "All Current Statuses":
+        work_df = work_df[work_df["Status"].eq(status_filter)].copy()
+
+    search_filter = _safe_str(search_filter).lower()
+    if search_filter:
+        searchable_columns = [
+            "Booking Number",
+            "Load ID",
+            "Reference Number",
+            "Container Number",
+            "Customer",
+            "Port",
+            "Warehouse",
+            "Address",
+            "Driver Name",
+            "Truck Assigned",
+            "Chassis",
+            "Status",
+            "Next Action",
+            "Department Queue",
+            "Dispatcher Notes",
+        ]
+        available_columns = [column for column in searchable_columns if column in work_df.columns]
+        search_blob = work_df[available_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        for term in [part for part in re.split(r"\s+", search_filter) if part]:
+            search_blob_mask = search_blob.str.contains(re.escape(term), na=False)
+            work_df = work_df[search_blob_mask].copy()
+            search_blob = search_blob[search_blob_mask]
+
+    status_scope = work_df.copy()
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Visible Loads", len(status_scope))
+    metric_cols[1].metric("Ready for PIN", int(status_scope["Status"].isin(["Booking Verified", "Port Verified", "Ready for Appointment / PIN", "Ready for Port PIN"]).sum()))
+    metric_cols[2].metric("Ready to Dispatch", int(status_scope["Status"].isin(["PIN Received", "Ready to Dispatch"]).sum()))
+    metric_cols[3].metric("On Driver", int(status_scope["Status"].isin(ACTIVE_DRIVER_STATUSES).sum()))
+    metric_cols[4].metric("Exceptions", int(status_scope["Exceptions"].astype(str).str.strip().ne("").sum()))
+    metric_cols[5].metric("Billing Ready", int(status_scope["Status"].isin(["POD Received", "Ready for ProfitTools"]).sum()))
+
+    with st.expander("Status Counts", expanded=False):
+        status_counts = (
+            status_scope["Status"]
+            .value_counts()
+            .rename_axis("Status")
+            .reset_index(name="Loads")
+        )
+        status_counts["Meaning"] = status_counts["Status"].map(STATUS_MEANINGS).fillna("")
+        if status_counts.empty:
+            st.info("No statuses found for the current filters.")
+        else:
+            styled_counts = status_counts.style.apply(_status_row_style, axis=1)
+            st.dataframe(styled_counts, use_container_width=True, hide_index=True)
+
+    display_columns = [
+        "_row_id",
+        "TYPE",
+        "Status",
+        "Readiness %",
+        "Next Action",
+        "Department Queue",
+        "Exceptions",
+        "Booking Number",
+        "Load ID",
+        "Customer",
+        "Container Number",
+        "Port",
+        "Warehouse",
+        "Delivery Need Date",
+        "LFD",
+        "Driver Name",
+        "Truck Assigned",
+        "Chassis",
+        "current_location",
+        "eta",
+    ]
+    display_cols = [column for column in display_columns if column in work_df.columns]
+
+    if work_df.empty:
+        st.info("No loads match the current Active Status filters.")
+        return
+
+    sort_columns = [column for column in ["Status", "Delivery Need Date", "LFD", "_row_id"] if column in work_df.columns]
+    sorted_df = work_df.sort_values(sort_columns, ascending=[True] * len(sort_columns)) if sort_columns else work_df.copy()
+    styled_df = sorted_df[display_cols].style.apply(_status_row_style, axis=1)
+
+    event = st.dataframe(
+        styled_df,
+        use_container_width=True,
+        hide_index=True,
+        selection_mode="single-row",
+        on_select="rerun",
+        key="active_status_table",
+    )
+    selected_rows = event.selection.rows
+    if selected_rows:
+        selected_row_id = int(sorted_df.iloc[selected_rows[0]]["_row_id"])
+        st.session_state["active_status_selected_row_id"] = selected_row_id
+
+    selected_row_id = st.session_state.get("active_status_selected_row_id")
+    if selected_row_id is None:
+        st.caption("Select any row to open dispatch details and update status, driver, truck, chassis, notes, documents, or billing information.")
+        return
+
+    visible_ids = set(sorted_df["_row_id"].dropna().astype(int).tolist()) if "_row_id" in sorted_df.columns else set()
+    if int(selected_row_id) not in visible_ids:
+        st.info("Selected load is not visible with the current filters.")
+        if st.button("Clear Active Status Selection", use_container_width=True):
+            st.session_state.pop("active_status_selected_row_id", None)
+            st.rerun()
+        return
+
+    selected_load = sorted_df[sorted_df["_row_id"].astype(int).eq(int(selected_row_id))].iloc[0]
+    render_dispatch_workspace(selected_load)
 
 
 def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
@@ -10599,11 +12279,16 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             )
 
         with c3:
+            current_order_status = _safe_str(selected_load.get("Status", "New"))
+            order_status_options = list(ORDER_MANAGEMENT_STATUSES)
+            if current_order_status and current_order_status not in order_status_options:
+                order_status_options.insert(0, current_order_status)
             status = st.selectbox(
                 "Status",
-                LOAD_STATUS_FLOW,
-                index=LOAD_STATUS_FLOW.index(_safe_str(selected_load.get("Status", "New")))
-                if _safe_str(selected_load.get("Status", "New")) in LOAD_STATUS_FLOW else 0,
+                order_status_options,
+                index=order_status_options.index(current_order_status)
+                if current_order_status in order_status_options else 0,
+                format_func=lambda value: ORDER_MANAGEMENT_STATUS_LABELS.get(value, value),
                 key=f"{form_key}_status",
             )
             driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")), key=f"{form_key}_driver")
@@ -10662,18 +12347,18 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             st.warning("Order marked Hold/Need Info.")
             st.rerun()
     with q2:
-        if st.button("Move To Dispatch", key=f"quick_ready_dispatch_{safe_context}_{selected_row_id}", use_container_width=True):
+        if st.button("Mark Booking Verified", key=f"quick_booking_verified_{safe_context}_{selected_row_id}", use_container_width=True):
             DispatchDatabaseClient().update_row_fields(
                 selected_row_id,
                 {
-                    "Status": "Ready to Dispatch",
-                    "Dispatcher Notes": notes.strip() or "Order reviewed and moved to dispatch.",
+                    "Status": "Booking Verified",
+                    "Dispatcher Notes": notes.strip() or "Order reviewed and booking verified. Next action: verify booking with Port Houston.",
                 },
             )
             st.session_state.pop("orders_management_selected_row_id", None)
             st.session_state.pop("orders_management_selected_context", None)
             refresh_data()
-            st.success("Order moved to Dispatch Board.")
+            st.success("Order marked Booking Verified.")
             st.rerun()
     with q3:
         if st.button("Cancel Order", key=f"quick_cancel_order_{safe_context}_{selected_row_id}", use_container_width=True):
@@ -10690,31 +12375,20 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
 
 def render_orders_management(df: pd.DataFrame) -> None:
     st.subheader("Orders / Load Management")
-    st.caption("Manage orders after they are created from Operations Inbox.")
+    st.caption("Review newly created orders, resolve missing information, mark bookings verified, or cancel bad orders before dispatch work begins.")
 
     work_df = df.copy()
 
-    planning_statuses = ["New", "Hold/Need Info", "Awaiting Appointment"]
-    ready_statuses = ["Ready to Dispatch"]
-    active_statuses = [
-        "Assigned", "En Route to Pickup", "At Pickup",
-        "Loaded", "En Route To Delivery", "Returning Empty",
-    ]
-    closed_statuses = [
-        "Delivered", "POD Received", "Ready for ProfitTools",
-        "Exported to ProfitTools", "Invoiced", "Closed", "Cancelled",
-    ]
-
-    planning_df = work_df[work_df["Status"].isin(planning_statuses)].copy()
-    ready_df = work_df[work_df["Status"].isin(ready_statuses)].copy()
-    active_df = work_df[work_df["Status"].isin(active_statuses)].copy()
-    closed_df = work_df[work_df["Status"].isin(closed_statuses)].copy()
+    new_df = work_df[work_df["Status"].eq("New")].copy()
+    missing_info_df = work_df[work_df["Status"].eq("Hold/Need Info")].copy()
+    verified_df = work_df[work_df["Status"].eq("Booking Verified")].copy()
+    cancelled_df = work_df[work_df["Status"].eq("Cancelled")].copy()
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Planning", len(planning_df))
-    k2.metric("Ready for Dispatch", len(ready_df))
-    k3.metric("Active", len(active_df))
-    k4.metric("Closed / Billing", len(closed_df))
+    k1.metric("New", len(new_df))
+    k2.metric("Missing Info", len(missing_info_df))
+    k3.metric("Booking Verified", len(verified_df))
+    k4.metric("Cancel", len(cancelled_df))
 
     columns = [
         "_row_id", "TYPE", "Booking Number", "Load ID", "Customer",
@@ -10756,9 +12430,10 @@ def render_orders_management(df: pd.DataFrame) -> None:
         display_cols = [c for c in columns if c in type_df.columns]
         sorted_type_df = type_df.sort_values("_row_id", ascending=False)
         context_key = f"{title}_{type_value}"
+        styled_type_df = sorted_type_df[display_cols].style.apply(_status_row_style, axis=1)
 
         event = st.dataframe(
-            sorted_type_df[display_cols],
+            styled_type_df,
             use_container_width=True,
             hide_index=True,
             selection_mode="single-row",
@@ -10783,16 +12458,16 @@ def render_orders_management(df: pd.DataFrame) -> None:
                 _render_order_detail_editor(work_df, int(selected_row_id), context_key)
 
     queue_options = [
-        "Planning",
-        "Ready for Dispatch",
-        "Active Orders",
-        "Closed / Billing",
+        "New",
+        "Missing Info",
+        "Booking Verified",
+        "Cancel",
     ]
     queue_map = {
-        "Planning": planning_df,
-        "Ready for Dispatch": ready_df,
-        "Active Orders": active_df,
-        "Closed / Billing": closed_df,
+        "New": new_df,
+        "Missing Info": missing_info_df,
+        "Booking Verified": verified_df,
+        "Cancel": cancelled_df,
     }
 
     selected_queue = st.radio("Order Queue", queue_options, horizontal=True, key="orders_management_queue")
@@ -11392,6 +13067,309 @@ def _apply_port_houston_updates(load_id: int, updates: dict, action_type: str) -
         )
 
 
+def _update_load_columns_if_present(load_id: int, updates: dict) -> list[str]:
+    existing_columns = _existing_load_columns()
+    safe_updates = {
+        column: value
+        for column, value in (updates or {}).items()
+        if column in existing_columns and column not in {"id", "created_at", "updated_at"}
+    }
+    if not safe_updates:
+        return []
+    set_clause = ", ".join([f"{column} = :{column}" for column in safe_updates])
+    params = dict(safe_updates)
+    params["load_id"] = int(load_id)
+    execute(
+        f"""
+        update loads
+        set {set_clause},
+            updated_at = now()
+        where id = :load_id
+        """,
+        params,
+    )
+    return list(safe_updates.keys())
+
+
+def _port_houston_core_updates_from_records(load_row: dict, unit_record: dict | None, booking_record: dict | None) -> tuple[dict, dict]:
+    core_updates: dict = {}
+    extra_updates: dict = {}
+    notes = _safe_str(load_row.get("Dispatcher Notes", ""))
+
+    if unit_record:
+        summary = summarize_unit(unit_record)
+        if _safe_str(summary.get("Container", "")) and not _safe_str(load_row.get("Container Number", "")):
+            core_updates["Container Number"] = summary["Container"]
+        if _safe_str(summary.get("Size", "")) and not _safe_str(load_row.get("Size", "")):
+            core_updates["Size"] = summary["Size"]
+        if _safe_str(summary.get("Facility", "")) and not _safe_str(load_row.get("Port", "")):
+            core_updates["Port"] = summary["Facility"]
+        if _safe_str(summary.get("Line", "")):
+            extra_updates["steamship_line"] = summary["Line"]
+        if _safe_str(summary.get("Facility", "")):
+            extra_updates["terminal"] = summary["Facility"]
+        if _safe_str(summary.get("Return Location", "")):
+            extra_updates["empty_return_location"] = summary["Return Location"]
+        if _safe_str(summary.get("Position", "")):
+            extra_updates["current_location"] = summary["Position"]
+        notes = _append_port_houston_notes(notes, summary)
+
+    if booking_record:
+        booking = _safe_str(booking_record.get("nbr", ""))
+        if booking and not _safe_str(load_row.get("Booking Number", "")):
+            core_updates["Booking Number"] = booking
+        client_ref = _safe_str(booking_record.get("clientRefNo", ""))
+        if client_ref and not _safe_str(load_row.get("Reference Number", "")):
+            core_updates["Reference Number"] = client_ref
+        if _safe_str(booking_record.get("destination", "")) and not _safe_str(load_row.get("Warehouse", "")):
+            core_updates["Warehouse"] = _safe_str(booking_record.get("destination", ""))
+
+        first_item = {}
+        items = booking_record.get("items")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            first_item = items[0]
+        size = " ".join(
+            [
+                part
+                for part in [
+                    _safe_str(first_item.get("eqSize", "")),
+                    _safe_str(first_item.get("eqHeight", "")),
+                    _safe_str(first_item.get("eqIsoGroup", "")),
+                ]
+                if part
+            ]
+        )
+        if size and not _safe_str(load_row.get("Size", "")):
+            core_updates["Size"] = size
+        if _safe_str(booking_record.get("lineId", "")):
+            extra_updates["steamship_line"] = _safe_str(booking_record.get("lineId", ""))
+        if _safe_str(get_nested(booking_record, "visit.visitId")):
+            extra_updates["vessel_name"] = _safe_str(get_nested(booking_record, "visit.visitId"))
+        if _safe_str(booking_record.get("latestDate", "")) and not _safe_str(load_row.get("Document Cutoff", "")):
+            core_updates["Document Cutoff"] = _safe_str(booking_record.get("latestDate", ""))
+
+        summary = {
+            "Booking": booking,
+            "Line": booking_record.get("lineId", ""),
+            "Visit": get_nested(booking_record, "visit.visitId"),
+            "POL": booking_record.get("polId", ""),
+            "POD": booking_record.get("pod1Id", ""),
+            "Earliest": booking_record.get("earliestDate", ""),
+            "Latest": booking_record.get("latestDate", ""),
+            "Quantity": booking_record.get("quantity", ""),
+            "Tally": booking_record.get("tally", ""),
+        }
+        notes = _append_port_houston_notes(notes, summary)
+
+    if unit_record or booking_record:
+        core_updates["Dispatcher Notes"] = notes
+        if _safe_str(load_row.get("Status", "")) in {"Booking Verified", "Awaiting Appointment"}:
+            core_updates["Status"] = "Port Verified"
+
+    return core_updates, extra_updates
+
+
+def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
+    load_id = int(selected_load["_row_id"])
+    default_container = _safe_str(selected_load.get("Container Number", ""))
+    default_booking = _safe_str(selected_load.get("Booking Number", ""))
+
+    st.markdown("### Port Sync")
+    st.caption("Sync Port Houston data after the order is created and before dispatch. This keeps terminal, availability, LFD/return notes, and appointment context attached to the load.")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Port Verified", "Yes" if readiness.get("port_verified") else "No")
+    p2.metric("Terminal", _first_present(selected_load, ["terminal", "Port"], "-"))
+    p3.metric("PIN / Appt", _load_pin_display(selected_load))
+    p4.metric("Next Action", readiness.get("next_action", "-"))
+
+    c1, c2 = st.columns(2)
+    container_value = c1.text_input("Container", value=default_container, key=f"load_port_sync_container_{load_id}")
+    booking_value = c2.text_input("Booking", value=default_booking, key=f"load_port_sync_booking_{load_id}")
+
+    if st.button("Sync Port Data", key=f"load_port_sync_{load_id}", use_container_width=True):
+        if not container_value.strip() and not booking_value.strip():
+            st.error("Container or booking is required for Port Houston sync.")
+        else:
+            client = _get_port_houston_client_or_none()
+            if client:
+                unit_record = None
+                booking_record = None
+                errors = []
+                if container_value.strip():
+                    try:
+                        unit_data = client.get_inventory_units(container=container_value)
+                        unit_records = content_records(unit_data)
+                        unit_record = unit_records[0] if unit_records else None
+                        _store_port_houston_result(f"load_port_unit_result_{load_id}", unit_data, "Container / Unit", container_value, load_id)
+                    except Exception as exc:
+                        errors.append(f"Container lookup failed: {exc}")
+                        _log_port_houston_event(action_type="lookup", lookup_type="Container / Unit", request_reference=container_value, load_id=load_id, status="failed", error_message=str(exc))
+                if booking_value.strip():
+                    try:
+                        booking_data = client.get_bookings(booking=booking_value)
+                        booking_records = content_records(booking_data)
+                        booking_record = booking_records[0] if booking_records else None
+                        _store_port_houston_result(f"load_port_booking_result_{load_id}", booking_data, "Booking", booking_value, load_id)
+                    except Exception as exc:
+                        errors.append(f"Booking lookup failed: {exc}")
+                        _log_port_houston_event(action_type="lookup", lookup_type="Booking", request_reference=booking_value, load_id=load_id, status="failed", error_message=str(exc))
+
+                core_updates, extra_updates = _port_houston_core_updates_from_records(selected_load, unit_record, booking_record)
+                updated_fields = []
+                if core_updates:
+                    DispatchDatabaseClient().update_row_fields(load_id, core_updates)
+                    updated_fields.extend(core_updates.keys())
+                updated_fields.extend(_update_load_columns_if_present(load_id, extra_updates))
+
+                _log_port_houston_event(
+                    action_type="load_port_sync",
+                    lookup_type="Container / Booking",
+                    request_reference=container_value or booking_value,
+                    load_id=load_id,
+                    status="failed" if errors and not updated_fields else "success",
+                    error_message="; ".join(errors),
+                    response_summary={"updated_fields": updated_fields, "unit_found": bool(unit_record), "booking_found": bool(booking_record)},
+                )
+                if errors:
+                    st.warning("; ".join(errors))
+                if updated_fields:
+                    refresh_data()
+                    st.success("Port data synced. Updated: " + ", ".join(updated_fields))
+                    st.rerun()
+                elif not errors:
+                    st.info("Port Houston returned no matching container or booking records.")
+
+    unit_records = _render_port_houston_result(f"load_port_unit_result_{load_id}", mode="unit")
+    booking_records = _render_port_houston_result(f"load_port_booking_result_{load_id}")
+
+    st.divider()
+    st.markdown("### Appointment / PIN")
+    pin_requirements = []
+    if not _status_at_or_after(_safe_str(selected_load.get("Status", "")), "Booking Verified"):
+        pin_requirements.append("booking verified")
+    if not readiness.get("port_verified"):
+        pin_requirements.append("port verified")
+    if not _load_has_driver(selected_load):
+        pin_requirements.append("driver assigned")
+    if not _load_has_truck(selected_load):
+        pin_requirements.append("truck assigned")
+    if not _first_present(selected_load, ["Port", "terminal"], ""):
+        pin_requirements.append("terminal confirmed")
+    if not _first_present(selected_load, ["Delivery Need Date", "delivery_need_date"], ""):
+        pin_requirements.append("pickup/delivery date")
+    if pin_requirements:
+        st.warning("Before requesting PIN/appointment: " + ", ".join(pin_requirements))
+    else:
+        st.success("Ready for Port PIN / appointment request.")
+
+    pin_c1, pin_c2, pin_c3 = st.columns(3)
+    pin_driver = pin_c1.text_input("Driver", value=_safe_str(selected_load.get("Driver Name", "")), key=f"load_pin_driver_{load_id}")
+    pin_truck = pin_c2.text_input("Truck License / Truck #", value=_safe_str(selected_load.get("Truck Assigned", "")), key=f"load_pin_truck_{load_id}")
+    pin_chassis = pin_c3.text_input("Chassis", value=_safe_str(selected_load.get("Chassis", "")), key=f"load_pin_chassis_{load_id}")
+
+    pin_d1, pin_d2, pin_d3 = st.columns(3)
+    pin_tran_label = pin_d1.selectbox("Transaction Type", list(PORT_HOUSTON_APPOINTMENT_TRAN_TYPES.keys()), key=f"load_pin_tran_type_{load_id}")
+    pin_date = pin_d2.date_input("Requested Date", value=date.today(), key=f"load_pin_date_{load_id}")
+    pin_time = pin_d3.selectbox("Requested Time", ["06:00:00", "07:00:00", "08:00:00", "09:00:00", "10:00:00", "11:00:00", "12:00:00", "13:00:00", "14:00:00", "15:00:00", "16:00:00", "17:00:00"], key=f"load_pin_time_{load_id}")
+
+    pin_g1, pin_g2, pin_g3 = st.columns(3)
+    pin_gate = pin_g1.selectbox("Gate", ["BPT MAIN", "BCT MAIN"], key=f"load_pin_gate_{load_id}")
+    pin_scac = pin_g2.text_input("Trucking Company / SCAC", value=_get_app_setting("PORT_HOUSTON_OPERATOR", "POHA"), key=f"load_pin_scac_{load_id}")
+    pin_confirmation = pin_g3.text_input("PIN / Appointment #", value="", key=f"load_pin_confirmation_{load_id}")
+    pin_equipment_type = st.text_input("Equipment Type", value=_safe_str(selected_load.get("Size", "")) or "40HC", key=f"load_pin_equipment_{load_id}")
+
+    pin_payload = _build_port_houston_appointment_payload(
+        action="Create",
+        appointment_nbr=pin_confirmation,
+        appointment_date=pin_date,
+        appointment_time=pin_time,
+        gate_id=pin_gate,
+        truck_license=pin_truck,
+        trucking_co_id=pin_scac,
+        tran_type=PORT_HOUSTON_APPOINTMENT_TRAN_TYPES[pin_tran_label],
+        container=container_value,
+        booking=booking_value,
+        chassis=pin_chassis,
+        equipment_type=pin_equipment_type,
+        owns_chassis=True,
+    )
+    with st.expander("Review PIN / Appointment Payload", expanded=False):
+        st.text_area("Payload", value=pin_payload, height=240, key=f"load_pin_payload_{load_id}")
+
+    pin_save_requirements = []
+    if not _status_at_or_after(_safe_str(selected_load.get("Status", "")), "Booking Verified"):
+        pin_save_requirements.append("booking verified")
+    if not readiness.get("port_verified"):
+        pin_save_requirements.append("port verified")
+    if not pin_driver.strip():
+        pin_save_requirements.append("driver")
+    if not pin_truck.strip():
+        pin_save_requirements.append("truck")
+    if not _first_present(selected_load, ["Port", "terminal"], ""):
+        pin_save_requirements.append("terminal")
+    if not _first_present(selected_load, ["Delivery Need Date", "delivery_need_date"], ""):
+        pin_save_requirements.append("pickup/delivery date")
+
+    if st.button("Save PIN / Appointment To Load", key=f"load_save_pin_{load_id}", use_container_width=True):
+        if pin_save_requirements:
+            st.error("Cannot save PIN / appointment until these items are complete: " + ", ".join(pin_save_requirements))
+        elif not booking_value and not container_value:
+            st.error("Booking or container is required.")
+        elif not pin_truck.strip():
+            st.error("Truck license / truck number is required.")
+        else:
+            target_status = "PIN Received" if pin_confirmation.strip() else "Ready for Appointment / PIN"
+            appointment_value = pd.Timestamp.combine(pin_date, pd.to_datetime(pin_time).time()).to_pydatetime()
+            note = (
+                "\n\nPort Houston PIN / Appointment:"
+                f"\nTransaction Type: {pin_tran_label}"
+                f"\nDate/Time: {pin_date} {pin_time}"
+                f"\nGate: {pin_gate}"
+                f"\nPIN / Appointment #: {pin_confirmation.strip() or 'Pending'}"
+                f"\nBooking: {booking_value}"
+                f"\nContainer: {container_value}"
+                f"\nTruck: {pin_truck}"
+                f"\nDriver: {pin_driver}"
+                f"\nChassis: {pin_chassis}"
+            )
+            DispatchDatabaseClient().update_row_fields(
+                load_id,
+                {
+                    "Status": target_status,
+                    "Driver Name": pin_driver.strip(),
+                    "Truck Assigned": pin_truck.strip(),
+                    "Chassis": pin_chassis.strip(),
+                    "Dispatcher Notes": (_safe_str(selected_load.get("Dispatcher Notes", "")) + note).strip(),
+                },
+            )
+            updated_extra = _update_load_columns_if_present(
+                load_id,
+                {
+                    "pickup_reference": pin_confirmation.strip() or None,
+                    "pickup_appointment": appointment_value,
+                },
+            )
+            _log_port_houston_event(
+                action_type="pin_appointment_saved",
+                lookup_type="Express Pass / PIN",
+                request_reference=booking_value or container_value,
+                load_id=load_id,
+                response_summary={
+                    "status": target_status,
+                    "transaction_type": pin_tran_label,
+                    "date": str(pin_date),
+                    "time": pin_time,
+                    "gate": pin_gate,
+                    "pin": pin_confirmation.strip(),
+                    "payload": pin_payload,
+                    "updated_extra": updated_extra,
+                },
+            )
+            refresh_data()
+            st.success("PIN / appointment details saved to the load.")
+            st.rerun()
+
+
 def _xml_escape(value) -> str:
     text = _safe_str(value)
     return (
@@ -11940,7 +13918,8 @@ def main() -> None:
             st.rerun()
 
         st.divider()
-        _render_status_legend()
+        if section in STATUS_LEGEND_SECTIONS:
+            _render_status_legend()
 
     df = _load_current_tms_data_or_stop() if section in LOAD_DATA_SECTIONS else pd.DataFrame()
 
@@ -11952,6 +13931,8 @@ def main() -> None:
         render_dashboard(df)
     elif section == "Orders/Load Management":
         render_orders_management(df)
+    elif section == "Active Status":
+        render_active_status_view(df)
     elif section == "Dispatch Board":
         render_dispatch_board_focused(df)
     elif section == "Calendar View":

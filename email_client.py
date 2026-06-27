@@ -270,14 +270,62 @@ def _account_setting_suffix(email_address):
     return re.sub(r"[^A-Za-z0-9]+", "_", local_part).strip("_").upper()
 
 
-def _password_for_email_account(email_address):
+NAMED_EMAIL_ACCOUNTS = {
+    "DISPATCH": "dispatch@calitranscorp.com",
+    "MARGIE": "margiea@calitranscorp.com",
+    "ACCOUNTING": "accounting@calitranscorp.com",
+}
+
+
+def _unique_values(values):
+    result = []
+    seen = set()
+    for value in values:
+        value = str(value or "").strip()
+        normalized = value.upper()
+        if not value or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+    return result
+
+
+def _email_account_aliases(email_address):
+    normalized_email = str(email_address or "").strip().lower()
     suffix = _account_setting_suffix(email_address)
-    candidates = [
-        f"OPERATIONS_EMAIL_PASSWORD_{suffix}",
-        f"EMAIL_APP_PASSWORD_{suffix}",
-        f"YAHOO_APP_PASSWORD_{suffix}",
-        f"SMTP_PASSWORD_{suffix}",
-    ]
+    aliases = [suffix]
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = (
+            get_setting(f"{alias}_YAHOO_EMAIL")
+            or get_setting(f"{alias}_EMAIL")
+            or get_setting(f"YAHOO_EMAIL_{alias}")
+            or default_email
+        )
+        if normalized_email == str(configured_email or "").strip().lower():
+            aliases.append(alias)
+            if alias == "MARGIE":
+                aliases.append("MARGIEA")
+    return _unique_values(aliases)
+
+
+def _setting_candidates_for_aliases(aliases, templates):
+    return _unique_values(template.format(alias=alias) for alias in aliases for template in templates)
+
+
+def _password_for_email_account(email_address):
+    aliases = _email_account_aliases(email_address)
+    candidates = _setting_candidates_for_aliases(
+        aliases,
+        [
+            "{alias}_YAHOO_APP_PASSWORD",
+            "{alias}_EMAIL_APP_PASSWORD",
+            "{alias}_SMTP_PASSWORD",
+            "OPERATIONS_EMAIL_PASSWORD_{alias}",
+            "EMAIL_APP_PASSWORD_{alias}",
+            "YAHOO_APP_PASSWORD_{alias}",
+            "SMTP_PASSWORD_{alias}",
+        ],
+    )
     for key in candidates:
         value = get_setting(key)
         if value:
@@ -299,6 +347,15 @@ def _operations_email_accounts():
         )
     )
     configured_accounts = _split_email_accounts(raw_accounts)
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = (
+            get_setting(f"{alias}_YAHOO_EMAIL")
+            or get_setting(f"{alias}_EMAIL")
+            or get_setting(f"YAHOO_EMAIL_{alias}")
+            or default_email
+        )
+        if configured_email and configured_email not in configured_accounts:
+            configured_accounts.append(configured_email)
     default_email = get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS")
     if default_email and default_email not in configured_accounts:
         configured_accounts.insert(0, default_email)

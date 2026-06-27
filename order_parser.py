@@ -1,6 +1,8 @@
 import re
 import pdfplumber
 
+from email_parser import parse_email_text
+
 
 def _append_note(existing, note):
     existing = str(existing or "").strip()
@@ -54,10 +56,13 @@ def parse_order_text(text):
         "Reference Number": "",
         "Container Number": "",
         "Customer": "",
+        "Size": "",
         "Port": "",
         "Warehouse": "",
+        "Address": "",
         "Document Cutoff": "",
         "Delivery Need Date": "",
+        "LFD": "",
         "Dispatcher Notes": "",
         "Status": "New",
     }
@@ -205,14 +210,39 @@ def parse_order_text(text):
         "Warehouse": find_pattern(text, [
             r"Warehouse[:\s]+(.+)",
             r"Delivery Location[:\s]+(.+)",
+            r"Destination[:\s]+(.+)",
+            r"Deliver To[:\s]+(.+)",
+        ]),
+        "Address": find_pattern(text, [
+            r"Delivery Address[:\s]+(.+)",
+            r"Warehouse Address[:\s]+(.+)",
+            r"Destination Address[:\s]+(.+)",
+        ]),
+        "Size": find_pattern(text, [
+            r"\b(?:\d+\s*x\s*)?(20|40|45)\s*'?\s*(?:ft|hc|hq|std|container)?\b",
         ]),
         "Document Cutoff": find_pattern(text, [
             r"Document Cutoff[:\s]+(.+)",
             r"Doc Cutoff[:\s]+(.+)",
             r"Port Cut-Off Date:\s*([^\n]+)",
         ]),
+        "LFD": find_pattern(text, [
+            r"LFD[:\s]+(.+)",
+            r"Last Free Day[:\s]+(.+)",
+        ]),
         "Dispatcher Notes": "Parsed from generic order PDF",
     })
+
+    try:
+        email_style_parsed = parse_email_text("", text)
+    except Exception:
+        email_style_parsed = {}
+
+    for field, value in email_style_parsed.items():
+        if field == "Dispatcher Notes":
+            parsed["Dispatcher Notes"] = _append_note(parsed.get("Dispatcher Notes", ""), value)
+        elif value and not parsed.get(field):
+            parsed[field] = value
 
     if corrected_container:
         parsed["Container Number"] = corrected_container

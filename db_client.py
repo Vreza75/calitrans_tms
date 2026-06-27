@@ -4,11 +4,10 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from config import DATABASE_URL, DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS
+from config import DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
 
 
 SM_TO_DB_COLUMNS = {
@@ -140,22 +139,29 @@ def _clean_value(column: str, value: Any) -> Any:
     return text_value if text_value else None
 
 
-@st.cache_resource(show_spinner=False)
-def get_engine() -> Engine:
-    if not DATABASE_URL:
+_ENGINE_CACHE: dict[str, Engine] = {}
+
+
+def get_engine(database_url: str | None = None) -> Engine:
+    database_url = str(database_url or get_secret("DATABASE_URL") or "").strip()
+    if not database_url:
         raise RuntimeError(
-            "DATABASE_URL is missing. Add it to .streamlit/secrets.toml or your environment."
+            f"DATABASE_URL is missing. Config source checked: {get_config_source('DATABASE_URL')}."
         )
-    return create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+    engine = _ENGINE_CACHE.get(database_url)
+    if engine is None:
+        engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        _ENGINE_CACHE[database_url] = engine
+    return engine
 
 
 def read_df(sql: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
-    with get_engine().connect() as conn:
+    with get_engine(get_secret("DATABASE_URL")).connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})
 
 
 def execute(sql: str, params: dict[str, Any] | None = None) -> None:
-    with get_engine().begin() as conn:
+    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
         conn.execute(text(sql), params or {})
 
 
@@ -225,7 +231,7 @@ class DispatchDatabaseClient:
             returning id
         """
 
-        with get_engine().begin() as conn:
+        with get_engine(get_secret("DATABASE_URL")).begin() as conn:
             new_id = conn.execute(
                 text(sql),
                 {col: db_data[col] for col in columns},

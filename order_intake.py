@@ -10,7 +10,7 @@ import streamlit as st
 from config import DOCUMENT_STORAGE_DIR
 from db_client import DispatchDatabaseClient, execute, read_df
 from email_client import fetch_recent_load_emails
-from email_parser import parse_email_text
+from email_parser import extract_latest_email_body, parse_email_text
 from order_parser import extract_text_from_pdf, parse_order_text
 
 
@@ -95,9 +95,12 @@ def create_intake_record(
 
 def _suggest_action(parsed_data: dict[str, Any]) -> str:
     missing = []
-    for field in ["Booking Number", "Customer", "Warehouse"]:
-        if not str(parsed_data.get(field, "") or "").strip():
-            missing.append(field)
+    if not (str(parsed_data.get("Booking Number", "") or "").strip() or str(parsed_data.get("Reference Number", "") or "").strip()):
+        missing.append("Booking or Reference Number")
+    if not str(parsed_data.get("Customer", "") or "").strip():
+        missing.append("Customer")
+    if not (str(parsed_data.get("Warehouse", "") or "").strip() or str(parsed_data.get("Address", "") or "").strip()):
+        missing.append("Warehouse or Address")
 
     if missing:
         return "Missing: " + ", ".join(missing)
@@ -168,11 +171,12 @@ def update_intake_status(record_id: int, status: str, action_required: str | Non
 
 
 def create_load_from_intake(record_id: int, edited_data: dict[str, Any]) -> int:
+    booking_value = edited_data.get("Booking Number", "") or edited_data.get("Reference Number", "")
     client = DispatchDatabaseClient()
     created = client.add_row(
         {
-            "TYPE": edited_data.get("TYPE", "OTR Import"),
-            "Booking Number": edited_data.get("Booking Number", ""),
+            "TYPE": edited_data.get("TYPE", "Import"),
+            "Booking Number": booking_value,
             "Reference Number": edited_data.get("Reference Number", ""),
             "Customer": edited_data.get("Customer", ""),
             "Container Number": edited_data.get("Container Number", ""),
@@ -281,16 +285,17 @@ def render_email_intake_panel() -> None:
         subject = item.get("subject", "")
         sender = item.get("from", "")
         body = item.get("body", "") or item.get("snippet", "") or ""
+        latest_body = extract_latest_email_body(body) or body
         attachments = item.get("attachments", [])
 
         with st.expander(f"{subject} — {sender}", expanded=False):
             st.markdown("#### Email Verification Window")
             st.write(f"**Subject:** {subject}")
             st.write(f"**From:** {sender}")
-            st.text_area("Email Body", value=body, height=220, key=f"email_body_preview_{idx}")
+            st.text_area("Email Body", value=latest_body, height=220, key=f"email_body_preview_{idx}")
 
             try:
-                body_parsed = parse_email_text(subject, body)
+                body_parsed = parse_email_text(subject, latest_body, sender)
             except Exception as exc:
                 st.warning(f"Could not parse email body: {exc}")
                 body_parsed = {}
@@ -318,7 +323,8 @@ def render_email_intake_panel() -> None:
 
             all_fields = [
                 "TYPE", "Customer", "Booking Number", "Reference Number", "Container Number",
-                "Port", "Warehouse", "Delivery Need Date", "Document Cutoff", "LFD", "Dispatcher Notes",
+                "Size", "Port", "Warehouse", "Address", "Delivery Need Date", "Document Cutoff", "LFD",
+                "Contact Name", "Contact Email", "Contact Phone", "Contact Company", "Dispatcher Notes",
             ]
 
             final_data = {}
@@ -365,7 +371,13 @@ def render_email_intake_panel() -> None:
             c3.metric("PDF Fields Found", sum(1 for v in pdf_parsed.values() if str(v).strip()))
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
-            missing = [f for f in ["Booking Number", "Customer", "Warehouse"] if not str(final_data.get(f, "") or "").strip()]
+            missing = []
+            if not (str(final_data.get("Booking Number", "") or "").strip() or str(final_data.get("Reference Number", "") or "").strip()):
+                missing.append("Booking or Reference Number")
+            if not str(final_data.get("Customer", "") or "").strip():
+                missing.append("Customer")
+            if not (str(final_data.get("Warehouse", "") or "").strip() or str(final_data.get("Address", "") or "").strip()):
+                missing.append("Warehouse or Address")
             action_required = "Missing: " + ", ".join(missing) if missing else "Review parsed details and create load"
             st.info(f"Suggested action: {action_required}")
 
@@ -380,7 +392,7 @@ def render_email_intake_panel() -> None:
                     filename=None,
                     file_path=None,
                     parsed_data=body_parsed,
-                    raw_text=body,
+                    raw_text=latest_body,
                     action_required=action_required,
                 )
                 execute(
@@ -471,7 +483,7 @@ def render_email_intake_panel() -> None:
                     filename=filename,
                     file_path=file_path,
                     parsed_data=final_data,
-                    raw_text=f"EMAIL BODY:\n{body}\n\nPDF TEXT:\n{pdf_text}",
+                    raw_text=f"EMAIL BODY:\n{latest_body}\n\nPDF TEXT:\n{pdf_text}",
                     action_required=action_required,
                 )
                 execute(
@@ -534,17 +546,19 @@ def render_action_queue_panel() -> None:
         with col1:
             type_val = st.selectbox(
                 "TYPE",
-                ["OTR Import", "OTR Export", "OTR Local Import"],
+                ["Import", "Export", "Export Local", "Import Local"],
                 index=0,
             )
             booking = st.text_input("Booking Number", value=str(parsed.get("Booking Number", "") or ""))
             reference = st.text_input("Reference Number", value=str(parsed.get("Reference Number", "") or ""))
             customer = st.text_input("Customer", value=str(parsed.get("Customer", "") or ""))
             container = st.text_input("Container Number", value=str(parsed.get("Container Number", "") or ""))
+            size = st.text_input("Size", value=str(parsed.get("Size", "") or ""))
 
         with col2:
             port = st.text_input("Port", value=str(parsed.get("Port", "") or ""))
             warehouse = st.text_input("Warehouse", value=str(parsed.get("Warehouse", "") or ""))
+            address = st.text_input("Address", value=str(parsed.get("Address", "") or ""))
             document_cutoff = st.text_input("Document Cutoff", value=str(parsed.get("Document Cutoff", "") or ""))
             delivery_need = st.text_input("Delivery Need Date", value=str(parsed.get("Delivery Need Date", "") or ""))
             lfd = st.text_input("LFD", value=str(parsed.get("LFD", "") or ""))
@@ -564,22 +578,25 @@ def render_action_queue_panel() -> None:
 
     if submitted:
         if action == "Create Load":
-            if not booking.strip():
-                st.error("Booking Number is required before creating a load.")
+            booking_or_reference = booking.strip() or reference.strip()
+            if not booking_or_reference:
+                st.error("Booking Number or Reference Number is required before creating a load.")
             else:
                 load_id = create_load_from_intake(
                     int(selected_id),
                     {
                         "TYPE": type_val,
-                        "Booking Number": booking,
+                        "Booking Number": booking_or_reference,
                         "Reference Number": reference,
                         "Customer": customer,
                         "Container Number": container,
                         "Port": port,
                         "Warehouse": warehouse,
+                        "Address": address,
                         "Document Cutoff": document_cutoff,
                         "Delivery Need Date": delivery_need,
                         "LFD": lfd,
+                        "Size": size,
                         "Status": status,
                         "Dispatcher Notes": notes,
                     },
