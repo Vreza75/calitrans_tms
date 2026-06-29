@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 from datetime import date, datetime
 from email.utils import getaddresses, parseaddr
@@ -7,12 +6,25 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, unquote
+from ai_agents.intent_agent import IntentAgent
+from ai_agents.operations_parser_agent import OperationsParserAgent
+from ai_agents.load_intelligence_agent import LoadIntelligenceAgent
+from ai_agents.workflow_agent import WorkflowAgent
+from ai_agents.response_agent import ResponseAgent
+
+
 import base64
 import importlib
 import os
 import smtplib
 import zipfile
 import xml.etree.ElementTree as ET
+
+intent_agent = IntentAgent()
+operations_parser_agent = OperationsParserAgent()
+load_intelligence_agent = LoadIntelligenceAgent()
+workflow_agent = WorkflowAgent()
+response_agent = ResponseAgent()
 
 
 def _load_local_env_file() -> None:
@@ -6635,6 +6647,15 @@ def sync_operations_email_engine(limit: int = 50) -> dict:
             body_parsed = parse_email_text(subject, latest_body or body, _safe_str(item.get("from", "")))
         except Exception:
             body_parsed = {}
+            from ai_agents.operations_email_intake_agent import ai_intake_agent
+
+            ai_result = ai_intake_agent(
+                subject=subject,
+                body=latest_body or body,
+                sender=_safe_str(item.get("from", "")),
+            )
+
+            body_parsed["_ai_intake"] = ai_result
 
         saved_attachments = []
         for attachment_index, attachment in enumerate(item.get("attachments", []) or [], start=1):
@@ -7473,14 +7494,97 @@ def auto_classify_open_inbox_items(inbox_df: pd.DataFrame) -> int:
         subject = subject_for_classification
         body = latest_text_for_classification
         parsed = _coerce_json_dict(row.get("parsed_data"))
+        intake_id = int(row["id"])
+        subject = subject_for_classification
+        body = latest_text_for_classification
+        parsed = _coerce_json_dict(row.get("parsed_data"))
+
+        sender = _safe_str(row.get("source_sender", ""))
+        thread_conversation_key = _row_conversation_join_key(row)
+
+        intent_result = intent_agent.analyze(
+            subject=subject,
+            body=body,
+            sender=sender,
+        )
 
         classification = _build_operations_email_classification(
             subject,
             body,
             parsed,
-            fallback_key=f"intake-{intake_id}",
-            sender=str(row.get("source_sender", "") or ""),
+            fallback_key=thread_conversation_key or f"intake-{intake_id}",
+            sender=sender,
         )
+
+        classification["conversation_key"] = thread_conversation_key
+
+        parsed["_intent_agent"] = intent_result
+
+        parser_result = operations_parser_agent.analyze(
+            subject=subject,
+            body=body,
+            intent_result=intent_result,
+            existing_load=None,
+        )
+
+        parsed["_operations_parser_agent"] = parser_result
+
+        tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+        matched_load_id = classification.get("matched_load_id")
+
+        load_candidates = find_load_match_candidates(
+            tokens,
+            parsed=parsed,
+            subject=subject,
+            body=body,
+            limit=5,
+        )
+
+        load_intelligence_result = load_intelligence_agent.analyze(
+            intent_result=intent_result,
+            parser_result=parser_result,
+            load_candidates=load_candidates,
+            conversation_context={
+                "matched_load_id": matched_load_id,
+                "conversation_key": thread_conversation_key,
+            },
+        )
+
+        parsed["_load_intelligence_agent"] = load_intelligence_result
+
+        if load_intelligence_result.get("matched_load_id"):
+            matched_load_id = load_intelligence_result["matched_load_id"]
+            classification["matched_load_id"] = matched_load_id
+
+        workflow_result = workflow_agent.analyze(
+            intent_result=intent_result,
+            parser_result=parser_result,
+            load_intelligence_result=load_intelligence_result,
+            existing_case=None,
+        )
+
+        parsed["_workflow_agent"] = workflow_result
+            response_result = response_agent.analyze(
+            subject=subject,
+            body=body,
+            sender=sender,
+            intent_result=intent_result,
+            parser_result=parser_result,
+            load_intelligence_result=load_intelligence_result,
+            workflow_result=workflow_result,
+            existing_load=None,
+            company_memory={},
+        )
+
+        parsed["_response_agent"] = response_result
+         # Agent 2 enrichment
+        classification["ai_intent"] = intent_result["primary_intent"]
+        classification["ai_language"] = intent_result["language"]
+        classification["ai_department_owner"] = intent_result["department_owner"]
+        classification["ai_confidence"] = intent_result["confidence"]
+        classification["ai_recommended_action"] = intent_result["recommended_action"]
+        classification["ai_reason"] = intent_result["reason"]
+
         detected_type = classification["request_type"]
         matched_load_id = classification["matched_load_id"]
         confidence = classification["confidence_score"]
