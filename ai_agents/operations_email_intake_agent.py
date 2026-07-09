@@ -1,13 +1,12 @@
 # operations_email_intake_agent.py
 
 from __future__ import annotations
+from ai_core.llm import get_llm
 
-import json
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
 
 
 INTAKE_MODEL = "gpt-4.1-mini"
@@ -147,7 +146,6 @@ def ai_intake_agent(
     """
 
     base = rule_based_intake(subject, body, sender)
-    client = OpenAI()
 
     system_prompt = """
 You are the CaliTrans AI Email Intake Agent for a drayage/container trucking company.
@@ -155,8 +153,8 @@ You are the CaliTrans AI Email Intake Agent for a drayage/container trucking com
 CaliTrans handles:
 - Import
 - Export
-- Import Local
-- Export Local
+- Local Import
+- Local Export
 - Port Houston drayage
 - warehouse transfers
 - billing/POD requests
@@ -230,17 +228,44 @@ Return JSON only.
     }
 
     try:
-        response = client.responses.create(
-            model=INTAKE_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt, default=str)},
-            ],
+        llm = get_llm()
+
+        llm_result = llm.generate_json(
+            task="operations_email_intake_agent",
+            system_prompt=system_prompt,
+            user_payload=user_prompt,
             temperature=0.1,
         )
 
-        content = response.output_text.strip()
-        result = json.loads(content)
+        if llm_result.get("ok"):
+            result = llm_result.get("output_json", {})
+
+            result["llm_used"] = True
+            result["llm_debug"] = {
+                "task": llm_result.get("task"),
+                "model": llm_result.get("model"),
+                "latency_seconds": llm_result.get("latency_seconds"),
+                "attempts": llm_result.get("attempts"),
+            }
+
+            # Keep fallback values if LLM omitted anything important
+            for key, value in base.items():
+                result.setdefault(key, value)
+
+        else:
+            result = {
+                **base,
+                "summary": "AI intake failed; using rule-based classification.",
+                "error": llm_result.get("error", ""),
+                "extracted_fields": {},
+                "match_recommendation": {},
+                "database_update_recommendation": {},
+                "draft_reply": "",
+                "llm_used": False,
+                "llm_debug": llm_result,
+                "human_review_required": True,
+                "automation_allowed": False,
+            }
 
     except Exception as exc:
         result = {
@@ -251,10 +276,11 @@ Return JSON only.
             "match_recommendation": {},
             "database_update_recommendation": {},
             "draft_reply": "",
+            "llm_used": False,
+            "llm_debug": {},
             "human_review_required": True,
             "automation_allowed": False,
-        }
-
+    }
     result["processed_at"] = datetime.utcnow().isoformat()
     result["agent_name"] = "ai_email_intake_agent_v1"
 
