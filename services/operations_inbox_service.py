@@ -697,7 +697,124 @@ def operations_email_source_filter(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     return f"{prefix}source in ({sql_literal_list(OPERATIONS_EMAIL_SYNC_SOURCES)})"
 
+def _is_strong_operations_business_key(value: str) -> bool:
+    value = safe_str(value).strip()
 
+    if not value:
+        return False
+
+    lowered = value.lower()
+
+    if lowered in {
+        "-",
+        "none",
+        "null",
+        "nan",
+        "unknown",
+        "contact",
+        "customer-request",
+        "customer request",
+    }:
+        return False
+
+    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-")):
+        return False
+
+    if not any(char.isdigit() for char in value):
+        return False
+
+    return len(value) >= 5
+
+
+def load_operations_business_conversation_timeline(
+    *,
+    conversation_key: str = "",
+    booking_number: str = "",
+    container_number: str = "",
+    reference_number: str = "",
+    limit: int = 50,
+):
+    """
+    Strict business-conversation timeline.
+
+    Avoid broad topic/customer matching. This prevents unrelated 300+ message
+    timelines when the selected key is weak.
+    """
+
+    keys = []
+
+    for value in [conversation_key, booking_number, container_number, reference_number]:
+        clean_value = safe_str(value).strip()
+        if _is_strong_operations_business_key(clean_value) and clean_value not in keys:
+            keys.append(clean_value)
+
+    if not keys:
+        return read_df(
+            """
+            select
+                id,
+                source_received_at,
+                created_at,
+                email_direction,
+                conversation_status,
+                review_status,
+                source_sender,
+                source_subject,
+                raw_text,
+                ''::text as message_preview,
+                conversation_key
+            from order_intake
+            where 1 = 0
+            """
+        )
+
+    clauses = []
+    params = {
+        "limit": int(limit or 50),
+    }
+
+    for index, key in enumerate(keys):
+        key_param = f"key_{index}"
+        like_param = f"like_{index}"
+
+        params[key_param] = key
+        params[like_param] = f"%{key}%"
+
+        clauses.append(
+            f"""
+            conversation_key = :{key_param}
+            or source_subject ilike :{like_param}
+            or raw_text ilike :{like_param}
+            or parsed_data::text ilike :{like_param}
+            """
+        )
+
+    where_sql = " or ".join(f"({clause})" for clause in clauses)
+
+    return read_df(
+        f"""
+        select
+            id,
+            source_received_at,
+            created_at,
+            coalesce(email_direction, 'inbound') as email_direction,
+            coalesce(conversation_status, 'New Conversation') as conversation_status,
+            coalesce(review_status, 'Open') as review_status,
+            coalesce(source_sender, '') as source_sender,
+            coalesce(source_subject, '') as source_subject,
+            coalesce(raw_text, '') as raw_text,
+            left(coalesce(raw_text, ''), 180) as message_preview,
+            coalesce(conversation_key, '') as conversation_key
+        from order_intake
+        where {where_sql}
+        order by coalesce(source_received_at, created_at) asc, id asc
+        limit :limit
+        """,
+        params,
+    )
+
+
+_load_operations_business_conversation_timeline = load_operations_business_conversation_timeline
 def conversation_join_expr(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     generic_conversation_key = (
@@ -4099,7 +4216,32 @@ OPERATIONS_REPLY_MAILBOXES = [
     "accounting@calitranscorp.com",
 ]
 
+def _extract_booking_from_text(text: str) -> str:
+    text = safe_str(text)
 
+    patterns = [
+        r"\bBK[-\s]?\d{5,12}\b",
+        r"\bBKG[\s#:.-]*([A-Z0-9-]{5,20})\b",
+        r"\bBOOKING[\s#:.-]*([A-Z0-9-]{5,20})\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1) if match.lastindex else match.group(0)
+            return safe_str(value).replace(" ", "").upper()
+
+    return ""
+
+
+def _extract_container_from_text(text: str) -> str:
+    text = safe_str(text)
+
+    match = re.search(r"\b[A-Z]{4}\d{6,7}\b", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(0).upper()
+
+    return ""
 def _operations_reply_sender_options() -> list[str]:
     configured = _split_email_list(
         _get_app_setting(
@@ -4119,7 +4261,188 @@ def _operations_reply_sender_options() -> list[str]:
         seen.add(normalized)
         result.append(email_address)
     return result
+def _first_non_empty(*values) -> str:
+    for value in values:
+        clean_value = safe_str(value).strip()
+        if clean_value:
+            return clean_value
+    return ""
 
+
+def _business_conversation_key_from_context(
+    *,
+    record=None,
+    parsed: dict | None = None,
+    tokens: dict | None = None,
+    subject: str = "",
+    body: str = "",
+    fallback_key: str = "",
+) -> str:
+    """
+    Returns the business-level conversation key used for operational tracking.
+
+    Priority:
+    1. Booking number
+    2. Container number
+    3. Reference number
+    4. Existing conversation key
+    """
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+    tokens = tokens if isinstance(tokens, dict) else {}
+
+    record_booking = ""
+    record_container = ""
+    record_reference = ""
+    record_conversation = ""
+
+    if hasattr(record, "get"):
+        record_booking = safe_str(record.get("booking_number", ""))
+        record_container = safe_str(record.get("container_number", ""))
+        record_reference = safe_str(record.get("reference_number", ""))
+        record_conversation = safe_str(record.get("conversation_key", ""))
+
+    booking = _first_non_empty(
+        tokens.get("booking_number"),
+        parsed.get("Booking Number"),
+        parsed.get("booking_number"),
+        record_booking,
+        _extract_booking_from_text(f"{subject}\n{body}"),
+    )
+
+    container = _first_non_empty(
+        tokens.get("container_number"),
+        parsed.get("Container Number"),
+        parsed.get("container_number"),
+        record_container,
+        _extract_container_from_text(f"{subject}\n{body}"),
+    )
+
+    reference = _first_non_empty(
+        tokens.get("reference_number"),
+        parsed.get("Reference Number"),
+        parsed.get("reference_number"),
+        record_reference,
+    )
+
+    return _first_non_empty(
+        booking,
+        container,
+        reference,
+        record_conversation,
+        fallback_key,
+    )
+
+
+def _get_business_conversation_history(
+    *,
+    business_key: str,
+    booking_number: str = "",
+    container_number: str = "",
+    reference_number: str = "",
+):
+    """
+    Pull all inbound/outbound messages for the same booking/container/reference,
+    even if the raw IMAP/Gmail thread key differs.
+    """
+
+    business_key = safe_str(business_key).strip()
+    booking_number = safe_str(booking_number).strip()
+    container_number = safe_str(container_number).strip()
+    reference_number = safe_str(reference_number).strip()
+
+    search_terms = [
+        value
+        for value in [business_key, booking_number, container_number, reference_number]
+        if value
+    ]
+
+    if not search_terms:
+        return read_df(
+            """
+            select
+                id,
+                source_received_at as time,
+                email_direction as direction,
+                conversation_status,
+                review_status,
+                source_sender,
+                source_subject,
+                raw_text
+            from order_intake
+            where 1 = 0
+            """
+        )
+
+    clauses = []
+    params = {}
+
+    for index, term in enumerate(search_terms):
+        param_key = f"term_{index}"
+        like_key = f"like_{index}"
+
+        params[param_key] = term
+        params[like_key] = f"%{term}%"
+
+        clauses.append(
+            f"""
+            conversation_key = :{param_key}
+            or email_thread_id = :{param_key}
+            or email_in_reply_to = :{param_key}
+            or source_message_id = :{param_key}
+            or source_subject ilike :{like_key}
+            or raw_text ilike :{like_key}
+            or parsed_data::text ilike :{like_key}
+            """
+        )
+
+    where_sql = " or ".join(f"({clause})" for clause in clauses)
+
+    return read_df(
+        f"""
+        select
+            id,
+            source_received_at as time,
+            coalesce(email_direction, 'inbound') as direction,
+            coalesce(conversation_status, '') as conversation_status,
+            coalesce(review_status, '') as review_status,
+            coalesce(source_sender, '') as source_sender,
+            coalesce(source_subject, '') as source_subject,
+            coalesce(raw_text, '') as raw_text,
+            coalesce(conversation_key, '') as conversation_key
+        from order_intake
+        where {where_sql}
+        order by source_received_at asc, id asc
+        """,
+        params,
+    )
+
+
+def _sync_current_intake_to_business_conversation(
+    *,
+    intake_id: int,
+    business_key: str,
+) -> None:
+    """
+    Make the selected email row use the business conversation key.
+    This lets replies to pending orders group under booking/container.
+    """
+
+    business_key = safe_str(business_key).strip()
+    if not business_key:
+        return
+
+    execute(
+        """
+        update order_intake
+        set conversation_key = :business_key
+        where id = :intake_id
+        """,
+        {
+            "business_key": business_key,
+            "intake_id": int_or_none(intake_id),
+        },
+    )
 
 def _suggested_operations_reply_sender(request_type: str, operations_case: dict | None) -> str:
     operations_case = operations_case or {}
