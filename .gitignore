@@ -1,6 +1,38 @@
-.streamlit/secrets.toml
-.venv/
+# Secrets
 .env
+.streamlit/secrets.toml
+
+# Python / Streamlit
+.venv/
 __pycache__/
 *.pyc
-exports/.streamlit/secrets.toml
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local storage / downloaded docs
+storage/
+exports/
+backups/
+
+# Codex / local build folders
+.codex_pydeps/
+.agents/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional local Python version file
+.python-version
+# Local archives
+.agents.zip
+
+# Local application backups
+backups/
+
+# Runtime-uploaded operational documents
+storage/load_documents/

@@ -1,11 +1,11 @@
 # ai_agents/response_agent.py
 
-import json
-import streamlit as st
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 
-from openai import OpenAI
+from ai_core.llm import get_llm
 
 
 @dataclass
@@ -17,25 +17,15 @@ class ResponseResult:
     requires_human_review: bool
     reason: str
     llm_used: bool
+    llm_debug: Dict
 
 
 class ResponseAgent:
     """
-    Agent 6: LLM Response Agent
-
-    Uses ChatGPT/OpenAI to draft customer replies.
-    Does NOT send emails.
-    Dispatcher must review before sending.
+    Agent 6: Response Agent using centralized LLM wrapper.
+    Does not send emails.
+    Dispatcher reviews before sending.
     """
-    def __init__(self, model: str = "gpt-4.1-mini"):
-        self.client = OpenAI(
-            api_key=st.secrets["OPENAI_API_KEY"]
-        )
-
-        self.model = st.secrets.get(
-            "OPENAI_RESPONSE_MODEL",
-            model
-        )
 
     def analyze(
         self,
@@ -50,41 +40,33 @@ class ResponseAgent:
         company_memory: Optional[Dict] = None,
     ) -> Dict:
 
-        try:
-            return self._draft_with_llm(
-                subject=subject,
-                body=body,
-                sender=sender,
-                intent_result=intent_result,
-                parser_result=parser_result,
-                load_intelligence_result=load_intelligence_result,
-                workflow_result=workflow_result,
-                existing_load=existing_load or {},
-                company_memory=company_memory or {},
-            )
-        except Exception as exc:
-            return self._fallback_response(subject, intent_result, workflow_result, str(exc))
+        llm = get_llm()
 
-    def _draft_with_llm(
-        self,
-        subject: str,
-        body: str,
-        sender: str,
-        intent_result: Dict,
-        parser_result: Dict,
-        load_intelligence_result: Dict,
-        workflow_result: Dict,
-        existing_load: Dict,
-        company_memory: Dict,
-    ) -> Dict:
+        system_prompt = """
+You are CaliTrans Operations Response Agent.
 
-        prompt = {
+You draft safe, short, professional customer replies for a drayage trucking company.
+
+Rules:
+- Return only valid JSON.
+- Do not send the email.
+- Do not invent ETAs, prices, appointment confirmations, driver locations, or completion status.
+- If something is not confirmed, say the operations team is reviewing or checking.
+- Match the customer's language: English, Spanish, or bilingual.
+- Keep the reply concise and dispatcher-friendly.
+
+Required JSON keys:
+response_language
+response_tone
+draft_subject
+draft_body
+reason
+"""
+
+        user_payload = {
             "company": {
                 "name": "CaliTrans",
-                "business": "Small drayage trucking company moving containers to and from Port Houston, warehouses, and customers.",
-                "office_roles": ["Dispatcher", "Manager", "Accounting"],
-                "reply_style": "Professional, clear, friendly, short, operations-focused.",
-                "safety_rule": "Never promise completion unless confirmed. Use 'we are reviewing', 'we will confirm', or 'we are checking' when uncertain.",
+                "business": "Small drayage trucking company handling Port Houston, containers, warehouses, appointments, billing, and dispatch.",
             },
             "email": {
                 "sender": sender,
@@ -96,51 +78,36 @@ class ResponseAgent:
                 "parser_result": parser_result,
                 "load_intelligence_result": load_intelligence_result,
                 "workflow_result": workflow_result,
-                "existing_load": existing_load,
-                "company_memory": company_memory,
+                "existing_load": existing_load or {},
+                "company_memory": company_memory or {},
             },
-            "task": (
-                "Draft a customer email reply. Detect whether the reply should be English, Spanish, or bilingual. "
-                "Do not send the email. Do not invent appointment times, ETAs, prices, driver locations, or confirmations. "
-                "Return only valid JSON with keys: response_language, response_tone, draft_subject, draft_body, reason."
-            ),
         }
 
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are CaliTrans Operations Response Agent. "
-                        "You draft safe, concise customer replies for a drayage dispatcher. "
-                        "You must return only valid JSON."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(prompt, default=str),
-                },
-            ],
+        llm_result = llm.generate_json(
+            task="response_agent",
+            system_prompt=system_prompt,
+            user_payload=user_payload,
             temperature=0.2,
         )
 
-        raw_text = response.output_text.strip()
-        data = json.loads(raw_text)
+        if llm_result.get("ok"):
+            data = llm_result.get("output_json", {})
 
-        return asdict(ResponseResult(
-            response_language=data.get("response_language", "English"),
-            response_tone=data.get("response_tone", "Professional"),
-            draft_subject=data.get("draft_subject", self._reply_subject(subject)),
-            draft_body=data.get("draft_body", ""),
-            requires_human_review=True,
-            reason=data.get("reason", "LLM draft created for dispatcher review."),
-            llm_used=True,
-        ))
+            return asdict(ResponseResult(
+                response_language=data.get("response_language", "English"),
+                response_tone=data.get("response_tone", "Professional"),
+                draft_subject=data.get("draft_subject", self._reply_subject(subject)),
+                draft_body=data.get("draft_body", ""),
+                requires_human_review=True,
+                reason=data.get("reason", "LLM draft created for dispatcher review."),
+                llm_used=True,
+                llm_debug=llm_result,
+            ))
 
-    def _fallback_response(self, subject: str, intent_result: Dict, workflow_result: Dict, error: str) -> Dict:
+        return self._fallback_response(subject, intent_result, llm_result)
+
+    def _fallback_response(self, subject: str, intent_result: Dict, llm_result: Dict) -> Dict:
         language = str(intent_result.get("language", "english")).lower()
-        intent = intent_result.get("primary_intent", "unknown")
 
         if language == "spanish":
             body = (
@@ -167,8 +134,9 @@ class ResponseAgent:
             draft_subject=self._reply_subject(subject),
             draft_body=body,
             requires_human_review=True,
-            reason=f"Fallback draft used because LLM call failed: {error}",
+            reason=f"Fallback draft used because LLM call failed: {llm_result.get('error', '')}",
             llm_used=False,
+            llm_debug=llm_result,
         ))
 
     def _reply_subject(self, subject: str) -> str:
