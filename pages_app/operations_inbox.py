@@ -3,7 +3,6 @@ import os
 import re
 from datetime import datetime
 
-from altair import value
 import pandas as pd
 import streamlit as st
 import services.operations_inbox_service as ops
@@ -461,6 +460,172 @@ def _ops_parse_structured_email_fields(subject: str, body: str) -> dict:
             fields["TYPE"] = "Import"
 
     return fields
+
+def _ops_parse_fcl_booking_confirmation_fields(subject: str, body: str) -> dict:
+    """
+    Parse FCL booking confirmations like Continental / Fleur De Lis.
+
+    Handles patterns such as:
+    NUMBER OF CNTRS CARGO DESCRIPTION
+    4 X 40HC RESIN NON HAZ
+
+    Also handles email-body table values:
+    RELEASE REF, CONTAINER QTY, WAREHOUSE, BOOKING, DOC CUT OFF, PORT CUTOFF.
+    """
+
+    text = f"{ops._safe_str(subject)}\n{ops._safe_str(body)}"
+    clean = re.sub(r"[ \t]+", " ", text)
+    clean = re.sub(r"\r\n?", "\n", clean)
+    upper = clean.upper()
+
+    fields = {}
+
+    def first_match(pattern: str, flags=re.I | re.S) -> str:
+        match = re.search(pattern, clean, flags)
+        return ops._safe_str(match.group(1)).strip() if match else ""
+
+    def clean_value(value: str) -> str:
+        value = ops._safe_str(value).strip()
+        value = re.sub(r"\s+", " ", value)
+        return value.strip(" :|-")
+
+    # Booking / references
+    booking = (
+        first_match(r"\bBOOKING\s*(?:NUMBER|NO\.?|#)?\s*:?\s*([A-Z0-9-]{6,})", re.I)
+        or first_match(r"\bHOUSE BILL OF LADING\s+([A-Z0-9-]{6,})", re.I)
+        or first_match(r"\bOCEAN BILL OF LADING\s+([A-Z0-9-]{6,})", re.I)
+    )
+
+    if booking:
+        fields["Booking Number"] = clean_value(booking)
+
+    reference = (
+        first_match(r"\bRELEASE REF\s*:?\s*([A-Z0-9/.-]+)", re.I)
+        or first_match(r"\bREFERENCE NUMBER\s*:?\s*([A-Z0-9/.-]+)", re.I)
+        or first_match(r"\bORDER NUMBERS\s+([A-Z0-9/.-]+)", re.I)
+    )
+
+    if reference:
+        fields["Reference Number"] = clean_value(reference)
+
+    # Customer
+    if "CONTINENTAL INDUSTRIES GROUP" in upper:
+        fields["Customer"] = "Continental Industries Group"
+
+    # Service flow
+    export_terms = [
+        "FULL RETURN",
+        "PORT OF LOADING",
+        "PORT OF DISCHARGE",
+        "EXPORTING CARRIER",
+        "CARGO CUT OFF",
+        "VGM CUT OFF",
+    ]
+
+    if any(term in upper for term in export_terms):
+        fields["TYPE"] = "Export"
+
+    # Container quantity and size
+    qty_size = None
+
+    qty_size_patterns = [
+        r"\bNUMBER OF CNTRS\s+CARGO DESCRIPTION\s+(\d+)\s*[Xx]\s*([0-9]{2}\s*[A-Z]{0,3})\s+([A-Z0-9 /.-]+)",
+        r"\bCONTAINER QTY\s*:?\s*(\d+)\s*[Xx]\s*([0-9]{2}\s*[A-Z]{0,3})",
+        r"\bSEA FREIGHT\s*-\s*(\d+)\s+([0-9]{2}\s*[A-Z]{0,3})\b",
+        r"\b(\d+)\s*[Xx]\s*(40HC|40HQ|40|20|45HC)\b",
+    ]
+
+    for pattern in qty_size_patterns:
+        match = re.search(pattern, clean, re.I | re.S)
+        if match:
+            qty_size = match
+            break
+
+    if qty_size:
+        try:
+            fields["Container Qty"] = str(int(qty_size.group(1)))
+        except Exception:
+            fields["Container Qty"] = qty_size.group(1)
+
+        fields["Size"] = clean_value(qty_size.group(2)).upper().replace(" ", "")
+
+        if len(qty_size.groups()) >= 3:
+            commodity = clean_value(qty_size.group(3))
+            commodity = re.split(
+                r"\bSUPPLIER\b|\bWAREHOUSE\b|\bPICK-UP\b|\bTHE CHARGES\b",
+                commodity,
+                flags=re.I,
+            )[0].strip()
+            if commodity:
+                fields["Commodity"] = commodity.title()
+
+    # Locations
+    empty_pickup = first_match(r"\bEMPTY PICK UP\s+FULL RETURN\s+(.+?)\s+Bayport Terminal", re.I | re.S)
+    if empty_pickup:
+        fields["Empty Pickup"] = clean_value(empty_pickup)
+
+    if "BAYPORT TERMINAL" in upper:
+        fields["Full Return Terminal"] = "Bayport Terminal"
+        fields["Port"] = "Bayport Terminal"
+
+    warehouse = first_match(r"\bWAREHOUSE\s*:?\s*([A-Z0-9 &.,/-]+)", re.I)
+    if warehouse:
+        fields["Warehouse"] = clean_value(warehouse).title()
+
+    # Carrier / vessel
+    vessel = first_match(r"\bVESSEL\s*:?\s*([A-Z0-9 .-]+)", re.I)
+    if vessel:
+        fields["Vessel Name"] = clean_value(vessel).upper()
+
+    if "OCEAN NETWORK EXPRESS" in upper or re.search(r"\bONE\b", upper):
+        fields["Steamship Line"] = "ONE"
+
+    carrier = first_match(r"\bEXPORTING CARRIER\s+PLACE OF RECEIPT\s+(.+?)\s+Houston", re.I | re.S)
+    if carrier:
+        fields["Exporting Carrier"] = clean_value(carrier)
+
+    # Ports
+    if re.search(r"\bPORT OF LOADING\s+PORT OF DISCHARGE\s+Houston\s+Kaohsiung", clean, re.I):
+        fields["Port Of Loading"] = "Houston"
+        fields["Port Of Discharge"] = "Kaohsiung"
+        fields["Place Of Delivery"] = "Kaohsiung"
+
+    # Cutoffs / dates
+    date_patterns = {
+        "Opens For Receiving": r"\bOPENS FOR RECEIVING\s*:?\s*([0-9A-Za-z:-]+\s+[0-9:]+)",
+        "Document Cutoff": r"\bDOCUMENTATION CUT OFF\s*:?\s*([0-9A-Za-z:-]+\s+[0-9:]+)",
+        "VGM Cutoff": r"\bVGM CUT OFF\s*:?\s*([0-9A-Za-z:-]+\s+[0-9:]+)",
+        "Cargo Cutoff": r"\bCARGO CUT OFF\s*:?\s*([0-9A-Za-z:-]+\s+[0-9:]+)",
+        "Sailing Date": r"\bSAILING\s*:?\s*([0-9A-Za-z:-]+)",
+        "ETA Date": r"\bETA\s*:?\s*([0-9A-Za-z:-]+)",
+        "Port Cutoff": r"\bPORT CUTOFF\s*:?\s*([0-9/.-]+)",
+    }
+
+    for field_name, pattern in date_patterns.items():
+        value = first_match(pattern, re.I)
+        if value:
+            fields[field_name] = clean_value(value)
+
+    # Rate sheet fields
+    rate_per_container = first_match(r"\b([0-9]+\.[0-9]{2})/CN\b", re.I)
+    if rate_per_container:
+        fields["Rate Per Container"] = rate_per_container
+
+    job_total = first_match(r"\bJob Total\s+([0-9,]+\.[0-9]{2})", re.I)
+    if job_total:
+        fields["Rate Total"] = job_total.replace(",", "")
+
+    fields["_multi_container_booking"] = bool(
+        int(fields.get("Container Qty") or 0) > 1
+        if str(fields.get("Container Qty", "")).isdigit()
+        else False
+    )
+
+    return {
+        key: value
+        for key, value in fields.items()
+        if ops._safe_str(value).strip() != ""
+    }    
 _MONTH_NAME_TO_NUMBER = {
     "jan": 1,
     "january": 1,
@@ -526,7 +691,96 @@ def _ops_parse_loose_date(value: str) -> str:
             return f"{year:04d}-{month:02d}-{int(day):02d}"
 
     return ""
+def _ops_clean_pending_draft_value(value: str) -> str:
+    value = ops._safe_str(value).strip()
 
+    if not value:
+        return ""
+
+    stop_phrases = [
+        "please confirm",
+        "thank you",
+        "thanks,",
+        "regards,",
+        "sent from",
+    ]
+
+    lowered = value.lower()
+    cut_index = None
+
+    for phrase in stop_phrases:
+        found_index = lowered.find(phrase)
+        if found_index >= 0:
+            cut_index = found_index if cut_index is None else min(cut_index, found_index)
+
+    if cut_index is not None:
+        value = value[:cut_index].strip(" ,.;:-")
+
+    return value.strip()
+
+
+def _ops_pending_draft_fields_from_parsed(parsed: dict) -> dict:
+    """
+    Map parsed email fields into order_intake_drafts columns.
+
+    This keeps the pending draft current while client/dispatcher
+    go back and forth before a load is created.
+    """
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    def pick(*keys: str) -> str:
+        for key in keys:
+            value = ops._safe_str(parsed.get(key, "")).strip()
+            if value:
+                return _ops_clean_pending_draft_value(value)
+        return ""
+
+    fields = {
+        "customer": pick("Customer", "customer", "Contact Company", "Contact Name"),
+        "booking_number": pick("Booking Number", "booking_number", "Booking"),
+        "container_number": pick("Container Number", "container_number", "Container"),
+        "service_flow": pick("TYPE", "Type", "Service Flow", "service_flow"),
+        "origin_port": pick("Port", "Origin", "Origin Port", "Pickup", "Pickup Terminal"),
+        "destination_warehouse": pick("Warehouse", "Destination", "Destination Warehouse"),
+        "delivery_address": pick("Address", "Delivery Address"),
+        "delivery_need_date": pick("Delivery Need Date", "delivery_need_date", "Need Date"),
+        "lfd": pick("LFD", "Last Free Day"),
+        "container_size": pick("Size", "Container Size"),
+        "reference_number": pick("Reference Number", "reference_number", "Reference"),
+        "container_qty": pick("Container Qty", "container_qty", "Container Quantity", "Number Of Containers"),
+        "commodity": pick("Commodity", "commodity", "Cargo Description"),
+        "empty_pickup_location": pick("Empty Pickup", "empty_pickup_location"),
+        "full_return_terminal": pick("Full Return Terminal", "full_return_terminal"),
+        "port_of_loading": pick("Port Of Loading", "port_of_loading"),
+        "port_of_discharge": pick("Port Of Discharge", "port_of_discharge"),
+        "opens_for_receiving": pick("Opens For Receiving", "opens_for_receiving"),
+        "vgm_cutoff": pick("VGM Cutoff", "vgm_cutoff"),
+        "cargo_cutoff": pick("Cargo Cutoff", "cargo_cutoff"),
+        "sailing_date": pick("Sailing Date", "sailing_date"),
+        "eta_date": pick("ETA Date", "eta_date"),
+        "rate_per_container": pick("Rate Per Container", "rate_per_container"),
+        "rate_total": pick("Rate Total", "rate_total"),
+    }
+
+    # Clean common service flow values.
+    service_flow = fields.get("service_flow", "")
+    if service_flow:
+        lowered = service_flow.lower()
+        if "import" in lowered:
+            fields["service_flow"] = "Import"
+        elif "export" in lowered:
+            fields["service_flow"] = "Export"
+    qty_text = ops._safe_str(fields.get("container_qty", "")).strip()
+    qty_match = re.search(r"\d+", qty_text)
+
+    if qty_match:
+        fields["container_qty"] = qty_match.group(0)
+    return {
+        key: value
+        for key, value in fields.items()
+        if ops._safe_str(value).strip()
+    }
 
 def _ops_pending_order_reply_updates(subject: str, body: str) -> dict:
     """
@@ -627,183 +881,6 @@ def _ops_merge_parsed_fields(base: dict, source: dict, *, force: bool = False) -
 
     return merged
 
-_WEAK_CONVERSATION_KEYS = {
-    "",
-    "-",
-    "none",
-    "null",
-    "nan",
-    "unknown",
-    "contact",
-    "customer-request",
-    "customer request",
-}
-
-
-def _ops_is_strong_business_key(value: str) -> bool:
-    value = ops._safe_str(value).strip()
-
-    if not value:
-        return False
-
-    lowered = value.lower()
-
-    if lowered in _WEAK_CONVERSATION_KEYS:
-        return False
-
-    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-")):
-        return False
-
-    # Strong business keys usually contain numbers:
-    # booking number, container number, reference number.
-    if not any(char.isdigit() for char in value):
-        return False
-
-    return len(value) >= 5
-
-
-def _ops_row_business_key(row) -> str:
-    """
-    Return the business key used to group inbox rows into one active work item.
-
-    Priority:
-    1. Booking
-    2. Container
-    3. Reference
-    4. Strong conversation_key
-    """
-
-    if row is None or not hasattr(row, "get"):
-        return ""
-
-    booking = ops._safe_str(row.get("booking_hint", ""))
-    container = ops._safe_str(row.get("container_hint", ""))
-    reference = ops._safe_str(row.get("reference_hint", ""))
-    conversation_key = ops._safe_str(row.get("conversation_key", ""))
-
-    subject = ops._safe_str(row.get("source_subject", ""))
-    preview = (
-        ops._safe_str(row.get("raw_text_preview", ""))
-        or ops._safe_str(row.get("raw_text", ""))
-    )
-
-    parsed = ops._coerce_json_dict(row.get("parsed_data"))
-
-    parsed_booking = ops._safe_str(parsed.get("Booking Number"))
-    parsed_container = ops._safe_str(parsed.get("Container Number"))
-    parsed_reference = ops._safe_str(parsed.get("Reference Number"))
-
-    tokens = ops._extract_reference_tokens(
-        f"{subject}\n{preview}\n{json.dumps(parsed, default=str)}"
-    )
-
-    candidates = [
-        booking,
-        parsed_booking,
-        ops._safe_str(tokens.get("booking_number")),
-        container,
-        parsed_container,
-        ops._safe_str(tokens.get("container_number")),
-        reference,
-        parsed_reference,
-        ops._safe_str(tokens.get("reference_number")),
-        conversation_key,
-    ]
-
-    for candidate in candidates:
-        candidate = ops._safe_str(candidate).strip()
-        if _ops_is_strong_business_key(candidate):
-            return candidate.upper()
-
-    return ""
-
-
-def _ops_filter_active_conversation_work_items(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Keep only active work items.
-
-    Rules:
-    - Closed items are hidden.
-    - Waiting-on-customer items are hidden until customer replies again.
-    - For the same booking/conversation, only the latest active row appears.
-    """
-
-    if df is None or df.empty:
-        return df
-
-    work_df = df.copy()
-
-    if "id" not in work_df.columns:
-        return work_df
-
-    work_df["_ops_business_key"] = work_df.apply(_ops_row_business_key, axis=1)
-
-    if "source_received_at" in work_df.columns:
-        work_df["_ops_received_sort"] = pd.to_datetime(
-            work_df["source_received_at"],
-            errors="coerce",
-        )
-    elif "received_at" in work_df.columns:
-        work_df["_ops_received_sort"] = pd.to_datetime(
-            work_df["received_at"],
-            errors="coerce",
-        )
-    else:
-        work_df["_ops_received_sort"] = pd.NaT
-
-    if "review_status_clean" in work_df.columns:
-        review_status = work_df["review_status_clean"].fillna("").astype(str)
-    else:
-        review_status = work_df.get("review_status", "").fillna("").astype(str)
-
-    if "email_direction" in work_df.columns:
-        direction = work_df["email_direction"].fillna("").astype(str).str.lower()
-    else:
-        direction = pd.Series(["inbound"] * len(work_df), index=work_df.index)
-
-    hidden_statuses = {
-        "closed",
-        "waiting customer",
-        "waiting on customer",
-        "reply sent",
-        "sent",
-        "archived",
-    }
-
-    hide_status = review_status.str.strip().str.lower().isin(hidden_statuses)
-
-    # Outbound replies should not be active work items.
-    hide_outbound = direction.eq("outbound")
-
-    work_df = work_df[~hide_status & ~hide_outbound].copy()
-
-    if work_df.empty:
-        return work_df.drop(
-            columns=["_ops_business_key", "_ops_received_sort"],
-            errors="ignore",
-        )
-
-    # Keep latest active row per business conversation.
-    with_key = work_df[work_df["_ops_business_key"].astype(str).str.strip().ne("")].copy()
-    without_key = work_df[work_df["_ops_business_key"].astype(str).str.strip().eq("")].copy()
-
-    if not with_key.empty:
-        with_key = with_key.sort_values(
-            by=["_ops_business_key", "_ops_received_sort", "id"],
-            ascending=[True, True, True],
-        )
-        with_key = with_key.groupby("_ops_business_key", as_index=False).tail(1)
-
-    result_df = pd.concat([with_key, without_key], ignore_index=True)
-    result_df = result_df.sort_values(
-        by=["_ops_received_sort", "id"],
-        ascending=[False, False],
-    )
-
-    return result_df.drop(
-        columns=["_ops_business_key", "_ops_received_sort"],
-        errors="ignore",
-    )    
 def _ops_order_evidence(parsed, tokens, subject: str, body: str, record=None) -> dict:
     parsed = parsed if isinstance(parsed, dict) else {}
     tokens = tokens if isinstance(tokens, dict) else {}
@@ -902,6 +979,17 @@ def _ops_final_dispatcher_decision(
     has_document = _ops_has_document_signal(record, parsed, subject, body)
     has_exception = _ops_has_exception_signal(record, subject, body)
 
+    booking_confirmation = ops._is_booking_confirmation(
+        subject,
+        body,
+        parsed,
+    )
+
+    actual_billing_request = ops._has_actual_billing_request(
+        subject,
+        body,
+        parsed,
+    )
     decision = {
         "work_type": request_type or detected_type or "Work Item",
         "queue": current_queue or "Needs Review",
@@ -950,7 +1038,46 @@ def _ops_final_dispatcher_decision(
 
         decision["action_buttons"].append("Close / No Action")
         return decision
+        # Authoritative booking confirmation must win before Documents or Billing.
+    if booking_confirmation and not actual_billing_request:
+        missing_fields = _ops_pending_order_missing_fields(
+            parsed,
+            tokens,
+            evidence,
+        )
 
+        draft_ready = not bool(missing_fields)
+
+        decision["work_type"] = "New Booking"
+        decision["queue"] = "New Orders"
+        decision["recommended_action"] = (
+            "Review Order Draft"
+            if draft_ready
+            else "Review Extracted Booking Details"
+        )
+        decision["allow_create_order"] = draft_ready
+        decision["allow_update_load"] = False
+        decision["allow_attach_document"] = bool(has_document)
+        decision["allow_open_case"] = bool(has_exception)
+        decision["llm_required"] = False
+        decision["llm_reason"] = ""
+        decision["reason"] = (
+            "A booking confirmation was detected. "
+            "Passive invoice, rate-sheet, and bill-of-lading language "
+            "does not make this a Billing request."
+        )
+
+        decision["action_buttons"] = ["Review Order Draft"]
+
+        if has_document:
+            decision["action_buttons"].append("Review Attachment")
+
+        if has_exception:
+            decision["action_buttons"].append("Open Case")
+
+        decision["action_buttons"].append("Close / No Action")
+
+        return decision
     # Existing load/update path should win only after a real load exists,
     # or when the message is clearly not part of a pending order.
     is_new_order = bool(evidence.get("new_order_signal") and not evidence.get("update_signal"))
@@ -998,7 +1125,16 @@ def _ops_final_dispatcher_decision(
         decision["reason"] = "This appears to be a quote request."
         return decision
 
-    if has_document and ("document" in text or "pod" in text or "bol" in text or "invoice" in text):
+    if (
+        has_document
+        and not booking_confirmation
+        and (
+        "document" in text
+        or "pod" in text
+        or "bol" in text
+        or "invoice" in text
+        )
+        ):
         decision["work_type"] = "Document"
         decision["queue"] = "Documents"
         decision["recommended_action"] = "Attach Document"
@@ -1008,7 +1144,7 @@ def _ops_final_dispatcher_decision(
         decision["reason"] = "Document or attachment signal found."
         return decision
 
-    if "billing" in text or "invoice" in text:
+    if actual_billing_request:
         decision["work_type"] = "Billing"
         decision["queue"] = "Billing"
         decision["recommended_action"] = "Send to Billing"
@@ -1324,17 +1460,28 @@ DISPATCHER_QUEUE_ORDER = [
     "Documents",
     "Billing",
     "Needs Review",
-    "Store Only / Archive",
-]
+    "Store Only / Archive",]
 def _dispatcher_queue_for_row(row) -> str:
-    request_type = _safe_str(row.get("request_type_clean", "") if hasattr(row, "get") else "")
-    work_queue = _safe_str(row.get("work_queue", "") if hasattr(row, "get") else "")
-    control_level = _safe_str(row.get("control_level", "") if hasattr(row, "get") else "")
-    department_lane = _safe_str(row.get("department_lane", "") if hasattr(row, "get") else "")
-    matched_load_id = _safe_str(row.get("matched_load_id", "") if hasattr(row, "get") else "")
+    if row is None or not hasattr(row, "get"):
+        return "Needs Review"
 
-    subject = _safe_str(row.get("source_subject", "") if hasattr(row, "get") else "")
-    preview = _safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else "")
+    request_type = _safe_str(
+        row.get("request_type_clean")
+        or row.get("request_type")
+    )
+
+    work_queue = _safe_str(row.get("work_queue", ""))
+    control_level = _safe_str(row.get("control_level", ""))
+    department_lane = _safe_str(row.get("department_lane", ""))
+    matched_load_id = _safe_str(row.get("matched_load_id", ""))
+
+    subject = _safe_str(row.get("source_subject", ""))
+    preview = (
+        _safe_str(row.get("raw_text_preview", ""))
+        or _safe_str(row.get("raw_text", ""))
+    )
+
+    parsed = ops._coerce_json_dict(row.get("parsed_data"))
 
     text = " ".join(
         [
@@ -1346,52 +1493,115 @@ def _dispatcher_queue_for_row(row) -> str:
         ]
     ).lower()
 
-    is_update = _ops_has_reply_or_update_signal(subject, preview, row)
-    is_new_order = _ops_has_true_new_order_signal(subject, preview, row)
+    is_update = _ops_has_reply_or_update_signal(
+        subject,
+        preview,
+        row,
+    )
 
+    is_new_order = _ops_has_true_new_order_signal(
+        subject,
+        preview,
+        row,
+    )
+
+    booking_confirmation = ops._is_booking_confirmation(
+        subject,
+        preview,
+        parsed,
+    )
+
+    actual_billing_request = ops._has_actual_billing_request(
+        subject,
+        preview,
+    )
+
+    # Terminal/no-action routing remains authoritative.
     if (
         control_level == "Level 3 - No Action / Archive"
         or request_type in {"No Action / FYI", "Spam/Marketing"}
-        or work_queue in {"Archive", "Archive / FYI", "Store Only / Archive"}
+        or work_queue in {
+            "Archive",
+            "Archive / FYI",
+            "Store Only / Archive",
+        }
     ):
         return "Store Only / Archive"
 
-    if request_type == "Quote Request" or work_queue in {"Quote Request", "Quote Requests", "Quotes"}:
+    if request_type == "Quote Request" or work_queue in {
+        "Quote Request",
+        "Quote Requests",
+        "Quotes",
+    }:
         return "Quotes"
 
-    if request_type == "Appointment Update" or "appointment" in text or "pin" in text:
-        return "Appointments / PIN"
+    # A clear booking confirmation wins before Billing and Documents.
+    if booking_confirmation and not actual_billing_request:
+        return "New Orders"
 
-    if request_type == "Billing" or work_queue == "Billing" or department_lane == "Accounting":
-        return "Billing"
-
-    if request_type == "POD Request" or work_queue == "Documents" or ops._operations_document_signal_for_row(row):
-        return "Documents"
-    if request_type in {"New Booking", "Pending Order Reply", "Pending Order Draft", "Pending Order Ready"}:
+    if request_type in {
+        "New Booking",
+        "Pending Order Reply",
+        "Pending Order Draft",
+        "Pending Order Ready",
+    }:
         return "New Orders"
 
     if is_new_order and not is_update:
         return "New Orders"
 
-    # Reply to a new booking thread should remain in New Orders if no load has been matched yet.
     if (
-        not matched_load_id
-        and subject.lower().startswith(("re:", "fw:", "fwd:"))
-        and "new booking" in subject.lower()
+        request_type == "Appointment Update"
+        or "appointment" in text
+        or " pin " in f" {text} "
     ):
-        return "New Orders"
+        return "Appointments / PIN"
+
+    # Billing requires an actionable billing request.
+    if actual_billing_request:
+        return "Billing"
+
+    if (
+        request_type == "Billing"
+        or work_queue == "Billing"
+        or department_lane == "Accounting"
+    ):
+        # Do not trust stale Billing values when the message is a booking.
+        if not booking_confirmation:
+            return "Billing"
+
+    if (
+        request_type == "POD Request"
+        or work_queue == "Documents"
+        or ops._operations_document_signal_for_row(row)
+    ):
+        if not booking_confirmation:
+            return "Documents"
+
     if (
         matched_load_id
-        or work_queue in {"Existing Loads", "Existing Load Updates", "Waiting"}
-        or request_type in {"Booking Update", "Cancellation", "Driver Issue", "Port Issue"}
+        or work_queue in {
+            "Existing Loads",
+            "Existing Load Updates",
+            "Waiting",
+        }
+        or request_type in {
+            "Booking Update",
+            "Cancellation",
+            "Driver Issue",
+            "Port Issue",
+        }
         or is_update
     ):
         return "Existing Load Updates"
 
-    if request_type in {"Needs Classification", "Other", ""} or work_queue in {"Review", "Action Required"}:
-        return "Needs Review"
-
-    if request_type in {"Customer Request", "Missing Information"}:
+    if request_type in {
+        "Needs Classification",
+        "Other",
+        "",
+        "Customer Request",
+        "Missing Information",
+    }:
         return "Needs Review"
 
     return "Needs Review"
@@ -1448,7 +1658,122 @@ def _ops_business_conversation_key(
 
     return ops._safe_str(fallback_key).strip()
 
+def _ops_active_row_business_key(row) -> str:
+    if row is None or not hasattr(row, "get"):
+        return ""
 
+    parsed = ops._coerce_json_dict(row.get("parsed_data"))
+
+    subject = ops._safe_str(row.get("source_subject", ""))
+    body_preview = (
+        ops._safe_str(row.get("raw_text_preview", ""))
+        or ops._safe_str(row.get("raw_text", ""))
+    )
+
+    tokens = ops._extract_reference_tokens(
+        f"{subject}\n{body_preview}\n{json.dumps(parsed, default=str)}"
+    )
+
+    candidates = [
+        row.get("booking_hint", ""),
+        parsed.get("Booking Number", ""),
+        tokens.get("booking_number", ""),
+        row.get("container_hint", ""),
+        parsed.get("Container Number", ""),
+        tokens.get("container_number", ""),
+        row.get("reference_hint", ""),
+        parsed.get("Reference Number", ""),
+        tokens.get("reference_number", ""),
+        row.get("conversation_key", ""),
+    ]
+
+    for candidate in candidates:
+        clean = ops._safe_str(candidate).strip()
+        if clean and not _ops_is_weak_conversation_key(clean):
+            return clean.upper()
+
+    return ""
+
+
+def _ops_filter_active_conversation_work_items(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hide stale/outbound/replied rows from active work queues.
+
+    Keeps only the latest active row for each booking/container/reference.
+    """
+
+    if df is None or df.empty:
+        return df
+
+    work_df = df.copy()
+
+    if "id" not in work_df.columns:
+        return work_df
+
+    work_df["_ops_business_key"] = work_df.apply(_ops_active_row_business_key, axis=1)
+
+    if "source_received_at" in work_df.columns:
+        work_df["_ops_received_sort"] = pd.to_datetime(
+            work_df["source_received_at"],
+            errors="coerce",
+        )
+    else:
+        work_df["_ops_received_sort"] = pd.NaT
+
+    review_status = (
+        work_df.get("review_status_clean", work_df.get("review_status", ""))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    latest_direction = (
+        work_df.get("latest_direction", work_df.get("email_direction", "inbound"))
+        .fillna("inbound")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    hidden_statuses = {
+        "closed",
+        "waiting customer",
+        "waiting on customer",
+        "reply sent",
+        "sent",
+        "archived",
+    }
+
+    hide_row = review_status.isin(hidden_statuses) | latest_direction.eq("outbound")
+    work_df = work_df[~hide_row].copy()
+
+    if work_df.empty:
+        return work_df.drop(
+            columns=["_ops_business_key", "_ops_received_sort"],
+            errors="ignore",
+        )
+
+    with_key = work_df[work_df["_ops_business_key"].astype(str).str.strip().ne("")].copy()
+    without_key = work_df[work_df["_ops_business_key"].astype(str).str.strip().eq("")].copy()
+
+    if not with_key.empty:
+        with_key = with_key.sort_values(
+            by=["_ops_business_key", "_ops_received_sort", "id"],
+            ascending=[True, True, True],
+        )
+        with_key = with_key.groupby("_ops_business_key", as_index=False).tail(1)
+
+    result_df = pd.concat([with_key, without_key], ignore_index=True)
+    result_df = result_df.sort_values(
+        by=["_ops_received_sort", "id"],
+        ascending=[False, False],
+    )
+
+    return result_df.drop(
+        columns=["_ops_business_key", "_ops_received_sort"],
+        errors="ignore",
+    )
 def _bulk_archive_obvious_non_dispatch_emails(*, dry_run: bool = True, limit: int = 100) -> dict:
     """
     Classify obvious non-dispatch emails as Spam/Marketing or No Action / FYI.
@@ -1828,7 +2153,23 @@ def _ops_upsert_pending_order_draft(
         "latest_direction": direction,
         "latest_subject": subject,
         "latest_sender": sender,
-    }
+        "container_qty": int(parsed.get("Container Qty") or 1) if ops._safe_str(parsed.get("Container Qty", "")).isdigit() else 1,
+        "load_group_key": f"{booking_number or reference_number or clean_conversation_key}",
+        "commodity": ops._safe_str(parsed.get("Commodity")),
+        "empty_pickup_location": ops._safe_str(parsed.get("Empty Pickup")),
+        "full_return_terminal": ops._safe_str(parsed.get("Full Return Terminal")),
+        "port_of_loading": ops._safe_str(parsed.get("Port Of Loading")),
+        "port_of_discharge": ops._safe_str(parsed.get("Port Of Discharge")),
+        "place_of_delivery": ops._safe_str(parsed.get("Place Of Delivery")),
+        "exporting_carrier": ops._safe_str(parsed.get("Exporting Carrier")),
+        "opens_for_receiving": ops._safe_str(parsed.get("Opens For Receiving")),
+        "vgm_cutoff": ops._safe_str(parsed.get("VGM Cutoff")),
+        "cargo_cutoff": ops._safe_str(parsed.get("Cargo Cutoff")),
+        "sailing_date": ops._safe_str(parsed.get("Sailing Date")),
+        "eta_date": ops._safe_str(parsed.get("ETA Date")),
+        "rate_per_container": ops._safe_str(parsed.get("Rate Per Container")),
+        "rate_total": ops._safe_str(parsed.get("Rate Total")),
+            }
 
     try:
         ops._execute(
@@ -1960,76 +2301,7 @@ def _ops_upsert_pending_order_draft(
             "request_stage": request_stage,
             "conversation_key": clean_conversation_key,
             }
-    show_pending_order_draft = (
-        matched_load_id is None
-        and selected_conversation_key
-        and (
-            final_decision.get("queue") == "New Orders"
-            or final_decision.get("work_type") in {"New Booking", "Pending Order Reply", "Pending Order Draft"}
-            or "new booking" in ops._safe_str(subject).lower()
-        )
-    )
 
-    if show_pending_order_draft:
-        draft_df = ops.read_df(
-            """
-            select
-                conversation_key,
-                draft_status,
-                request_stage,
-                customer,
-                booking_number,
-                container_number,
-                service_flow,
-                origin_port,
-                destination_warehouse,
-                delivery_address,
-                delivery_need_date,
-                lfd,
-                container_size,
-                missing_fields,
-                created_load_id,
-                updated_at
-            from public.order_intake_drafts
-            where conversation_key = :conversation_key
-            or booking_number = :conversation_key
-            or container_number = :conversation_key
-            order by updated_at desc
-            limit 1
-            """,
-            {"conversation_key": selected_conversation_key},
-        )
-
-        with st.expander("Active Pending Order Draft", expanded=True):
-            if draft_df is None or draft_df.empty:
-                st.info("No pending order draft has been created yet for this conversation.")
-            else:
-                draft = draft_df.iloc[0].to_dict()
-
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Draft Status", ops._safe_str(draft.get("draft_status", "-")))
-                d2.metric("Stage", ops._safe_str(draft.get("request_stage", "-")))
-                d3.metric("Booking", ops._safe_str(draft.get("booking_number", "-")))
-                d4.metric("Container", ops._safe_str(draft.get("container_number", "-")))
-
-                d5, d6, d7 = st.columns(3)
-                d5.metric("Customer", ops._safe_str(draft.get("customer", "-")))
-                d6.metric("Service Flow", ops._safe_str(draft.get("service_flow", "-")))
-                d7.metric("Size", ops._safe_str(draft.get("container_size", "-")))
-
-                st.write("**Route / Delivery Details**")
-                st.write(
-                    f"Origin: {ops._safe_str(draft.get('origin_port', '-'))} | "
-                    f"Destination: {ops._safe_str(draft.get('destination_warehouse', '-'))} | "
-                    f"Address: {ops._safe_str(draft.get('delivery_address', '-'))} | "
-                    f"Need Date: {ops._safe_str(draft.get('delivery_need_date', '-'))}"
-                )
-
-                missing_fields = draft.get("missing_fields") or []
-                if missing_fields:
-                    st.warning(f"Missing fields: {missing_fields}")
-                elif not draft.get("created_load_id"):
-                    st.success("Draft appears ready for dispatcher review before creating the order.")        
 def _render_new_order_review_panel(
     *,
     selected_id: int,
@@ -2196,6 +2468,512 @@ def _render_new_order_review_panel(
                 st.success(f"Created order/load ID {load_id}.")
                 st.rerun()   
 
+
+def _render_active_pending_order_draft_panel(
+    *,
+    selected_id: int,
+    selected_conversation_key: str,
+    matched_load_id,
+    final_decision: dict,
+    subject: str,
+    sender: str,
+) -> None:
+    """
+    Show and maintain the pending order draft before actual container work
+    orders are created.
+    """
+
+    def _safe_int(value, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    show_pending_order_draft = (
+        matched_load_id is None
+        and bool(selected_conversation_key)
+        and (
+            final_decision.get("queue") == "New Orders"
+            or final_decision.get("work_type") in {
+                "New Booking",
+                "Possible New Booking",
+                "Pending Order Reply",
+                "Pending Order Draft",
+            }
+            or "new booking" in ops._safe_str(subject).lower()
+        )
+    )
+
+    if not show_pending_order_draft:
+        return
+
+    try:
+        draft_df = ops.read_df(
+            """
+            select
+                conversation_key,
+                draft_status,
+                request_stage,
+                customer,
+                booking_number,
+                reference_number,
+                container_number,
+                container_qty,
+                containers_created,
+                load_group_key,
+                service_flow,
+                origin_port,
+                destination_warehouse,
+                delivery_address,
+                delivery_need_date,
+                lfd,
+                container_size,
+                commodity,
+                empty_pickup_location,
+                full_return_terminal,
+                port_of_loading,
+                port_of_discharge,
+                place_of_delivery,
+                exporting_carrier,
+                vessel_name,
+                steamship_line,
+                opens_for_receiving,
+                document_cutoff,
+                vgm_cutoff,
+                cargo_cutoff,
+                sailing_date,
+                eta_date,
+                rate_per_container,
+                rate_total,
+                dispatcher_notes,
+                missing_fields,
+                created_load_id,
+                updated_at
+            from public.order_intake_drafts
+            where (
+                    conversation_key = :conversation_key
+                 or booking_number = :conversation_key
+                 or container_number = :conversation_key
+            )
+            order by updated_at desc
+            limit 1
+            """,
+            {"conversation_key": selected_conversation_key},
+        )
+    except Exception as exc:
+        with st.expander("Active Pending Order Draft", expanded=False):
+            st.warning(f"Could not load pending order draft: {exc}")
+        return
+
+    with st.expander("Active Pending Order Draft", expanded=True):
+        if draft_df is None or draft_df.empty:
+            st.info("No pending order draft has been created yet for this conversation.")
+            return
+
+        draft = draft_df.iloc[0].to_dict()
+        draft_conversation_key = (
+            ops._safe_str(draft.get("conversation_key", ""))
+            or ops._safe_str(selected_conversation_key)
+        )
+
+        container_qty = max(_safe_int(draft.get("container_qty"), 1), 1)
+        containers_created = max(_safe_int(draft.get("containers_created"), 0), 0)
+        remaining_to_create = max(container_qty - containers_created, 0)
+
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Draft Status", ops._safe_str(draft.get("draft_status", "-")) or "-")
+        d2.metric("Stage", ops._safe_str(draft.get("request_stage", "-")) or "-")
+        d3.metric("Booking", ops._safe_str(draft.get("booking_number", "-")) or "-")
+        d4.metric("Reference", ops._safe_str(draft.get("reference_number", "-")) or "-")
+
+        d5, d6, d7, d8 = st.columns(4)
+        d5.metric("Customer", ops._safe_str(draft.get("customer", "-")) or "-")
+        d6.metric("Service Flow", ops._safe_str(draft.get("service_flow", "-")) or "-")
+        d7.metric("Container Size", ops._safe_str(draft.get("container_size", "-")) or "-")
+        d8.metric("Known Container", ops._safe_str(draft.get("container_number", "-")) or "-")
+
+        d9, d10, d11 = st.columns(3)
+        d9.metric("Containers Required", container_qty)
+        d10.metric("Containers Created", containers_created)
+        d11.metric("Remaining", remaining_to_create)
+
+        st.write("**Route / Delivery Details**")
+        st.write(
+            f"Origin: {ops._safe_str(draft.get('origin_port', '-')) or '-'} | "
+            f"Destination: {ops._safe_str(draft.get('destination_warehouse', '-')) or '-'} | "
+            f"Address: {ops._safe_str(draft.get('delivery_address', '-')) or '-'} | "
+            f"Need Date: {ops._safe_str(draft.get('delivery_need_date', '-')) or '-'}"
+        )
+
+        st.markdown("#### Export / Booking Details")
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Commodity", ops._safe_str(draft.get("commodity", "-")) or "-")
+        b2.metric("Empty Pickup", ops._safe_str(draft.get("empty_pickup_location", "-")) or "-")
+        b3.metric("Full Return", ops._safe_str(draft.get("full_return_terminal", "-")) or "-")
+
+        b4, b5, b6 = st.columns(3)
+        b4.metric("Document Cutoff", ops._safe_str(draft.get("document_cutoff", "-")) or "-")
+        b5.metric("VGM Cutoff", ops._safe_str(draft.get("vgm_cutoff", "-")) or "-")
+        b6.metric("Cargo Cutoff", ops._safe_str(draft.get("cargo_cutoff", "-")) or "-")
+
+        b7, b8, b9 = st.columns(3)
+        b7.metric("Sailing", ops._safe_str(draft.get("sailing_date", "-")) or "-")
+        b8.metric("ETA", ops._safe_str(draft.get("eta_date", "-")) or "-")
+        b9.metric("Carrier", ops._safe_str(draft.get("steamship_line", "-")) or "-")
+
+        missing_fields = draft.get("missing_fields") or []
+        if isinstance(missing_fields, str):
+            try:
+                missing_fields = json.loads(missing_fields)
+            except Exception:
+                missing_fields = [missing_fields] if missing_fields else []
+
+        if missing_fields:
+            st.warning("Missing fields: " + ", ".join(map(str, missing_fields)))
+        elif not draft.get("created_load_id"):
+            st.success("Draft appears ready for dispatcher review before creating work orders.")
+
+        st.markdown("#### Latest Agreed Order Info")
+
+        service_flow_options = ["", "Import", "Export", "Local Import", "Local Export"]
+        current_service_flow = ops._safe_str(draft.get("service_flow", ""))
+        service_flow_index = (
+            service_flow_options.index(current_service_flow)
+            if current_service_flow in service_flow_options
+            else 0
+        )
+
+        with st.form(
+            key=f"pending_order_latest_agreed_form_{selected_id}_{draft_conversation_key}",
+            clear_on_submit=False,
+        ):
+            edit_col1, edit_col2 = st.columns(2)
+
+            with edit_col1:
+                edit_customer = st.text_input(
+                    "Customer",
+                    value=ops._safe_str(draft.get("customer", "")),
+                )
+                edit_booking = st.text_input(
+                    "Booking Number",
+                    value=ops._safe_str(draft.get("booking_number", "")),
+                )
+                edit_reference = st.text_input(
+                    "Reference Number",
+                    value=ops._safe_str(draft.get("reference_number", "")),
+                )
+                edit_container = st.text_input(
+                    "Known Container Number (optional)",
+                    value=ops._safe_str(draft.get("container_number", "")),
+                )
+                edit_qty = st.number_input(
+                    "Containers Required",
+                    min_value=1,
+                    max_value=100,
+                    value=container_qty,
+                    step=1,
+                )
+                edit_size = st.text_input(
+                    "Container Size",
+                    value=ops._safe_str(draft.get("container_size", "")),
+                )
+
+            with edit_col2:
+                edit_service_flow = st.selectbox(
+                    "Service Flow",
+                    service_flow_options,
+                    index=service_flow_index,
+                )
+                edit_origin = st.text_input(
+                    "Origin / Port",
+                    value=ops._safe_str(draft.get("origin_port", "")),
+                )
+                edit_destination = st.text_input(
+                    "Destination / Warehouse",
+                    value=ops._safe_str(draft.get("destination_warehouse", "")),
+                )
+                edit_need_date = st.text_input(
+                    "Delivery Need Date",
+                    value=ops._safe_str(draft.get("delivery_need_date", "")),
+                    placeholder="YYYY-MM-DD",
+                )
+                edit_empty_pickup = st.text_input(
+                    "Empty Pickup Location",
+                    value=ops._safe_str(draft.get("empty_pickup_location", "")),
+                )
+                edit_full_return = st.text_input(
+                    "Full Return Terminal",
+                    value=ops._safe_str(draft.get("full_return_terminal", "")),
+                )
+
+            edit_address = st.text_area(
+                "Delivery Address",
+                value=ops._safe_str(draft.get("delivery_address", "")),
+                height=80,
+            )
+            edit_commodity = st.text_input(
+                "Commodity",
+                value=ops._safe_str(draft.get("commodity", "")),
+            )
+            edit_notes = st.text_area(
+                "Dispatcher Notes / Final Agreement Notes",
+                value=ops._safe_str(draft.get("dispatcher_notes", "")),
+                height=80,
+            )
+
+            save_latest_agreed = st.form_submit_button(
+                "Save Latest Agreed Draft Details",
+                use_container_width=True,
+            )
+
+        if save_latest_agreed:
+            saved = ops._update_pending_order_draft_fields(
+                conversation_key=draft_conversation_key,
+                fields={
+                    "customer": edit_customer,
+                    "booking_number": edit_booking,
+                    "reference_number": edit_reference,
+                    "container_number": edit_container,
+                    "container_qty": int(edit_qty),
+                    "container_size": edit_size,
+                    "service_flow": edit_service_flow,
+                    "origin_port": edit_origin,
+                    "destination_warehouse": edit_destination,
+                    "delivery_address": edit_address,
+                    "delivery_need_date": edit_need_date,
+                    "empty_pickup_location": edit_empty_pickup,
+                    "full_return_terminal": edit_full_return,
+                    "commodity": edit_commodity,
+                    "dispatcher_notes": edit_notes,
+                },
+                last_intake_id=int(selected_id),
+                latest_subject=subject,
+                latest_sender=sender,
+                request_stage="Dispatcher Confirmed Draft",
+            )
+
+            if saved:
+                st.success("Latest agreed order draft details were saved.")
+                refresh_data()
+                st.rerun()
+            else:
+                st.warning("Draft was not saved. Confirm the pending draft exists and try again.")
+
+        st.markdown("#### Container Work Orders")
+
+        # Recalculate from the values loaded for this render. After saving, the
+        # page reruns and reloads the newest values.
+        container_qty = max(_safe_int(draft.get("container_qty"), 1), 1)
+        containers_created = max(_safe_int(draft.get("containers_created"), 0), 0)
+        remaining_to_create = max(container_qty - containers_created, 0)
+
+        if container_qty > 1:
+            st.info(
+                f"This booking requires {container_qty} container moves. "
+                f"{containers_created} have been created; {remaining_to_create} remain."
+            )
+
+        required_for_creation = {
+            "Customer": ops._safe_str(draft.get("customer", "")),
+            "Booking Number": ops._safe_str(draft.get("booking_number", "")),
+            "Service Flow": ops._safe_str(draft.get("service_flow", "")),
+            "Container Size": ops._safe_str(draft.get("container_size", "")),
+        }
+        creation_missing = [
+            label for label, value in required_for_creation.items() if not value
+        ]
+
+        if creation_missing:
+            st.warning(
+                "Complete these fields before creating work orders: "
+                + ", ".join(creation_missing)
+            )
+
+        create_child_loads_disabled = (
+            remaining_to_create <= 0
+            or bool(creation_missing)
+        )
+
+        if st.button(
+            f"Create {remaining_to_create} Container Work Order(s)",
+            key=f"create_child_container_work_orders_{selected_id}_{draft_conversation_key}",
+            use_container_width=True,
+            disabled=create_child_loads_disabled,
+        ):
+            created_load_ids = []
+            creation_errors = []
+
+            for sequence in range(containers_created + 1, container_qty + 1):
+                try:
+                    existing_df = ops.read_df(
+                        """
+                        select id
+                        from public.loads
+                        where parent_booking_key = :parent_booking_key
+                          and container_sequence = :container_sequence
+                        limit 1
+                        """,
+                        {
+                            "parent_booking_key": draft_conversation_key,
+                            "container_sequence": sequence,
+                        },
+                    )
+                except Exception:
+                    existing_df = None
+
+                if existing_df is not None and not existing_df.empty:
+                    continue
+
+                child_notes = (
+                    f"Created from multi-container booking draft {draft_conversation_key}. "
+                    f"Container {sequence} of {container_qty}."
+                )
+
+                try:
+                    result = create_load_from_inbox_item(
+                        int(selected_id),
+                        {
+                            "TYPE": ops._safe_str(draft.get("service_flow", "")) or "Export",
+                            "Booking Number": ops._safe_str(draft.get("booking_number", "")),
+                            "Reference Number": ops._safe_str(draft.get("reference_number", "")),
+                            "Customer": ops._safe_str(draft.get("customer", "")),
+                            "Container Number": "",
+                            "Port": (
+                                ops._safe_str(draft.get("full_return_terminal", ""))
+                                or ops._safe_str(draft.get("port_of_loading", ""))
+                            ),
+                            "Warehouse": (
+                                ops._safe_str(draft.get("destination_warehouse", ""))
+                                or ops._safe_str(draft.get("empty_pickup_location", ""))
+                            ),
+                            "Address": ops._safe_str(draft.get("delivery_address", "")),
+                            "Document Cutoff": ops._safe_str(draft.get("document_cutoff", "")),
+                            "Delivery Need Date": ops._safe_str(draft.get("delivery_need_date", "")),
+                            "LFD": ops._safe_str(draft.get("lfd", "")),
+                            "Size": ops._safe_str(draft.get("container_size", "")),
+                            "Status": "New",
+                            "Dispatcher Notes": child_notes,
+                            "Commodity": ops._safe_str(draft.get("commodity", "")),
+                        },
+                        conversation_key=draft_conversation_key,
+                        request_type="New Booking",
+                        subject=subject,
+                        sender=sender,
+                        body=(
+                            f"Multi-container booking placeholder. "
+                            f"Container {sequence} of {container_qty}."
+                        ),
+                        case_id=None,
+                        case_priority="Normal",
+                    )
+
+                    result = result if isinstance(result, dict) else {}
+                    load_id = result.get("load_id")
+
+                    if not load_id:
+                        creation_errors.append(
+                            f"Container {sequence}: no load ID was returned."
+                        )
+                        continue
+
+                    load_id = int(load_id)
+                    created_load_ids.append(load_id)
+
+                    ops._execute(
+                        """
+                        update public.loads
+                        set parent_booking_key = :parent_booking_key,
+                            container_sequence = :container_sequence,
+                            container_total = :container_total,
+                            is_placeholder_container = true,
+                            commodity = :commodity,
+                            empty_pickup_location = :empty_pickup_location,
+                            full_return_terminal = :full_return_terminal,
+                            port_of_loading = :port_of_loading,
+                            port_of_discharge = :port_of_discharge,
+                            vessel_name = :vessel_name,
+                            steamship_line = :steamship_line
+                        where id = :load_id
+                        """,
+                        {
+                            "load_id": load_id,
+                            "parent_booking_key": draft_conversation_key,
+                            "container_sequence": sequence,
+                            "container_total": container_qty,
+                            "commodity": ops._safe_str(draft.get("commodity", "")),
+                            "empty_pickup_location": ops._safe_str(
+                                draft.get("empty_pickup_location", "")
+                            ),
+                            "full_return_terminal": ops._safe_str(
+                                draft.get("full_return_terminal", "")
+                            ),
+                            "port_of_loading": ops._safe_str(
+                                draft.get("port_of_loading", "")
+                            ),
+                            "port_of_discharge": ops._safe_str(
+                                draft.get("port_of_discharge", "")
+                            ),
+                            "vessel_name": ops._safe_str(draft.get("vessel_name", "")),
+                            "steamship_line": ops._safe_str(
+                                draft.get("steamship_line", "")
+                            ),
+                        },
+                    )
+                except Exception as exc:
+                    creation_errors.append(f"Container {sequence}: {exc}")
+
+            try:
+                count_df = ops.read_df(
+                    """
+                    select count(*)::int as created_count
+                    from public.loads
+                    where parent_booking_key = :parent_booking_key
+                    """,
+                    {"parent_booking_key": draft_conversation_key},
+                )
+                actual_created_count = (
+                    _safe_int(count_df.iloc[0].get("created_count"), 0)
+                    if count_df is not None and not count_df.empty
+                    else containers_created + len(created_load_ids)
+                )
+
+                ops._execute(
+                    """
+                    update public.order_intake_drafts
+                    set containers_created = :created_count,
+                        draft_status = case
+                            when :created_count >= coalesce(container_qty, 1)
+                            then 'Container Work Orders Created'
+                            else 'Container Work Orders Partially Created'
+                        end,
+                        request_stage = case
+                            when :created_count >= coalesce(container_qty, 1)
+                            then 'Container Work Orders Created'
+                            else 'Container Work Orders Partially Created'
+                        end,
+                        updated_at = now()
+                    where conversation_key = :conversation_key
+                    """,
+                    {
+                        "conversation_key": draft_conversation_key,
+                        "created_count": actual_created_count,
+                    },
+                )
+            except Exception as exc:
+                creation_errors.append(f"Could not update draft count: {exc}")
+
+            if created_load_ids:
+                st.success(
+                    "Created container work orders: "
+                    + ", ".join(map(str, created_load_ids))
+                )
+
+            if creation_errors:
+                st.warning("Some work orders were not created:\n- " + "\n- ".join(creation_errors))
+
+            refresh_data()
+            st.rerun()
 def _ops_extract_ai_reply_draft(ai_suggestion: dict) -> str:
     """
     Pull the reply draft text from an AI suggestion response using several possible keys.
@@ -2265,14 +3043,43 @@ def render_operations_inbox() -> None:
     c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.2, 1.0, 1.4])
 
     with c1:
-        if st.button("Sync Email Engine", key="operations_sync_email_engine", use_container_width=True):
+        sync_running = bool(st.session_state.get("operations_email_sync_running", False))
+
+        if st.button(
+            "Sync Email Engine",
+            key="operations_sync_email_engine",
+            use_container_width=True,
+            disabled=sync_running,
+        ):
+            sync_completed = False
+            st.session_state["operations_email_sync_running"] = True
+
             try:
-                sync_limit = int(st.session_state.get("operations_email_sync_limit", 75))
-                st.session_state["operations_email_import_result"] = ops.sync_operations_email_engine(limit=sync_limit)
+                with st.spinner("Checking the most recent operations emails..."):
+                    sync_result = ops.sync_operations_email_engine(
+                        limit=8,
+                        time_budget_seconds=25,
+                    )
+
+                st.session_state["operations_email_import_result"] = sync_result
+                sync_completed = True
+
+            except Exception as exc:
+                st.session_state["operations_email_import_result"] = {
+                    "error": str(exc),
+                    "fetched": 0,
+                    "imported": 0,
+                    "skipped": 0,
+                    "errors": 1,
+                }
+                st.error(f"Could not synchronize email: {exc}")
+
+            finally:
+                st.session_state["operations_email_sync_running"] = False
+
+            if sync_completed:
                 ops.refresh_data()
                 st.rerun()
-            except Exception as exc:
-                st.error(f"Could not synchronize email: {exc}")
 
     with c2:
         if st.button("Refresh Inbox", key="operations_refresh_inbox", use_container_width=True):
@@ -2782,6 +3589,7 @@ def render_operations_inbox() -> None:
         queue: f"{queue} ({int(filtered_df['dispatcher_queue'].eq(queue).sum())})"
         for queue in DISPATCHER_QUEUE_ORDER
     }
+        
     queue_label_to_value = {label: queue for queue, label in queue_titles.items()}
     selected_queue_label = st.radio(
         "Operations Queue",
@@ -2894,16 +3702,22 @@ def render_operations_inbox() -> None:
         hybrid_fields = {}
 
     structured_fields = _ops_parse_structured_email_fields(subject, body)
+    
+    fcl_booking_fields = _ops_parse_fcl_booking_confirmation_fields(subject, body)
 
     parsed_before = dict(parsed or {})
+
+    # Hybrid parser fills blanks.
+    # Explicit key/value fields and FCL booking fields override weak parser results.
+    parsed = _ops_merge_parsed_fields(parsed, hybrid_fields, force=False)
+    parsed = _ops_merge_parsed_fields(parsed, structured_fields, force=True)
+    parsed = _ops_merge_parsed_fields(parsed, fcl_booking_fields, force=True)
+
     pending_reply_update = _ops_pending_order_reply_updates(subject, body)
     pending_reply_updated_fields = pending_reply_update.get("updated_fields") or {}
 
     if pending_reply_updated_fields:
         parsed = _ops_merge_parsed_fields(parsed, pending_reply_updated_fields, force=True)
-        # Hybrid parser fills blanks. Explicit key/value email fields override weak parser results.
-        parsed = _ops_merge_parsed_fields(parsed, hybrid_fields, force=False)
-        parsed = _ops_merge_parsed_fields(parsed, structured_fields, force=True)
 
     # Clear bad parser artifacts from earlier parsing.
     bad_values = {"", "-", "none", "nan", "null", "service flow:"}
@@ -2947,10 +3761,19 @@ def render_operations_inbox() -> None:
     tokens = classification.get("tokens") or ops._extract_reference_tokens(
         f"{subject}\n{body}\n{json.dumps(parsed, default=str)}"
     )
-
     matched_load_id = classification.get("matched_load_id")
     confidence = int(classification.get("confidence_score") or record.get("confidence_score") or 0)
-    conversation_key = classification.get("conversation_key") or f"intake-{selected_id}"
+
+    # ------------------------------------------------------------
+    # Resolve conversation keys once, early.
+    # Do not remove selected_conversation_key. The page needs it for
+    # metadata, history, pending draft, replies, and load communications.
+    # ------------------------------------------------------------
+    conversation_key = (
+        ops._safe_str(classification.get("conversation_key", ""))
+        or ops._safe_str(record.get("conversation_key", ""))
+        or f"intake-{selected_id}"
+    )
 
     business_conversation_key = _ops_business_conversation_key(
         record=record,
@@ -2959,10 +3782,19 @@ def render_operations_inbox() -> None:
         fallback_key=conversation_key,
     )
 
-    if business_conversation_key:
-        conversation_key = business_conversation_key
-        classification["conversation_key"] = business_conversation_key
+    selected_conversation_key = (
+        ops._safe_str(business_conversation_key)
+        or ops._safe_str(conversation_key)
+        or ops._safe_str(ops._row_conversation_join_key(record))
+        or f"intake-{selected_id}"
+    )
 
+    conversation_key = selected_conversation_key
+    classification["conversation_key"] = selected_conversation_key
+
+    current_record_conversation_key = ops._safe_str(record.get("conversation_key", ""))
+
+    if selected_conversation_key and selected_conversation_key != current_record_conversation_key:
         try:
             ops._execute(
                 """
@@ -2972,17 +3804,19 @@ def render_operations_inbox() -> None:
                 """,
                 {
                     "intake_id": int(selected_id),
-                    "conversation_key": business_conversation_key,
+                    "conversation_key": selected_conversation_key,
                 },
             )
-            record["conversation_key"] = business_conversation_key
+            record["conversation_key"] = selected_conversation_key
         except Exception:
             pass
-    if pending_reply_updated_fields and business_conversation_key:
+
+    # If this reply contains a direct update, merge that update into the pending draft.
+    if pending_reply_updated_fields and selected_conversation_key:
         try:
             draft_update_sets = []
             draft_update_params = {
-                "conversation_key": business_conversation_key,
+                "conversation_key": selected_conversation_key,
                 "intake_id": int(selected_id),
                 "latest_subject": subject,
                 "latest_sender": sender,
@@ -3013,13 +3847,36 @@ def render_operations_inbox() -> None:
                         last_customer_message_at = now(),
                         last_intake_id = :intake_id,
                         parsed_data = coalesce(parsed_data, '{{}}'::jsonb) || cast(:parsed_data as jsonb)
-                    where conversation_key = :conversation_key
-                    and created_load_id is null
+                    where created_load_id is null
+                    and (
+                            conversation_key = :conversation_key
+                        or booking_number = :conversation_key
+                        or container_number = :conversation_key
+                    )
                     """,
                     draft_update_params,
                 )
         except Exception:
-            pass       
+            pass
+
+    pending_draft_merge_fields = _ops_pending_draft_fields_from_parsed(parsed)
+
+    if pending_draft_merge_fields and selected_conversation_key and matched_load_id is None:
+        try:
+            ops._update_pending_order_draft_fields(
+                conversation_key=selected_conversation_key,
+                fields=pending_draft_merge_fields,
+                last_intake_id=int(selected_id),
+                latest_subject=subject,
+                latest_sender=sender,
+                request_stage=(
+                    "Pending Order Reply"
+                    if subject.lower().startswith(("re:", "fw:", "fwd:"))
+                    else "Initial Order Request"
+                ),
+            )
+        except Exception:
+            pass
     # If the email is clearly a new booking, persist that correction so the top table moves it to New Orders.
     is_true_new_booking = (
         _ops_has_true_new_order_signal(subject, body, record)
@@ -3229,12 +4086,7 @@ def render_operations_inbox() -> None:
                     ops.refresh_data()
                     st.success("Operations Case opened for this order email.")
                     st.rerun()
-
-    selected_conversation_key = (
-        business_conversation_key
-        or conversation_key
-        or ops._row_conversation_join_key(record)
-    )
+    
     with st.expander("Email Synchronization Metadata", expanded=False):
         st.write(f"**Direction:** {ops._safe_str(record.get('email_direction', 'inbound')) or 'inbound'}")
         st.write(f"**Mailbox:** {ops._safe_str(record.get('email_mailbox', '')) or '-'}")
@@ -3265,10 +4117,10 @@ def render_operations_inbox() -> None:
             ops.refresh_data()
             st.rerun()
     selected_booking = (
-    ops._safe_str(tokens.get("booking_number"))
-    or ops._safe_str(parsed.get("Booking Number"))
-    or ops._safe_str(record.get("booking_hint", ""))
-)
+        ops._safe_str(tokens.get("booking_number"))
+        or ops._safe_str(parsed.get("Booking Number"))
+        or ops._safe_str(record.get("booking_hint", ""))
+    )
 
     selected_container = (
         ops._safe_str(tokens.get("container_number"))
@@ -3335,11 +4187,85 @@ def render_operations_inbox() -> None:
                 "Preview",
             ]
 
-            st.dataframe(
-                history_display[display_cols],
+            history_source_df = history_df.reset_index(drop=True).copy()
+            history_table_df = history_display[display_cols].reset_index(drop=True).copy()
+
+            history_event = st.dataframe(
+                history_table_df,
                 use_container_width=True,
                 hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=f"operations_history_table_{selected_id}_{selected_conversation_key}",
             )
+
+            selected_history_rows = history_event.selection.rows
+
+            if selected_history_rows:
+                selected_history_index = selected_history_rows[0]
+                selected_history_row = history_source_df.iloc[selected_history_index].to_dict()
+
+                try:
+                    selected_history_id = int(selected_history_row.get("id"))
+                except Exception:
+                    selected_history_id = None
+
+                if selected_history_id is not None:
+                    selected_history_detail_df = ops._load_operations_intake_message(selected_history_id)
+
+                    if selected_history_detail_df is not None and not selected_history_detail_df.empty:
+                        selected_history_detail = selected_history_detail_df.iloc[0].to_dict()
+                    else:
+                        selected_history_detail = selected_history_row
+
+                    with st.container(border=True):
+                        st.markdown("#### Selected History Message")
+
+                        h_col1, h_col2, h_col3 = st.columns([1.2, 1.2, 1.6])
+
+                        h_col1.metric(
+                            "Direction",
+                            ops._safe_str(selected_history_detail.get("email_direction", "inbound")).title() or "-",
+                        )
+
+                        h_col2.metric(
+                            "Status",
+                            ops._safe_str(selected_history_detail.get("review_status", "-")) or "-",
+                        )
+
+                        h_col3.metric(
+                            "Conversation",
+                            ops._safe_str(selected_history_detail.get("conversation_key", "-")) or "-",
+                        )
+
+                        st.write(
+                            f"**From:** {ops._safe_str(selected_history_detail.get('source_sender', ''))}"
+                        )
+
+                        st.write(
+                            f"**Subject:** {ops._safe_str(selected_history_detail.get('source_subject', ''))}"
+                        )
+
+                        st.caption(
+                            f"Received: {ops._safe_str(selected_history_detail.get('source_received_at', ''))} "
+                            f"| Message ID: {ops._safe_str(selected_history_detail.get('source_message_id', ''))}"
+                        )
+
+                        st.text_area(
+                            "Historical Message Body",
+                            value=ops._safe_str(selected_history_detail.get("raw_text", "")),
+                            height=280,
+                            disabled=True,
+                            key=f"operations_history_message_body_{selected_id}_{selected_history_id}",
+                        )
+
+                        parsed_history = ops._coerce_json_dict(selected_history_detail.get("parsed_data"))
+
+                        if parsed_history:
+                            with st.expander("Historical Parsed Fields", expanded=False):
+                                st.json(parsed_history)
+        # -----------------------------------------------------------------
+
     if operations_case:
         _render_operations_case_panel(
             selected_id=int(selected_id),
@@ -3348,10 +4274,15 @@ def render_operations_inbox() -> None:
             show_timeline=False,
         )
 
-    saved_request_type = str(record.get("request_type", "") or "").strip()
+    saved_request_type = ops._safe_str(record.get("request_type", "")).strip()
     effective_saved_request_type = _effective_operations_request_type_for_row(record)
-    if effective_saved_request_type != saved_request_type and effective_saved_request_type in REQUEST_TYPES:
+
+    if (
+        effective_saved_request_type != saved_request_type
+        and effective_saved_request_type in REQUEST_TYPES
+    ):
         saved_request_type = effective_saved_request_type
+
     default_request_type = saved_request_type if saved_request_type in REQUEST_TYPES else detected_type
 
     # Request type is now treated as the current routing classification.
@@ -3372,6 +4303,22 @@ def render_operations_inbox() -> None:
         tokens=tokens,
         matched_load_id=matched_load_id,
     )
+
+    request_type_label = (
+        ops._safe_str(request_type)
+        or ops._safe_str(default_request_type)
+        or ops._safe_str(detected_type)
+        or "Needs Classification"
+    )
+
+    _render_active_pending_order_draft_panel(
+        selected_id=int(selected_id),
+        selected_conversation_key=selected_conversation_key,
+        matched_load_id=matched_load_id,
+        final_decision=final_decision,
+        subject=subject,
+        sender=sender,
+    )
     # -----------------------------------------------------------------
     # Primary Email Action Center
     # -----------------------------------------------------------------
@@ -3385,15 +4332,19 @@ def render_operations_inbox() -> None:
         f"operations_selected_primary_action_{selected_id}",
         "",
     )
-
+    detected_reply_language_label = (
+        ops._safe_str(locals().get("detected_reply_language", ""))
+        or _detect_customer_language(subject, body)
+        or "English"
+    )
     send_reply = False
 
     with st.container(border=True):
         a1, a2, a3 = st.columns([1.2, 1.2, 1.6])
 
         a1.metric("Email Workflow", "Reply / Forward")
-        a2.metric("Work Type", request_type)
-        a3.metric("Detected Language", detected_reply_language or "English")
+        a2.metric("Work Type", request_type_label)
+        a3.metric("Detected Language", detected_reply_language_label)
 
         st.caption(
             "Use this panel to reply, reply-all, or forward the selected email. "
@@ -3408,7 +4359,7 @@ def render_operations_inbox() -> None:
             "Reply Language",
             REPLY_LANGUAGE_OPTIONS,
             index=REPLY_LANGUAGE_OPTIONS.index("Auto") if "Auto" in REPLY_LANGUAGE_OPTIONS else 0,
-            help=f"Auto detected: {detected_reply_language}. Choose Spanish or Bilingual when needed.",
+            help=f"Auto detected: {detected_reply_language_label}. Choose Spanish or Bilingual when needed.",
             key=f"operations_reply_language_{selected_id}",
         )
 
@@ -3502,7 +4453,7 @@ def render_operations_inbox() -> None:
             key=f"operations_reply_subject_{selected_id}_{action_key_suffix}",
         )
 
-        default_reply_body = ops._safe_str(locals().get("default_reply_body", ""))
+        default_reply_body = ops._safe_str(reply_body_default)
 
         pending_update_summary = ""
         pending_update_booking = (
@@ -3510,6 +4461,28 @@ def render_operations_inbox() -> None:
             or ops._safe_str(parsed.get("Booking Number"))
             or ops._safe_str(record.get("booking_hint", ""))
         )
+
+        try:
+            pending_update_summary = pending_reply_update.get("summary", "")
+        except Exception:
+            pending_update_summary = ""
+
+        is_reply_context = ops._safe_str(subject).lower().startswith(("re:", "fw:", "fwd:"))
+
+        if is_reply_context and pending_update_summary:
+            default_reply_body = _ops_pending_order_reply_body(
+                booking=pending_update_booking,
+                update_summary=pending_update_summary,
+            )
+
+        if not default_reply_body:
+            default_reply_body = (
+                "Hello,\n\n"
+                "We received your email and our dispatch team is reviewing it now. "
+                "We will follow up with the next update or any missing details.\n\n"
+                "Thank you,\n"
+                "CaliTrans Dispatch"
+            )
 
         try:
             pending_update_summary = pending_reply_update.get("summary", "")
@@ -4358,7 +5331,7 @@ def render_operations_inbox() -> None:
         or ops._safe_str(parsed.get("Container Number", ""))
         or ops._safe_str(tokens.get("container_number", ""))
     )
-    order_customer = ops.app_helpers_safe_str(parsed.get("Customer", "")) or ops._safe_str(sender).split("<")[0].strip()
+    order_customer = ops._safe_str(parsed.get("Customer", "")) or ops._safe_str(sender).split("<")[0].strip()
     order_evidence = _ops_order_evidence(parsed, tokens, subject, body, record)
     parsed_has_new_order_details = ops._has_new_order_details(message_text, parsed, tokens)
     can_create_order = bool(final_decision.get("allow_create_order") and parsed_has_new_order_details)

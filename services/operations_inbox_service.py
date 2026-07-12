@@ -153,7 +153,226 @@ def parse_date_or_none(value: Any):
 def contains_any(text: str, terms: list[str]) -> bool:
     lowered = str(text or "").lower()
     return any(term in lowered for term in terms)
+VALID_SERVICE_FLOWS = {
+    "Import",
+    "Export",
+    "Local Import",
+    "Local Export",
+}
 
+
+def is_booking_confirmation(
+    subject: str,
+    body: str,
+    parsed: dict | None = None,
+) -> bool:
+    """
+    Return True when the message is clearly a booking/order confirmation.
+
+    Booking evidence must take priority over passive invoice language,
+    bill-of-lading labels, and rate-sheet terminology.
+    """
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    subject_text = safe_str(subject).lower()
+    body_text = safe_str(body).lower()
+    combined = f"{subject_text}\n{body_text}"
+
+    booking_number = safe_str(
+        parsed.get("Booking Number")
+        or parsed.get("booking_number")
+        or parsed.get("Booking")
+    )
+
+    container_qty = safe_str(
+        parsed.get("Container Qty")
+        or parsed.get("container_qty")
+        or parsed.get("Container Quantity")
+        or parsed.get("Number Of Containers")
+    )
+
+    parse_profile = safe_str(
+        parsed.get("_parse_profile")
+        or parsed.get("parse_profile")
+    ).lower()
+
+    explicit_subject_signals = [
+        "new booking",
+        "booking confirmation",
+        "new order",
+        "load order",
+        "delivery order",
+    ]
+
+    explicit_body_signals = [
+        "booking confirmation",
+        "number of cntrs",
+        "container qty",
+        "containers required",
+        "please see the attached booking confirmation",
+        "please arrange drayage",
+        "please arrange transportation",
+    ]
+
+    if any(signal in subject_text for signal in explicit_subject_signals):
+        return True
+
+    if any(signal in combined for signal in explicit_body_signals):
+        return True
+
+    if parsed.get("_booking_confirmation") is True:
+        return True
+
+    if "booking" in parse_profile:
+        return True
+
+    if booking_number and container_qty:
+        return True
+
+    if booking_number and any(
+        signal in combined
+        for signal in [
+            "vessel:",
+            "cargo cut off",
+            "vgm cut off",
+            "port of loading",
+            "port of discharge",
+            "empty pick up",
+            "full return",
+        ]
+    ):
+        return True
+
+    return False
+
+
+def has_actual_billing_request(
+    subject: str,
+    body: str,
+) -> bool:
+    """
+    Detect an actionable billing request.
+
+    Passive terms inside a booking confirmation do not make the message Billing.
+    Examples excluded:
+    - bill of lading
+    - charges will be invoiced
+    - invoice should be sent to
+    - this document is not an invoice
+    """
+
+    text = f"{safe_str(subject)}\n{safe_str(body)}".lower()
+
+    actual_billing_patterns = [
+        r"\bplease\s+(?:send|submit|review|correct|revise|approve)\s+(?:the\s+)?invoice\b",
+        r"\bplease\s+invoice\b",
+        r"\binvoice\s+(?:request|status|correction|revision|dispute|question|issue)\b",
+        r"\bmissing\s+invoice\b",
+        r"\bincorrect\s+invoice\b",
+        r"\bpayment\s+(?:request|status|due|issue|question)\b",
+        r"\bbilling\s+(?:request|question|issue|correction|dispute)\b",
+        r"\bdetention\s+(?:invoice|charge|billing)\b",
+        r"\bdemurrage\s+(?:invoice|charge|billing)\b",
+        r"\baccessorial\s+(?:invoice|charge|billing)\b",
+        r"\blumper\s+(?:receipt|invoice|charge)\b",
+        r"\bfactura\s+(?:solicitud|correccion|corrección|problema|pendiente)\b",
+        r"\bsolicitud\s+de\s+factura\b",
+    ]
+
+    return any(
+        re.search(pattern, text, flags=re.I)
+        for pattern in actual_billing_patterns
+    )
+
+
+def enforce_authoritative_booking_triage(
+    *,
+    subject: str,
+    body: str,
+    parsed: dict | None,
+    triage: dict | None,
+) -> dict:
+    """
+    Prevent clear booking confirmations from being overwritten by broad
+    Billing or Documents classifications.
+    """
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+    corrected = dict(triage or {})
+
+    booking_confirmation = is_booking_confirmation(
+        subject,
+        body,
+        parsed,
+    )
+
+    actual_billing_request = has_actual_billing_request(
+        subject,
+        body,
+    )
+
+    if not booking_confirmation or actual_billing_request:
+        return corrected
+
+    booking_number = safe_str(
+        parsed.get("Booking Number")
+        or parsed.get("booking_number")
+        or parsed.get("Booking")
+    )
+
+    corrected.update(
+        {
+            "request_type": "New Booking",
+            "work_level": "Level 1 - Operational Cases",
+            "department_lane": "Dispatch",
+            "work_queue": "New Orders",
+            "store_only": False,
+            "status": "Complete",
+            "engine": safe_str(corrected.get("engine")) or "authoritative_booking_guard_v1",
+            "triage_reason": (
+                "Booking confirmation evidence overrides passive billing, "
+                "invoice, rate-sheet, and bill-of-lading language."
+            ),
+            "action_required": (
+                "Review booking details and create the required container work orders."
+            ),
+            "llm_required": False,
+            "llm_review_required": False,
+        }
+    )
+
+    if booking_number:
+        corrected["conversation_key"] = booking_number
+
+    try:
+        current_confidence = int(
+            float(corrected.get("confidence_score", 0) or 0)
+        )
+    except Exception:
+        current_confidence = 0
+
+    corrected["confidence_score"] = max(current_confidence, 95)
+
+    tags = corrected.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+
+    if "booking_confirmation" not in tags:
+        tags.append("booking_confirmation")
+
+    if "authoritative_booking_guard" not in tags:
+        tags.append("authoritative_booking_guard")
+
+    corrected["tags"] = tags
+
+    return corrected
+
+
+# Compatibility aliases used by the Streamlit page.
+_is_booking_confirmation = is_booking_confirmation
+_has_actual_billing_request = has_actual_billing_request
+_enforce_authoritative_booking_triage = enforce_authoritative_booking_triage
 
 def sql_literal_list(values: list[str]) -> str:
     return ", ".join("'" + str(value).replace("'", "''") + "'" for value in values)
@@ -516,7 +735,30 @@ MISSING_INFO_TERMS = [
 
 CANCELLATION_TERMS = ["cancel", "cancelled", "canceled", "cancelar", "cancelado", "cancelacion", "cancelación"]
 POD_TERMS = ["pod", "proof of delivery", "prueba de entrega", "comprobante de entrega"]
-BILLING_TERMS = ["invoice", "billing", "bill", "payment", "statement", "accessorial", "detention", "demurrage", "lumper", "factura", "facturacion", "pago", "cobro"]
+BILLING_TERMS = [
+    "billing request",
+    "billing question",
+    "billing issue",
+    "invoice request",
+    "invoice correction",
+    "invoice dispute",
+    "invoice status",
+    "incorrect invoice",
+    "missing invoice",
+    "payment request",
+    "payment status",
+    "payment due",
+    "statement request",
+    "accessorial invoice",
+    "detention invoice",
+    "demurrage invoice",
+    "lumper receipt",
+    "factura pendiente",
+    "correccion de factura",
+    "corrección de factura",
+    "solicitud de factura",
+    "problema de facturacion",
+    "problema de facturación",]
 DRIVER_ISSUE_TERMS = ["driver", "truck", "chassis", "flat tire", "breakdown", "accident", "late driver", "no show", "chofer", "conductor", "camion", "chasis", "accidente"]
 PORT_ISSUE_TERMS = ["port", "terminal", "hold", "customs hold", "line hold", "exam", "x-ray", "gate", "trouble ticket", "puerto", "retenido", "aduana", "inspeccion"]
 SPAM_MARKETING_TERMS = ["unsubscribe", "newsletter", "marketing", "promotion", "webinar", "seo", "lead generation", "limited time offer", "sales outreach"]
@@ -717,7 +959,42 @@ def _is_strong_operations_business_key(value: str) -> bool:
     }:
         return False
 
-    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-")):
+    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-", "cah+")):
+        return False
+
+    if "@" in lowered and "." in lowered:
+        return False
+
+    if not any(char.isdigit() for char in value):
+        return False
+
+    return len(value) >= 5
+# Paste this into services/operations_inbox_service.py near the other conversation/timeline helpers.
+
+def _is_strong_operations_business_key(value: str) -> bool:
+    value = safe_str(value).strip()
+
+    if not value:
+        return False
+
+    lowered = value.lower()
+
+    if lowered in {
+        "-",
+        "none",
+        "null",
+        "nan",
+        "unknown",
+        "contact",
+        "customer-request",
+        "customer request",
+    }:
+        return False
+
+    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-", "cah+")):
+        return False
+
+    if "@" in lowered and "." in lowered:
         return False
 
     if not any(char.isdigit() for char in value):
@@ -725,6 +1002,370 @@ def _is_strong_operations_business_key(value: str) -> bool:
 
     return len(value) >= 5
 
+
+def load_operations_business_conversation_timeline(
+    *,
+    conversation_key: str = "",
+    booking_number: str = "",
+    container_number: str = "",
+    reference_number: str = "",
+    limit: int = 50,
+) -> pd.DataFrame:
+    """
+    Strict booking/container/reference conversation timeline.
+
+    This prevents broad unrelated histories such as 300+ unrelated messages.
+    """
+
+    keys: list[str] = []
+
+    for value in [conversation_key, booking_number, container_number, reference_number]:
+        clean = safe_str(value).strip()
+        if _is_strong_operations_business_key(clean) and clean not in keys:
+            keys.append(clean)
+
+    if not keys:
+        return pd.DataFrame()
+
+    clauses = []
+    params = {"limit": int(limit or 50)}
+
+    for index, key in enumerate(keys):
+        key_param = f"key_{index}"
+        like_param = f"like_{index}"
+
+        params[key_param] = key
+        params[like_param] = f"%{key}%"
+
+        clauses.append(
+            f"""
+            conversation_key = :{key_param}
+            or source_subject ilike :{like_param}
+            or raw_text ilike :{like_param}
+            or parsed_data::text ilike :{like_param}
+            """
+        )
+
+    where_sql = " or ".join(f"({clause})" for clause in clauses)
+
+    try:
+        return read_df(
+            f"""
+            select
+                id,
+                source_received_at,
+                created_at,
+                coalesce(email_direction, 'inbound') as email_direction,
+                coalesce(conversation_status, 'New Conversation') as conversation_status,
+                coalesce(review_status, 'Open') as review_status,
+                coalesce(source_sender, '') as source_sender,
+                coalesce(source_subject, '') as source_subject,
+                coalesce(raw_text, '') as raw_text,
+                left(coalesce(raw_text, ''), 180) as message_preview,
+                coalesce(conversation_key, '') as conversation_key
+            from order_intake
+            where {operations_email_source_filter()}
+              and ({where_sql})
+            order by coalesce(source_received_at, created_at) asc, id asc
+            limit :limit
+            """,
+            params,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+_load_operations_business_conversation_timeline = load_operations_business_conversation_timeline
+def load_operations_intake_message(intake_id: int) -> pd.DataFrame:
+    """
+    Load one full operations inbox message for historical review.
+    Used when dispatcher clicks a Communication History row.
+    """
+
+    try:
+        return read_df(
+            """
+            select
+                id,
+                source,
+                source_subject,
+                source_sender,
+                source_received_at,
+                source_message_id,
+                email_direction,
+                email_mailbox,
+                email_thread_id,
+                email_in_reply_to,
+                email_references,
+                conversation_key,
+                conversation_status,
+                review_status,
+                request_type,
+                action_required,
+                confidence_score,
+                matched_load_id,
+                case_id,
+                parsed_data,
+                raw_text,
+                created_at
+            from order_intake
+            where id = :intake_id
+            limit 1
+            """,
+            {"intake_id": int(intake_id)},
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+_load_operations_intake_message = load_operations_intake_message
+
+
+def _pending_order_required_missing_fields(fields: dict) -> list[str]:
+    """
+    Returns human-readable missing fields for pending order drafts.
+    This is intentionally practical for dispatch review.
+    """
+
+    customer = safe_str(fields.get("customer", ""))
+    service_flow = safe_str(fields.get("service_flow", ""))
+    origin_port = safe_str(fields.get("origin_port", ""))
+    destination_warehouse = safe_str(fields.get("destination_warehouse", ""))
+    delivery_address = safe_str(fields.get("delivery_address", ""))
+    booking_number = safe_str(fields.get("booking_number", ""))
+    container_number = safe_str(fields.get("container_number", ""))
+
+    missing = []
+
+    if not customer:
+        missing.append("Customer")
+
+    if not service_flow:
+        missing.append("Service Flow")
+
+    if not origin_port:
+        missing.append("Origin / Port")
+
+    if not destination_warehouse and not delivery_address:
+        missing.append("Destination / Warehouse / Address")
+
+    if not booking_number and not container_number:
+        missing.append("Booking or Container")
+
+    return missing
+
+
+def update_pending_order_draft_fields(
+    *,
+    conversation_key: str,
+    fields: dict,
+    last_intake_id: int | None = None,
+    latest_subject: str = "",
+    latest_sender: str = "",
+    request_stage: str = "Pending Order Reply",
+) -> bool:
+    """
+    Update the pending order draft with the latest agreed information.
+
+    This does not create a load. It only keeps the pending draft current
+    while dispatcher/client go back and forth.
+    """
+
+    conversation_key = safe_str(conversation_key).strip()
+    if not conversation_key:
+        return False
+
+    fields = fields if isinstance(fields, dict) else {}
+
+    allowed_fields =(
+    {
+        "reference_number": "reference_number",
+        "container_qty": "container_qty",
+        "commodity": "commodity",
+        "empty_pickup_location": "empty_pickup_location",
+        "full_return_terminal": "full_return_terminal",
+        "port_of_loading": "port_of_loading",
+        "port_of_discharge": "port_of_discharge",
+        "place_of_delivery": "place_of_delivery",
+        "exporting_carrier": "exporting_carrier",
+        "vessel_name": "vessel_name",
+        "steamship_line": "steamship_line",
+        "opens_for_receiving": "opens_for_receiving",
+        "document_cutoff": "document_cutoff",
+        "vgm_cutoff": "vgm_cutoff",
+        "cargo_cutoff": "cargo_cutoff",
+        "sailing_date": "sailing_date",
+        "eta_date": "eta_date",
+        "rate_per_container": "rate_per_container",
+        "rate_total": "rate_total",
+        "dispatcher_notes": "dispatcher_notes",
+    }
+    )
+
+    update_values = {}
+
+    for field_name, column_name in allowed_fields.items():
+        value = safe_str(fields.get(field_name, "")).strip()
+        if value:
+            update_values[column_name] = value
+
+    if not update_values:
+        return False
+
+    missing_fields = _pending_order_required_missing_fields(
+        {
+            **fields,
+            **update_values,
+        }
+    )
+
+    set_parts = []
+    params = {
+        "conversation_key": conversation_key,
+        "last_intake_id": last_intake_id,
+        "latest_subject": safe_str(latest_subject),
+        "latest_sender": safe_str(latest_sender),
+        "request_stage": safe_str(request_stage) or "Pending Order Reply",
+        "missing_fields": json.dumps(missing_fields),
+    }
+
+    for column_name, value in update_values.items():
+        set_parts.append(f"{column_name} = :{column_name}")
+        params[column_name] = value
+
+    set_sql = ",\n                    ".join(set_parts)
+
+    sql_with_missing_fields = f"""
+        update public.order_intake_drafts
+        set
+            {set_sql},
+            request_stage = :request_stage,
+            draft_status = case
+                when created_load_id is not null then draft_status
+                when :missing_fields = '[]' then 'Ready for Order Review'
+                else 'Needs Details'
+            end,
+            latest_direction = 'inbound',
+            latest_subject = :latest_subject,
+            latest_sender = :latest_sender,
+            last_customer_message_at = now(),
+            last_intake_id = coalesce(:last_intake_id, last_intake_id),
+            missing_fields = cast(:missing_fields as jsonb),
+            updated_at = now()
+        where created_load_id is null
+          and (
+                conversation_key = :conversation_key
+             or booking_number = :conversation_key
+             or container_number = :conversation_key
+          )
+    """
+
+    sql_without_missing_fields = f"""
+        update public.order_intake_drafts
+        set
+            {set_sql},
+            request_stage = :request_stage,
+            draft_status = case
+                when created_load_id is not null then draft_status
+                when :missing_fields = '[]' then 'Ready for Order Review'
+                else 'Needs Details'
+            end,
+            latest_direction = 'inbound',
+            latest_subject = :latest_subject,
+            latest_sender = :latest_sender,
+            last_customer_message_at = now(),
+            last_intake_id = coalesce(:last_intake_id, last_intake_id),
+            updated_at = now()
+        where created_load_id is null
+          and (
+                conversation_key = :conversation_key
+             or booking_number = :conversation_key
+             or container_number = :conversation_key
+          )
+    """
+
+    try:
+        execute(sql_with_missing_fields, params)
+        return True
+    except Exception:
+        try:
+            execute(sql_without_missing_fields, params)
+            return True
+        except Exception:
+            return False
+
+
+_update_pending_order_draft_fields = update_pending_order_draft_fields
+def load_operations_business_conversation_timeline(
+        *,
+        conversation_key: str = "",
+        booking_number: str = "",
+        container_number: str = "",
+        reference_number: str = "",
+        limit: int = 50,
+    ) -> pd.DataFrame:
+        """
+        Strict booking/container/reference conversation timeline.
+
+        This prevents broad unrelated histories such as 390-message timelines.
+        """
+
+        keys: list[str] = []
+
+        for value in [conversation_key, booking_number, container_number, reference_number]:
+            clean = safe_str(value).strip()
+            if _is_strong_operations_business_key(clean) and clean not in keys:
+                keys.append(clean)
+
+        if not keys:
+            return pd.DataFrame()
+
+        clauses = []
+        params = {"limit": int(limit or 50)}
+
+        for index, key in enumerate(keys):
+            key_param = f"key_{index}"
+            like_param = f"like_{index}"
+
+            params[key_param] = key
+            params[like_param] = f"%{key}%"
+
+            clauses.append(
+                f"""
+                conversation_key = :{key_param}
+                or source_subject ilike :{like_param}
+                or raw_text ilike :{like_param}
+                or parsed_data::text ilike :{like_param}
+                """
+            )
+
+        where_sql = " or ".join(f"({clause})" for clause in clauses)
+
+        try:
+            return read_df(
+                f"""
+                select
+                    id,
+                    source_received_at,
+                    created_at,
+                    coalesce(email_direction, 'inbound') as email_direction,
+                    coalesce(conversation_status, 'New Conversation') as conversation_status,
+                    coalesce(review_status, 'Open') as review_status,
+                    coalesce(source_sender, '') as source_sender,
+                    coalesce(source_subject, '') as source_subject,
+                    coalesce(raw_text, '') as raw_text,
+                    left(coalesce(raw_text, ''), 180) as message_preview,
+                    coalesce(conversation_key, '') as conversation_key
+                from order_intake
+                where {operations_email_source_filter()}
+                and ({where_sql})
+                order by coalesce(source_received_at, created_at) asc, id asc
+                limit :limit
+                """,
+                params,
+            )
+        except Exception:
+            return pd.DataFrame()
 
 def load_operations_business_conversation_timeline(
     *,
@@ -1119,9 +1760,56 @@ def fast_triage_for_record(record) -> dict:
 
     return triage
 
-
-def apply_fast_triage_to_intake(intake_id: int, triage: dict, parsed_data: dict | None = None) -> None:
+def apply_fast_triage_to_intake(
+    intake_id: int,
+    triage: dict,
+    parsed_data: dict | None = None,
+    *,
+    subject: str = "",
+    body: str = "",
+) -> None:
     parsed_data = parsed_data if isinstance(parsed_data, dict) else {}
+
+    if not subject or not body:
+        try:
+            source_df = read_df(
+                """
+                select
+                    coalesce(source_subject, '') as source_subject,
+                    coalesce(raw_text, '') as raw_text
+                from order_intake
+                where id = :intake_id
+                limit 1
+                """,
+                {"intake_id": int(intake_id)},
+            )
+
+            if source_df is not None and not source_df.empty:
+                source_record = source_df.iloc[0].to_dict()
+
+                if not subject:
+                    subject = safe_str(
+                        source_record.get("source_subject", "")
+                    )
+
+                if not body:
+                    raw_text = safe_str(
+                        source_record.get("raw_text", "")
+                    )
+                    body = (
+                        extract_latest_email_body(raw_text)
+                        or raw_text
+                    )
+        except Exception:
+            pass
+
+    triage = enforce_authoritative_booking_triage(
+        subject=subject,
+        body=body,
+        parsed=parsed_data,
+        triage=triage,
+    )
+
     parsed_data["_fast_triage"] = triage or {}
 
     execute(
@@ -3086,6 +3774,12 @@ def auto_classify_open_inbox_items(
                 mailbox=safe_str(record.get("email_mailbox", "")),
                 classification=classification,
             )
+            triage = enforce_authoritative_booking_triage(
+                subject=subject,
+                body=body,
+                parsed=parsed,
+                triage=triage,
+            )
             if not triage.get("conversation_key"):
                 triage["conversation_key"] = classification.get("conversation_key", "")
             if triage.get("matched_load_id") is None:
@@ -3527,6 +4221,12 @@ def _insert_operations_email_message(message: dict) -> dict:
         mailbox=safe_str(message.get("mailbox")),
         classification=classification,
     )
+    triage = enforce_authoritative_booking_triage(
+        subject=subject,
+        body=body,
+        parsed=parsed,
+        triage=triage,
+)
     parsed["_fast_triage"] = triage
 
     if safe_str(triage.get("request_type")):
@@ -3719,8 +4419,21 @@ def sync_conversation_status(conversation_key: str) -> None:
         return
 
 
-def sync_operations_email_engine(limit: int = 12, *args, **kwargs) -> dict:
+def sync_operations_email_engine(
+    limit: int = 12,
+    time_budget_seconds: int = 25,
+    *args,
+    **kwargs,
+) -> dict:
     started = time.perf_counter()
+
+    try:
+        time_budget_seconds = max(5, int(time_budget_seconds or 25))
+    except Exception:
+        time_budget_seconds = 25
+
+    deadline = started + time_budget_seconds
+
     result = {
         "fetched": 0,
         "inbound_fetched": 0,
@@ -3736,7 +4449,9 @@ def sync_operations_email_engine(limit: int = 12, *args, **kwargs) -> dict:
         "llm_required": 0,
         "store_only": 0,
         "elapsed_seconds": None,
+        "stopped_early": False,
         "error": "",
+        "error_messages": [],
         "messages": [],
     }
 
@@ -3754,15 +4469,28 @@ def sync_operations_email_engine(limit: int = 12, *args, **kwargs) -> dict:
         result["outbound_fetched"] = sum(1 for item in messages if safe_str(item.get("direction")).lower() == "outbound")
         result["accounts_synced"] = len({safe_str(item.get("mailbox_account")) for item in messages if safe_str(item.get("mailbox_account"))})
 
-        existing_lookup = load_existing_operations_email_lookup(limit=max(5000, int(limit or 50) * 100))
-        touched_conversations = set()
+        lookup_limit = max(
+            1000,
+            min(3000, int(limit or 12) * 40),
+        )
+
+        existing_lookup = load_existing_operations_email_lookup(
+            limit=lookup_limit
+        )
+        touched_conversations: set[str] = set()
 
         for message in messages:
             subject = safe_str(message.get("subject")) or "(no subject)"
             sender = safe_str(message.get("from")) or safe_str(message.get("sender")) or "(unknown sender)"
             received_at = safe_str(message.get("received_at")) or None
             message_id = _email_sync_unique_message_id(message)
-
+            if time.perf_counter() >= deadline:
+                result["stopped_early"] = True
+                result.setdefault("diagnostics", {})["processing_timed_out"] = True
+                result["error_messages"].append(
+                    "Email processing stopped after reaching the interactive sync time budget."
+                )
+                break
             if operations_email_already_imported(
                 message_id,
                 subject=subject,
@@ -3784,7 +4512,6 @@ def sync_operations_email_engine(limit: int = 12, *args, **kwargs) -> dict:
                     result["store_only"] += 1
                 if inserted.get("conversation_key"):
                     touched_conversations.add(inserted["conversation_key"])
-                    sync_conversation_status(inserted["conversation_key"])
                 result["messages"].append(
                     {
                         "subject": subject,
@@ -3800,7 +4527,20 @@ def sync_operations_email_engine(limit: int = 12, *args, **kwargs) -> dict:
 
         result["threads_synced"] = len(touched_conversations)
         refresh_data()
+        for touched_conversation_key in touched_conversations:
+            if time.perf_counter() >= deadline:
+                result["stopped_early"] = True
+                break
 
+            try:
+                sync_conversation_status(touched_conversation_key)
+                result["threads_synced"] += 1
+            except Exception as exc:
+                result["errors"] += 1
+                result["error_messages"].append(
+                    f"Thread status update failed for "
+                    f"{touched_conversation_key}: {exc}"
+                )
     except Exception as exc:
         result["error"] = str(exc)
 
