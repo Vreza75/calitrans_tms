@@ -668,7 +668,7 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     def _filter_options(column: str) -> list[str]:
         if column not in board_df.columns:
             return []
-        values = board_df[column].astype(str).str.strip()
+        values = (str(value).strip() for value in board_df[column])
         return sorted({value for value in values if value and value.lower() not in ("nan", "none")})
 
     extra_filter_cols = st.columns(4)
