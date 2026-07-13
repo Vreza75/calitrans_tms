@@ -48,6 +48,9 @@ EXT_LOAD_COLUMNS = [
     "live_load_status",
     "live_unload_status",
     "last_driver_update",
+    "parent_booking_key",
+    "container_sequence",
+    "container_total",
 ]
 
 LOAD_SEARCH_COLUMNS = [
@@ -148,7 +151,10 @@ def get_ext_df() -> pd.DataFrame:
                 eta,
                 live_load_status,
                 live_unload_status,
-                last_driver_update
+                last_driver_update,
+                parent_booking_key,
+                container_sequence,
+                container_total
             from loads
             """
         )
