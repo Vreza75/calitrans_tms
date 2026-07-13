@@ -40,6 +40,8 @@ from services.dispatch_board_view import (
     get_next_action,
     is_active_dispatch_status,
 )
+from services.dispatch_card_priority import sort_booking_cards
+from services.dispatch_card_view_model import build_booking_card_view_models
 from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
 from services.dispatch_transition_service import apply_transition
 from services.load_grouping_service import group_loads_by_booking
@@ -952,6 +954,69 @@ def _render_dispatch_row_group(group_row, refresh_callback) -> None:
             st.rerun()
 
 
+def _render_booking_card(card: dict) -> None:
+    display_status = get_display_label(card["move_type"], card["canonical_status"])
+    visible = card["visible_container_count"]
+    total = card["total_container_count"]
+    container_label = f"{visible} of {total} containers" if total != visible else (f"{visible} container" if visible == 1 else f"{visible} containers")
+    appt = card["earliest_need_date"] or "No appt set"
+    lfd_suffix = f" · LFD {card['earliest_lfd']}" if card["earliest_lfd"] else ""
+    badges = ""
+    if card["exception_count"]:
+        badges += f'<span style="background:#fee2e2;color:#991b1b;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;margin-right:4px;">{card["exception_count"]} exception{"s" if card["exception_count"] != 1 else ""}</span>'
+    if card["unassigned_count"]:
+        badges += f'<span style="background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;">{card["unassigned_count"]} unassigned</span>'
+    html = f'<a href="{escape(card["workspace_url"])}" target="_blank" style="text-decoration:none;color:inherit;display:block;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:10px;background:#ffffff;box-shadow:0 1px 2px rgba(0,0,0,0.05);"><div style="font-weight:700;font-size:13px;color:#0f172a;">{escape(card["booking_number"])}</div><div style="font-size:11px;color:#475569;margin-top:2px;">{escape(card["customer"])} · {escape(card["move_type"])} · {escape(container_label)}</div><div style="font-size:11px;color:#475569;">{escape(display_status)} · {escape(appt)}{escape(lfd_suffix)}</div><div style="margin-top:6px;">{badges}</div></a>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_swimlane_board(scope_df: pd.DataFrame, totals_df: pd.DataFrame, completed_df: pd.DataFrame) -> None:
+    """One full-width horizontal lane per canonical status. Booking-level
+    rollup cards render left-to-right within each lane using
+    services.dispatch_card_view_model (never services.load_grouping_service,
+    which the row-based board still uses)."""
+    cards = build_booking_card_view_models(scope_df, totals_df)
+    completed_cards = build_booking_card_view_models(completed_df, completed_df) if not completed_df.empty else []
+
+    by_status: dict[str, list[dict]] = {}
+    for card in cards:
+        by_status.setdefault(card["canonical_status"], []).append(card)
+
+    lanes = [stage for stage in get_board_columns() if stage != "Completed"]
+    for status in lanes:
+        lane_cards = sort_booking_cards(by_status.get(status, []))
+        booking_count = len(lane_cards)
+        container_count = sum(c["visible_container_count"] for c in lane_cards)
+        unassigned_count = sum(c["unassigned_count"] for c in lane_cards)
+        label = f"{status} — {booking_count} Bookings · {container_count} Containers"
+        if unassigned_count:
+            label += f" · {unassigned_count} Unassigned"
+        with st.expander(label, expanded=bool(lane_cards)):
+            if not lane_cards:
+                st.caption("No bookings in this stage.")
+                continue
+            chunk_size = 4
+            for start in range(0, len(lane_cards), chunk_size):
+                row_cards = lane_cards[start:start + chunk_size]
+                cols = st.columns(chunk_size)
+                for col, card in zip(cols, row_cards):
+                    with col:
+                        _render_booking_card(card)
+
+    completed_label = f"Completed — {len(completed_cards)} Bookings · {sum(c['visible_container_count'] for c in completed_cards)} Containers (recent)"
+    with st.expander(completed_label, expanded=False):
+        if not completed_cards:
+            st.caption("No recently completed bookings.")
+        else:
+            chunk_size = 4
+            for start in range(0, len(completed_cards), chunk_size):
+                row_cards = completed_cards[start:start + chunk_size]
+                cols = st.columns(chunk_size)
+                for col, card in zip(cols, row_cards):
+                    with col:
+                        _render_booking_card(card)
+
+
 def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
     st.subheader("Dispatch Board")
     st.caption("Action board by move type. Port/PIN work appears only for port imports and exports.")
@@ -1072,30 +1137,23 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     for idx, label in enumerate(exception_labels):
         exception_cols[idx].metric(label, int(exception_counts.get(label, 0)))
 
-    if scope_df.empty:
+    completed_df = board_df[board_df["Status"].eq("Completed")].copy()
+    if search_filter:
+        completed_available_columns = [column for column in [
+            "Booking Number", "Load ID", "Reference Number", "Container Number",
+            "Customer", "Port", "Warehouse", "Address", "Driver Name",
+            "Truck Assigned", "Chassis", "Status", "Dispatcher Notes",
+        ] if column in completed_df.columns]
+        completed_blob = completed_df[completed_available_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+        for term in [part for part in re.split(r"\s+", search_filter) if part]:
+            completed_df = completed_df[completed_blob.str.contains(re.escape(term), na=False)]
+            completed_blob = completed_blob[completed_blob.str.contains(re.escape(term), na=False)]
+    completed_df = completed_df.sort_values("_row_id", ascending=False).head(30)
+
+    if scope_df.empty and completed_df.empty:
         st.info("No active dispatch loads match the current Dispatch Board filters.")
     else:
-        stage_sort = {stage: idx for idx, stage in enumerate(get_board_columns())}
-        severity_rank = {"late": 0, "risk": 1, "": 2}
-        scope_df["_risk"] = scope_df.apply(_risk_level, axis=1)
-        scope_df["_risk_sort"] = scope_df["_risk"].map(severity_rank).fillna(2)
-        scope_df["_stage_sort"] = scope_df["Status"].map(stage_sort).fillna(len(stage_sort))
-        sorted_df = scope_df.sort_values(
-            ["_risk_sort", "_stage_sort", "Exception Count", "Delivery Date Parsed", "LFD Parsed", "_row_id"],
-            ascending=[True, True, False, True, True, True],
-            na_position="last",
-        )
-        grouped_df = group_loads_by_booking(sorted_df, require_same_status=True)
-        header_cols = st.columns([0.6, 1.4, 0.8, 1.1, 1.3, 1.3, 1.0, 1.0, 1.0, 0.9, 1.1, 1.3, 0.7])
-        headers = ["Risk", "Load", "Type", "Status", "Origin", "Destination", "Appt / LFD", "Driver", "Truck/Chassis", "ETA", "Exceptions", "Next Action", ""]
-        for col, label in zip(header_cols, headers):
-            col.caption(f"**{label}**" if label else "")
-        for _, row in grouped_df.head(60).iterrows():
-            row_ids = row.get("_grouped_row_ids", [])
-            if len(row_ids) > 1:
-                _render_dispatch_row_group(row, refresh_callback)
-            else:
-                _render_dispatch_row(row, refresh_callback)
+        _render_swimlane_board(scope_df, board_df, completed_df)
 
     selected_row_id = st.session_state.get("dispatch_board_selected_row_id")
     if selected_row_id is None:
