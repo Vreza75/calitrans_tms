@@ -646,7 +646,7 @@ def render_orders_management(df: pd.DataFrame) -> None:
     k4.metric("Cancel", len(cancelled_df))
 
     columns = [
-        "_row_id", "TYPE", "Booking Number", "Load ID", "Customer",
+        "_row_id", "TYPE", "Booking Number", "Containers", "Load ID", "Customer",
         "Container Number", "Port", "Warehouse", "Delivery Need Date",
         "LFD", "Status", "Driver Name", "Truck Assigned",
         "Chassis", "Dispatcher Notes",
@@ -669,10 +669,17 @@ def render_orders_management(df: pd.DataFrame) -> None:
             return
 
         grouped_df = group_loads_by_booking(table_df)
-        display_cols = [c for c in columns if c in grouped_df.columns] + ["Containers"]
+        display_cols = [c for c in columns if c in grouped_df.columns]
         sorted_type_df = grouped_df.sort_values("_row_id", ascending=False)
         context_key = f"{title}_{selected_flow}"
-        styled_type_df = sorted_type_df[display_cols].style.apply(_status_row_style, axis=1)
+        styled_type_df = (
+            sorted_type_df[display_cols]
+            .style.apply(_status_row_style, axis=1)
+            .map(
+                lambda value: "font-weight: 800; color: #003B8E;" if value else "",
+                subset=["Containers"],
+            )
+        )
 
         event = st.dataframe(
             styled_type_df,
