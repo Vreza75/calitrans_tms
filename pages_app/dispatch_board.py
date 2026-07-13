@@ -39,6 +39,8 @@ from services.dispatch_workflow_service import (
     _status_row_style,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
+from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
+from services.dispatch_transition_service import apply_transition
 from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
@@ -114,6 +116,131 @@ def _get_selected_dispatch_load(df: pd.DataFrame):
         return None
 
     return selected_df.iloc[0]
+
+
+def _render_operational_status_tab(selected_load, load_id: int, current_status: str, operational_stages: list[str], refresh_callback) -> None:
+    status_options = operational_stages + [CANCELLED_STATUS]
+    current_index = status_options.index(current_status) if current_status in status_options else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    new_status = c1.selectbox("New Status", status_options, index=current_index, key=f"new_status_{load_id}")
+    driver = c2.text_input("Driver Name", value=str(selected_load.get("Driver Name", "") or ""), key=f"status_driver_{load_id}")
+    truck = c3.text_input("Truck Assigned", value=str(selected_load.get("Truck Assigned", "") or ""), key=f"status_truck_{load_id}")
+    chassis = c4.text_input("Chassis", value=str(selected_load.get("Chassis", "") or ""), key=f"status_chassis_{load_id}")
+    customer_email = st.text_input(
+        "Customer Email",
+        value=str(selected_load.get("Customer Email", "") or ""),
+        key=f"customer_email_{load_id}",
+    )
+    note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120, key=f"status_note_{load_id}")
+
+    override = st.checkbox("Override transition rules (requires a reason)", key=f"status_override_{load_id}")
+    override_reason = ""
+    if override:
+        override_reason = st.text_input("Override reason", key=f"status_override_reason_{load_id}")
+
+    if st.button("Save Status Update", key=f"save_status_{load_id}"):
+        detail_updates = {}
+        if driver.strip() != str(selected_load.get("Driver Name", "") or "").strip():
+            detail_updates["Driver Name"] = driver.strip()
+        if truck.strip() != str(selected_load.get("Truck Assigned", "") or "").strip():
+            detail_updates["Truck Assigned"] = truck.strip()
+        if chassis.strip() != str(selected_load.get("Chassis", "") or "").strip():
+            detail_updates["Chassis"] = chassis.strip()
+
+        if detail_updates:
+            DispatchDatabaseClient().update_row_fields(load_id, detail_updates)
+
+        if new_status != current_status:
+            result = apply_transition(
+                load_id,
+                new_status,
+                note=note.strip(),
+                override=override,
+                override_reason=override_reason.strip(),
+            )
+            if not result["ok"]:
+                st.error(result["reason"])
+                return
+
+            email_sent, email_msg = _send_customer_status_update_email(
+                load_id, selected_load, current_status, new_status, note.strip(), customer_email.strip(),
+            )
+            if email_sent:
+                st.success(f"Status updated. {email_msg}")
+            else:
+                st.warning(f"Status updated, but customer email was not sent: {email_msg}")
+
+            _run_refresh(refresh_callback)
+            st.rerun()
+        elif detail_updates:
+            st.success("Load details updated.")
+            _run_refresh(refresh_callback)
+            st.rerun()
+        else:
+            st.info("No changes detected.")
+
+
+def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, refresh_callback) -> None:
+    """Unchanged pre-dispatch status path — loads not yet in the new
+    operational model (Ready to Dispatch or later) keep the original free
+    status selectbox until Phase 5 gives them their own Intake &
+    Verification workspace."""
+    c1, c2, c3, c4 = st.columns(4)
+    status_index = LOAD_STATUS_FLOW.index(current_status) if current_status in LOAD_STATUS_FLOW else 0
+
+    new_status = c1.selectbox("New Status", LOAD_STATUS_FLOW, index=status_index, key=f"legacy_status_{load_id}")
+    driver = c2.text_input("Driver Name", value=str(selected_load.get("Driver Name", "") or ""), key=f"legacy_driver_{load_id}")
+    truck = c3.text_input("Truck Assigned", value=str(selected_load.get("Truck Assigned", "") or ""), key=f"legacy_truck_{load_id}")
+    chassis = c4.text_input("Chassis", value=str(selected_load.get("Chassis", "") or ""), key=f"legacy_chassis_{load_id}")
+    customer_email = st.text_input(
+        "Customer Email",
+        value=str(selected_load.get("Customer Email", "") or ""),
+        key=f"legacy_customer_email_{load_id}",
+    )
+
+    note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120, key=f"legacy_note_{load_id}")
+
+    if st.button("Save Status Update", key=f"legacy_save_status_{load_id}"):
+        readiness = _load_readiness_details(selected_load, documents_df=_read_documents_for_load(load_id))
+        if (
+            new_status in ["Ready to Dispatch", "Dispatched"]
+            and new_status != current_status
+            and not readiness.get("dispatchable")
+        ):
+            st.error("This load cannot be marked Ready to Dispatch or Dispatched until order details, port verification, driver, truck, and PIN/appointment are complete.")
+            return
+        updates = {}
+        if new_status != current_status:
+            updates["Status"] = new_status
+        if driver.strip() != str(selected_load.get("Driver Name", "") or "").strip():
+            updates["Driver Name"] = driver.strip()
+        if truck.strip() != str(selected_load.get("Truck Assigned", "") or "").strip():
+            updates["Truck Assigned"] = truck.strip()
+        if chassis.strip() != str(selected_load.get("Chassis", "") or "").strip():
+            updates["Chassis"] = chassis.strip()
+        if note.strip() != str(selected_load.get("Dispatcher Notes", "") or "").strip():
+            updates["Dispatcher Notes"] = note.strip()
+
+        if updates:
+            DispatchDatabaseClient().update_row_fields(load_id, updates)
+
+            if "Status" in updates:
+                email_sent, email_msg = _send_customer_status_update_email(
+                    load_id, selected_load, current_status, new_status, note.strip(), customer_email.strip(),
+                )
+                if email_sent:
+                    st.success(f"Status updated. {email_msg}")
+                else:
+                    st.warning(f"Status updated, but customer email was not sent: {email_msg}")
+            else:
+                st.success("Load details updated.")
+
+            _run_refresh(refresh_callback)
+            st.rerun()
+        else:
+            st.info("No changes detected.")
+
 
 def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
     load_id = int(selected_load["_row_id"])
@@ -198,67 +325,16 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
 
     with status_tab:
         st.markdown("### Status Update")
-        c1, c2, c3, c4 = st.columns(4)
         current_status = str(selected_load.get("Status", "") or "New")
-        status_index = LOAD_STATUS_FLOW.index(current_status) if current_status in LOAD_STATUS_FLOW else 0
+        move_type = _normalize_load_type(selected_load)
+        operational_stages = get_operational_stages(move_type)
 
-        new_status = c1.selectbox("New Status", LOAD_STATUS_FLOW, index=status_index)
-        driver = c2.text_input("Driver Name", value=str(selected_load.get("Driver Name", "") or ""))
-        truck = c3.text_input("Truck Assigned", value=str(selected_load.get("Truck Assigned", "") or ""))
-        chassis = c4.text_input("Chassis", value=str(selected_load.get("Chassis", "") or ""))
-        customer_email = st.text_input(
-            "Customer Email",
-            value=str(selected_load.get("Customer Email", "") or ""),
-            key=f"customer_email_{load_id}",
-    )
-
-        note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120)
-
-        if st.button("Save Status Update", key=f"save_status_{load_id}"):
-            if (
-                new_status in ["Ready to Dispatch", "Dispatched"]
-                and new_status != current_status
-                and not readiness.get("dispatchable")
-            ):
-                st.error("This load cannot be marked Ready to Dispatch or Dispatched until order details, port verification, driver, truck, and PIN/appointment are complete.")
-                return
-            updates = {}
-            if new_status != current_status:
-                updates["Status"] = new_status
-            if driver.strip() != str(selected_load.get("Driver Name", "") or "").strip():
-                updates["Driver Name"] = driver.strip()
-            if truck.strip() != str(selected_load.get("Truck Assigned", "") or "").strip():
-                updates["Truck Assigned"] = truck.strip()
-            if chassis.strip() != str(selected_load.get("Chassis", "") or "").strip():
-                updates["Chassis"] = chassis.strip()
-            if note.strip() != str(selected_load.get("Dispatcher Notes", "") or "").strip():
-                updates["Dispatcher Notes"] = note.strip()
-           
-
-            if updates:
-                DispatchDatabaseClient().update_row_fields(load_id, updates)
-
-                if "Status" in updates:
-                    email_sent, email_msg = _send_customer_status_update_email(
-                        load_id,
-                        selected_load,
-                        current_status,
-                        new_status,
-                        note.strip(),
-                        customer_email.strip(),
-                    )
-
-                    if email_sent:
-                        st.success(f"Status updated. {email_msg}")
-                    else:
-                        st.warning(f"Status updated, but customer email was not sent: {email_msg}")
-                else:
-                    st.success("Load details updated.")
-
-                _run_refresh(refresh_callback)
-                st.rerun()
-            else:
-                st.info("No changes detected.")
+        if current_status in operational_stages or current_status == CANCELLED_STATUS:
+            _render_operational_status_tab(
+                selected_load, load_id, current_status, operational_stages, refresh_callback
+            )
+        else:
+            _render_legacy_status_tab(selected_load, load_id, current_status, refresh_callback)
 
     with timeline_tab:
         st.markdown("### Load Timeline")
