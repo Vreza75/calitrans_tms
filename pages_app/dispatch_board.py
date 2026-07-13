@@ -39,6 +39,7 @@ from services.dispatch_workflow_service import (
     _status_row_style,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
+from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
 
@@ -712,7 +713,7 @@ def render_dispatch_board(df: pd.DataFrame, refresh_callback: Callable[[], None]
         if selected_load is not None:
             open_load_workspace_dialog(selected_load)
 
-def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str) -> None:
+def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str, show_work_button: bool = True) -> None:
     row_id = _int_or_none(row.get("_row_id")) or 0
     status = _clean_display_value(row.get("Status", ""), "New")
     move_type = _clean_display_value(row.get("Dispatch Move Type", ""), _normalize_load_type(row))
@@ -773,9 +774,36 @@ def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str) -
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Work Load", key=f"dispatch_card_{card_key_prefix}_{row_id}", use_container_width=True):
+    if show_work_button and st.button("Work Load", key=f"dispatch_card_{card_key_prefix}_{row_id}", use_container_width=True):
         st.session_state["dispatch_board_selected_row_id"] = row_id
         st.rerun()
+
+
+def _render_dispatch_action_group_card(group_row, action_label: str, card_key_prefix: str) -> None:
+    """Render one card for a collapsed multi-container booking group.
+
+    Shows the same summary info as _render_dispatch_action_card plus the
+    "N containers" badge. Instead of opening the workspace directly, reveals
+    a small picker so the dispatcher chooses which container to work.
+    """
+    row_ids = list(group_row.get("_grouped_row_ids", []))
+    containers_label = group_row.get("Containers") or f"{len(row_ids)} containers"
+
+    _render_dispatch_action_card(group_row, action_label, card_key_prefix, show_work_button=False)
+    st.caption(f"📦 {containers_label} — pick one below to work it")
+
+    picker_key = f"dispatch_group_picker_{card_key_prefix}"
+    if st.session_state.get(f"{picker_key}_open"):
+        for row_id in row_ids:
+            if st.button(f"Work container (load {row_id})", key=f"{picker_key}_{row_id}", use_container_width=True):
+                st.session_state["dispatch_board_selected_row_id"] = row_id
+                st.session_state.pop(f"{picker_key}_open", None)
+                st.rerun()
+    else:
+        if st.button("Choose container to work", key=f"{picker_key}_toggle", use_container_width=True):
+            st.session_state[f"{picker_key}_open"] = True
+            st.rerun()
+
 
 def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
     st.subheader("Dispatch Board")
@@ -953,8 +981,14 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
                     if action_df.empty:
                         st.caption("No loads")
                     else:
-                        for card_idx, (_, row) in enumerate(action_df.head(30).iterrows()):
-                            _render_dispatch_action_card(row, action_label, f"{lane_name}_{action_key}_{card_idx}")
+                        grouped_action_df = group_loads_by_booking(action_df, require_same_status=True)
+                        for card_idx, (_, row) in enumerate(grouped_action_df.head(30).iterrows()):
+                            row_ids = row.get("_grouped_row_ids", [])
+                            card_key = f"{lane_name}_{action_key}_{card_idx}"
+                            if len(row_ids) > 1:
+                                _render_dispatch_action_group_card(row, action_label, card_key)
+                            else:
+                                _render_dispatch_action_card(row, action_label, card_key)
 
     selected_row_id = st.session_state.get("dispatch_board_selected_row_id")
     if selected_row_id is None:
