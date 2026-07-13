@@ -18,20 +18,15 @@ from services.dispatch_data_service import (
     _update_load_extra_fields,
 )
 from services.dispatch_workflow_service import (
-    DISPATCH_BOARD_STATUSES,
     LOAD_STATUS_FLOW,
-    LOAD_TYPE_TABS,
     _clean_display_value,
     _generate_driver_dispatch_message,
-    _get_status_border_color,
-    _get_status_color,
     _int_or_none,
     _load_exception_summary,
     _load_readiness_details,
     _normalize_load_type,
     _normalize_load_type_value,
     _safe_str,
-    _status_row_style,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
 from services.dispatch_board_view import (
@@ -66,60 +61,6 @@ def _render_port_panel(selected_load, readiness: dict | None = None, port_housto
             port_houston_panel_renderer(selected_load)
     else:
         st.info("Port Houston panel is not available from this page context.")
-
-def render_load_card(row) -> None:
-    booking = str(row.get("Booking Number", "") or "")
-    row_id = int(row.get("_row_id", 0))
-    status = str(row.get("Status", "") or "")
-    container = str(row.get("Container Number", "") or "-")
-    customer = str(row.get("Customer", "") or "-")
-    driver = _clean_display_value(row.get("Driver Name", ""), "Unassigned")
-    need_date = str(row.get("Delivery Need Date", "") or "-")
-
-    status_color = _get_status_color(status)
-    border_color = _get_status_border_color(status)
-
-    st.markdown(
-        f"""
-        <div style="
-            background:{status_color};
-            border-left:5px solid {border_color};
-            border-radius:8px;
-            padding:6px 7px;
-            margin-bottom:5px;
-            font-size:10px;
-            line-height:1.15;
-        ">
-            <b>{booking}</b><br>
-            {container}<br>
-            <span>{customer}</span><br>
-            <span>{driver}</span> · <span>{need_date}</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if st.button("Open", key=f"open_load_{row_id}", use_container_width=True):
-        st.session_state["selected_dispatch_load_id"] = row_id
-        st.session_state["show_load_workspace_dialog"] = True
-        st.rerun()
-
-def _get_selected_dispatch_load(df: pd.DataFrame):
-    selected_id = st.session_state.get("selected_dispatch_load_id")
-
-    if selected_id is None and not df.empty:
-        selected_id = int(df.iloc[0]["_row_id"])
-        st.session_state["selected_dispatch_load_id"] = selected_id
-
-    if selected_id is None:
-        return None
-
-    selected_df = df[df["_row_id"].astype(int).eq(int(selected_id))]
-    if selected_df.empty:
-        return None
-
-    return selected_df.iloc[0]
-
 
 def _render_operational_status_tab(selected_load, load_id: int, current_status: str, operational_stages: list[str], refresh_callback) -> None:
     status_options = operational_stages + [CANCELLED_STATUS]
@@ -609,189 +550,6 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                 st.warning(f"Marked Ready for ProfitTools, but customer email was not sent: {email_msg}")
             _run_refresh(refresh_callback)
             st.rerun()
-
-def open_load_workspace_dialog(selected_load):
-    render_dispatch_workspace(selected_load, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
-
-def render_dispatch_board(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
-    st.subheader("Dispatch Board")
-    st.caption("Live Dispatch, Tomorrow Planning, and Future Pipeline.")
-
-    board_df = df.copy()
-    board_df["TYPE"] = board_df.get("TYPE", pd.Series("", index=board_df.index)).apply(_normalize_load_type_value)
-    selected_flow = render_service_flow_filter("dispatch_board_legacy_service_flow")
-    board_df = apply_service_flow_filter(board_df, selected_flow)
-
-    board_df["Delivery Date Parsed"] = pd.to_datetime(
-        board_df["Delivery Need Date"].astype(str).str.strip(),
-        errors="coerce",
-    )
-
-    today = pd.Timestamp(date.today()).normalize()
-    tomorrow = today + pd.Timedelta(days=1)
-
-    live_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().eq(today)
-        & board_df["Status"].isin(DISPATCH_BOARD_STATUSES)
-    ].copy()
-
-    tomorrow_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().eq(tomorrow)
-        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
-    ].copy()
-
-    future_df = board_df[
-        board_df["Delivery Date Parsed"].dt.normalize().gt(tomorrow)
-        & ~board_df["Status"].isin(["Closed", "Cancelled", "Invoiced"])
-    ].copy()
-
-    main_tabs = st.tabs(["Live Dispatch", "Tomorrow Planning", "Future Pipeline"])
-
-    with main_tabs[0]:
-        st.markdown("### Live Dispatch")
-
-        type_tabs = st.tabs(LOAD_TYPE_TABS)
-
-        for type_tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
-            with type_tab:
-                type_df = live_df[
-                    live_df["TYPE"].astype(str).str.strip().eq(type_value)
-                ].copy()
-
-                st.markdown(f"#### {type_value}")
-                st.caption(f"{len(type_df)} active load(s) today")
-
-                status_cols = st.columns(len(DISPATCH_BOARD_STATUSES), gap="small")
-
-                for idx, status in enumerate(DISPATCH_BOARD_STATUSES):
-                    with status_cols[idx]:
-                        status_df = type_df[
-                            type_df["Status"].astype(str).str.strip().eq(status)
-                        ].copy()
-
-                        st.markdown(
-                            f"""
-                            <div style="
-                                text-align:center;
-                                font-weight:800;
-                                background:#f1f5f9;
-                                border:1px solid #cbd5e1;
-                                border-radius:10px;
-                                padding:8px;
-                                margin-bottom:8px;
-                            ">
-                                {status}<br>
-                                <span style="font-size:18px;">{len(status_df)}</span>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        if status_df.empty:
-                            st.caption("No loads")
-                        else:
-                            for _, row in status_df.head(30).iterrows():
-                                render_load_card(row)
-
-    with main_tabs[1]:
-        st.markdown("### Tomorrow Planning")
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Tomorrow Loads", len(tomorrow_df))
-        k2.metric("Assigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().ne("").sum()))
-        k3.metric("Unassigned", int(tomorrow_df["Driver Name"].astype(str).str.strip().isin(["", "nan", "None", "Unassigned"]).sum()))
-        k4.metric("Needs Info", int(tomorrow_df["Status"].eq("Hold/Need Info").sum()))
-
-        type_tabs = st.tabs(LOAD_TYPE_TABS)
-
-        for type_tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
-            with type_tab:
-                type_df = tomorrow_df[
-                    tomorrow_df["TYPE"].astype(str).str.strip().eq(type_value)
-                ].copy()
-
-                st.markdown(f"#### {type_value} — Tomorrow")
-                st.caption(f"{len(type_df)} planned load(s)")
-
-                if type_df.empty:
-                    st.info(f"No {type_value} loads planned for tomorrow.")
-                    continue
-
-                columns = [
-                    "_row_id",
-                    "TYPE",
-                    "Booking Number",
-                    "Load ID",
-                    "Customer",
-                    "Container Number",
-                    "Warehouse",
-                    "Delivery Need Date",
-                    "LFD",
-                    "Status",
-                    "Driver Name",
-                    "Truck Assigned",
-                    "Chassis",
-                    "Dispatcher Notes",
-                ]
-
-                display_cols = [c for c in columns if c in type_df.columns]
-
-                styled = (
-                    type_df.sort_values(["Status", "Delivery Need Date"], ascending=[True, True])[display_cols]
-                    .style
-                    .apply(_status_row_style, axis=1)
-                )
-
-                st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    with main_tabs[2]:
-        st.markdown("### Future Pipeline")
-
-        type_tabs = st.tabs(LOAD_TYPE_TABS)
-
-        for type_tab, type_value in zip(type_tabs, LOAD_TYPE_TABS):
-            with type_tab:
-                type_df = future_df[
-                    future_df["TYPE"].astype(str).str.strip().eq(type_value)
-                ].copy()
-
-                st.markdown(f"#### {type_value} — Future")
-                st.caption(f"{len(type_df)} upcoming load(s)")
-
-                if type_df.empty:
-                    st.info(f"No future {type_value} loads found.")
-                    continue
-
-                columns = [
-                    "_row_id",
-                    "TYPE",
-                    "Booking Number",
-                    "Load ID",
-                    "Customer",
-                    "Container Number",
-                    "Port",
-                    "Warehouse",
-                    "Delivery Need Date",
-                    "LFD",
-                    "Status",
-                    "Driver Name",
-                    "Dispatcher Notes",
-                ]
-
-                display_cols = [c for c in columns if c in type_df.columns]
-
-                st.dataframe(
-                    type_df.sort_values("Delivery Need Date")[display_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-    if st.session_state.get("show_load_workspace_dialog"):
-        selected_load = _get_selected_dispatch_load(df)
-
-        if selected_load is not None:
-            open_load_workspace_dialog(selected_load)
-
 
 def _render_booking_card(card: dict) -> None:
     display_status = get_display_label(card["move_type"], card["canonical_status"])
