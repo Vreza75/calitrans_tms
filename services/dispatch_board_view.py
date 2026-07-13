@@ -1,79 +1,84 @@
 from __future__ import annotations
 
-from services.dispatch_stages import COMPLETION_STATUS, get_operational_stages
+from services.dispatch_stages import SHARED_STAGES, get_operational_stages
 from services.workflow_constants import normalize_service_flow
 
-SHARED_BOARD_STAGES = [
-    "Ready to Dispatch",
-    "Assigned",
-    "En Route to Pickup",
-    "At Pickup",
-    "En Route to Delivery",
-    "At Delivery",
-    "Empty Return",
-    "Completed",
-]
-
-_SHARED_STAGE_MAP: dict[str, dict[str, str]] = {
+_DISPLAY_LABELS: dict[str, dict[str, str]] = {
     "Import": {
-        "Ready to Dispatch": "Ready to Dispatch",
-        "Driver Assigned": "Assigned",
-        "En Route to Port": "En Route to Pickup",
-        "At Port": "At Pickup",
-        "Container Picked Up": "At Pickup",
-        "En Route to Delivery Warehouse": "En Route to Delivery",
-        "At Delivery Warehouse": "At Delivery",
-        "Delivered": "At Delivery",
-        "Returning Empty": "Empty Return",
-        "Empty Returned": "Empty Return",
-        "Dispatch Complete": "Completed",
+        "En Route to Pickup": "En Route to Port",
+        "At Pickup": "At Port",
+        "En Route to Delivery": "En Route to Delivery Warehouse",
+        "At Delivery": "At Delivery Warehouse",
     },
     "Export": {
-        "Ready to Dispatch": "Ready to Dispatch",
-        "Driver Assigned": "Assigned",
-        "En Route to Pickup Warehouse": "En Route to Pickup",
-        "At Pickup Warehouse": "At Pickup",
-        "Container Loaded": "At Pickup",
-        "En Route to Port": "En Route to Delivery",
-        "At Port": "At Delivery",
-        "In-Gated": "Completed",
-        "Dispatch Complete": "Completed",
+        "En Route to Pickup": "En Route to Pickup Warehouse",
+        "At Pickup": "At Pickup Warehouse",
+        "En Route to Delivery": "En Route to Port",
+        "At Delivery": "At Port",
+        "Completed": "In-Gated",
     },
     "Local Import": {
-        "Ready to Dispatch": "Ready to Dispatch",
-        "Driver Assigned": "Assigned",
-        "En Route to Origin Warehouse": "En Route to Pickup",
-        "At Origin Warehouse": "At Pickup",
-        "Loaded / Picked Up": "At Pickup",
-        "En Route to Destination Warehouse": "En Route to Delivery",
-        "At Destination Warehouse": "At Delivery",
-        "Delivered": "At Delivery",
-        "Dispatch Complete": "Completed",
+        "En Route to Pickup": "En Route to Origin Warehouse",
+        "At Pickup": "At Origin Warehouse",
+        "En Route to Delivery": "En Route to Destination Warehouse",
+        "At Delivery": "At Destination Warehouse",
     },
 }
-_SHARED_STAGE_MAP["Local Export"] = _SHARED_STAGE_MAP["Local Import"]
+_DISPLAY_LABELS["Local Export"] = _DISPLAY_LABELS["Local Import"]
 
 
-def to_shared_stage(move_type: str, status: str) -> str:
-    """Map a move-type-specific operational status to one of the 8 shared
-    board buckets, for the "All Service Flows" board view. Returns "" for
-    a status this move type doesn't recognize."""
+def get_display_label(move_type: str, canonical_status: str, *, via_empty_return: bool = False) -> str:
+    """Contextual, move-type-specific label for a canonical status. Purely
+    cosmetic — never stored. Falls back to the canonical status itself if
+    this move type has no override for it."""
     normalized = normalize_service_flow(move_type, default="Local Import")
-    mapping = _SHARED_STAGE_MAP.get(normalized, _SHARED_STAGE_MAP["Local Import"])
-    return mapping.get(status, "")
+    if normalized == "Import" and canonical_status == "Completed" and via_empty_return:
+        return "Empty Returned"
+    return _DISPLAY_LABELS.get(normalized, {}).get(canonical_status, canonical_status)
 
 
-def get_board_columns(service_flow_filter: str) -> list[str]:
-    """Column set for the active board: the 8 shared buckets when viewing
-    all service flows, or that move type's exact operational stage
-    sequence when filtered to one specific flow."""
-    if service_flow_filter == "All":
-        return list(SHARED_BOARD_STAGES)
-    return get_operational_stages(service_flow_filter)
+def get_board_columns() -> list[str]:
+    """Canonical stages are shared across move types now, so there's one
+    status-filter option list. A move type that doesn't use a given stage
+    (e.g. Export + Returning Empty) simply never has rows in it."""
+    return list(SHARED_STAGES)
 
 
 def is_active_dispatch_status(move_type: str, status: str) -> bool:
-    """True once a load has reached Ready to Dispatch and hasn't yet
-    reached Dispatch Complete — i.e. belongs on the active Dispatch Board."""
     stages = get_operational_stages(move_type)
-    return status in stages and status != COMPLETION_STATUS
+    return status in stages and status != "Completed"
+
+
+def get_next_action(
+    move_type: str,
+    status: str,
+    *,
+    has_driver: bool = False,
+    empty_return_required: bool = False,
+) -> tuple[str, str] | None:
+    """Return (button_label, target_canonical_status) for the next valid
+    operational action from this status, or None if there isn't one
+    (Completed / Cancelled — no forward action)."""
+    normalized = normalize_service_flow(move_type, default="Local Import")
+
+    if status == "Ready to Dispatch":
+        label = "Start En Route" if has_driver else "Assign & Start"
+        return label, "En Route to Pickup"
+    if status == "En Route to Pickup":
+        return "Mark Arrived", "At Pickup"
+    if status == "At Pickup":
+        label = "Mark Container Picked Up" if normalized == "Import" else "Mark Loaded / Picked Up"
+        return label, "En Route to Delivery"
+    if status == "En Route to Delivery":
+        return "Mark Arrived", "At Delivery"
+    if status == "At Delivery":
+        if normalized == "Import" and empty_return_required:
+            return "Start Empty Return", "Returning Empty"
+        if normalized == "Import":
+            return "Complete Dispatch", "Completed"
+        if normalized == "Export":
+            return "Mark In-Gated", "Completed"
+        return "Mark Delivered", "Completed"
+    if status == "Returning Empty":
+        return "Mark Empty Returned", "Completed"
+    return None
