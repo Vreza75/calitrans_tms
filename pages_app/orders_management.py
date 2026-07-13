@@ -7,6 +7,7 @@ import streamlit as st
 
 from db_client import DispatchDatabaseClient
 from services.dispatch_workflow_service import LOAD_TYPE_TABS, _normalize_load_type_value, _status_row_style
+from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
 
@@ -667,8 +668,9 @@ def render_orders_management(df: pd.DataFrame) -> None:
             st.info(f"No {title.lower()} orders.")
             return
 
-        display_cols = [c for c in columns if c in table_df.columns]
-        sorted_type_df = table_df.sort_values("_row_id", ascending=False)
+        grouped_df = group_loads_by_booking(table_df)
+        display_cols = [c for c in columns if c in grouped_df.columns] + ["Containers"]
+        sorted_type_df = grouped_df.sort_values("_row_id", ascending=False)
         context_key = f"{title}_{selected_flow}"
         styled_type_df = sorted_type_df[display_cols].style.apply(_status_row_style, axis=1)
 
@@ -684,15 +686,41 @@ def render_orders_management(df: pd.DataFrame) -> None:
         selected_rows = event.selection.rows
 
         if selected_rows:
-            selected_row_id = int(sorted_type_df.iloc[selected_rows[0]]["_row_id"])
-            st.session_state["orders_management_selected_row_id"] = selected_row_id
+            selected_group_ids = list(sorted_type_df.iloc[selected_rows[0]]["_grouped_row_ids"])
+            st.session_state["orders_management_selected_group_ids"] = selected_group_ids
             st.session_state["orders_management_selected_context"] = context_key
+            if len(selected_group_ids) == 1:
+                st.session_state["orders_management_selected_row_id"] = int(selected_group_ids[0])
+            else:
+                st.session_state.pop("orders_management_selected_row_id", None)
 
         selected_context = st.session_state.get("orders_management_selected_context")
+        selected_group_ids = st.session_state.get("orders_management_selected_group_ids")
         selected_row_id = st.session_state.get("orders_management_selected_row_id")
 
-        if selected_context == context_key and selected_row_id is not None:
-            visible_ids = set(sorted_type_df["_row_id"].dropna().astype(int).tolist())
+        if selected_context != context_key:
+            return
+
+        if selected_group_ids and len(selected_group_ids) > 1:
+            st.divider()
+            st.markdown(f"#### {len(selected_group_ids)} containers in this booking")
+            containers_df = work_df[work_df["_row_id"].astype(int).isin(selected_group_ids)]
+            container_cols = [c for c in ["_row_id", "Container Number", "Status", "Driver Name", "Delivery Need Date"] if c in containers_df.columns]
+            container_event = st.dataframe(
+                containers_df[container_cols],
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key=f"orders_table_containers_{context_key}",
+            )
+            if container_event.selection.rows:
+                picked_row_id = int(containers_df.iloc[container_event.selection.rows[0]]["_row_id"])
+                st.session_state["orders_management_selected_row_id"] = picked_row_id
+                selected_row_id = picked_row_id
+
+        if selected_row_id is not None:
+            visible_ids = set(work_df["_row_id"].dropna().astype(int).tolist())
             if int(selected_row_id) in visible_ids:
                 st.divider()
                 _render_order_detail_editor(work_df, int(selected_row_id), context_key)
