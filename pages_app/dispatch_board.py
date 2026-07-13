@@ -628,6 +628,13 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     selected_flow = render_service_flow_filter("dispatch_board_service_flow")
     board_df = apply_service_flow_filter(board_df, selected_flow)
     board_df["Dispatch Move Type"] = board_df["TYPE"].apply(_normalize_load_type_value)
+
+    status_filter = st.selectbox(
+        "Status Filter",
+        ["All Active"] + get_board_columns(),
+        key="dispatch_board_status_filter",
+    )
+
     board_df["Delivery Date Parsed"] = pd.to_datetime(
         board_df.get("Delivery Need Date", pd.Series("", index=board_df.index)).astype(str).str.strip(),
         errors="coerce",
@@ -736,11 +743,6 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
 
     unassigned_mask = scope_df["Driver Name"].astype(str).str.strip().isin(["", "None", "nan", "Unassigned"])
 
-    status_filter = st.selectbox(
-        "Status Filter",
-        ["All Active"] + get_board_columns(),
-        key="dispatch_board_status_filter",
-    )
     if status_filter != "All Active":
         scope_df = scope_df[scope_df["Status"].eq(status_filter)].copy()
 
@@ -772,25 +774,28 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     active_cards = build_booking_card_view_models(scope_df, board_df)
     booking_identities = {(c["booking_number"], c["customer"], c["move_type"]) for c in active_cards}
 
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("Bookings", len(booking_identities))
-    summary_cols[1].metric("Containers", len(scope_df))
-    summary_cols[2].metric("Unassigned", int(unassigned_mask.sum()))
-    summary_cols[3].metric("Active Exceptions", int(scope_df["Exception Count"].gt(0).sum()))
+    active_exception_count = int(scope_df["Exception Count"].gt(0).sum())
 
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Ready to Dispatch", int(scope_df["Status"].eq("Ready to Dispatch").sum()))
-    metric_cols[1].metric("En Route", int(scope_df["Status"].isin(["En Route to Pickup", "En Route to Delivery"]).sum()))
-    metric_cols[2].metric("At Pickup", int(scope_df["Status"].eq("At Pickup").sum()))
-    metric_cols[3].metric("At Delivery", int(scope_df["Status"].eq("At Delivery").sum()))
-    metric_cols[4].metric("Empty Returns Due", int(scope_df["Status"].eq("Returning Empty").sum()))
-    metric_cols[5].metric("Completed Today", len(completed_df))
+    with st.expander("Operational Summary", expanded=active_exception_count > 0):
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("Bookings", len(booking_identities))
+        summary_cols[1].metric("Containers", len(scope_df))
+        summary_cols[2].metric("Unassigned", int(unassigned_mask.sum()))
+        summary_cols[3].metric("Active Exceptions", active_exception_count)
 
-    exception_counts = _load_exception_summary(scope_df)
-    exception_labels = ["Late appointment", "No PIN", "Waiting driver", "Port hold"]
-    exception_cols = st.columns(len(exception_labels))
-    for idx, label in enumerate(exception_labels):
-        exception_cols[idx].metric(label, int(exception_counts.get(label, 0)))
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Ready to Dispatch", int(scope_df["Status"].eq("Ready to Dispatch").sum()))
+        metric_cols[1].metric("En Route", int(scope_df["Status"].isin(["En Route to Pickup", "En Route to Delivery"]).sum()))
+        metric_cols[2].metric("At Pickup", int(scope_df["Status"].eq("At Pickup").sum()))
+        metric_cols[3].metric("At Delivery", int(scope_df["Status"].eq("At Delivery").sum()))
+        metric_cols[4].metric("Empty Returns Due", int(scope_df["Status"].eq("Returning Empty").sum()))
+        metric_cols[5].metric("Completed Today", len(completed_df))
+
+        exception_counts = _load_exception_summary(scope_df)
+        exception_labels = ["Late appointment", "No PIN", "Waiting driver", "Port hold"]
+        exception_cols = st.columns(len(exception_labels))
+        for idx, label in enumerate(exception_labels):
+            exception_cols[idx].metric(label, int(exception_counts.get(label, 0)))
 
     if scope_df.empty and completed_df.empty:
         st.info("No active dispatch loads match the current Dispatch Board filters.")
