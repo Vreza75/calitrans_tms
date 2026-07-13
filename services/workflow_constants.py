@@ -108,3 +108,11 @@ def service_flow_label(value: str) -> str:
     """Return a display label for a service flow, preserving unknown values."""
     normalized = normalize_service_flow(value)
     return normalized or str(value or "").strip()
+
+
+def requires_port_pin(service_flow: str) -> bool:
+    """True only for the two flows that touch a marine terminal (Import,
+    Export). Local Import/Local Export never require Port Sync, a
+    terminal PIN, or a port appointment — they may still have a warehouse
+    or customer appointment, which is a different concept entirely."""
+    return normalize_service_flow(service_flow, default="") in {"Import", "Export"}

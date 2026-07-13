@@ -6,7 +6,7 @@ from datetime import date
 import pandas as pd
 
 from services.dispatch_data_service import _read_documents_for_load
-from services.workflow_constants import SERVICE_FLOWS, normalize_service_flow
+from services.workflow_constants import SERVICE_FLOWS, normalize_service_flow, requires_port_pin
 
 LOAD_STATUS_FLOW = [
     "New Email",
@@ -338,7 +338,7 @@ def _normalize_load_type(load) -> str:
     return _normalize_load_type_value(_first_present(load, ["TYPE", "type", "Load Type", "load_type"], ""))
 
 def _load_requires_port_type(move_type: str) -> bool:
-    return _normalize_load_type_value(move_type) in {"Import", "Export"}
+    return requires_port_pin(move_type)
 
 def _load_requires_port(load) -> bool:
     return _load_requires_port_type(_normalize_load_type(load))
