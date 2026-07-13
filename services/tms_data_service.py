@@ -158,7 +158,12 @@ def get_ext_df() -> pd.DataFrame:
             from loads
             """
         )
-    except Exception:
+    except Exception as exc:
+        # A single missing/renamed column here previously failed the whole
+        # query silently, blanking out every extended field app-wide
+        # (steamship line, rates, live tracking, container grouping, etc.)
+        # with no visible error. Surface it instead of hiding it.
+        st.warning(f"Could not load extended load fields — some columns may be showing blank: {exc}")
         return pd.DataFrame()
 
 
