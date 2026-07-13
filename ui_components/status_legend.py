@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import streamlit as st
 
-from services.dispatch_workflow_service import STATUS_COLORS, STATUS_MEANINGS
+from services.dispatch_workflow_service import STATUS_MEANINGS
+from ui_components.status_badge import render_status_badge
 
 STATUS_LEGEND_GROUPS = {
     "Intake / Verification": ["New Email", "Needs Review", "Order Created", "New", "Hold/Need Info", "Booking Verified", "Port Verified"],
@@ -21,16 +22,12 @@ def render_status_legend() -> None:
     for group_name, statuses in STATUS_LEGEND_GROUPS.items():
         st.markdown(f"**{group_name}**")
         for status in statuses:
-            color = STATUS_COLORS.get(status, "#ffffff")
             meaning = STATUS_MEANINGS.get(status, "")
             st.markdown(
                 f"""
-                <div style="display:flex; align-items:flex-start; gap:8px; margin:6px 0 8px 0;">
-                    <span style="min-width:18px; height:18px; border-radius:5px; background:{color}; border:1px solid #64748b; display:inline-block;"></span>
-                    <span style="font-size:12px; line-height:1.2;">
-                        <b>{status}</b><br>
-                        <span style="color:#64748b;">{meaning}</span>
-                    </span>
+                <div style="display:flex; align-items:center; gap:8px; margin:6px 0 8px 0;">
+                    {render_status_badge(status)}
+                    <span style="font-size:12px; color:#64748b; line-height:1.2;">{meaning}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
