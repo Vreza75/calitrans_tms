@@ -814,16 +814,7 @@ def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str, s
 
     st.markdown(
         f"""
-        <div style="
-            background:{status_color};
-            border:1px solid #cbd5e1;
-            border-left:5px solid {border_color};
-            border-radius:8px;
-            padding:8px;
-            margin-bottom:6px;
-            min-height:178px;
-            box-shadow:0 1px 2px rgba(15,23,42,.06);
-        ">
+        <div style="background:{status_color};border:1px solid #cbd5e1;border-left:5px solid {border_color};border-radius:8px;padding:8px;margin-bottom:6px;min-height:178px;box-shadow:0 1px 2px rgba(15,23,42,.06);">
             <div style="font-size:10px;font-weight:800;color:#334155;text-transform:uppercase;">{escape(action_label)}</div>
             <div style="font-size:13px;font-weight:800;color:#0f172a;line-height:1.2;margin-top:3px;">{escape(booking)}</div>
             <div style="font-size:11px;color:#334155;line-height:1.25;">{escape(container)} | {escape(customer)}</div>
@@ -1022,15 +1013,7 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
                 stage_df = sorted_df[sorted_df[board_stage_column].eq(stage_name)].copy()
                 st.markdown(
                     f"""
-                    <div style="
-                        background:#f8fafc;
-                        border:1px solid #cbd5e1;
-                        border-radius:8px;
-                        padding:8px;
-                        margin-bottom:8px;
-                        text-align:center;
-                        min-height:58px;
-                    ">
+                    <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;padding:8px;margin-bottom:8px;text-align:center;min-height:58px;">
                         <div style="font-size:12px;font-weight:800;color:#0f172a;">{escape(stage_name)}</div>
                         <div style="font-size:20px;font-weight:900;color:#0f172a;">{len(stage_df)}</div>
                     </div>
