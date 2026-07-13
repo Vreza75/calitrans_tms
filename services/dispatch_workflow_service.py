@@ -199,37 +199,58 @@ ACTIVE_DRIVER_STATUSES = [
 
 CLOSED_STATUSES = ["Closed", "Cancelled", "Invoiced"]
 
-STATUS_COLORS = {
-    "New Email": "#f8fafc",
-    "Needs Review": "#fef3c7",
-    "Order Created": "#e0f2fe",
-    "New": "#f8fafc",
-    "Hold/Need Info": "#fecaca",
-    "Booking Verified": "#dbeafe",
-    "Port Verified": "#c7d2fe",
-    "Ready for Appointment / PIN": "#ddd6fe",
-    "Ready for Port PIN": "#ddd6fe",
-    "PIN Received": "#bfdbfe",
-    "Awaiting Appointment": "#fdba74",
-    "Ready to Dispatch": "#bbf7d0",
-    "Driver Assigned": "#dcfce7",
-    "Assigned": "#dcfce7",
-    "Dispatched": "#ccfbf1",
-    "En Route to Pickup": "#bef264",
-    "At Port": "#fde68a",
-    "At Pickup": "#fde047",
-    "Loaded / Picked Up": "#a5b4fc",
-    "Loaded": "#a5b4fc",
-    "En Route To Delivery": "#5eead4",
-    "Delivered": "#93c5fd",
-    "Returning Empty": "#e0f2fe",
-    "POD Received": "#60a5fa",
-    "Ready for ProfitTools": "#4ade80",
-    "Exported to ProfitTools": "#c4b5fd",
-    "Invoiced": "#f0abfc",
-    "Closed": "#d1d5db",
-    "Cancelled": "#f87171",
+STATUS_UI: dict[str, dict[str, str]] = {
+    "New Email":                   {"background": "#f8fafc", "border": "#94a3b8", "text": "#0f172a"},
+    "Needs Review":                {"background": "#fef3c7", "border": "#d97706", "text": "#0f172a"},
+    "Order Created":                {"background": "#e0f2fe", "border": "#0284c7", "text": "#0f172a"},
+    "New":                          {"background": "#f8fafc", "border": "#94a3b8", "text": "#0f172a"},
+    "Hold/Need Info":               {"background": "#fecaca", "border": "#dc2626", "text": "#0f172a"},
+    "Booking Verified":             {"background": "#dbeafe", "border": "#2563eb", "text": "#0f172a"},
+    "Port Verified":                {"background": "#c7d2fe", "border": "#4f46e5", "text": "#0f172a"},
+    "Ready for Appointment / PIN":  {"background": "#ddd6fe", "border": "#7c3aed", "text": "#0f172a"},
+    "Ready for Port PIN":           {"background": "#ddd6fe", "border": "#7c3aed", "text": "#0f172a"},
+    "PIN Received":                 {"background": "#bfdbfe", "border": "#1d4ed8", "text": "#0f172a"},
+    "Awaiting Appointment":         {"background": "#fdba74", "border": "#ea580c", "text": "#0f172a"},
+    "Ready to Dispatch":            {"background": "#bbf7d0", "border": "#16a34a", "text": "#0f172a"},
+    "Driver Assigned":              {"background": "#dcfce7", "border": "#22c55e", "text": "#0f172a"},
+    "Assigned":                     {"background": "#dcfce7", "border": "#22c55e", "text": "#0f172a"},
+    "Dispatched":                   {"background": "#ccfbf1", "border": "#14b8a6", "text": "#0f172a"},
+    "En Route to Pickup":           {"background": "#bef264", "border": "#65a30d", "text": "#0f172a"},
+    "At Port":                      {"background": "#fde68a", "border": "#ca8a04", "text": "#0f172a"},
+    "At Pickup":                    {"background": "#fde047", "border": "#ca8a04", "text": "#0f172a"},
+    "Loaded / Picked Up":           {"background": "#a5b4fc", "border": "#4f46e5", "text": "#0f172a"},
+    "Loaded":                       {"background": "#a5b4fc", "border": "#4f46e5", "text": "#0f172a"},
+    "En Route To Delivery":         {"background": "#5eead4", "border": "#0d9488", "text": "#0f172a"},
+    "En Route to Delivery":         {"background": "#5eead4", "border": "#0d9488", "text": "#0f172a"},
+    "At Delivery":                  {"background": "#7dd3fc", "border": "#0284c7", "text": "#0f172a"},
+    "Delivered":                    {"background": "#93c5fd", "border": "#2563eb", "text": "#0f172a"},
+    "Returning Empty":              {"background": "#e0f2fe", "border": "#0284c7", "text": "#0f172a"},
+    "Completed":                    {"background": "#86efac", "border": "#15803d", "text": "#0f172a"},
+    "POD Received":                 {"background": "#60a5fa", "border": "#1d4ed8", "text": "#0f172a"},
+    "Ready for ProfitTools":        {"background": "#4ade80", "border": "#15803d", "text": "#0f172a"},
+    "Exported to ProfitTools":      {"background": "#c4b5fd", "border": "#7c3aed", "text": "#0f172a"},
+    "Invoiced":                     {"background": "#f0abfc", "border": "#c026d3", "text": "#0f172a"},
+    "Closed":                       {"background": "#d1d5db", "border": "#64748b", "text": "#0f172a"},
+    "Cancelled":                    {"background": "#f87171", "border": "#b91c1c", "text": "#0f172a"},
 }
+
+_DEFAULT_STATUS_UI = {"background": "#f1f5f9", "border": "#94a3b8", "text": "#0f172a"}
+
+
+def get_status_ui(status: str) -> dict[str, str]:
+    """Single canonical lookup for a status's background/border/text colors.
+
+    Returns a safe neutral default for any status not in STATUS_UI rather
+    than raising — callers (badges, cards, lane headers, status history)
+    never need their own fallback color.
+    """
+    return STATUS_UI.get(str(status or "").strip(), _DEFAULT_STATUS_UI)
+
+
+# Derived view kept for existing callers (ui_components/status_badge.py,
+# ui_components/status_legend.py, _status_row_style below) — STATUS_UI is
+# the single source of truth now, this dict is not hand-maintained.
+STATUS_COLORS = {status: ui["background"] for status, ui in STATUS_UI.items()}
 
 STATUS_MEANINGS = {
     "New Email": "Email received but not converted to order yet",
@@ -725,41 +746,10 @@ Instructions:
     return message.strip()
 
 def _get_status_color(status: str) -> str:
-    return STATUS_COLORS.get(str(status or "").strip(), "#f8fafc")
+    return get_status_ui(status)["background"]
 
 def _get_status_border_color(status: str) -> str:
-    border_colors = {
-        "New Email": "#94a3b8",
-        "Needs Review": "#d97706",
-        "Order Created": "#0284c7",
-        "New": "#94a3b8",
-        "Hold/Need Info": "#dc2626",
-        "Booking Verified": "#2563eb",
-        "Port Verified": "#4f46e5",
-        "Ready for Appointment / PIN": "#7c3aed",
-        "Ready for Port PIN": "#7c3aed",
-        "PIN Received": "#1d4ed8",
-        "Awaiting Appointment": "#ea580c",
-        "Ready to Dispatch": "#16a34a",
-        "Driver Assigned": "#22c55e",
-        "Assigned": "#22c55e",
-        "Dispatched": "#14b8a6",
-        "En Route to Pickup": "#65a30d",
-        "At Port": "#ca8a04",
-        "At Pickup": "#ca8a04",
-        "Loaded / Picked Up": "#4f46e5",
-        "Loaded": "#4f46e5",
-        "En Route To Delivery": "#0d9488",
-        "Delivered": "#2563eb",
-        "Returning Empty": "#0284c7",
-        "POD Received": "#1d4ed8",
-        "Ready for ProfitTools": "#15803d",
-        "Exported to ProfitTools": "#7c3aed",
-        "Invoiced": "#c026d3",
-        "Closed": "#64748b",
-        "Cancelled": "#b91c1c",
-    }
-    return border_colors.get(str(status or "").strip(), "#94a3b8")
+    return get_status_ui(status)["border"]
 
 def _status_row_style(row):
     status = str(row.get("Status", ""))
