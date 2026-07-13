@@ -34,11 +34,17 @@ from services.dispatch_workflow_service import (
     _status_row_style,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
-from services.dispatch_board_view import get_board_columns, is_active_dispatch_status, to_shared_stage
+from services.dispatch_board_view import (
+    get_board_columns,
+    get_display_label,
+    get_next_action,
+    is_active_dispatch_status,
+)
 from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
 from services.dispatch_transition_service import apply_transition
 from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
+from ui_components.status_badge import render_status_badge
 
 
 def _run_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
@@ -785,82 +791,163 @@ def render_dispatch_board(df: pd.DataFrame, refresh_callback: Callable[[], None]
         if selected_load is not None:
             open_load_workspace_dialog(selected_load)
 
-def _render_dispatch_action_card(row, action_label: str, card_key_prefix: str, show_work_button: bool = True) -> None:
-    row_id = _int_or_none(row.get("_row_id")) or 0
-    status = _clean_display_value(row.get("Status", ""), "New")
+def _risk_level(row) -> str:
+    """"" (healthy), "risk" (approaching/unassigned), or "late" (severe)."""
+    status = str(row.get("Status", "") or "")
+    if status in ("Completed", "Cancelled"):
+        return ""
+    delivery_date = pd.to_datetime(row.get("Delivery Need Date", ""), errors="coerce")
+    today = pd.Timestamp(pd.Timestamp.now().date())
+    if pd.notna(delivery_date) and delivery_date.normalize() < today:
+        return "late"
+    exceptions = _safe_str(row.get("Exceptions", ""))
+    if exceptions:
+        return "risk"
+    if status == "Ready to Dispatch" and not str(row.get("Driver Name", "") or "").strip():
+        return "risk"
+    return ""
+
+
+_RISK_BADGE = {
+    "late": '<span style="background:#fee2e2;color:#991b1b;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;">Late</span>',
+    "risk": '<span style="background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;">Risk</span>',
+    "": "",
+}
+
+
+def _render_row_next_action(row, load_id: int, move_type: str, canonical_status: str, empty_return_required: bool, refresh_callback) -> None:
+    has_driver = bool(str(row.get("Driver Name", "") or "").strip())
+    action = get_next_action(move_type, canonical_status, has_driver=has_driver, empty_return_required=empty_return_required)
+
+    if action is None:
+        st.caption("—")
+        return
+
+    label, target_status = action
+    needs_assignment = canonical_status == "Ready to Dispatch" and not has_driver
+
+    if needs_assignment:
+        assign_key = f"assign_open_{load_id}"
+        if st.session_state.get(assign_key):
+            driver_input = st.text_input("Driver", key=f"assign_driver_{load_id}", label_visibility="collapsed", placeholder="Driver name")
+            truck_input = st.text_input("Truck", key=f"assign_truck_{load_id}", label_visibility="collapsed", placeholder="Truck")
+            if st.button("Confirm", key=f"assign_confirm_{load_id}", use_container_width=True):
+                if not driver_input.strip():
+                    st.error("Driver is required.")
+                else:
+                    result = apply_transition(load_id, target_status, driver=driver_input.strip(), truck=truck_input.strip())
+                    if not result["ok"]:
+                        st.error(result["reason"])
+                    else:
+                        st.session_state.pop(assign_key, None)
+                        _run_refresh(refresh_callback)
+                        st.rerun()
+        else:
+            if st.button(label, key=f"next_action_{load_id}", use_container_width=True):
+                st.session_state[assign_key] = True
+                st.rerun()
+        return
+
+    if st.button(label, key=f"next_action_{load_id}", use_container_width=True):
+        result = apply_transition(load_id, target_status)
+        if not result["ok"]:
+            st.error(result["reason"])
+        else:
+            _run_refresh(refresh_callback)
+            st.rerun()
+
+
+def _render_dispatch_row(row, refresh_callback) -> None:
+    load_id = _int_or_none(row.get("_row_id")) or 0
     move_type = _clean_display_value(row.get("Dispatch Move Type", ""), _normalize_load_type(row))
+    canonical_status = _clean_display_value(row.get("Status", ""), "New")
+    empty_return_required = bool(str(row.get("empty_return_location", "") or "").strip())
+    display_status = get_display_label(move_type, canonical_status)
+
     booking = _clean_display_value(row.get("Booking Number", ""), "-")
-    load_ref = _clean_display_value(row.get("Load ID", ""), "-")
     container = _clean_display_value(row.get("Container Number", ""), "-")
     customer = _clean_display_value(row.get("Customer", ""), "-")
-    pickup = _clean_display_value(row.get("Port", ""), "Pickup pending")
-    delivery = _clean_display_value(row.get("Warehouse", ""), "Delivery pending")
-    driver = _clean_display_value(row.get("Driver Name", ""), "Unassigned")
-    truck = _clean_display_value(row.get("Truck Assigned", ""), "-")
+    origin = _clean_display_value(row.get("Port", "") or row.get("Warehouse", ""), "-")
+    destination = _clean_display_value(row.get("Warehouse", "") or row.get("Address", ""), "-")
     need_date = _clean_display_value(row.get("Delivery Need Date", ""), "-")
     lfd = _clean_display_value(row.get("LFD", ""), "-")
-    current_location = _clean_display_value(row.get("current_location", ""), "")
-    eta = _clean_display_value(row.get("eta", ""), "")
+    driver = _clean_display_value(row.get("Driver Name", ""), "Unassigned")
+    truck = _clean_display_value(row.get("Truck Assigned", ""), "-")
+    chassis = _clean_display_value(row.get("Chassis", ""), "-")
+    eta = _clean_display_value(row.get("eta", ""), "-")
     exceptions = [item.strip() for item in _safe_str(row.get("Exceptions", "")).split(",") if item.strip()]
+    risk = _risk_level(row)
 
-    status_color = _get_status_color(status)
-    border_color = _get_status_border_color(status)
-    exception_html = "".join(
-        f'<span style="display:inline-block;background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:999px;padding:2px 6px;margin:2px 4px 0 0;font-size:10px;font-weight:700;">{escape(item)}</span>'
-        for item in exceptions[:3]
-    )
-    if len(exceptions) > 3:
-        exception_html += f'<span style="font-size:10px;color:#991b1b;">+{len(exceptions) - 3} more</span>'
+    cols = st.columns([0.6, 1.4, 0.8, 1.1, 1.3, 1.3, 1.0, 1.0, 1.0, 0.9, 1.1, 1.3, 0.7])
 
-    st.markdown(
-        f"""
-        <div style="background:{status_color};border:1px solid #cbd5e1;border-left:5px solid {border_color};border-radius:8px;padding:8px;margin-bottom:6px;min-height:178px;box-shadow:0 1px 2px rgba(15,23,42,.06);">
-            <div style="font-size:10px;font-weight:800;color:#334155;text-transform:uppercase;">{escape(action_label)}</div>
-            <div style="font-size:13px;font-weight:800;color:#0f172a;line-height:1.2;margin-top:3px;">{escape(booking)}</div>
-            <div style="font-size:11px;color:#334155;line-height:1.25;">{escape(container)} | {escape(customer)}</div>
-            <div style="font-size:10px;color:#475569;margin-top:5px;">{escape(move_type)} | {escape(status)}</div>
-            <div style="font-size:10px;color:#475569;margin-top:6px;">
-                <b>From:</b> {escape(pickup)}<br>
-                <b>To:</b> {escape(delivery)}
-            </div>
-            <div style="font-size:10px;color:#475569;margin-top:6px;">
-                <b>Driver:</b> {escape(driver)} | <b>Truck:</b> {escape(truck)}<br>
-                <b>Need:</b> {escape(need_date)} | <b>LFD:</b> {escape(lfd)}
-            </div>
-            {f'<div style="font-size:10px;color:#475569;margin-top:6px;"><b>Location:</b> {escape(current_location)} | <b>ETA:</b> {escape(eta)}</div>' if current_location or eta else ''}
-            <div style="margin-top:5px;">{exception_html}</div>
-            <div style="font-size:9px;color:#64748b;margin-top:5px;">Load {escape(load_ref)} | Row {row_id}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if show_work_button and st.button("Work Load", key=f"dispatch_card_{card_key_prefix}_{row_id}", use_container_width=True):
-        st.session_state["dispatch_board_selected_row_id"] = row_id
-        st.rerun()
+    with cols[0]:
+        badge = _RISK_BADGE.get(risk, "")
+        if badge:
+            st.markdown(badge, unsafe_allow_html=True)
+    with cols[1]:
+        st.markdown(f"**{escape(booking)}**")
+        st.caption(f"{container} · {customer}")
+    with cols[2]:
+        st.caption(move_type)
+    with cols[3]:
+        st.markdown(render_status_badge(display_status) or escape(display_status), unsafe_allow_html=True)
+    with cols[4]:
+        st.caption(origin)
+    with cols[5]:
+        st.caption(destination)
+    with cols[6]:
+        st.caption(need_date)
+        if lfd != "-":
+            st.caption(f"LFD {lfd}")
+    with cols[7]:
+        st.caption(driver)
+    with cols[8]:
+        st.caption(f"{truck} / {chassis}")
+    with cols[9]:
+        st.caption(eta)
+    with cols[10]:
+        if exceptions:
+            st.caption(", ".join(exceptions[:2]) + (f" +{len(exceptions) - 2}" if len(exceptions) > 2 else ""))
+    with cols[11]:
+        _render_row_next_action(row, load_id, move_type, canonical_status, empty_return_required, refresh_callback)
+    with cols[12]:
+        if st.button("Open", key=f"open_row_{load_id}", use_container_width=True):
+            st.session_state["dispatch_board_selected_row_id"] = load_id
+            st.rerun()
+
+    with st.expander(f"Details — {booking}", expanded=False):
+        detail_cols = st.columns(3)
+        detail_cols[0].write(f"**Address:** {_clean_display_value(row.get('Address', ''), '-')}")
+        detail_cols[0].write(f"**Terminal:** {_clean_display_value(row.get('terminal', ''), '-')}")
+        detail_cols[1].write(f"**Pickup Appt:** {_clean_display_value(row.get('pickup_appointment', ''), '-')}")
+        detail_cols[1].write(f"**Delivery Appt:** {_clean_display_value(row.get('delivery_appointment', ''), '-')}")
+        detail_cols[2].write(f"**Empty Return:** {_clean_display_value(row.get('empty_return_location', ''), '-')}")
+        detail_cols[2].write(f"**Notes:** {_clean_display_value(row.get('Dispatcher Notes', ''), '-')}")
+        if exceptions:
+            st.warning("Exceptions: " + ", ".join(exceptions))
+
+    st.divider()
 
 
-def _render_dispatch_action_group_card(group_row, action_label: str, card_key_prefix: str) -> None:
-    """Render one card for a collapsed multi-container booking group.
-
-    Shows the same summary info as _render_dispatch_action_card plus the
-    "N containers" badge. Instead of opening the workspace directly, reveals
-    a small picker so the dispatcher chooses which container to work.
-    """
+def _render_dispatch_row_group(group_row, refresh_callback) -> None:
+    """A collapsed multi-container booking: show the summary row (using
+    the first container's data) plus a picker to open one specific
+    container, reusing the same pattern proven for the column board."""
     row_ids = list(group_row.get("_grouped_row_ids", []))
+    load_id = _int_or_none(group_row.get("_row_id")) or 0
     containers_label = group_row.get("Containers") or f"{len(row_ids)} containers"
 
-    _render_dispatch_action_card(group_row, action_label, card_key_prefix, show_work_button=False)
-    st.caption(f"📦 {containers_label} — pick one below to work it")
-
-    picker_key = f"dispatch_group_picker_{card_key_prefix}"
+    _render_dispatch_row(group_row, refresh_callback)
+    st.caption(f"📦 {containers_label} in this booking")
+    picker_key = f"dispatch_row_group_picker_{load_id}"
     if st.session_state.get(f"{picker_key}_open"):
         for row_id in row_ids:
-            if st.button(f"Work container (load {row_id})", key=f"{picker_key}_{row_id}", use_container_width=True):
+            if st.button(f"Open container (load {row_id})", key=f"{picker_key}_{row_id}", use_container_width=True):
                 st.session_state["dispatch_board_selected_row_id"] = row_id
                 st.session_state.pop(f"{picker_key}_open", None)
                 st.rerun()
     else:
-        if st.button("Choose container to work", key=f"{picker_key}_toggle", use_container_width=True):
+        if st.button("Show all containers in this booking", key=f"{picker_key}_toggle", use_container_width=True):
             st.session_state[f"{picker_key}_open"] = True
             st.rerun()
 
@@ -891,10 +978,6 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     readiness_rows = [_load_readiness_details(row, include_documents=False) for _, row in board_df.iterrows()]
     board_df["Exceptions"] = [", ".join(item.get("exceptions", [])) for item in readiness_rows]
     board_df["Exception Count"] = board_df["Exceptions"].apply(lambda value: len([item for item in _safe_str(value).split(",") if item.strip()]))
-    board_df["Board Stage"] = [
-        to_shared_stage(row["Dispatch Move Type"], row["Status"]) if selected_flow == "All" else row["Status"]
-        for _, row in board_df.iterrows()
-    ]
     board_df["Is Active Dispatch"] = [
         is_active_dispatch_status(row["Dispatch Move Type"], row["Status"]) for _, row in board_df.iterrows()
     ]
@@ -964,31 +1047,24 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
             scope_df = scope_df[mask].copy()
             search_blob = search_blob[mask]
 
-    board_stage_column = "Board Stage" if selected_flow == "All" else "Status"
     unassigned_mask = scope_df["Driver Name"].astype(str).str.strip().isin(["", "None", "nan", "Unassigned"])
 
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Ready to Dispatch", int(scope_df[board_stage_column].eq("Ready to Dispatch").sum()))
+    status_filter = st.selectbox(
+        "Status Filter",
+        ["All Active"] + get_board_columns(),
+        key="dispatch_board_status_filter",
+    )
+    if status_filter != "All Active":
+        scope_df = scope_df[scope_df["Status"].eq(status_filter)].copy()
+
+    metric_cols = st.columns(7)
+    metric_cols[0].metric("Ready to Dispatch", int(scope_df["Status"].eq("Ready to Dispatch").sum()))
     metric_cols[1].metric("Unassigned", int(unassigned_mask.sum()))
-    metric_cols[2].metric(
-        "En Route",
-        int(scope_df[board_stage_column].isin(["En Route to Pickup", "En Route to Delivery"]).sum())
-        if selected_flow == "All"
-        else int(scope_df["Status"].astype(str).str.startswith("En Route").sum()),
-    )
-    metric_cols[3].metric(
-        "At Pickup",
-        int(scope_df[board_stage_column].eq("At Pickup").sum())
-        if selected_flow == "All"
-        else int(scope_df["Status"].astype(str).str.contains("At Pickup Warehouse|At Port|At Origin Warehouse", regex=True, na=False).sum()),
-    )
-    metric_cols[4].metric(
-        "At Delivery",
-        int(scope_df[board_stage_column].eq("At Delivery").sum())
-        if selected_flow == "All"
-        else int(scope_df["Status"].astype(str).str.contains("At Delivery Warehouse|At Destination Warehouse", regex=True, na=False).sum()),
-    )
-    metric_cols[5].metric("Active Exceptions", int(scope_df["Exception Count"].gt(0).sum()))
+    metric_cols[2].metric("En Route", int(scope_df["Status"].isin(["En Route to Pickup", "En Route to Delivery"]).sum()))
+    metric_cols[3].metric("At Pickup", int(scope_df["Status"].eq("At Pickup").sum()))
+    metric_cols[4].metric("At Delivery", int(scope_df["Status"].eq("At Delivery").sum()))
+    metric_cols[5].metric("Empty Returns Due", int(scope_df["Status"].eq("Returning Empty").sum()))
+    metric_cols[6].metric("Active Exceptions", int(scope_df["Exception Count"].gt(0).sum()))
 
     exception_counts = _load_exception_summary(scope_df)
     exception_labels = ["Late appointment", "No PIN", "Waiting driver", "Port hold"]
@@ -999,38 +1075,27 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     if scope_df.empty:
         st.info("No active dispatch loads match the current Dispatch Board filters.")
     else:
-        columns = get_board_columns(selected_flow)
-        stage_sort = {stage: idx for idx, stage in enumerate(columns)}
-        scope_df["Board Stage Sort"] = scope_df[board_stage_column].map(stage_sort).fillna(len(columns))
+        stage_sort = {stage: idx for idx, stage in enumerate(get_board_columns())}
+        severity_rank = {"late": 0, "risk": 1, "": 2}
+        scope_df["_risk"] = scope_df.apply(_risk_level, axis=1)
+        scope_df["_risk_sort"] = scope_df["_risk"].map(severity_rank).fillna(2)
+        scope_df["_stage_sort"] = scope_df["Status"].map(stage_sort).fillna(len(stage_sort))
         sorted_df = scope_df.sort_values(
-            ["Board Stage Sort", "Exception Count", "Delivery Date Parsed", "LFD Parsed", "_row_id"],
-            ascending=[True, False, True, True, True],
+            ["_risk_sort", "_stage_sort", "Exception Count", "Delivery Date Parsed", "LFD Parsed", "_row_id"],
+            ascending=[True, True, False, True, True, True],
             na_position="last",
         )
-        board_cols = st.columns(len(columns), gap="small")
-        for idx, stage_name in enumerate(columns):
-            with board_cols[idx]:
-                stage_df = sorted_df[sorted_df[board_stage_column].eq(stage_name)].copy()
-                st.markdown(
-                    f"""
-                    <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;padding:8px;margin-bottom:8px;text-align:center;min-height:58px;">
-                        <div style="font-size:12px;font-weight:800;color:#0f172a;">{escape(stage_name)}</div>
-                        <div style="font-size:20px;font-weight:900;color:#0f172a;">{len(stage_df)}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if stage_df.empty:
-                    st.caption("No loads")
-                else:
-                    grouped_stage_df = group_loads_by_booking(stage_df, require_same_status=True)
-                    for card_idx, (_, row) in enumerate(grouped_stage_df.head(30).iterrows()):
-                        row_ids = row.get("_grouped_row_ids", [])
-                        card_key = f"{stage_name}_{card_idx}"
-                        if len(row_ids) > 1:
-                            _render_dispatch_action_group_card(row, stage_name, card_key)
-                        else:
-                            _render_dispatch_action_card(row, stage_name, card_key)
+        grouped_df = group_loads_by_booking(sorted_df, require_same_status=True)
+        header_cols = st.columns([0.6, 1.4, 0.8, 1.1, 1.3, 1.3, 1.0, 1.0, 1.0, 0.9, 1.1, 1.3, 0.7])
+        headers = ["Risk", "Load", "Type", "Status", "Origin", "Destination", "Appt / LFD", "Driver", "Truck/Chassis", "ETA", "Exceptions", "Next Action", ""]
+        for col, label in zip(header_cols, headers):
+            col.caption(f"**{label}**" if label else "")
+        for _, row in grouped_df.head(60).iterrows():
+            row_ids = row.get("_grouped_row_ids", [])
+            if len(row_ids) > 1:
+                _render_dispatch_row_group(row, refresh_callback)
+            else:
+                _render_dispatch_row(row, refresh_callback)
 
     selected_row_id = st.session_state.get("dispatch_board_selected_row_id")
     if selected_row_id is None:
