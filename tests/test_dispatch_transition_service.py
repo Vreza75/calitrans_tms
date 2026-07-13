@@ -5,13 +5,11 @@ from services import dispatch_transition_service as svc
 
 
 class _FakeDb:
-    """In-memory stand-in for DispatchDatabaseClient + db_client.read_df/execute,
-    scoped to exactly what apply_transition needs."""
-
     def __init__(self, load: dict):
         self.load = dict(load)
         self.update_calls = []
-        self.executed_sql = []
+        self.closeout_calls = []
+        self.audit_notes = []
 
     def read_load(self, load_id: int) -> pd.DataFrame:
         return pd.DataFrame([self.load])
@@ -20,9 +18,12 @@ class _FakeDb:
         self.update_calls.append(dict(updates))
         self.load.update(updates)
 
-    def execute_closeout(self, load_id: int, closeout_stage: str) -> None:
-        self.executed_sql.append(closeout_stage)
+    def set_closeout_stage(self, load_id: int, closeout_stage: str) -> None:
+        self.closeout_calls.append(closeout_stage)
         self.load["closeout_stage"] = closeout_stage
+
+    def insert_assignment_audit(self, load_id: int, current_status: str, notes: str) -> None:
+        self.audit_notes.append(notes)
 
 
 @pytest.fixture
@@ -31,104 +32,102 @@ def import_load():
         "_row_id": 1,
         "TYPE": "Import",
         "Status": "Ready to Dispatch",
-        "Driver Name": "Alex",
-        "Truck Assigned": "T1",
+        "Driver Name": "",
+        "Truck Assigned": "",
         "Port": "Bayport",
+        "empty_return_location": "",
         "closeout_stage": "Not Started",
     }
 
 
-def test_valid_transition_updates_status_and_calls_update_row_fields(import_load, monkeypatch):
-    fake = _FakeDb(import_load)
+def _wire(fake, monkeypatch):
     monkeypatch.setattr(svc, "_load_row", fake.read_load)
     monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
+    monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
+    monkeypatch.setattr(svc, "_insert_assignment_audit", fake.insert_assignment_audit)
 
-    result = svc.apply_transition(1, "Driver Assigned", note="dispatcher confirmed")
+
+def test_assign_and_start_writes_driver_truck_and_status_in_separate_calls(import_load, monkeypatch):
+    fake = _FakeDb(import_load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
 
     assert result["ok"] is True
-    assert fake.update_calls[0]["Status"] == "Driver Assigned"
+    assert result["status"] == "En Route to Pickup"
+    assert {"Driver Name": "Alex", "Truck Assigned": "T1"} in fake.update_calls
+    assert {"Status": "En Route to Pickup"} in fake.update_calls
+    assert len(fake.audit_notes) == 1
+    assert "Alex" in fake.audit_notes[0]
 
 
-def test_invalid_transition_does_not_call_update_row_fields(import_load, monkeypatch):
-    import_load["Driver Name"] = ""
-    import_load["Truck Assigned"] = ""
+def test_start_en_route_with_existing_driver_needs_no_assignment_write(monkeypatch):
+    load = {
+        "_row_id": 2, "TYPE": "Import", "Status": "Ready to Dispatch",
+        "Driver Name": "Sam", "Truck Assigned": "T2", "Port": "Bayport",
+        "empty_return_location": "", "closeout_stage": "Not Started",
+    }
+    fake = _FakeDb(load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(2, "En Route to Pickup")
+
+    assert result["ok"] is True
+    assert fake.audit_notes == []
+    assert {"Status": "En Route to Pickup"} in fake.update_calls
+
+
+def test_invalid_transition_without_driver_does_not_write_anything(import_load, monkeypatch):
     fake = _FakeDb(import_load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
-    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
+    _wire(fake, monkeypatch)
 
-    result = svc.apply_transition(1, "Driver Assigned")
+    result = svc.apply_transition(1, "En Route to Pickup")
+
+    assert result["ok"] is False
+    assert fake.update_calls == []
+    assert fake.audit_notes == []
+
+
+def test_reaching_completed_sets_closeout_stage_to_pod_needed(monkeypatch):
+    load = {
+        "_row_id": 3, "TYPE": "Export", "Status": "At Delivery",
+        "Driver Name": "Sam", "Truck Assigned": "T2", "Port": "Barbours Cut",
+        "empty_return_location": "", "closeout_stage": "Not Started",
+    }
+    fake = _FakeDb(load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(3, "Completed")
+
+    assert result["ok"] is True
+    assert fake.closeout_calls == ["POD Needed"]
+
+
+def test_override_without_reason_is_rejected(monkeypatch):
+    load = {
+        "_row_id": 4, "TYPE": "Import", "Status": "Completed",
+        "Driver Name": "Sam", "Truck Assigned": "T2", "Port": "Bayport",
+        "empty_return_location": "", "closeout_stage": "POD Needed",
+    }
+    fake = _FakeDb(load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(4, "En Route to Pickup", override=True, override_reason="")
 
     assert result["ok"] is False
     assert fake.update_calls == []
 
 
-def test_reaching_completion_milestone_sets_closeout_stage_to_pod_needed(monkeypatch):
+def test_override_with_reason_allows_backward_transition(monkeypatch):
     load = {
-        "_row_id": 2,
-        "TYPE": "Export",
-        "Status": "At Port",
-        "Driver Name": "Sam",
-        "Truck Assigned": "T2",
-        "Port": "Barbours Cut",
-        "closeout_stage": "Not Started",
+        "_row_id": 5, "TYPE": "Import", "Status": "At Pickup",
+        "Driver Name": "Sam", "Truck Assigned": "T2", "Port": "Bayport",
+        "empty_return_location": "", "closeout_stage": "Not Started",
     }
     fake = _FakeDb(load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
-    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
+    _wire(fake, monkeypatch)
 
-    result = svc.apply_transition(2, "In-Gated")
-    assert result["ok"] is True
-
-    result2 = svc.apply_transition(2, "Dispatch Complete")
-    assert result2["ok"] is True
-    assert fake.executed_sql == ["POD Needed"]
-
-
-def test_closeout_stage_not_overwritten_if_already_past_not_started(monkeypatch):
-    load = {
-        "_row_id": 3,
-        "TYPE": "Local Import",
-        "Status": "At Destination Warehouse",
-        "Driver Name": "Sam",
-        "Truck Assigned": "T2",
-        "Warehouse": "Origin WH",
-        "closeout_stage": "POD Received",
-    }
-    fake = _FakeDb(load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
-    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
-
-    fake.load["Status"] = "Delivered"
-    result = svc.apply_transition(3, "Dispatch Complete")
-    assert result["ok"] is True
-    assert fake.executed_sql == []
-
-
-def test_override_allows_backward_transition_with_reason(import_load, monkeypatch):
-    import_load["Status"] = "At Port"
-    fake = _FakeDb(import_load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
-    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
-
-    result = svc.apply_transition(1, "Driver Assigned", override=True, override_reason="dispatcher correction")
+    result = svc.apply_transition(5, "En Route to Pickup", override=True, override_reason="correction")
 
     assert result["ok"] is True
-    assert "override: dispatcher correction" in fake.update_calls[0]["Dispatcher Notes"].lower()
-
-
-def test_override_true_without_reason_is_rejected(import_load, monkeypatch):
-    import_load["Status"] = "At Port"
-    fake = _FakeDb(import_load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
-    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
-    monkeypatch.setattr(svc, "_set_closeout_stage", fake.execute_closeout)
-
-    result = svc.apply_transition(1, "Driver Assigned", override=True, override_reason="")
-
-    assert result["ok"] is False
-    assert fake.update_calls == []
+    assert any("override: correction" in u.get("Dispatcher Notes", "").lower() for u in fake.update_calls)

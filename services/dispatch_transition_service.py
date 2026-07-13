@@ -33,20 +33,36 @@ def _set_closeout_stage(load_id: int, closeout_stage: str) -> None:
     )
 
 
+def _insert_assignment_audit(load_id: int, current_status: str, notes: str) -> None:
+    """Driver/truck assignment gets its own status_events row, distinct
+    from the status-change row — old_status == new_status == the load's
+    status at the time of assignment, so this reads clearly as an
+    assignment event rather than a fake status transition."""
+    execute(
+        """
+        insert into status_events (load_id, old_status, new_status, notes, created_by)
+        values (:load_id, :status, :status, :notes, 'dispatcher')
+        """,
+        {"load_id": load_id, "status": current_status, "notes": notes},
+    )
+
+
 def apply_transition(
     load_id: int,
     new_status: str,
     *,
     note: str = "",
+    driver: str | None = None,
+    truck: str | None = None,
     override: bool = False,
     override_reason: str = "",
 ) -> dict:
     """Validate and apply an operational status transition for one load.
 
     This is the only function allowed to change loads.status going
-    forward. It reuses DispatchDatabaseClient.update_row_fields(), which
-    already inserts a status_events audit row whenever status changes —
-    that mechanism is not duplicated here.
+    forward. Driver/truck assignment (when provided) is written and
+    audited as its own event, separate from the status-change event —
+    assignment is data, not a board stage.
     """
     if override and not override_reason.strip():
         return {"ok": False, "reason": "An override requires a reason.", "status": "", "closeout_stage": ""}
@@ -58,8 +74,11 @@ def apply_transition(
     row = df.iloc[0]
     move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
     current_status = str(row.get("Status", "") or "New")
-    has_driver = bool(str(row.get("Driver Name", "") or "").strip())
-    has_truck = bool(str(row.get("Truck Assigned", "") or "").strip())
+    existing_driver = str(row.get("Driver Name", "") or "").strip()
+    existing_truck = str(row.get("Truck Assigned", "") or "").strip()
+
+    effective_driver = driver.strip() if driver and driver.strip() else existing_driver
+    effective_truck = truck.strip() if truck and truck.strip() else existing_truck
     has_origin = bool(str(row.get("Port", "") or row.get("Warehouse", "") or "").strip())
     empty_return_required = bool(str(row.get("empty_return_location", "") or "").strip())
 
@@ -67,8 +86,8 @@ def apply_transition(
         move_type,
         current_status,
         new_status,
-        has_driver=has_driver,
-        has_truck=has_truck,
+        has_driver=bool(effective_driver),
+        has_truck=bool(effective_truck),
         has_origin=has_origin,
         empty_return_required=empty_return_required,
         override=override,
@@ -77,14 +96,28 @@ def apply_transition(
     if not ok:
         return {"ok": False, "reason": reason, "status": current_status, "closeout_stage": str(row.get("closeout_stage", "Not Started"))}
 
-    updates: dict = {"Status": new_status}
+    assignment_updates = {}
+    if driver and driver.strip() and driver.strip() != existing_driver:
+        assignment_updates["Driver Name"] = driver.strip()
+    if truck and truck.strip() and truck.strip() != existing_truck:
+        assignment_updates["Truck Assigned"] = truck.strip()
+
+    if assignment_updates:
+        _update_load(load_id, assignment_updates)
+        parts = []
+        if "Driver Name" in assignment_updates:
+            parts.append(f"Driver assigned: {assignment_updates['Driver Name']}")
+        if "Truck Assigned" in assignment_updates:
+            parts.append(f"Truck assigned: {assignment_updates['Truck Assigned']}")
+        _insert_assignment_audit(load_id, current_status, "; ".join(parts))
+
+    status_updates: dict = {"Status": new_status}
     final_note = note.strip()
     if override:
         final_note = f"{final_note} [override: {override_reason.strip()}]".strip()
     if final_note:
-        updates["Dispatcher Notes"] = final_note
-
-    _update_load(load_id, updates)
+        status_updates["Dispatcher Notes"] = final_note
+    _update_load(load_id, status_updates)
 
     closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
     if new_status == COMPLETION_STATUS and closeout_stage == "Not Started":
