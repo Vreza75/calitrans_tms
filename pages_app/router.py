@@ -78,11 +78,13 @@ def _render_selected_page(section: str, df: pd.DataFrame) -> None:
 
 def route_selected_page() -> None:
     selected_booking = st.query_params.get("booking", None)
-    if selected_booking:
+    selected_load_id = st.query_params.get("load_id", None)
+    if selected_booking or selected_load_id:
         df = _load_current_tms_data_or_stop()
         render_booking_detail(
             df,
             selected_booking,
+            load_id=selected_load_id,
             refresh_callback=refresh_data,
             port_houston_panel_renderer=_render_load_port_houston_panel,
         )

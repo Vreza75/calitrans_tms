@@ -92,10 +92,15 @@ def build_booking_card_view_models(scoped_df: pd.DataFrame, totals_df: pd.DataFr
     # each other — one card per row, falling back to Load ID.
     for _, row in without_booking.iterrows():
         single = pd.DataFrame([row])
-        fallback_label = _safe_str(row.get("Load ID", "")) or f"Row {int(row.get('_row_id', 0))}"
+        row_id = int(row.get("_row_id", 0))
+        fallback_label = _safe_str(row.get("Load ID", "")) or f"Row {row_id}"
         card = _card_from_group("", row.get("Customer", ""), row.get("Dispatch Move Type", ""), row.get("Status", ""), single, 1)
         card["booking_number"] = f"Order Reference: {fallback_label}" if fallback_label else "No Booking Number"
-        card["group_id"] = f"no-booking|{int(row.get('_row_id', 0))}"
+        card["group_id"] = f"no-booking|{row_id}"
+        # No booking number to key a shared workspace on — route straight to
+        # this one load by _row_id instead, so cards never collide on the
+        # same "?booking=Booking Pending" URL.
+        card["workspace_url"] = f"?load_id={row_id}"
         cards.append(card)
 
     return cards

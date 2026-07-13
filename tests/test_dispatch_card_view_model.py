@@ -77,6 +77,17 @@ def test_missing_booking_numbers_never_group_together():
     assert all(card["total_container_count"] == 1 for card in cards)
 
 
+def test_missing_booking_number_cards_have_unique_workspace_urls():
+    df = pd.DataFrame([
+        _row(1, "", "Customer A", "Import", "Ready to Dispatch"),
+        _row(2, "", "Customer A", "Import", "Ready to Dispatch"),
+    ])
+    cards = build_booking_card_view_models(df, df)
+    urls = [card["workspace_url"] for card in cards]
+    assert len(set(urls)) == 2
+    assert all(url.startswith("?load_id=") for url in urls)
+
+
 def test_booking_number_normalization_trims_and_uppercases_for_grouping_only():
     df = pd.DataFrame([
         _row(1, " maeu-5560789 ", "Bogota Textiles LLC", "Import", "Ready to Dispatch"),
