@@ -38,6 +38,7 @@ from services.dispatch_board_view import (
 from services.dispatch_card_priority import sort_booking_cards
 from services.dispatch_card_view_model import build_booking_card_view_models
 from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
+from services.workflow_constants import requires_port_pin
 from services.dispatch_transition_service import apply_transition
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 from ui_components.status_badge import render_status_badge
@@ -213,9 +214,24 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
     if readiness["exceptions"]:
         st.error("Exceptions: " + ", ".join(readiness["exceptions"]))
 
-    dispatch_tab, port_tab, status_tab, timeline_tab, driver_tab, customer_tab, docs_tab, billing_tab = st.tabs(
-        ["Dispatch Details", "Port Sync / PIN", "Status Update", "Timeline", "Driver Notes/Text", "Customer Notes", "Documents", "Billing"]
-    )
+    move_type_for_tabs = _normalize_load_type(selected_load)
+    show_port_tab = requires_port_pin(move_type_for_tabs)
+
+    tab_labels = ["Dispatch Details"]
+    if show_port_tab:
+        tab_labels.append("Port Sync / PIN")
+    tab_labels += ["Status Update", "Timeline", "Driver Notes/Text", "Customer Notes", "Notes", "Documents", "Billing"]
+    tabs = st.tabs(tab_labels)
+    tab_iter = iter(tabs)
+    dispatch_tab = next(tab_iter)
+    port_tab = next(tab_iter) if show_port_tab else None
+    status_tab = next(tab_iter)
+    timeline_tab = next(tab_iter)
+    driver_tab = next(tab_iter)
+    customer_tab = next(tab_iter)
+    notes_tab = next(tab_iter)
+    docs_tab = next(tab_iter)
+    billing_tab = next(tab_iter)
 
     with dispatch_tab:
         st.markdown("### Dispatch Progress Details")
@@ -264,8 +280,9 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             _run_refresh(refresh_callback)
             st.rerun()
 
-    with port_tab:
-        _render_port_panel(selected_load, readiness, port_houston_panel_renderer)
+    if port_tab is not None:
+        with port_tab:
+            _render_port_panel(selected_load, readiness, port_houston_panel_renderer)
 
     with status_tab:
         st.markdown("### Status Update")
@@ -512,6 +529,37 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         messages = _read_dispatch_messages(load_id)
         customer_messages = messages[messages["message_type"].astype(str).str.contains("customer", case=False, na=False)] if not messages.empty else pd.DataFrame()
         st.dataframe(customer_messages, use_container_width=True, hide_index=True)
+
+    with notes_tab:
+        st.markdown("### Operational Notes")
+        st.caption("Internal operations notes, separate from customer-facing communication and from the Dispatcher status note.")
+        operational_note = st.text_area(
+            "Add Operational Note",
+            placeholder="Example: Chassis swapped at yard before dispatch, confirmed with yard checker.",
+            height=100,
+            key=f"operational_note_{load_id}",
+        )
+        if st.button("Save Operational Note", key=f"save_operational_note_{load_id}"):
+            if not operational_note.strip():
+                st.error("Note is required.")
+            else:
+                _insert_dispatch_message(load_id, "operational_note", "internal", "dispatcher", operational_note.strip())
+                st.success("Operational note saved.")
+                st.rerun()
+
+        messages = _read_dispatch_messages(load_id)
+        operational_notes = messages[
+            messages["message_type"].astype(str).eq("operational_note")
+        ] if not messages.empty else pd.DataFrame()
+        if operational_notes.empty:
+            st.info("No operational notes yet.")
+        else:
+            display_cols = [c for c in ["created_at", "sent_by", "message_body"] if c in operational_notes.columns]
+            st.dataframe(operational_notes[display_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("### Dispatcher Notes")
+        st.caption("Shown on Status Update — editable there, displayed here for quick reference.")
+        st.info(str(selected_load.get("Dispatcher Notes", "") or "No dispatcher notes yet."))
 
     with docs_tab:
         st.markdown("### Documents")
