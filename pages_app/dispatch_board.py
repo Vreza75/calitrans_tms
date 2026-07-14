@@ -44,6 +44,17 @@ from services.dispatch_transition_service import apply_transition
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 from ui_components.status_badge import render_status_badge
 
+# Booking-workspace popup size presets, keyed by label shown on the radio
+# control inside the popup. Deliberately click-based rather than native
+# CSS drag-resize: dragging the popup's edge conflicted with the dialog's
+# own click-outside/dismiss handling and made it disappear mid-drag.
+_DIALOG_SIZE_PRESETS: dict[str, tuple[str, str]] = {
+    "Compact": ("50vw", "60vh"),
+    "Medium": ("70vw", "75vh"),
+    "Large": ("85vw", "85vh"),
+    "Full Screen": ("96vw", "94vh"),
+}
+
 
 def _run_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
     if callable(refresh_callback):
@@ -918,11 +929,31 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
         booking_label = str(first_selected.get("Booking Number", "") or "").strip() or f"Load {first_selected.get('Load ID', '')}"
         dialog_title = f"Booking {booking_label}"
 
-    @st.dialog(dialog_title, width="small", on_dismiss=_close_dispatch_board_dialog)
+    @st.dialog(dialog_title, width="large", on_dismiss=_close_dispatch_board_dialog)
     def _booking_workspace_dialog() -> None:
-        if st.button("← Back to Dispatch Board", key="clear_dispatch_board_selection", use_container_width=True):
-            _close_dispatch_board_dialog()
-            st.rerun()
+        size_labels = list(_DIALOG_SIZE_PRESETS.keys())
+        current_size = st.session_state.get("dispatch_board_dialog_size", "Medium")
+        if current_size not in _DIALOG_SIZE_PRESETS:
+            current_size = "Medium"
+        header_cols = st.columns([2, 1])
+        with header_cols[0]:
+            if st.button("← Back to Dispatch Board", key="clear_dispatch_board_selection", use_container_width=True):
+                _close_dispatch_board_dialog()
+                st.rerun()
+        with header_cols[1]:
+            selected_size = st.radio(
+                "Popup size",
+                size_labels,
+                index=size_labels.index(current_size),
+                horizontal=True,
+                key="dispatch_board_dialog_size",
+                label_visibility="collapsed",
+            )
+        width, height = _DIALOG_SIZE_PRESETS[selected_size]
+        st.markdown(
+            f'<style>div[data-testid="stDialog"]{{width:{width} !important;height:{height} !important;}}</style>',
+            unsafe_allow_html=True,
+        )
         if selected_df.empty:
             st.warning("The selected booking is no longer available.")
         else:

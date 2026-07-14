@@ -288,36 +288,30 @@ section[data-testid="stSidebar"] .stRadio label:hover {
     line-height: 1.45;
 }
 
-/* Resizable Booking Workspace popup (pages_app/dispatch_board.py render_dispatch_board_focused).
-   div[data-testid="stDialog"] only sizes the outer popup box — Streamlit's
-   own internal wrappers (the actual dialog box, then .block-container,
-   then stVerticalBlock) each have their own intrinsic/capped width, so
-   they have to be forced to fill the resized popup too, or the content
-   stays centered at its original small size while empty space grows
-   around it.
-
-   Baseweb centers the dialog with position:fixed + transform:translate(-50%,-50%).
-   That recalculates the center point on every resize, so the box jumps and
-   the resize handle drifts out from under the cursor mid-drag ("disappears"
-   while resizing). Pinning it to a fixed top/left anchor instead of a
-   recalculated center fixes that. Height is intentionally left to flow
-   naturally (not forced to 100%) so overflow-y/overflow-x on the outer box
-   are what produce scrollbars, rather than fighting a forced child height. */
+/* Booking Workspace popup (pages_app/dispatch_board.py render_dispatch_board_focused).
+   Sized via click-based presets (Compact/Medium/Large/Full Screen, chosen
+   with a radio control inside the popup) rather than native CSS
+   resize:both drag-resize — dragging the popup's own edge conflicted with
+   the dialog's click-outside/dismiss handling and made it disappear
+   mid-drag. Baseweb centers the dialog with its own position:fixed +
+   transform:translate(-50%,-50%), which is left untouched here and
+   handles re-centering fine for a discrete width/height change (unlike a
+   continuous drag). The width/height below are just the default/fallback
+   before the popup's own inline <style> (written per the selected preset)
+   takes over. div[data-testid="stDialog"] only sizes the outer popup box —
+   Streamlit's own internal wrappers (.block-container, then
+   stVerticalBlock) each have their own intrinsic/capped width, so they
+   have to be forced to fill the popup too, or content stays centered at
+   its original small size with empty space around it. */
 div[data-testid="stDialog"] {
-    position: fixed !important;
-    top: 5vh !important;
-    left: 5vw !important;
-    transform: none !important;
-    margin: 0 !important;
-    resize: both;
     overflow-x: auto;
     overflow-y: auto;
     width: 70vw;
     height: 75vh;
     min-width: 360px;
     min-height: 240px;
-    max-width: 95vw;
-    max-height: 90vh;
+    max-width: 96vw;
+    max-height: 94vh;
     box-sizing: border-box;
 }
 div[data-testid="stDialog"] > div {
