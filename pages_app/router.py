@@ -10,7 +10,6 @@ from services.tms_data_service import load_tms_data, refresh_data
 from admin_pages import render_master_data_admin
 from pages_app.active_status import render_active_status_view
 from pages_app.billing_profittools import render_billing
-from pages_app.booking_detail import render_booking_detail
 from pages_app.calendar_view import render_calendar_view
 from pages_app.dashboard import render_dashboard
 from pages_app.dispatch_board import render_dispatch_board_focused
@@ -77,19 +76,6 @@ def _render_selected_page(section: str, df: pd.DataFrame) -> None:
 
 
 def route_selected_page() -> None:
-    selected_booking = st.query_params.get("booking", None)
-    selected_load_id = st.query_params.get("load_id", None)
-    if selected_booking or selected_load_id:
-        df = _load_current_tms_data_or_stop()
-        render_booking_detail(
-            df,
-            selected_booking,
-            load_id=selected_load_id,
-            refresh_callback=refresh_data,
-            port_houston_panel_renderer=_render_load_port_houston_panel,
-        )
-        return
-
     section = render_sidebar(
         refresh_callback=refresh_data,
         status_legend_renderer=render_status_legend,
