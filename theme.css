@@ -294,10 +294,24 @@ section[data-testid="stSidebar"] .stRadio label:hover {
    then stVerticalBlock) each have their own intrinsic/capped width, so
    they have to be forced to fill the resized popup too, or the content
    stays centered at its original small size while empty space grows
-   around it. */
+   around it.
+
+   Baseweb centers the dialog with position:fixed + transform:translate(-50%,-50%).
+   That recalculates the center point on every resize, so the box jumps and
+   the resize handle drifts out from under the cursor mid-drag ("disappears"
+   while resizing). Pinning it to a fixed top/left anchor instead of a
+   recalculated center fixes that. Height is intentionally left to flow
+   naturally (not forced to 100%) so overflow-y/overflow-x on the outer box
+   are what produce scrollbars, rather than fighting a forced child height. */
 div[data-testid="stDialog"] {
+    position: fixed !important;
+    top: 5vh !important;
+    left: 5vw !important;
+    transform: none !important;
+    margin: 0 !important;
     resize: both;
-    overflow: auto;
+    overflow-x: auto;
+    overflow-y: auto;
     width: 70vw;
     height: 75vh;
     min-width: 360px;
@@ -309,7 +323,6 @@ div[data-testid="stDialog"] {
 div[data-testid="stDialog"] > div {
     width: 100% !important;
     max-width: 100% !important;
-    height: 100% !important;
     box-sizing: border-box !important;
 }
 div[data-testid="stDialog"] .block-container {
