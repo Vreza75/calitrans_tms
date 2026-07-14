@@ -686,11 +686,11 @@ def render_booking_workspace(booking_df: pd.DataFrame, refresh_callback: Callabl
     canonical_status = str(first.get("Status", "") or "New")
     container_count = len(booking_df)
 
-    st.markdown(f"### Booking {booking_label}")
-    st.caption(f"{customer} · {move_type} · {container_count} Container{'s' if container_count != 1 else ''}")
-    st.markdown(render_status_badge(canonical_status), unsafe_allow_html=True)
-
     if container_count > 1:
+        st.markdown(f"### Booking {booking_label}")
+        st.caption(f"{customer} · {move_type} · {container_count} Container{'s' if container_count != 1 else ''}")
+        st.markdown(render_status_badge(canonical_status), unsafe_allow_html=True)
+
         tab_labels = ["Booking Summary"] + [
             f"Container {i + 1} — {str(row.get('Container Number', '') or row.get('Load ID', '') or row.get('_row_id', ''))}"
             for i, (_, row) in enumerate(booking_df.iterrows())
