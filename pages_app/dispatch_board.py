@@ -27,6 +27,7 @@ from services.dispatch_workflow_service import (
     _normalize_load_type,
     _normalize_load_type_value,
     _safe_str,
+    get_status_ui,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
 from services.dispatch_board_view import (
@@ -606,13 +607,17 @@ def _render_booking_card(card: dict) -> None:
     container_label = f"{visible} of {total} containers" if total != visible else (f"{visible} container" if visible == 1 else f"{visible} containers")
     appt = card["earliest_need_date"] or "No appt set"
     lfd_suffix = f" · LFD {card['earliest_lfd']}" if card["earliest_lfd"] else ""
+    border_color = get_status_ui(card["canonical_status"])["border"]
     badges = ""
     if card["exception_count"]:
         badges += f'<span style="background:#fee2e2;color:#991b1b;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;margin-right:4px;">{card["exception_count"]} exception{"s" if card["exception_count"] != 1 else ""}</span>'
     if card["unassigned_count"]:
         badges += f'<span style="background:#fef3c7;color:#92400e;border-radius:999px;padding:2px 8px;font-size:10px;font-weight:700;">{card["unassigned_count"]} unassigned</span>'
-    html = f'<a href="{escape(card["workspace_url"])}" target="_blank" style="text-decoration:none;color:inherit;display:block;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;margin-bottom:10px;background:#ffffff;box-shadow:0 1px 2px rgba(0,0,0,0.05);"><div style="font-weight:700;font-size:13px;color:#0f172a;">{escape(card["booking_number"])}</div><div style="font-size:11px;color:#475569;margin-top:2px;">{escape(card["customer"])} · {escape(card["move_type"])} · {escape(container_label)}</div><div style="font-size:11px;color:#475569;">{escape(display_status)} · {escape(appt)}{escape(lfd_suffix)}</div><div style="margin-top:6px;">{badges}</div></a>'
+    html = f'<div style="border:1px solid #e2e8f0;border-left:4px solid {border_color};border-radius:10px;padding:10px 12px;margin-bottom:2px;background:#ffffff;box-shadow:0 1px 2px rgba(0,0,0,0.05);"><div style="font-weight:700;font-size:13px;color:#0f172a;">{escape(card["booking_number"])}</div><div style="font-size:11px;color:#475569;margin-top:2px;">{escape(card["customer"])} · {escape(card["move_type"])} · {escape(container_label)}</div><div style="font-size:11px;color:#475569;">{escape(display_status)} · {escape(appt)}{escape(lfd_suffix)}</div><div style="margin-top:6px;">{badges}</div></div>'
     st.markdown(html, unsafe_allow_html=True)
+    if st.button("Open →", key=f"open_card_{card['group_id']}", use_container_width=True):
+        st.session_state["dispatch_board_selected_row_ids"] = list(card["row_ids"])
+        st.rerun()
 
 
 def _render_swimlane_board(scope_df: pd.DataFrame, totals_df: pd.DataFrame, completed_df: pd.DataFrame) -> None:
@@ -660,6 +665,45 @@ def _render_swimlane_board(scope_df: pd.DataFrame, totals_df: pd.DataFrame, comp
                 for col, card in zip(cols, row_cards):
                     with col:
                         _render_booking_card(card)
+
+
+def render_booking_workspace(booking_df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+    """Booking-level wrapper around render_dispatch_workspace.
+
+    A single-container booking renders render_dispatch_workspace directly
+    — no extra tab layer, matching how active_status.py already opens it.
+    A multi-container booking gets a compact header plus one tab per
+    container, each tab rendering the exact same render_dispatch_workspace
+    content — no second, thinner implementation of dispatch controls."""
+    if booking_df.empty:
+        st.warning("The selected load is no longer available.")
+        return
+
+    first = booking_df.iloc[0]
+    booking_label = str(first.get("Booking Number", "") or "").strip() or f"Load {first.get('Load ID', '')}"
+    customer = str(first.get("Customer", "") or "-")
+    move_type = str(first.get("Dispatch Move Type", "") or first.get("TYPE", "") or "-")
+    canonical_status = str(first.get("Status", "") or "New")
+    container_count = len(booking_df)
+
+    st.markdown(f"### Booking {booking_label}")
+    st.caption(f"{customer} · {move_type} · {container_count} Container{'s' if container_count != 1 else ''}")
+    st.markdown(render_status_badge(canonical_status), unsafe_allow_html=True)
+
+    if container_count > 1:
+        tab_labels = ["Booking Summary"] + [
+            f"Container {i + 1} — {str(row.get('Container Number', '') or row.get('Load ID', '') or row.get('_row_id', ''))}"
+            for i, (_, row) in enumerate(booking_df.iterrows())
+        ]
+        tabs = st.tabs(tab_labels)
+        with tabs[0]:
+            summary_cols = [c for c in ["Container Number", "Load ID", "Status", "Driver Name", "Truck Assigned", "Delivery Need Date", "LFD", "Exceptions"] if c in booking_df.columns]
+            st.dataframe(booking_df[summary_cols], hide_index=True, use_container_width=True)
+        for i, (_, row) in enumerate(booking_df.iterrows()):
+            with tabs[i + 1]:
+                render_dispatch_workspace(row, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+    else:
+        render_dispatch_workspace(first, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
 
 
 def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
@@ -850,24 +894,20 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     else:
         _render_swimlane_board(scope_df, board_df, completed_df)
 
-    selected_row_id = st.session_state.get("dispatch_board_selected_row_id")
-    if selected_row_id is None:
-        st.caption("Open any load card to review dispatch details, sync port data, request PIN, update status, or send the driver packet.")
+    selected_row_ids = st.session_state.get("dispatch_board_selected_row_ids")
+    if not selected_row_ids:
+        st.caption("Open any booking card to review dispatch details, sync port data, request PIN, update status, or send the driver packet.")
         return
 
-    selected_df = board_df[board_df["_row_id"].astype(int).eq(int(selected_row_id))].copy() if "_row_id" in board_df.columns else pd.DataFrame()
+    selected_df = board_df[board_df["_row_id"].astype(int).isin([int(v) for v in selected_row_ids])].copy() if "_row_id" in board_df.columns else pd.DataFrame()
     if selected_df.empty:
-        st.warning("The selected load is no longer available.")
-        if st.button("Clear Dispatch Selection", use_container_width=True):
-            st.session_state.pop("dispatch_board_selected_row_id", None)
+        st.warning("The selected booking is no longer available.")
+        if st.button("← Back to Dispatch Board", use_container_width=True):
+            st.session_state.pop("dispatch_board_selected_row_ids", None)
             st.rerun()
         return
 
-    clear_cols = st.columns([4, 1])
-    with clear_cols[0]:
-        st.markdown("### Selected Load")
-    with clear_cols[1]:
-        if st.button("Clear Selection", key="clear_dispatch_board_selection", use_container_width=True):
-            st.session_state.pop("dispatch_board_selected_row_id", None)
-            st.rerun()
-    render_dispatch_workspace(selected_df.iloc[0], refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+    if st.button("← Back to Dispatch Board", key="clear_dispatch_board_selection"):
+        st.session_state.pop("dispatch_board_selected_row_ids", None)
+        st.rerun()
+    render_booking_workspace(selected_df, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
