@@ -287,4 +287,14 @@ section[data-testid="stSidebar"] .stRadio label:hover {
     font-size: var(--font-size-body);
     line-height: 1.45;
 }
+
+/* Resizable Booking Workspace popup (pages_app/dispatch_board.py render_dispatch_board_focused) */
+div[data-testid="stDialog"] {
+    resize: both;
+    overflow: auto;
+    min-width: 360px;
+    min-height: 240px;
+    max-width: 95vw;
+    max-height: 90vh;
+}
 </style>
