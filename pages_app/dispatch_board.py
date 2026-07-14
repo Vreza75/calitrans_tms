@@ -55,6 +55,19 @@ def _run_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
             pass
 
 
+def _close_workspace_and_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
+    """Close the Dispatch Board's booking-workspace popup and refresh data.
+
+    Called after every successful save/update inside the workspace, per
+    dispatcher request: any commit inside the popup returns to the board
+    rather than leaving the popup open. Safe to call from callers that
+    don't use the Dispatch Board's own selection key (e.g. active_status.py)
+    — popping an absent session_state key is a no-op."""
+    _run_refresh(refresh_callback)
+    st.session_state.pop("dispatch_board_selected_row_ids", None)
+    st.rerun()
+
+
 def _render_port_panel(selected_load, readiness: dict | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
     if callable(port_houston_panel_renderer):
         try:
@@ -117,12 +130,10 @@ def _render_operational_status_tab(selected_load, load_id: int, current_status: 
             else:
                 st.warning(f"Status updated, but customer email was not sent: {email_msg}")
 
-            _run_refresh(refresh_callback)
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
         elif detail_updates:
             st.success("Load details updated.")
-            _run_refresh(refresh_callback)
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
         else:
             st.info("No changes detected.")
 
@@ -182,8 +193,7 @@ def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, 
             else:
                 st.success("Load details updated.")
 
-            _run_refresh(refresh_callback)
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
         else:
             st.info("No changes detected.")
 
@@ -278,8 +288,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         if st.button("Save Dispatch Progress", key=f"save_dispatch_progress_{load_id}"):
             _update_load_extra_fields(load_id, current_location, eta_value, live_load_status, live_unload_status)
             st.success("Dispatch progress saved.")
-            _run_refresh(refresh_callback)
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
 
     if port_tab is not None:
         with port_tab:
@@ -360,7 +369,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                     edited_message.strip(),
                 )
                 st.success("Driver dispatch message saved to history.")
-                st.rerun()
+                _close_workspace_and_refresh(refresh_callback)
 
         with action_cols[1]:
             st.download_button(
@@ -437,12 +446,11 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             with quick_cols[idx % 4]:
                 if st.button(status_label, key=f"quick_status_{load_id}_{status_label}", use_container_width=True):
                     email_sent, email_msg = _save_status_quick_update(load_id, selected_load, status_label, default_note)
-                    _run_refresh(refresh_callback)
                     if email_sent:
                         st.success(f"Updated to {status_label}. {email_msg}")
                     else:
                         st.warning(f"Updated to {status_label}, but customer email was not sent: {email_msg}")
-                    st.rerun()
+                    _close_workspace_and_refresh(refresh_callback)
 
         st.markdown("#### Manual Driver Note / Message")
         manual_cols = st.columns([1, 2])
@@ -490,7 +498,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                     message_body.strip(),
                 )
                 st.success("Driver communication saved.")
-                st.rerun()
+                _close_workspace_and_refresh(refresh_callback)
 
         st.markdown("#### Driver Communication Thread")
         messages = _read_dispatch_messages(load_id)
@@ -525,7 +533,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             else:
                 _insert_dispatch_message(load_id, "customer_note", "outbound", customer, customer_note.strip())
                 st.success("Customer note saved.")
-                st.rerun()
+                _close_workspace_and_refresh(refresh_callback)
 
         messages = _read_dispatch_messages(load_id)
         customer_messages = messages[messages["message_type"].astype(str).str.contains("customer", case=False, na=False)] if not messages.empty else pd.DataFrame()
@@ -546,7 +554,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             else:
                 _insert_dispatch_message(load_id, "operational_note", "internal", "dispatcher", operational_note.strip())
                 st.success("Operational note saved.")
-                st.rerun()
+                _close_workspace_and_refresh(refresh_callback)
 
         messages = _read_dispatch_messages(load_id)
         operational_notes = messages[
@@ -570,7 +578,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         if st.button("Attach Document", key=f"attach_doc_{load_id}") and uploaded is not None:
             DispatchDatabaseClient().attach_file_to_row(load_id, uploaded, source="dispatch_workspace")
             st.success("Document attached.")
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
 
     with billing_tab:
         st.markdown("### Billing Readiness")
@@ -597,8 +605,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                 st.success(f"Marked Ready for ProfitTools. {email_msg}")
             else:
                 st.warning(f"Marked Ready for ProfitTools, but customer email was not sent: {email_msg}")
-            _run_refresh(refresh_callback)
-            st.rerun()
+            _close_workspace_and_refresh(refresh_callback)
 
 def _render_booking_card(card: dict) -> None:
     display_status = get_display_label(card["move_type"], card["canonical_status"])
@@ -900,14 +907,25 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
         return
 
     selected_df = board_df[board_df["_row_id"].astype(int).isin([int(v) for v in selected_row_ids])].copy() if "_row_id" in board_df.columns else pd.DataFrame()
-    if selected_df.empty:
-        st.warning("The selected booking is no longer available.")
-        if st.button("← Back to Dispatch Board", use_container_width=True):
-            st.session_state.pop("dispatch_board_selected_row_ids", None)
-            st.rerun()
-        return
 
-    if st.button("← Back to Dispatch Board", key="clear_dispatch_board_selection"):
+    def _close_dispatch_board_dialog() -> None:
         st.session_state.pop("dispatch_board_selected_row_ids", None)
-        st.rerun()
-    render_booking_workspace(selected_df, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+
+    if selected_df.empty:
+        dialog_title = "Booking Workspace"
+    else:
+        first_selected = selected_df.iloc[0]
+        booking_label = str(first_selected.get("Booking Number", "") or "").strip() or f"Load {first_selected.get('Load ID', '')}"
+        dialog_title = f"Booking {booking_label}"
+
+    @st.dialog(dialog_title, width="small", on_dismiss=_close_dispatch_board_dialog)
+    def _booking_workspace_dialog() -> None:
+        if st.button("← Back to Dispatch Board", key="clear_dispatch_board_selection", use_container_width=True):
+            _close_dispatch_board_dialog()
+            st.rerun()
+        if selected_df.empty:
+            st.warning("The selected booking is no longer available.")
+        else:
+            render_booking_workspace(selected_df, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+
+    _booking_workspace_dialog()
