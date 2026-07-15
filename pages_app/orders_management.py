@@ -15,7 +15,6 @@ ORDER_MANAGEMENT_STATUSES = [
     "New",
     "Hold/Need Info",
     "Booking Verified",
-    "Ready to Dispatch",
     "Cancelled",
 ]
 
@@ -23,7 +22,6 @@ ORDER_MANAGEMENT_STATUS_LABELS = {
     "New": "New",
     "Hold/Need Info": "Missing Info",
     "Booking Verified": "Booking Verified",
-    "Ready to Dispatch": "Ready to Dispatch",
     "Cancelled": "Cancel",
 }
 
@@ -545,6 +543,9 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
                 format_func=lambda value: ORDER_MANAGEMENT_STATUS_LABELS.get(value, value),
                 key=f"{form_key}_status",
             )
+            driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")), key=f"{form_key}_driver")
+            truck = st.text_input("Truck Assigned", value=_safe_str(selected_load.get("Truck Assigned", "")), key=f"{form_key}_truck")
+            chassis = st.text_input("Chassis", value=_safe_str(selected_load.get("Chassis", "")), key=f"{form_key}_chassis")
             notes = st.text_area(
                 "Dispatcher Notes",
                 value=_safe_str(selected_load.get("Dispatcher Notes", "")),
@@ -568,6 +569,9 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             "delivery_need_date": delivery_need,
             "lfd": lfd,
             "status": status,
+            "driver_name": driver.strip(),
+            "truck_assigned": truck.strip(),
+            "chassis": chassis.strip(),
             "dispatcher_notes": notes.strip(),
         }
 
