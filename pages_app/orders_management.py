@@ -804,7 +804,7 @@ def render_orders_management(df: pd.DataFrame) -> None:
         st.session_state["orders_management_last_service_flow"] = selected_flow
         clear_order_editor()
 
-    def render_clickable_order_table(table_df: pd.DataFrame, title: str):
+    def render_clickable_order_table(table_df: pd.DataFrame, title: str, detail_renderer=_render_order_detail_editor):
         st.markdown(f"### {title}")
         st.caption(f"{len(table_df)} order(s)")
 
@@ -874,19 +874,24 @@ def render_orders_management(df: pd.DataFrame) -> None:
             visible_ids = set(work_df["_row_id"].dropna().astype(int).tolist())
             if int(selected_row_id) in visible_ids:
                 st.divider()
-                _render_order_detail_editor(work_df, int(selected_row_id), context_key)
+                detail_renderer(work_df, int(selected_row_id), context_key)
 
     queue_options = [
         "New",
         "Missing Info",
         "Booking Verified",
+        "Ready to Dispatch",
         "Cancel",
     ]
     queue_map = {
         "New": new_df,
         "Missing Info": missing_info_df,
         "Booking Verified": verified_df,
+        "Ready to Dispatch": verified_df,
         "Cancel": cancelled_df,
+    }
+    queue_detail_renderers = {
+        "Ready to Dispatch": _render_ready_to_dispatch_panel,
     }
 
     selected_queue = st.radio("Order Queue", queue_options, horizontal=True, key="orders_management_queue")
@@ -894,6 +899,10 @@ def render_orders_management(df: pd.DataFrame) -> None:
         st.session_state["orders_management_last_queue"] = selected_queue
         clear_order_editor()
 
-    render_clickable_order_table(queue_map[selected_queue], selected_queue)
+    render_clickable_order_table(
+        queue_map[selected_queue],
+        selected_queue,
+        detail_renderer=queue_detail_renderers.get(selected_queue, _render_order_detail_editor),
+    )
 
     st.caption("Select any order row to edit it under that queue. Changing queue or service flow clears the previous editor.")
