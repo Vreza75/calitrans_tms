@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from db_client import DispatchDatabaseClient
+from services.dispatch_data_service import _insert_dispatch_message
 from services.dispatch_workflow_service import (
     LOAD_TYPE_TABS,
     _generate_driver_dispatch_message,
@@ -16,6 +17,7 @@ from services.dispatch_workflow_service import (
     _status_row_style,
 )
 from services.driver_roster_service import find_driver_in_roster, list_active_drivers
+from services.driver_sms_service import format_phone_e164, send_sms
 from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
@@ -732,7 +734,7 @@ def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int,
     preview_load["Truck Assigned"] = truck
     preview_load["Chassis"] = chassis
     generated_message = _generate_driver_dispatch_message(preview_load)
-    st.text_area(
+    edited_message = st.text_area(
         "Dispatch Message",
         value=generated_message,
         height=260,
@@ -741,32 +743,47 @@ def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int,
     if phone.strip():
         st.caption(f"Driver phone on file: {phone.strip()}")
 
-    ready_disabled = not (driver_name.strip() and truck.strip() and chassis.strip())
+    ready_disabled = not (driver_name.strip() and truck.strip() and chassis.strip() and phone.strip())
     if st.button(
         "Mark Ready to Dispatch",
         key=f"{panel_key}_mark_ready",
         use_container_width=True,
         disabled=ready_disabled,
     ):
-        DispatchDatabaseClient().update_row_fields(
-            selected_row_id,
-            {
-                "Driver Name": driver_name.strip(),
-                "Truck Assigned": truck.strip(),
-                "Chassis": chassis.strip(),
-                "Status": "Ready to Dispatch",
-                "Dispatcher Notes": _safe_str(selected_load.get("Dispatcher Notes", ""))
-                or "Driver, truck, and chassis assigned. Ready to dispatch.",
-            },
-        )
-        st.session_state.pop("orders_management_selected_row_id", None)
-        st.session_state.pop("orders_management_selected_context", None)
-        refresh_data()
-        st.success("Order marked Ready to Dispatch.")
-        st.rerun()
+        normalized_phone = format_phone_e164(phone)
+        if not normalized_phone:
+            st.error(f"'{phone.strip()}' isn't a valid phone number. Fix it and try again — no text was sent.")
+        else:
+            sent, sid_or_error = send_sms(normalized_phone, edited_message)
+            if sent:
+                _insert_dispatch_message(
+                    selected_row_id,
+                    "driver_dispatch_sms",
+                    "outbound",
+                    normalized_phone,
+                    edited_message,
+                )
+                DispatchDatabaseClient().update_row_fields(
+                    selected_row_id,
+                    {
+                        "Driver Name": driver_name.strip(),
+                        "Truck Assigned": truck.strip(),
+                        "Chassis": chassis.strip(),
+                        "Status": "Ready to Dispatch",
+                        "Dispatcher Notes": _safe_str(selected_load.get("Dispatcher Notes", ""))
+                        or "Driver, truck, and chassis assigned. Ready to dispatch.",
+                    },
+                )
+                st.session_state.pop("orders_management_selected_row_id", None)
+                st.session_state.pop("orders_management_selected_context", None)
+                refresh_data()
+                st.success(f"Text sent to {driver_name} and load marked Ready to Dispatch.")
+                st.rerun()
+            else:
+                st.error(f"Could not send the text — no changes were made. {sid_or_error}")
 
     if ready_disabled:
-        st.info("Mark Ready to Dispatch is disabled until Driver, Truck, and Chassis are all filled in.")
+        st.info("Mark Ready to Dispatch is disabled until Driver, Truck, Chassis, and Phone are all filled in.")
 
 
 def render_orders_management(df: pd.DataFrame) -> None:
