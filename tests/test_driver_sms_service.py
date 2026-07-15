@@ -39,3 +39,11 @@ def test_none_returns_none():
 
 def test_non_numeric_junk_returns_none():
     assert format_phone_e164("no phone on file") is None
+
+
+def test_non_ascii_digits_rejected():
+    # Fullwidth digits (U+FF10-U+FF19) pass str.isdigit() but are not ASCII 0-9.
+    # "１２３４５６７８９０" is exactly 10 fullwidth digit characters.
+    # Old code would extract all 10 (isdigit()→True) and return "+1１２３４５６７８９０"
+    # New code extracts only ASCII 0-9, finds "", length 0, returns None.
+    assert format_phone_e164("１２３４５６７８９０") is None

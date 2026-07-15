@@ -11,7 +11,7 @@ def format_phone_e164(phone) -> str | None:
     Returns None if the input can't produce a plausible 10-digit US number
     — callers must treat None as "cannot send," never guess or truncate.
     """
-    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    digits = "".join(ch for ch in str(phone or "") if ch in "0123456789")
 
     if len(digits) == 10:
         return f"+1{digits}"
