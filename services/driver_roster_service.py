@@ -30,12 +30,8 @@ def find_driver_in_roster(drivers_df: pd.DataFrame | None, driver_name: str) -> 
 
 
 def list_active_drivers() -> pd.DataFrame:
-    """Active roster drivers available for Ready to Dispatch assignment.
-
-    Thin I/O wrapper around the `drivers` table — not unit tested directly
-    (no test database in this environment); verified with a manual
-    read-only smoke check (Task 2, Step 2).
-    """
+    """Active roster drivers (driver_name, phone, truck_number) available
+    for Ready to Dispatch assignment, ordered by driver name."""
     return read_df(
         "select driver_name, phone, truck_number from drivers "
         "where status = 'Active' order by driver_name"
