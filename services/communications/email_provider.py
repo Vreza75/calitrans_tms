@@ -8,7 +8,9 @@ def send_message(recipient: str, body: str, **kwargs) -> SendResult:
     """Email provider adapter. Requires `subject` in kwargs — plain SMTP
     has no subject-less send path. `from_email`/`cc_email` are optional
     passthroughs to `_send_smtp_email`."""
-    subject = kwargs.get("subject", "")
+    subject = str(kwargs.get("subject", "")).strip()
+    if not subject:
+        return {"success": False, "provider_message_id": None, "error": "subject is required for email"}
     from_email = kwargs.get("from_email", "")
     cc_email = kwargs.get("cc_email", "")
     try:
