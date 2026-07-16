@@ -74,7 +74,7 @@ def ensure_communications_schema() -> None:
     round trip and this app's traffic (~10-20 drivers, one dispatcher)
     never makes that a bottleneck. No st.session_state caching here —
     services/ modules must not import streamlit (CLAUDE.md)."""
-    if column_exists("dispatch_messages", "provider"):
+    if column_exists("dispatch_messages", "provider_message_id"):
         return
     execute("alter table dispatch_messages add column if not exists provider text not null default 'internal'")
     execute("alter table dispatch_messages add column if not exists delivery_status text")
