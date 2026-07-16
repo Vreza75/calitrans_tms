@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from db_client import DispatchDatabaseClient, execute, read_df
+from db_client import DispatchDatabaseClient, column_exists, execute, read_df
 
 def _read_status_timeline(load_id: int) -> pd.DataFrame:
     try:
@@ -65,6 +65,23 @@ def _update_load_extra_fields(load_id: int, current_location: str, eta_value, li
             "live_unload_status": live_unload_status or None,
         },
     )
+
+def ensure_communications_schema() -> None:
+    """Idempotently extends dispatch_messages with the columns the
+    Communications Engine's provider-agnostic layer needs (provider,
+    delivery/read status, attachments, metadata, provider message id).
+    Safe to call on every insert/read: column_exists() is a single cheap
+    round trip and this app's traffic (~10-20 drivers, one dispatcher)
+    never makes that a bottleneck. No st.session_state caching here —
+    services/ modules must not import streamlit (CLAUDE.md)."""
+    if column_exists("dispatch_messages", "provider"):
+        return
+    execute("alter table dispatch_messages add column if not exists provider text not null default 'internal'")
+    execute("alter table dispatch_messages add column if not exists delivery_status text")
+    execute("alter table dispatch_messages add column if not exists read_status text")
+    execute("alter table dispatch_messages add column if not exists attachments jsonb")
+    execute("alter table dispatch_messages add column if not exists metadata jsonb")
+    execute("alter table dispatch_messages add column if not exists provider_message_id text")
 
 def _insert_dispatch_message(load_id: int, message_type: str, direction: str, recipient: str, message_body: str) -> None:
     execute(
