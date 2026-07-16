@@ -95,3 +95,13 @@ def test_unknown_channel_returns_failure_without_raising():
     result = cs.send_message("carrier_pigeon", "recipient", "hi")
     assert result["success"] is False
     assert "Unknown communications channel" in result["error"]
+
+
+def test_schema_check_error_does_not_propagate_and_returns_empty_df(monkeypatch):
+    """Verify that ensure_communications_schema() raising an exception is swallowed,
+    and the function returns an empty DataFrame with expected columns instead of raising."""
+    monkeypatch.setattr(cs, "ensure_communications_schema", lambda: (_ for _ in ()).throw(RuntimeError("db connection failed")))
+    monkeypatch.setattr(cs, "read_df", _fake_read_df([], []))
+    result = cs.get_load_timeline(123)
+    assert result.empty
+    assert list(result.columns) == ["created_at", "direction", "channel", "party", "message_body"]

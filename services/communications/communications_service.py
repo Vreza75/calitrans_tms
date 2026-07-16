@@ -36,7 +36,10 @@ def get_load_timeline(load_id: int) -> pd.DataFrame:
     load, normalized to a common shape and sorted newest first. Purely
     additive — no writes, no changes to load_communications or the
     Operations Inbox."""
-    ensure_communications_schema()
+    try:
+        ensure_communications_schema()
+    except Exception:
+        pass
 
     try:
         dispatch_df = read_df(
