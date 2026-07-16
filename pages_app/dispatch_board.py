@@ -41,6 +41,7 @@ from services.dispatch_card_view_model import build_booking_card_view_models
 from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
 from services.workflow_constants import requires_port_pin
 from services.dispatch_transition_service import apply_transition
+from services.communications.communications_service import get_load_timeline
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 from ui_components.status_badge import render_status_badge
 
@@ -242,13 +243,14 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
     tab_labels = ["Dispatch Details"]
     if show_port_tab:
         tab_labels.append("Port Sync / PIN")
-    tab_labels += ["Status Update", "Timeline", "Driver Notes/Text", "Customer Notes", "Notes", "Documents", "Billing"]
+    tab_labels += ["Status Update", "Timeline", "Communications", "Driver Notes/Text", "Customer Notes", "Notes", "Documents", "Billing"]
     tabs = st.tabs(tab_labels)
     tab_iter = iter(tabs)
     dispatch_tab = next(tab_iter)
     port_tab = next(tab_iter) if show_port_tab else None
     status_tab = next(tab_iter)
     timeline_tab = next(tab_iter)
+    comms_tab = next(tab_iter)
     driver_tab = next(tab_iter)
     customer_tab = next(tab_iter)
     notes_tab = next(tab_iter)
@@ -325,6 +327,15 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             st.info("No timeline records yet.")
         else:
             st.dataframe(timeline, use_container_width=True, hide_index=True)
+
+    with comms_tab:
+        st.markdown("### Communications")
+        st.caption("Combined driver, customer, and internal communication history for this load.")
+        comms_timeline = get_load_timeline(load_id)
+        if comms_timeline.empty:
+            st.info("No communications recorded yet.")
+        else:
+            st.dataframe(comms_timeline, use_container_width=True, hide_index=True)
 
     with driver_tab:
         st.markdown("### Driver Communication Center")
