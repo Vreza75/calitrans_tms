@@ -537,7 +537,12 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
 
     with customer_tab:
         st.markdown("### Customer Notes / Updates")
-        customer_note = st.text_area("Customer Update Note", placeholder="Example: Container picked up. ETA to warehouse 2:30 PM.", height=100)
+        customer_note = st.text_area(
+            "Customer Update Note",
+            placeholder="Example: Container picked up. ETA to warehouse 2:30 PM.",
+            height=100,
+            key=f"customer_note_{load_id}",
+        )
         if st.button("Save Customer Note", key=f"save_customer_note_{load_id}"):
             if not customer_note.strip():
                 st.error("Customer note is required.")

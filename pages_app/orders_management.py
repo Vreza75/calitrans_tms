@@ -6,7 +6,18 @@ import pandas as pd
 import streamlit as st
 
 from db_client import DispatchDatabaseClient
-from services.dispatch_workflow_service import LOAD_TYPE_TABS, _normalize_load_type_value, _status_row_style
+from services.dispatch_data_service import _insert_dispatch_message
+from services.dispatch_workflow_service import (
+    LOAD_TYPE_TABS,
+    _generate_driver_dispatch_message,
+    _load_has_pin_or_appointment,
+    _load_port_verified,
+    _load_requires_port,
+    _normalize_load_type_value,
+    _status_row_style,
+)
+from services.driver_roster_service import find_driver_in_roster, list_active_drivers
+from services.driver_sms_service import format_phone_e164, send_sms
 from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
@@ -15,6 +26,7 @@ ORDER_MANAGEMENT_STATUSES = [
     "New",
     "Hold/Need Info",
     "Booking Verified",
+    "Ready to Dispatch",
     "Cancelled",
 ]
 
@@ -22,6 +34,7 @@ ORDER_MANAGEMENT_STATUS_LABELS = {
     "New": "New",
     "Hold/Need Info": "Missing Info",
     "Booking Verified": "Booking Verified",
+    "Ready to Dispatch": "Ready to Dispatch",
     "Cancelled": "Cancel",
 }
 
@@ -543,9 +556,6 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
                 format_func=lambda value: ORDER_MANAGEMENT_STATUS_LABELS.get(value, value),
                 key=f"{form_key}_status",
             )
-            driver = st.text_input("Driver Name", value=_safe_str(selected_load.get("Driver Name", "")), key=f"{form_key}_driver")
-            truck = st.text_input("Truck Assigned", value=_safe_str(selected_load.get("Truck Assigned", "")), key=f"{form_key}_truck")
-            chassis = st.text_input("Chassis", value=_safe_str(selected_load.get("Chassis", "")), key=f"{form_key}_chassis")
             notes = st.text_area(
                 "Dispatcher Notes",
                 value=_safe_str(selected_load.get("Dispatcher Notes", "")),
@@ -569,9 +579,6 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             "delivery_need_date": delivery_need,
             "lfd": lfd,
             "status": status,
-            "driver_name": driver.strip(),
-            "truck_assigned": truck.strip(),
-            "chassis": chassis.strip(),
             "dispatcher_notes": notes.strip(),
         }
 
@@ -625,6 +632,160 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             st.rerun()
 
 
+def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
+    selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
+
+    if selected_df.empty:
+        st.warning("Selected order was not found.")
+        return
+
+    selected_load = selected_df.iloc[0]
+    safe_context = re.sub(r"[^A-Za-z0-9_]+", "_", context_key)
+    panel_key = f"ready_to_dispatch_{safe_context}_{selected_row_id}"
+
+    st.markdown("### Ready to Dispatch")
+    st.caption(
+        f"Assign driver, truck, and chassis, then mark Ready to Dispatch. "
+        f"Editing: {selected_load.get('Booking Number', '')} | "
+        f"{selected_load.get('Customer', '')} | row {selected_row_id}"
+    )
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Booking", _safe_str(selected_load.get("Booking Number", "")) or "-")
+    summary_cols[1].metric("Container", _safe_str(selected_load.get("Container Number", "")) or "-")
+    summary_cols[2].metric("Customer", _safe_str(selected_load.get("Customer", "")) or "-")
+    summary_cols[3].metric("Status", _safe_str(selected_load.get("Status", "")) or "-")
+
+    with st.expander("Order details", expanded=False):
+        details = {
+            "Port / Pickup": selected_load.get("Port", ""),
+            "Warehouse / Delivery": selected_load.get("Warehouse", ""),
+            "Delivery Need Date": selected_load.get("Delivery Need Date", ""),
+            "LFD": selected_load.get("LFD", ""),
+        }
+        st.dataframe(
+            pd.DataFrame([{"Field": k, "Value": v} for k, v in details.items()]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if _load_requires_port(selected_load) and not (
+        _load_port_verified(selected_load) or _load_has_pin_or_appointment(selected_load)
+    ):
+        st.warning(
+            "Port Verified / PIN is not complete yet. This load can still be marked "
+            "Ready to Dispatch, but the Dispatch Board will flag it as an exception "
+            "until Port Sync / PIN is done."
+        )
+
+    roster_df = list_active_drivers()
+    current_driver_name = _safe_str(selected_load.get("Driver Name", ""))
+    current_in_roster = find_driver_in_roster(roster_df, current_driver_name) if current_driver_name else None
+
+    roster_options = ["Other / not in roster"]
+    if current_driver_name and not current_in_roster:
+        roster_options.append(f"{current_driver_name} (not in roster)")
+    roster_options.extend(
+        f"{row['driver_name']} ({_safe_str(row.get('truck_number', '')) or 'no truck on file'})"
+        for _, row in roster_df.iterrows()
+    )
+
+    driver_choice = st.selectbox("Driver", roster_options, key=f"{panel_key}_driver_choice")
+
+    if driver_choice == "Other / not in roster":
+        driver_name = st.text_input(
+            "Driver Name",
+            value=current_driver_name if not current_in_roster else "",
+            key=f"{panel_key}_driver_manual",
+        )
+        default_truck = _safe_str(selected_load.get("Truck Assigned", ""))
+        default_phone = ""
+    elif driver_choice.endswith("(not in roster)"):
+        driver_name = current_driver_name
+        default_truck = _safe_str(selected_load.get("Truck Assigned", ""))
+        default_phone = ""
+    else:
+        typed_name = driver_choice.rsplit(" (", 1)[0]
+        roster_match = find_driver_in_roster(roster_df, typed_name)
+        driver_name = roster_match["driver_name"] if roster_match else typed_name
+        default_truck = (roster_match or {}).get("truck_number") or ""
+        default_phone = (roster_match or {}).get("phone") or ""
+
+    field_cols = st.columns(3)
+    truck = field_cols[0].text_input(
+        "Truck Assigned",
+        value=default_truck,
+        key=f"{panel_key}_truck_{driver_choice}",
+    )
+    chassis = field_cols[1].text_input(
+        "Chassis",
+        value=_safe_str(selected_load.get("Chassis", "")),
+        key=f"{panel_key}_chassis",
+    )
+    phone = field_cols[2].text_input(
+        "Driver Phone",
+        value=default_phone,
+        key=f"{panel_key}_phone_{driver_choice}",
+    )
+
+    st.markdown("#### Generated Dispatch Message")
+    preview_load = selected_load.copy()
+    preview_load["Driver Name"] = driver_name
+    preview_load["Truck Assigned"] = truck
+    preview_load["Chassis"] = chassis
+    generated_message = _generate_driver_dispatch_message(preview_load)
+    edited_message = st.text_area(
+        "Dispatch Message",
+        value=generated_message,
+        height=260,
+        key=f"{panel_key}_message",
+    )
+    if phone.strip():
+        st.caption(f"Driver phone on file: {phone.strip()}")
+
+    ready_disabled = not (driver_name.strip() and truck.strip() and chassis.strip() and phone.strip())
+    if st.button(
+        "Mark Ready to Dispatch",
+        key=f"{panel_key}_mark_ready",
+        use_container_width=True,
+        disabled=ready_disabled,
+    ):
+        normalized_phone = format_phone_e164(phone)
+        if not normalized_phone:
+            st.error(f"'{phone.strip()}' isn't a valid phone number. Fix it and try again — no text was sent.")
+        else:
+            sent, sid_or_error = send_sms(normalized_phone, edited_message)
+            if sent:
+                _insert_dispatch_message(
+                    selected_row_id,
+                    "driver_dispatch_sms",
+                    "outbound",
+                    normalized_phone,
+                    edited_message,
+                )
+                DispatchDatabaseClient().update_row_fields(
+                    selected_row_id,
+                    {
+                        "Driver Name": driver_name.strip(),
+                        "Truck Assigned": truck.strip(),
+                        "Chassis": chassis.strip(),
+                        "Status": "Ready to Dispatch",
+                        "Dispatcher Notes": _safe_str(selected_load.get("Dispatcher Notes", ""))
+                        or "Driver, truck, and chassis assigned. Ready to dispatch.",
+                    },
+                )
+                st.session_state.pop("orders_management_selected_row_id", None)
+                st.session_state.pop("orders_management_selected_context", None)
+                refresh_data()
+                st.success(f"Text sent to {driver_name} and load marked Ready to Dispatch.")
+                st.rerun()
+            else:
+                st.error(f"Could not send the text — no changes were made. {sid_or_error}")
+
+    if ready_disabled:
+        st.info("Mark Ready to Dispatch is disabled until Driver, Truck, Chassis, and Phone are all filled in.")
+
+
 def render_orders_management(df: pd.DataFrame) -> None:
     st.subheader("Orders / Load Management")
     st.caption("Review newly created orders, resolve missing information, mark bookings verified, or cancel bad orders before dispatch work begins.")
@@ -660,7 +821,7 @@ def render_orders_management(df: pd.DataFrame) -> None:
         st.session_state["orders_management_last_service_flow"] = selected_flow
         clear_order_editor()
 
-    def render_clickable_order_table(table_df: pd.DataFrame, title: str):
+    def render_clickable_order_table(table_df: pd.DataFrame, title: str, detail_renderer=_render_order_detail_editor):
         st.markdown(f"### {title}")
         st.caption(f"{len(table_df)} order(s)")
 
@@ -730,19 +891,24 @@ def render_orders_management(df: pd.DataFrame) -> None:
             visible_ids = set(work_df["_row_id"].dropna().astype(int).tolist())
             if int(selected_row_id) in visible_ids:
                 st.divider()
-                _render_order_detail_editor(work_df, int(selected_row_id), context_key)
+                detail_renderer(work_df, int(selected_row_id), context_key)
 
     queue_options = [
         "New",
         "Missing Info",
         "Booking Verified",
+        "Ready to Dispatch",
         "Cancel",
     ]
     queue_map = {
         "New": new_df,
         "Missing Info": missing_info_df,
         "Booking Verified": verified_df,
+        "Ready to Dispatch": verified_df,
         "Cancel": cancelled_df,
+    }
+    queue_detail_renderers = {
+        "Ready to Dispatch": _render_ready_to_dispatch_panel,
     }
 
     selected_queue = st.radio("Order Queue", queue_options, horizontal=True, key="orders_management_queue")
@@ -750,6 +916,10 @@ def render_orders_management(df: pd.DataFrame) -> None:
         st.session_state["orders_management_last_queue"] = selected_queue
         clear_order_editor()
 
-    render_clickable_order_table(queue_map[selected_queue], selected_queue)
+    render_clickable_order_table(
+        queue_map[selected_queue],
+        selected_queue,
+        detail_renderer=queue_detail_renderers.get(selected_queue, _render_order_detail_editor),
+    )
 
     st.caption("Select any order row to edit it under that queue. Changing queue or service flow clears the previous editor.")
