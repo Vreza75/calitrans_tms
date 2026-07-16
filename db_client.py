@@ -165,6 +165,25 @@ def execute(sql: str, params: dict[str, Any] | None = None) -> None:
         conn.execute(text(sql), params or {})
 
 
+def column_exists(table: str, column: str) -> bool:
+    """Real DB-state check for schema-readiness guards. A single round trip
+    that lets ensure_*_schema() functions skip their idempotent-but-slow
+    ALTER/CREATE INDEX chains once already applied, instead of relying only
+    on an in-memory session flag that doesn't survive process restarts."""
+    try:
+        with get_engine(get_secret("DATABASE_URL")).connect() as conn:
+            result = conn.execute(
+                text(
+                    "select 1 from information_schema.columns "
+                    "where table_name = :table and column_name = :column limit 1"
+                ),
+                {"table": table, "column": column},
+            )
+            return result.first() is not None
+    except Exception:
+        return False
+
+
 class DispatchDatabaseClient:
     """Postgres-backed replacement for the previous Smartsheet client."""
 
