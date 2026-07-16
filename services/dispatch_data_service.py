@@ -83,11 +83,12 @@ def ensure_communications_schema() -> None:
     execute("alter table dispatch_messages add column if not exists metadata jsonb")
     execute("alter table dispatch_messages add column if not exists provider_message_id text")
 
-def _insert_dispatch_message(load_id: int, message_type: str, direction: str, recipient: str, message_body: str) -> None:
+def _insert_dispatch_message(load_id: int, message_type: str, direction: str, recipient: str, message_body: str, provider: str = "internal") -> None:
+    ensure_communications_schema()
     execute(
         """
-        insert into dispatch_messages (load_id, message_type, direction, recipient, message_body, sent_by)
-        values (:load_id, :message_type, :direction, :recipient, :message_body, 'dispatcher')
+        insert into dispatch_messages (load_id, message_type, direction, recipient, message_body, sent_by, provider)
+        values (:load_id, :message_type, :direction, :recipient, :message_body, 'dispatcher', :provider)
         """,
         {
             "load_id": load_id,
@@ -95,6 +96,7 @@ def _insert_dispatch_message(load_id: int, message_type: str, direction: str, re
             "direction": direction,
             "recipient": recipient or None,
             "message_body": message_body,
+            "provider": provider,
         },
     )
 

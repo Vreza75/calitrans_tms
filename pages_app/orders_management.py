@@ -762,6 +762,7 @@ def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int,
                     "outbound",
                     normalized_phone,
                     edited_message,
+                    provider="twilio",
                 )
                 DispatchDatabaseClient().update_row_fields(
                     selected_row_id,
