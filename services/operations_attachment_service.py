@@ -201,7 +201,7 @@ def parse_operations_pdf_bytes(content: bytes, filename: str) -> tuple[str, dict
         company_memory={},
     )
 
-    parsed = hybrid_doc_result.get("parsed_fields", {}) or {}
+    parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
     parsed["_hybrid_document_parser"] = hybrid_doc_result
 
     return pdf_text, parsed
@@ -232,7 +232,7 @@ def parse_operations_attachment_bytes(
             company_memory={},
         )
 
-        parsed = hybrid_doc_result.get("parsed_fields", {}) or {}
+        parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
         parsed["_hybrid_document_parser"] = hybrid_doc_result
 
         return text, parsed
@@ -251,7 +251,7 @@ def parse_operations_attachment_bytes(
             company_memory={},
         )
 
-        parsed = hybrid_doc_result.get("parsed_fields", {}) or {}
+        parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
         parsed["_hybrid_document_parser"] = hybrid_doc_result
 
         return text, parsed
@@ -525,7 +525,15 @@ def merge_operations_body_parsed_fields(current: dict, reparsed: dict) -> tuple[
     return updated, changed
 
 
-def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict]) -> dict:
+def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], force: bool = False) -> dict:
+    """force=False (default): only fill fields that are currently blank -
+    used when an attachment is first saved/imported. force=True: an
+    already-populated field may be replaced by a fresh non-blank reparse
+    result - used only for an explicit dispatcher "Parse / Reparse" click,
+    so a parser fix can actually correct a previously-wrong stored value.
+    order_intake.parsed_data has no field-level dispatcher-confirmed
+    tracking of its own (that lives on the separate pending-draft table),
+    so this is safe to force-overwrite on an explicit reparse action."""
     updated = dict(parsed or {})
 
     for attachment in saved_attachments:
@@ -545,7 +553,7 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict]) -
                 elif not existing_value:
                     updated[field] = attachment_value
 
-            elif not safe_str(updated.get(field, "")):
+            elif force or not safe_str(updated.get(field, "")):
                 updated[field] = attachment_value
 
     if saved_attachments:

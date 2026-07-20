@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from db_client import execute, read_df
+from db_client import column_exists, execute, read_df
 from services.email_parser import extract_latest_email_body, parse_email_text
 
 
@@ -78,6 +78,10 @@ def int_or_none(value: Any) -> int | None:
 
 def ensure_operations_case_schema() -> None:
     if st.session_state.get("_operations_case_schema_ready"):
+        return
+
+    if column_exists("operations_email_replies", "case_id"):
+        st.session_state["_operations_case_schema_ready"] = True
         return
 
     execute(

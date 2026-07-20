@@ -290,6 +290,46 @@ def _safe_str(value, default: str = "") -> str:
         return default
     return value_str
 
+
+def build_search_blob(df: pd.DataFrame | None, requested_columns) -> pd.Series:
+    """Return one normalized, searchable string per row of `df`.
+
+    Always returns a Series aligned to `df.index`, never a DataFrame.
+    pandas' `.agg(" ".join, axis=1)` degrades to returning a DataFrame
+    instead of a Series when the frame has zero rows, which crashes any
+    caller that chains `.str` onto the result — this handles that and
+    every other edge case (missing/duplicate columns, nulls) in one place
+    so active and completed load search behave identically.
+    """
+    if df is None:
+        return pd.Series(dtype="string")
+
+    if df.empty:
+        return pd.Series("", index=df.index, dtype="string")
+
+    unique_columns = list(dict.fromkeys(requested_columns or []))
+    available_columns = [column for column in unique_columns if column in df.columns]
+
+    if not available_columns:
+        return pd.Series("", index=df.index, dtype="string")
+
+    source_df = df.loc[:, ~df.columns.duplicated()].copy()
+    available_columns = [column for column in available_columns if column in source_df.columns]
+
+    if not available_columns:
+        return pd.Series("", index=df.index, dtype="string")
+
+    text_df = source_df.loc[:, available_columns].copy()
+    for column in available_columns:
+        text_df[column] = text_df[column].fillna("").astype(str)
+
+    result = text_df.apply(
+        lambda row: " ".join(value.strip() for value in row.tolist() if value and value.strip()),
+        axis=1,
+    )
+
+    return result.astype("string").str.casefold()
+
 def _int_or_none(value):
     if value is None:
         return None

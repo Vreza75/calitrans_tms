@@ -8,7 +8,7 @@ from services.workflow_constants import normalize_service_flow
 
 FIELDS = [
     "TYPE", "Customer", "Booking Number", "Reference Number", "Container Number",
-    "Size", "Port", "Warehouse", "Address", "Delivery Need Date",
+    "Container Qty", "Size", "Port", "Warehouse", "Address", "Delivery Need Date",
     "Document Cutoff", "LFD", "Contact Name", "Contact Email", "Contact Phone",
     "Contact Company", "Dispatcher Notes",
 ]
@@ -19,6 +19,7 @@ LABEL_ALIASES = {
     "Booking Number": ["Booking Number", "Booking #", "Booking", "Booking Ref", "Booking Reference", "Booking No", "BKG", "BKG Ref"],
     "Reference Number": ["Reference Number", "Reference #", "Reference", "Ref", "Ref #", "Load Reference", "Shipment Reference", "PME Ref", "PINC Ref", "Customer Ref"],
     "Container Number": ["Container Number", "Container #", "Container", "Cntr", "Container No"],
+    "Container Qty": ["Number Of Cntrs", "Number Of Containers", "Container Qty", "Containers Required", "Ctr Qty", "Qty Containers"],
     "Size": ["Size", "Container Size", "Equipment", "Container Type", "Ctr QTY/Size", "Ctr Qty/Size", "Qty/Size"],
     "Port": ["Port", "Terminal", "Port/Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
     "Warehouse": ["Warehouse", "Delivery Warehouse", "Delivery Location", "Deliver To", "Delivery To", "Destination", "Destination Location", "Consignee", "Loading At", "Load At"],
@@ -445,6 +446,19 @@ def _find_labeled_value(text: str, aliases: list[str]) -> str:
                     continue
                 return value
     return ""
+
+
+def _extract_container_size(text: str) -> str:
+    """Extract a container size (e.g. "40HC") keeping the equipment suffix.
+
+    A bare digit match here previously dropped the HC/HQ/GP suffix, which
+    silently turned "40HC" into "40" for dispatchers and downstream parsers.
+    """
+    match = re.search(r"\b(20|40|45)\s*'?\s*(hc|hq|gp|rf|std|dv)?\b", str(text or ""), re.I)
+    if not match:
+        return ""
+    suffix = (match.group(2) or "").upper()
+    return f"{match.group(1)}{suffix}" if suffix else match.group(1)
 
 
 def _infer_type(text: str) -> str:
@@ -890,10 +904,34 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
         if re.search(r"\bflat\s*world\b|@flatworldgs\.com\b", combined, re.I):
             parsed["Customer"] = "Flat World Global Logistics"
 
+    # A labeled Size value (e.g. "Equipment: 40HC container needed...") may have
+    # swallowed trailing prose; re-extract just the size token from it.
+    if parsed["Size"]:
+        cleaned_label_size = _extract_container_size(parsed["Size"])
+        if cleaned_label_size:
+            parsed["Size"] = cleaned_label_size
+
+    qty_size_match = re.search(
+        r"\b(\d{1,2})\s*[xX]\s*(20|40|45)\s*(?:'|ft)?\s*(HC|HQ|GP|STD|RF|DV)?\b",
+        parsed["Container Qty"] or combined,
+        re.I,
+    )
+    if qty_size_match:
+        parsed["Container Qty"] = qty_size_match.group(1)
+        if not parsed["Size"]:
+            suffix = (qty_size_match.group(3) or "").upper()
+            parsed["Size"] = f"{qty_size_match.group(2)}{suffix}" if suffix else qty_size_match.group(2)
+    elif parsed["Container Qty"] and not re.match(r"^\d{1,2}$", parsed["Container Qty"].strip()):
+        # Reject anything that isn't a clean number or an "N x SIZE" pair
+        # (e.g. "TBD", or a value that swallowed an unrelated label).
+        parsed["Container Qty"] = ""
+
     if not parsed["Size"]:
-        match = re.search(r"\b(?:\d+\s*x\s*)?(20|40|45)\s*'?\s*(?:ft|hc|hq|std|drayage|container)?\b", combined, re.I)
+        # Require an explicit equipment suffix here so a bare "20"/"40"/"45"
+        # from an unrelated date or cutoff time isn't mistaken for a size.
+        match = re.search(r"\b(20|40|45)\s*'?\s*(hc|hq|gp|rf|std|dv)\b", combined, re.I)
         if match:
-            parsed["Size"] = match.group(1)
+            parsed["Size"] = f"{match.group(1)}{match.group(2).upper()}"
 
     if not parsed["Delivery Need Date"]:
         match = (

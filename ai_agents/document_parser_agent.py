@@ -39,6 +39,7 @@ class DocumentParserAgent:
         "Booking Number",
         "Reference Number",
         "Container Number",
+        "Container Qty",
         "Size",
         "Port",
         "Terminal",
@@ -113,6 +114,7 @@ Customer
 Booking Number
 Reference Number
 Container Number
+Container Qty
 Size
 Port
 Terminal

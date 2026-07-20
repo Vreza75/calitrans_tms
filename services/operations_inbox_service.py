@@ -13,11 +13,15 @@ import pandas as pd
 import streamlit as st
 import services.operations_attachment_service as attachment_service
 
-from db_client import execute, read_df
+from db_client import column_exists, execute, read_df
 from services.email_parser import extract_latest_email_body, parse_email_text
 from services.order_intake import create_load_from_intake
 import services.operations_case_service as case_service
-from services.operations_email_triage_service import triage_operations_email
+from services.operations_email_triage_service import (
+    has_actual_billing_request,
+    is_booking_confirmation,
+    triage_operations_email,
+)
 
 
 
@@ -81,6 +85,11 @@ try:
     from ui_components.document_review_panel import render_document_review_panel
 except Exception:
     render_document_review_panel = None
+
+try:
+    from ui_components.pdf_preview import render_pdf_preview
+except Exception:
+    render_pdf_preview = None
 
 try:
     from services.operations_ai import (
@@ -159,131 +168,6 @@ VALID_SERVICE_FLOWS = {
     "Local Import",
     "Local Export",
 }
-
-
-def is_booking_confirmation(
-    subject: str,
-    body: str,
-    parsed: dict | None = None,
-) -> bool:
-    """
-    Return True when the message is clearly a booking/order confirmation.
-
-    Booking evidence must take priority over passive invoice language,
-    bill-of-lading labels, and rate-sheet terminology.
-    """
-
-    parsed = parsed if isinstance(parsed, dict) else {}
-
-    subject_text = safe_str(subject).lower()
-    body_text = safe_str(body).lower()
-    combined = f"{subject_text}\n{body_text}"
-
-    booking_number = safe_str(
-        parsed.get("Booking Number")
-        or parsed.get("booking_number")
-        or parsed.get("Booking")
-    )
-
-    container_qty = safe_str(
-        parsed.get("Container Qty")
-        or parsed.get("container_qty")
-        or parsed.get("Container Quantity")
-        or parsed.get("Number Of Containers")
-    )
-
-    parse_profile = safe_str(
-        parsed.get("_parse_profile")
-        or parsed.get("parse_profile")
-    ).lower()
-
-    explicit_subject_signals = [
-        "new booking",
-        "booking confirmation",
-        "new order",
-        "load order",
-        "delivery order",
-    ]
-
-    explicit_body_signals = [
-        "booking confirmation",
-        "number of cntrs",
-        "container qty",
-        "containers required",
-        "please see the attached booking confirmation",
-        "please arrange drayage",
-        "please arrange transportation",
-    ]
-
-    if any(signal in subject_text for signal in explicit_subject_signals):
-        return True
-
-    if any(signal in combined for signal in explicit_body_signals):
-        return True
-
-    if parsed.get("_booking_confirmation") is True:
-        return True
-
-    if "booking" in parse_profile:
-        return True
-
-    if booking_number and container_qty:
-        return True
-
-    if booking_number and any(
-        signal in combined
-        for signal in [
-            "vessel:",
-            "cargo cut off",
-            "vgm cut off",
-            "port of loading",
-            "port of discharge",
-            "empty pick up",
-            "full return",
-        ]
-    ):
-        return True
-
-    return False
-
-
-def has_actual_billing_request(
-    subject: str,
-    body: str,
-) -> bool:
-    """
-    Detect an actionable billing request.
-
-    Passive terms inside a booking confirmation do not make the message Billing.
-    Examples excluded:
-    - bill of lading
-    - charges will be invoiced
-    - invoice should be sent to
-    - this document is not an invoice
-    """
-
-    text = f"{safe_str(subject)}\n{safe_str(body)}".lower()
-
-    actual_billing_patterns = [
-        r"\bplease\s+(?:send|submit|review|correct|revise|approve)\s+(?:the\s+)?invoice\b",
-        r"\bplease\s+invoice\b",
-        r"\binvoice\s+(?:request|status|correction|revision|dispute|question|issue)\b",
-        r"\bmissing\s+invoice\b",
-        r"\bincorrect\s+invoice\b",
-        r"\bpayment\s+(?:request|status|due|issue|question)\b",
-        r"\bbilling\s+(?:request|question|issue|correction|dispute)\b",
-        r"\bdetention\s+(?:invoice|charge|billing)\b",
-        r"\bdemurrage\s+(?:invoice|charge|billing)\b",
-        r"\baccessorial\s+(?:invoice|charge|billing)\b",
-        r"\blumper\s+(?:receipt|invoice|charge)\b",
-        r"\bfactura\s+(?:solicitud|correccion|corrección|problema|pendiente)\b",
-        r"\bsolicitud\s+de\s+factura\b",
-    ]
-
-    return any(
-        re.search(pattern, text, flags=re.I)
-        for pattern in actual_billing_patterns
-    )
 
 
 def enforce_authoritative_booking_triage(
@@ -1163,12 +1047,20 @@ def update_pending_order_draft_fields(
     latest_subject: str = "",
     latest_sender: str = "",
     request_stage: str = "Pending Order Reply",
+    dispatcher_confirmed: bool = False,
 ) -> bool:
     """
     Update the pending order draft with the latest agreed information.
 
     This does not create a load. It only keeps the pending draft current
     while dispatcher/client go back and forth.
+
+    dispatcher_confirmed=True marks this call as an explicit dispatcher save
+    (the "Save Latest Agreed Draft Details" form). That stamps
+    dispatcher_confirmed_at, and every other caller (automated re-parses as
+    new customer messages arrive) then skips overwriting fields on a draft
+    that's already been confirmed — a weaker parser must never silently
+    replace a value the dispatcher already signed off on.
     """
 
     conversation_key = safe_str(conversation_key).strip()
@@ -1179,6 +1071,16 @@ def update_pending_order_draft_fields(
 
     allowed_fields =(
     {
+        "customer": "customer",
+        "booking_number": "booking_number",
+        "container_number": "container_number",
+        "container_size": "container_size",
+        "service_flow": "service_flow",
+        "origin_port": "origin_port",
+        "destination_warehouse": "destination_warehouse",
+        "delivery_address": "delivery_address",
+        "delivery_need_date": "delivery_need_date",
+        "lfd": "lfd",
         "reference_number": "reference_number",
         "container_qty": "container_qty",
         "commodity": "commodity",
@@ -1205,6 +1107,11 @@ def update_pending_order_draft_fields(
     update_values = {}
 
     for field_name, column_name in allowed_fields.items():
+        if column_name == "container_qty":
+            qty = int_or_none(fields.get(field_name))
+            if qty is not None and 1 <= qty <= 10:
+                update_values[column_name] = qty
+            continue
         value = safe_str(fields.get(field_name, "")).strip()
         if value:
             update_values[column_name] = value
@@ -1227,10 +1134,21 @@ def update_pending_order_draft_fields(
         "latest_sender": safe_str(latest_sender),
         "request_stage": safe_str(request_stage) or "Pending Order Reply",
         "missing_fields": json.dumps(missing_fields),
+        "dispatcher_confirmed": bool(dispatcher_confirmed),
     }
 
     for column_name, value in update_values.items():
-        set_parts.append(f"{column_name} = :{column_name}")
+        if dispatcher_confirmed:
+            set_parts.append(f"{column_name} = :{column_name}")
+        else:
+            # A draft the dispatcher already confirmed is frozen against
+            # further automated overwrites of its fields; only an explicit
+            # dispatcher save (above) can change it after that point.
+            set_parts.append(
+                f"{column_name} = case "
+                f"when dispatcher_confirmed_at is null then :{column_name} "
+                f"else {column_name} end"
+            )
         params[column_name] = value
 
     set_sql = ",\n                    ".join(set_parts)
@@ -1244,6 +1162,10 @@ def update_pending_order_draft_fields(
                 when created_load_id is not null then draft_status
                 when :missing_fields = '[]' then 'Ready for Order Review'
                 else 'Needs Details'
+            end,
+            dispatcher_confirmed_at = case
+                when :dispatcher_confirmed then now()
+                else dispatcher_confirmed_at
             end,
             latest_direction = 'inbound',
             latest_subject = :latest_subject,
@@ -1269,6 +1191,10 @@ def update_pending_order_draft_fields(
                 when created_load_id is not null then draft_status
                 when :missing_fields = '[]' then 'Ready for Order Review'
                 else 'Needs Details'
+            end,
+            dispatcher_confirmed_at = case
+                when :dispatcher_confirmed then now()
+                else dispatcher_confirmed_at
             end,
             latest_direction = 'inbound',
             latest_subject = :latest_subject,
@@ -1489,6 +1415,10 @@ def ensure_operations_fast_triage_schema() -> None:
     if st.session_state.get("_operations_fast_triage_schema_ready"):
         return
 
+    if column_exists("order_intake", "llm_review_reason"):
+        st.session_state["_operations_fast_triage_schema_ready"] = True
+        return
+
     execute("alter table order_intake add column if not exists triage_status text not null default 'Not Triaged'")
     execute("alter table order_intake add column if not exists triage_engine text")
     execute("alter table order_intake add column if not exists triage_reason text")
@@ -1509,6 +1439,12 @@ def ensure_operations_fast_triage_schema() -> None:
 
 def ensure_operations_email_sync_schema() -> None:
     if st.session_state.get("_operations_email_sync_schema_ready"):
+        ensure_operations_fast_triage_schema()
+        ensure_operations_case_schema()
+        return
+
+    if column_exists("order_intake", "case_id"):
+        st.session_state["_operations_email_sync_schema_ready"] = True
         ensure_operations_fast_triage_schema()
         ensure_operations_case_schema()
         return
@@ -2509,7 +2445,7 @@ def operations_intent_scores(subject: str, body: str, parsed: dict | None = None
     add("Quote Request", 70, contains_any(text, QUOTE_INTENT_TERMS))
     add("Booking Update", 60, contains_any(text, UPDATE_INTENT_TERMS))
     add("New Booking", 65, contains_any(text, NEW_ORDER_INTENT_TERMS))
-    add("Billing", 75, contains_any(text, BILLING_TERMS))
+    add("Billing", 75, contains_any(text, BILLING_TERMS) or has_actual_billing_request(subject, body))
     add("Driver Issue", 70, contains_any(text, DRIVER_ISSUE_TERMS))
     add("Port Issue", 70, contains_any(text, PORT_ISSUE_TERMS))
     add("Spam/Marketing", 85, contains_any(text, SPAM_MARKETING_TERMS))
@@ -2551,6 +2487,9 @@ def classify_customer_request(subject: str, body: str, parsed: dict | None = Non
     parsed = coerce_parsed_for_classification(subject, body, parsed)
     tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
     has_reference = has_reference_details(tokens, parsed)
+
+    if is_booking_confirmation(subject, body, parsed) and not has_actual_billing_request(subject, body):
+        return "New Booking"
 
     if is_information_update(text) and not has_order_placement_signal(text):
         return "Booking Update" if has_reference else "Customer Request"
@@ -4167,24 +4106,40 @@ def _save_operations_email_attachments(message: dict, message_id: str) -> list[d
     return saved_attachments
 
 
-def _insert_operations_email_message(message: dict) -> dict:
+def _prepare_operations_email_record(message: dict) -> dict:
+    """Pure (DB-write-free) half of email insert processing: parsing,
+    attachment saving, classification, and triage. Each step is isolated so
+    a failure in any one of them (a bad attachment, a classifier exception)
+    cannot prevent the raw email fields from being available to the caller
+    for an insert - only that step's contribution is degraded, and the
+    failure is recorded in processing_errors instead of being swallowed."""
     subject = safe_str(message.get("subject")) or "(no subject)"
     sender = safe_str(message.get("from")) or safe_str(message.get("sender")) or "(unknown sender)"
     received_at = safe_str(message.get("received_at")) or None
     raw_body = safe_str(message.get("body"))
     latest_body = extract_latest_email_body(raw_body) or raw_body
     direction = safe_str(message.get("direction")) or "inbound"
-    source = _email_sync_source_for_direction(direction)
     message_id = _email_sync_unique_message_id(message)
+
+    processing_errors: list[str] = []
 
     try:
         parsed = parse_email_text(subject, latest_body)
-    except Exception:
+    except Exception as exc:
         parsed = {}
+        processing_errors.append(f"parse_email_text failed: {exc}")
 
-    saved_attachments = _save_operations_email_attachments(message, message_id)
+    try:
+        saved_attachments = _save_operations_email_attachments(message, message_id)
+    except Exception as exc:
+        saved_attachments = []
+        processing_errors.append(f"attachment processing failed: {exc}")
+
     if saved_attachments:
-        parsed = merge_saved_attachment_fields(parsed, saved_attachments)
+        try:
+            parsed = merge_saved_attachment_fields(parsed, saved_attachments)
+        except Exception as exc:
+            processing_errors.append(f"attachment field merge failed: {exc}")
 
     sync_metadata = {
         "source": "imap",
@@ -4203,31 +4158,43 @@ def _insert_operations_email_message(message: dict) -> dict:
         or safe_str(message.get("thread_id"))
         or message_id
     )
-    classification = build_operations_email_classification(
-        subject=subject,
-        body=latest_body,
-        parsed=parsed,
-        fallback_key=fallback_key,
-        sender=sender,
-    )
 
-    triage = triage_operations_email(
-        sender=sender,
-        subject=subject,
-        body=latest_body,
-        parsed=parsed,
-        attachments=saved_attachments or message.get("attachments") or [],
-        direction=direction,
-        mailbox=safe_str(message.get("mailbox")),
-        classification=classification,
-    )
-    triage = enforce_authoritative_booking_triage(
-        subject=subject,
-        body=body,
-        parsed=parsed,
-        triage=triage,
-)
+    try:
+        classification = build_operations_email_classification(
+            subject=subject,
+            body=latest_body,
+            parsed=parsed,
+            fallback_key=fallback_key,
+            sender=sender,
+        )
+    except Exception as exc:
+        classification = {}
+        processing_errors.append(f"classification failed: {exc}")
+
+    try:
+        triage = triage_operations_email(
+            sender=sender,
+            subject=subject,
+            body=latest_body,
+            parsed=parsed,
+            attachments=saved_attachments or message.get("attachments") or [],
+            direction=direction,
+            mailbox=safe_str(message.get("mailbox")),
+            classification=classification,
+        )
+        triage = enforce_authoritative_booking_triage(
+            subject=subject,
+            body=latest_body,
+            parsed=parsed,
+            triage=triage,
+        )
+    except Exception as exc:
+        triage = {}
+        processing_errors.append(f"triage failed: {exc}")
+
     parsed["_fast_triage"] = triage
+    if processing_errors:
+        parsed["_email_sync_errors"] = processing_errors
 
     if safe_str(triage.get("request_type")):
         classification["request_type"] = triage.get("request_type")
@@ -4248,6 +4215,45 @@ def _insert_operations_email_message(message: dict) -> dict:
     thread_id = safe_str(message.get("thread_id")) or conversation_key or message_id
     normalized_subject = safe_str(message.get("normalized_subject")) or subject.lower()
     conversation_status = "Waiting Customer" if direction.lower() == "outbound" else "Customer Replied"
+
+    return {
+        "subject": subject,
+        "sender": sender,
+        "received_at": received_at,
+        "latest_body": latest_body,
+        "direction": direction,
+        "message_id": message_id,
+        "parsed": parsed,
+        "classification": classification,
+        "triage": triage,
+        "saved_attachments": saved_attachments,
+        "fallback_key": fallback_key,
+        "conversation_key": conversation_key,
+        "thread_id": thread_id,
+        "normalized_subject": normalized_subject,
+        "conversation_status": conversation_status,
+        "processing_errors": processing_errors,
+    }
+
+
+def _insert_operations_email_message(message: dict) -> dict:
+    record = _prepare_operations_email_record(message)
+
+    subject = record["subject"]
+    sender = record["sender"]
+    received_at = record["received_at"]
+    latest_body = record["latest_body"]
+    direction = record["direction"]
+    message_id = record["message_id"]
+    parsed = record["parsed"]
+    classification = record["classification"]
+    triage = record["triage"]
+    saved_attachments = record["saved_attachments"]
+    conversation_key = record["conversation_key"]
+    thread_id = record["thread_id"]
+    normalized_subject = record["normalized_subject"]
+    conversation_status = record["conversation_status"]
+    source = _email_sync_source_for_direction(direction)
 
     execute(
         """
@@ -4419,6 +4425,36 @@ def sync_conversation_status(conversation_key: str) -> None:
         return
 
 
+INSERT_LOOP_MIN_SECONDS = 5
+
+
+def compute_fetch_time_budget(time_budget_seconds, elapsed_before_fetch, insert_reserve_seconds=INSERT_LOOP_MIN_SECONDS):
+    """How long fetch_operations_email_sync may run so the insert loop still
+    gets its reserved share of the outer sync deadline. ensure_operations_email_sync_schema()
+    can cost ~26s on a cold session and fetch itself does several IMAP round
+    trips, so elapsed_before_fetch can already exceed the outer budget; this
+    always returns at least 5s rather than telling fetch to run for 0 or a
+    negative duration."""
+    return max(5, time_budget_seconds - elapsed_before_fetch - insert_reserve_seconds)
+
+
+def compute_insert_loop_deadline(outer_deadline, now, min_seconds=INSERT_LOOP_MIN_SECONDS):
+    """The insert loop must always get at least min_seconds to persist
+    fetched messages, even if schema-check + fetch already blew past the
+    outer deadline - otherwise every sync attempt imports zero messages and
+    Last Sync never advances, regardless of what was actually fetched."""
+    return max(outer_deadline, now + min_seconds)
+
+
+def diagnose_operations_email_accounts() -> list[dict]:
+    """Test IMAP connection/login/folder-select for every configured
+    operations mailbox without importing any email. Safe for a UI button -
+    never returns passwords, tokens, or message content."""
+    from services import email_client
+
+    return email_client.diagnose_operations_email_accounts()
+
+
 def sync_operations_email_engine(
     limit: int = 12,
     time_budget_seconds: int = 25,
@@ -4459,7 +4495,12 @@ def sync_operations_email_engine(
         ensure_operations_email_sync_schema()
         from services import email_client
 
-        messages = email_client.fetch_operations_email_sync(limit=int(limit or 12)) or []
+        elapsed_before_fetch = time.perf_counter() - started
+        fetch_time_budget = compute_fetch_time_budget(time_budget_seconds, elapsed_before_fetch)
+        messages = email_client.fetch_operations_email_sync(
+            limit=int(limit or 12), time_budget_seconds=fetch_time_budget
+        ) or []
+        insert_deadline = compute_insert_loop_deadline(deadline, time.perf_counter())
         diagnostics = email_client.get_last_operations_email_sync_diagnostics()
         result["diagnostics"] = diagnostics
         if diagnostics.get("errors") and diagnostics.get("accounts_attempted", 0) == 0:
@@ -4484,7 +4525,7 @@ def sync_operations_email_engine(
             sender = safe_str(message.get("from")) or safe_str(message.get("sender")) or "(unknown sender)"
             received_at = safe_str(message.get("received_at")) or None
             message_id = _email_sync_unique_message_id(message)
-            if time.perf_counter() >= deadline:
+            if time.perf_counter() >= insert_deadline:
                 result["stopped_early"] = True
                 result.setdefault("diagnostics", {})["processing_timed_out"] = True
                 result["error_messages"].append(
@@ -4604,6 +4645,43 @@ def render_operations_pdf_panel(
     with st.expander("Operations Attachments / PDF Review", expanded=expanded):
         st.caption("Review saved email attachments, parse PDFs/documents, approve fields, and attach or apply them to loads.")
 
+        rescan_cols = st.columns([3, 1])
+        with rescan_cols[1]:
+            if st.button(
+                "Check Source Email for Attachments",
+                key=f"ops_rescan_attachments_{intake_id}",
+                use_container_width=True,
+            ):
+                from services import email_client
+
+                with st.spinner("Checking the source mailbox for attachments..."):
+                    rescan_result = rescan_operations_request_attachments(
+                        record_dict,
+                        fetch_by_message_id=email_client.fetch_operations_email_by_message_id,
+                        fetch_recent_emails=lambda limit: email_client.fetch_operations_email_near_date(
+                            sender=safe_str(record_dict.get("source_sender", "")),
+                            received_at=record_dict.get("source_received_at"),
+                            limit=min(limit, 20),
+                        ),
+                    )
+
+                if rescan_result.get("saved"):
+                    st.success(
+                        f"Found and saved {rescan_result['saved']} attachment(s): "
+                        + ", ".join(rescan_result.get("attachment_names", []))
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+                elif rescan_result.get("matched"):
+                    st.info("Matched the source email, but it had no new attachments to save.")
+                else:
+                    st.warning(
+                        "Could not find a matching source email with attachments. "
+                        "Quick sync does not download attachments by default, so a message "
+                        "imported before its attachment was fetched may need another look. "
+                        "You can also upload the file manually below."
+                    )
+
         uploaded_files = st.file_uploader(
             "Add attachment to this operations request",
             type=["pdf", "docx", "txt", "csv"],
@@ -4688,6 +4766,8 @@ def render_operations_pdf_panel(
                     key=f"download_ops_attachment_{intake_id}_{selected_index}",
                     use_container_width=True,
                 )
+                if (is_pdf_filename(filename, content_type) or selected_attachment.get("is_pdf")) and render_pdf_preview is not None:
+                    render_pdf_preview(file_bytes, key=f"ops_pdf_preview_{intake_id}_{selected_index}")
             except Exception as exc:
                 st.warning(f"Attachment file could not be read from storage: {exc}")
 
@@ -4713,7 +4793,7 @@ def render_operations_pdf_panel(
 
                         updated_attachments = list(attachments)
                         updated_attachments[selected_index] = updated_attachment
-                        updated_parsed = merge_saved_attachment_fields(parsed, updated_attachments)
+                        updated_parsed = merge_saved_attachment_fields(parsed, updated_attachments, force=True)
                         store_operations_parsed_data(
                             intake_id,
                             updated_parsed,

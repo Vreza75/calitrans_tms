@@ -44,6 +44,28 @@ def extract_text_from_pdf(uploaded_file):
     uploaded_file.seek(0)
     return text.strip()
 
+
+def _flat_world_section_address(text, section_label):
+    """Flat World's rate confirmation wraps a location's street address and
+    city/state/zip across two lines, each with unrelated trailing text
+    (Phone:/a ready-time fragment) that a single-line pattern would either
+    swallow or stop short of. section_label scopes the match to one
+    location block (e.g. "Pickup Full Information") since the document
+    repeats "Address:" for each location."""
+    match = re.search(
+        re.escape(section_label) + r":.*?Address:\s*([^\n]+?)\s+Phone:[^\n]*\n\s*([A-Za-z][^\n]*?,\s*[A-Z]{2}\s+\d{5})",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    street = match.group(1).strip()
+    city_state_zip = match.group(2).strip()
+    if street and city_state_zip:
+        return f"{street}, {city_state_zip}"
+    return street or city_state_zip
+
+
 def parse_order_text(text):
     is_gmt = "Global Marine Transportation" in text or "GMT Work order" in text
     is_flat_world = "Flat World" in text or "DRAYAGE RATE CONFIRMATION" in text
@@ -99,6 +121,11 @@ def parse_order_text(text):
         return parsed
 
     if is_flat_world:
+        ready_date = find_pattern(text, [
+            r"Ready Date:\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+            r"Ready Date:\s*([^\n]+?)\s+Customer PO:",
+            r"Ready Date:\s*([^\n]+)",
+        ])
         parsed.update({
             "TYPE": "Import",
             "Customer": "Flat World Global Logistics",
@@ -111,16 +138,22 @@ def parse_order_text(text):
             "Container Number": find_pattern(text, [
                 r"Container #:\s*([A-Z]{4}\d{7})",
             ]),
-            "Date": find_pattern(text, [
-                r"Ready Date:\s*([^\n]+)",
-            ]),
-            "Delivery Need Date": find_pattern(text, [
-                r"Ready Date:\s*([^\n]+)",
+            "Date": ready_date,
+            "Delivery Need Date": ready_date,
+            # "Pickup Full Information" is the origin the driver picks up
+            # from; "Return Empty Information" is labeled for an empty
+            # container return, but on this Local Import rate confirmation
+            # it is actually the second (delivery) location. Port maps to
+            # origin and Warehouse maps to destination downstream, so pickup
+            # goes to Port and the second location goes to Warehouse - not
+            # the reverse.
+            "Port": find_pattern(text, [
+                r"Pickup Full Information:.*?Name:\s*([^\n]+?)\s+Contact:",
             ]),
             "Warehouse": find_pattern(text, [
-                r"Pickup Full Information:.*?Name:\s*([^\n]+)",
-                r"Name:\s*([^\n]+)\s+Contact:",
+                r"Return Empty Information:.*?Name:\s*([^\n]+?)\s+Contact:",
             ]),
+            "Address": _flat_world_section_address(text, "Pickup Full Information"),
             "Dispatcher Notes": "Parsed from Flat World Carrier Confirmation",
         })
         return parsed

@@ -91,6 +91,7 @@ summary
 proposed_updates should use friendly field names such as:
 Booking Number
 Container Number
+Container Qty
 Reference Number
 Customer
 Port

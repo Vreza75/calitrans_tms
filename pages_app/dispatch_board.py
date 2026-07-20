@@ -27,6 +27,7 @@ from services.dispatch_workflow_service import (
     _normalize_load_type,
     _normalize_load_type_value,
     _safe_str,
+    build_search_blob,
     get_status_ui,
 )
 from services.customer_status_email_service import _send_customer_status_update_email
@@ -42,19 +43,27 @@ from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
 from services.workflow_constants import requires_port_pin
 from services.dispatch_transition_service import apply_transition
 from services.communications.communications_service import get_load_timeline
+from ui_components.dialog_presets import DIALOG_SIZE_PRESETS as _DIALOG_SIZE_PRESETS
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 from ui_components.status_badge import render_status_badge
 
-# Booking-workspace popup size presets, keyed by label shown on the radio
-# control inside the popup. Deliberately click-based rather than native
-# CSS drag-resize: dragging the popup's edge conflicted with the dialog's
-# own click-outside/dismiss handling and made it disappear mid-drag.
-_DIALOG_SIZE_PRESETS: dict[str, tuple[str, str]] = {
-    "Compact": ("50vw", "60vh"),
-    "Medium": ("70vw", "75vh"),
-    "Large": ("85vw", "85vh"),
-    "Full Screen": ("96vw", "94vh"),
-}
+# Shared by both the active-scope and completed-lane search filters so the
+# two lanes always search the same fields. Deliberately excludes Port PIN.
+DISPATCH_SEARCHABLE_COLUMNS = [
+    "Booking Number",
+    "Load ID",
+    "Reference Number",
+    "Container Number",
+    "Customer",
+    "Port",
+    "Warehouse",
+    "Address",
+    "Driver Name",
+    "Truck Assigned",
+    "Chassis",
+    "Status",
+    "Dispatcher Notes",
+]
 
 
 def _run_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
@@ -843,27 +852,12 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
     if warehouse_filter != "All" and "Warehouse" in scope_df.columns:
         scope_df = scope_df[scope_df["Warehouse"].astype(str).str.strip().eq(warehouse_filter)].copy()
 
-    search_filter = _safe_str(search_filter).lower()
-    if search_filter:
-        searchable_columns = [
-            "Booking Number",
-            "Load ID",
-            "Reference Number",
-            "Container Number",
-            "Customer",
-            "Port",
-            "Warehouse",
-            "Address",
-            "Driver Name",
-            "Truck Assigned",
-            "Chassis",
-            "Status",
-            "Dispatcher Notes",
-        ]
-        available_columns = [column for column in searchable_columns if column in scope_df.columns]
-        search_blob = scope_df[available_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
-        for term in [part for part in re.split(r"\s+", search_filter) if part]:
-            mask = search_blob.str.contains(re.escape(term), na=False)
+    search_filter = _safe_str(search_filter).casefold()
+    search_terms = [part for part in re.split(r"\s+", search_filter) if part] if search_filter else []
+    if search_terms:
+        search_blob = build_search_blob(scope_df, DISPATCH_SEARCHABLE_COLUMNS)
+        for term in search_terms:
+            mask = search_blob.str.contains(term, regex=False, na=False)
             scope_df = scope_df[mask].copy()
             search_blob = search_blob[mask]
 
@@ -885,16 +879,12 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
         completed_df = completed_df[completed_df["Warehouse"].astype(str).str.strip().eq(warehouse_filter)].copy()
     if exception_only:
         completed_df = completed_df[completed_df["Exception Count"].gt(0)].copy()
-    if search_filter:
-        completed_available_columns = [column for column in [
-            "Booking Number", "Load ID", "Reference Number", "Container Number",
-            "Customer", "Port", "Warehouse", "Address", "Driver Name",
-            "Truck Assigned", "Chassis", "Status", "Dispatcher Notes",
-        ] if column in completed_df.columns]
-        completed_blob = completed_df[completed_available_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
-        for term in [part for part in re.split(r"\s+", search_filter) if part]:
-            completed_df = completed_df[completed_blob.str.contains(re.escape(term), na=False)]
-            completed_blob = completed_blob[completed_blob.str.contains(re.escape(term), na=False)]
+    if search_terms:
+        completed_blob = build_search_blob(completed_df, DISPATCH_SEARCHABLE_COLUMNS)
+        for term in search_terms:
+            mask = completed_blob.str.contains(term, regex=False, na=False)
+            completed_df = completed_df[mask]
+            completed_blob = completed_blob[mask]
     completed_df = completed_df.sort_values("_row_id", ascending=False).head(30)
 
     active_cards = build_booking_card_view_models(scope_df, board_df)

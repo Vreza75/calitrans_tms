@@ -11,7 +11,10 @@ from uuid import uuid4
 from ai_core.llm import get_llm
 from ai_agents.hybrid_email_body_parser import parse_email_body_hybrid
 from services.email_parser import extract_latest_email_body
+from services.operations_multi_container_service import create_container_work_orders
+from services.workflow_constants import normalize_service_flow
 from config import get_config_source
+from ui_components.dialog_presets import DIALOG_SIZE_PRESETS
 from ui_components.flow_filters import apply_service_flow_filter, extract_service_flow_value, render_service_flow_filter
 
 # Temporary compatibility aliases while Operations Inbox is extracted from app.py.
@@ -691,6 +694,27 @@ def _ops_parse_loose_date(value: str) -> str:
             return f"{year:04d}-{month:02d}-{int(day):02d}"
 
     return ""
+def _ops_numeric_or_none(value) -> str | None:
+    """Coerce a rate-like value to a clean numeric string, or None.
+
+    order_intake_drafts.rate_per_container/rate_total are `numeric` columns —
+    inserting '' (the default when a value is missing) raises
+    "invalid input syntax for type numeric", so callers must pass NULL
+    instead of an empty string.
+    """
+    text = ops._safe_str(value).strip()
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.]", "", text)
+    if not cleaned or cleaned.count(".") > 1:
+        return None
+    try:
+        float(cleaned)
+    except ValueError:
+        return None
+    return cleaned
+
+
 def _ops_clean_pending_draft_value(value: str) -> str:
     value = ops._safe_str(value).strip()
 
@@ -766,11 +790,7 @@ def _ops_pending_draft_fields_from_parsed(parsed: dict) -> dict:
     # Clean common service flow values.
     service_flow = fields.get("service_flow", "")
     if service_flow:
-        lowered = service_flow.lower()
-        if "import" in lowered:
-            fields["service_flow"] = "Import"
-        elif "export" in lowered:
-            fields["service_flow"] = "Export"
+        fields["service_flow"] = normalize_service_flow(service_flow, default=service_flow)
     qty_text = ops._safe_str(fields.get("container_qty", "")).strip()
     qty_match = re.search(r"\d+", qty_text)
 
@@ -854,6 +874,41 @@ def _ops_pending_order_reply_body(
         "CaliTrans Dispatch"
     )
 
+_CUSTOMER_SERVICE_PHRASE_DENYLIST = {
+    "otr import",
+    "otr export",
+    "local import",
+    "local export",
+    "import",
+    "export",
+    "drayage",
+    "otr",
+}
+
+
+def _resolve_confirmed_container_qty(*, existing_qty, edited_qty, confirmed: bool) -> int | None:
+    """The Containers Required number_input always needs *some* numeric
+    value to display even when nothing is known yet, so it falls back to
+    showing 1 - but that displayed placeholder must never be silently
+    written back as a real confirmed quantity. Only persist edited_qty when
+    the dispatcher has explicitly checked the confirmation box this save;
+    otherwise the draft stays Needs Review regardless of what the widget
+    happens to be showing."""
+    if confirmed:
+        return int(edited_qty)
+    return None
+
+
+def _ops_is_customer_service_phrase(value: str) -> bool:
+    """True when a candidate Customer value is nothing but a move/service
+    description (e.g. "OTR IMPORT" pulled off the trailing end of a
+    subject line) rather than an actual customer or company name. Never
+    infer a customer from these phrases - only reject an exact match, so a
+    real company name that happens to contain "import" (e.g. "Import
+    Trading Co") is still accepted."""
+    return value.strip().lower() in _CUSTOMER_SERVICE_PHRASE_DENYLIST
+
+
 def _ops_merge_parsed_fields(base: dict, source: dict, *, force: bool = False) -> dict:
     """
     Merge parsed fields safely.
@@ -872,6 +927,9 @@ def _ops_merge_parsed_fields(base: dict, source: dict, *, force: bool = False) -
 
         clean_value = ops._safe_str(value).strip()
         if not clean_value:
+            continue
+
+        if key in {"Customer", "customer"} and _ops_is_customer_service_phrase(clean_value):
             continue
 
         existing_value = ops._safe_str(merged.get(key, "")).strip()
@@ -988,7 +1046,6 @@ def _ops_final_dispatcher_decision(
     actual_billing_request = ops._has_actual_billing_request(
         subject,
         body,
-        parsed,
     )
     decision = {
         "work_type": request_type or detected_type or "Work Item",
@@ -2124,6 +2181,14 @@ def _ops_upsert_pending_order_draft(
         or ops._safe_str(tokens.get("reference_number"))
     )
 
+    _container_qty_str = ops._safe_str(parsed.get("Container Qty", "")).strip()
+    _container_qty_value = int(_container_qty_str) if _container_qty_str.isdigit() else None
+    if _container_qty_value is not None and not (1 <= _container_qty_value <= 10):
+        # Out-of-range/implausible quantities are treated the same as
+        # "unknown" so the dispatcher sees Needs Review instead of a load
+        # count that was never actually confirmed.
+        _container_qty_value = None
+
     params = {
         "conversation_key": clean_conversation_key,
         "draft_status": draft_status,
@@ -2137,6 +2202,7 @@ def _ops_upsert_pending_order_draft(
         "delivery_address": delivery_address,
         "delivery_need_date": ops._safe_str(parsed.get("Delivery Need Date")),
         "lfd": ops._safe_str(parsed.get("LFD")),
+        "document_cutoff": ops._safe_str(parsed.get("Document Cutoff")),
         "container_size": ops._safe_str(parsed.get("Size")),
         "pickup_appointment": ops._safe_str(parsed.get("Pickup Appointment")),
         "delivery_appointment": ops._safe_str(parsed.get("Delivery Appointment")),
@@ -2153,7 +2219,7 @@ def _ops_upsert_pending_order_draft(
         "latest_direction": direction,
         "latest_subject": subject,
         "latest_sender": sender,
-        "container_qty": int(parsed.get("Container Qty") or 1) if ops._safe_str(parsed.get("Container Qty", "")).isdigit() else 1,
+        "container_qty": _container_qty_value,
         "load_group_key": f"{booking_number or reference_number or clean_conversation_key}",
         "commodity": ops._safe_str(parsed.get("Commodity")),
         "empty_pickup_location": ops._safe_str(parsed.get("Empty Pickup")),
@@ -2167,8 +2233,8 @@ def _ops_upsert_pending_order_draft(
         "cargo_cutoff": ops._safe_str(parsed.get("Cargo Cutoff")),
         "sailing_date": ops._safe_str(parsed.get("Sailing Date")),
         "eta_date": ops._safe_str(parsed.get("ETA Date")),
-        "rate_per_container": ops._safe_str(parsed.get("Rate Per Container")),
-        "rate_total": ops._safe_str(parsed.get("Rate Total")),
+        "rate_per_container": _ops_numeric_or_none(parsed.get("Rate Per Container")),
+        "rate_total": _ops_numeric_or_none(parsed.get("Rate Total")),
             }
 
     try:
@@ -2187,7 +2253,10 @@ def _ops_upsert_pending_order_draft(
                 delivery_address,
                 delivery_need_date,
                 lfd,
+                document_cutoff,
                 container_size,
+                container_qty,
+                load_group_key,
                 pickup_appointment,
                 delivery_appointment,
                 warehouse_contact,
@@ -2196,6 +2265,20 @@ def _ops_upsert_pending_order_draft(
                 steamship_line,
                 vessel_name,
                 reference_number,
+                commodity,
+                empty_pickup_location,
+                full_return_terminal,
+                port_of_loading,
+                port_of_discharge,
+                place_of_delivery,
+                exporting_carrier,
+                opens_for_receiving,
+                vgm_cutoff,
+                cargo_cutoff,
+                sailing_date,
+                eta_date,
+                rate_per_container,
+                rate_total,
                 missing_fields,
                 parsed_data,
                 created_from_intake_id,
@@ -2219,7 +2302,10 @@ def _ops_upsert_pending_order_draft(
                 :delivery_address,
                 :delivery_need_date,
                 :lfd,
+                :document_cutoff,
                 :container_size,
+                :container_qty,
+                :load_group_key,
                 :pickup_appointment,
                 :delivery_appointment,
                 :warehouse_contact,
@@ -2228,6 +2314,20 @@ def _ops_upsert_pending_order_draft(
                 :steamship_line,
                 :vessel_name,
                 :reference_number,
+                :commodity,
+                :empty_pickup_location,
+                :full_return_terminal,
+                :port_of_loading,
+                :port_of_discharge,
+                :place_of_delivery,
+                :exporting_carrier,
+                :opens_for_receiving,
+                :vgm_cutoff,
+                :cargo_cutoff,
+                :sailing_date,
+                :eta_date,
+                :rate_per_container,
+                :rate_total,
                 cast(:missing_fields as jsonb),
                 cast(:parsed_data as jsonb),
                 :created_from_intake_id,
@@ -2243,24 +2343,45 @@ def _ops_upsert_pending_order_draft(
                 draft_status = excluded.draft_status,
                 request_stage = excluded.request_stage,
 
-                customer = coalesce(nullif(excluded.customer, ''), order_intake_drafts.customer),
-                booking_number = coalesce(nullif(excluded.booking_number, ''), order_intake_drafts.booking_number),
-                container_number = coalesce(nullif(excluded.container_number, ''), order_intake_drafts.container_number),
-                service_flow = coalesce(nullif(excluded.service_flow, ''), order_intake_drafts.service_flow),
-                origin_port = coalesce(nullif(excluded.origin_port, ''), order_intake_drafts.origin_port),
-                destination_warehouse = coalesce(nullif(excluded.destination_warehouse, ''), order_intake_drafts.destination_warehouse),
-                delivery_address = coalesce(nullif(excluded.delivery_address, ''), order_intake_drafts.delivery_address),
-                delivery_need_date = coalesce(nullif(excluded.delivery_need_date, ''), order_intake_drafts.delivery_need_date),
-                lfd = coalesce(nullif(excluded.lfd, ''), order_intake_drafts.lfd),
-                container_size = coalesce(nullif(excluded.container_size, ''), order_intake_drafts.container_size),
-                pickup_appointment = coalesce(nullif(excluded.pickup_appointment, ''), order_intake_drafts.pickup_appointment),
-                delivery_appointment = coalesce(nullif(excluded.delivery_appointment, ''), order_intake_drafts.delivery_appointment),
-                warehouse_contact = coalesce(nullif(excluded.warehouse_contact, ''), order_intake_drafts.warehouse_contact),
-                warehouse_phone = coalesce(nullif(excluded.warehouse_phone, ''), order_intake_drafts.warehouse_phone),
-                terminal = coalesce(nullif(excluded.terminal, ''), order_intake_drafts.terminal),
-                steamship_line = coalesce(nullif(excluded.steamship_line, ''), order_intake_drafts.steamship_line),
-                vessel_name = coalesce(nullif(excluded.vessel_name, ''), order_intake_drafts.vessel_name),
-                reference_number = coalesce(nullif(excluded.reference_number, ''), order_intake_drafts.reference_number),
+                -- Once a dispatcher has confirmed this draft (dispatcher_confirmed_at
+                -- is set), automated re-parses from later customer messages stop
+                -- overwriting these fields entirely; only an explicit dispatcher
+                -- save can change them after that point.
+                customer = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.customer else coalesce(nullif(excluded.customer, ''), order_intake_drafts.customer) end,
+                booking_number = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.booking_number else coalesce(nullif(excluded.booking_number, ''), order_intake_drafts.booking_number) end,
+                container_number = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.container_number else coalesce(nullif(excluded.container_number, ''), order_intake_drafts.container_number) end,
+                service_flow = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.service_flow else coalesce(nullif(excluded.service_flow, ''), order_intake_drafts.service_flow) end,
+                origin_port = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.origin_port else coalesce(nullif(excluded.origin_port, ''), order_intake_drafts.origin_port) end,
+                destination_warehouse = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.destination_warehouse else coalesce(nullif(excluded.destination_warehouse, ''), order_intake_drafts.destination_warehouse) end,
+                delivery_address = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.delivery_address else coalesce(nullif(excluded.delivery_address, ''), order_intake_drafts.delivery_address) end,
+                delivery_need_date = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.delivery_need_date else coalesce(nullif(excluded.delivery_need_date, ''), order_intake_drafts.delivery_need_date) end,
+                lfd = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.lfd else coalesce(nullif(excluded.lfd, ''), order_intake_drafts.lfd) end,
+                document_cutoff = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.document_cutoff else coalesce(nullif(excluded.document_cutoff, ''), order_intake_drafts.document_cutoff) end,
+                container_size = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.container_size else coalesce(nullif(excluded.container_size, ''), order_intake_drafts.container_size) end,
+                container_qty = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.container_qty else coalesce(excluded.container_qty, order_intake_drafts.container_qty) end,
+                load_group_key = coalesce(nullif(excluded.load_group_key, ''), order_intake_drafts.load_group_key),
+                pickup_appointment = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.pickup_appointment else coalesce(nullif(excluded.pickup_appointment, ''), order_intake_drafts.pickup_appointment) end,
+                delivery_appointment = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.delivery_appointment else coalesce(nullif(excluded.delivery_appointment, ''), order_intake_drafts.delivery_appointment) end,
+                warehouse_contact = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.warehouse_contact else coalesce(nullif(excluded.warehouse_contact, ''), order_intake_drafts.warehouse_contact) end,
+                warehouse_phone = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.warehouse_phone else coalesce(nullif(excluded.warehouse_phone, ''), order_intake_drafts.warehouse_phone) end,
+                terminal = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.terminal else coalesce(nullif(excluded.terminal, ''), order_intake_drafts.terminal) end,
+                steamship_line = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.steamship_line else coalesce(nullif(excluded.steamship_line, ''), order_intake_drafts.steamship_line) end,
+                vessel_name = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.vessel_name else coalesce(nullif(excluded.vessel_name, ''), order_intake_drafts.vessel_name) end,
+                reference_number = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.reference_number else coalesce(nullif(excluded.reference_number, ''), order_intake_drafts.reference_number) end,
+                commodity = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.commodity else coalesce(nullif(excluded.commodity, ''), order_intake_drafts.commodity) end,
+                empty_pickup_location = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.empty_pickup_location else coalesce(nullif(excluded.empty_pickup_location, ''), order_intake_drafts.empty_pickup_location) end,
+                full_return_terminal = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.full_return_terminal else coalesce(nullif(excluded.full_return_terminal, ''), order_intake_drafts.full_return_terminal) end,
+                port_of_loading = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.port_of_loading else coalesce(nullif(excluded.port_of_loading, ''), order_intake_drafts.port_of_loading) end,
+                port_of_discharge = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.port_of_discharge else coalesce(nullif(excluded.port_of_discharge, ''), order_intake_drafts.port_of_discharge) end,
+                place_of_delivery = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.place_of_delivery else coalesce(nullif(excluded.place_of_delivery, ''), order_intake_drafts.place_of_delivery) end,
+                exporting_carrier = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.exporting_carrier else coalesce(nullif(excluded.exporting_carrier, ''), order_intake_drafts.exporting_carrier) end,
+                opens_for_receiving = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.opens_for_receiving else coalesce(nullif(excluded.opens_for_receiving, ''), order_intake_drafts.opens_for_receiving) end,
+                vgm_cutoff = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.vgm_cutoff else coalesce(nullif(excluded.vgm_cutoff, ''), order_intake_drafts.vgm_cutoff) end,
+                cargo_cutoff = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.cargo_cutoff else coalesce(nullif(excluded.cargo_cutoff, ''), order_intake_drafts.cargo_cutoff) end,
+                sailing_date = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.sailing_date else coalesce(nullif(excluded.sailing_date, ''), order_intake_drafts.sailing_date) end,
+                eta_date = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.eta_date else coalesce(nullif(excluded.eta_date, ''), order_intake_drafts.eta_date) end,
+                rate_per_container = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.rate_per_container else coalesce(excluded.rate_per_container, order_intake_drafts.rate_per_container) end,
+                rate_total = case when order_intake_drafts.dispatcher_confirmed_at is not null then order_intake_drafts.rate_total else coalesce(excluded.rate_total, order_intake_drafts.rate_total) end,
 
                 missing_fields = excluded.missing_fields,
                 parsed_data = coalesce(order_intake_drafts.parsed_data, '{}'::jsonb) || excluded.parsed_data,
@@ -2466,7 +2587,19 @@ def _render_new_order_review_panel(
 
                 refresh_data()
                 st.success(f"Created order/load ID {load_id}.")
-                st.rerun()   
+                st.rerun()
+
+
+_ROUTE_CARGO_SECTION_TITLES = {
+    "Export": "Export Booking Details",
+    "Import": "Import Route Details",
+    "Local Import": "Local Import Route and Cargo Details",
+    "Local Export": "Local Export Route and Cargo Details",
+}
+
+
+def _ops_route_cargo_section_title(service_flow: str) -> str:
+    return _ROUTE_CARGO_SECTION_TITLES.get(service_flow, "Route and Cargo Details")
 
 
 def _render_active_pending_order_draft_panel(
@@ -2488,6 +2621,13 @@ def _render_active_pending_order_draft_panel(
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    def _normalize_container_qty(raw) -> int | None:
+        """A booking can have up to 10 containers. Anything outside 1-10,
+        or unset, is unknown and must surface as Needs Review — never
+        silently treated as 1."""
+        value = _safe_int(raw, 0)
+        return value if 1 <= value <= 10 else None
 
     show_pending_order_draft = (
         matched_load_id is None
@@ -2548,6 +2688,7 @@ def _render_active_pending_order_draft_panel(
                 dispatcher_notes,
                 missing_fields,
                 created_load_id,
+                dispatcher_confirmed_at,
                 updated_at
             from public.order_intake_drafts
             where (
@@ -2576,9 +2717,16 @@ def _render_active_pending_order_draft_panel(
             or ops._safe_str(selected_conversation_key)
         )
 
-        container_qty = max(_safe_int(draft.get("container_qty"), 1), 1)
+        container_qty = _normalize_container_qty(draft.get("container_qty"))
         containers_created = max(_safe_int(draft.get("containers_created"), 0), 0)
-        remaining_to_create = max(container_qty - containers_created, 0)
+        remaining_to_create = max((container_qty or 0) - containers_created, 0)
+        is_dispatcher_confirmed = bool(draft.get("dispatcher_confirmed_at"))
+
+        if is_dispatcher_confirmed:
+            st.caption(
+                "Dispatcher-confirmed — later automated re-parses of this "
+                "conversation will not overwrite these fields."
+            )
 
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Draft Status", ops._safe_str(draft.get("draft_status", "-")) or "-")
@@ -2593,9 +2741,9 @@ def _render_active_pending_order_draft_panel(
         d8.metric("Known Container", ops._safe_str(draft.get("container_number", "-")) or "-")
 
         d9, d10, d11 = st.columns(3)
-        d9.metric("Containers Required", container_qty)
+        d9.metric("Containers Required", container_qty if container_qty is not None else "Needs Review")
         d10.metric("Containers Created", containers_created)
-        d11.metric("Remaining", remaining_to_create)
+        d11.metric("Remaining", remaining_to_create if container_qty is not None else "-")
 
         st.write("**Route / Delivery Details**")
         st.write(
@@ -2605,22 +2753,29 @@ def _render_active_pending_order_draft_panel(
             f"Need Date: {ops._safe_str(draft.get('delivery_need_date', '-')) or '-'}"
         )
 
-        st.markdown("#### Export / Booking Details")
+        draft_service_flow = normalize_service_flow(
+            ops._safe_str(draft.get("service_flow", "")),
+            default=ops._safe_str(draft.get("service_flow", "")),
+        )
+        section_title = _ops_route_cargo_section_title(draft_service_flow)
+        st.markdown(f"#### {section_title}")
 
-        b1, b2, b3 = st.columns(3)
-        b1.metric("Commodity", ops._safe_str(draft.get("commodity", "-")) or "-")
-        b2.metric("Empty Pickup", ops._safe_str(draft.get("empty_pickup_location", "-")) or "-")
-        b3.metric("Full Return", ops._safe_str(draft.get("full_return_terminal", "-")) or "-")
+        st.metric("Commodity", ops._safe_str(draft.get("commodity", "-")) or "-")
 
-        b4, b5, b6 = st.columns(3)
-        b4.metric("Document Cutoff", ops._safe_str(draft.get("document_cutoff", "-")) or "-")
-        b5.metric("VGM Cutoff", ops._safe_str(draft.get("vgm_cutoff", "-")) or "-")
-        b6.metric("Cargo Cutoff", ops._safe_str(draft.get("cargo_cutoff", "-")) or "-")
+        if draft_service_flow == "Export":
+            b1, b2 = st.columns(2)
+            b1.metric("Empty Pickup", ops._safe_str(draft.get("empty_pickup_location", "-")) or "-")
+            b2.metric("Full Return", ops._safe_str(draft.get("full_return_terminal", "-")) or "-")
 
-        b7, b8, b9 = st.columns(3)
-        b7.metric("Sailing", ops._safe_str(draft.get("sailing_date", "-")) or "-")
-        b8.metric("ETA", ops._safe_str(draft.get("eta_date", "-")) or "-")
-        b9.metric("Carrier", ops._safe_str(draft.get("steamship_line", "-")) or "-")
+            b4, b5, b6 = st.columns(3)
+            b4.metric("Document Cutoff", ops._safe_str(draft.get("document_cutoff", "-")) or "-")
+            b5.metric("VGM Cutoff", ops._safe_str(draft.get("vgm_cutoff", "-")) or "-")
+            b6.metric("Cargo Cutoff", ops._safe_str(draft.get("cargo_cutoff", "-")) or "-")
+
+            b7, b8, b9 = st.columns(3)
+            b7.metric("Sailing", ops._safe_str(draft.get("sailing_date", "-")) or "-")
+            b8.metric("ETA", ops._safe_str(draft.get("eta_date", "-")) or "-")
+            b9.metric("Carrier", ops._safe_str(draft.get("steamship_line", "-")) or "-")
 
         missing_fields = draft.get("missing_fields") or []
         if isinstance(missing_fields, str):
@@ -2670,9 +2825,24 @@ def _render_active_pending_order_draft_panel(
                 edit_qty = st.number_input(
                     "Containers Required",
                     min_value=1,
-                    max_value=100,
-                    value=container_qty,
+                    max_value=10,
+                    value=container_qty or 1,
                     step=1,
+                    help=(
+                        "Needs Review: this defaults to 1 only for display. Check "
+                        "the confirmation box below before saving to record a real count."
+                        if container_qty is None
+                        else None
+                    ),
+                )
+                edit_qty_confirmed = st.checkbox(
+                    "Confirm containers required",
+                    value=container_qty is not None,
+                    help=(
+                        "Required before saving persists a container count. Prevents the "
+                        "number field's display default from being silently recorded as "
+                        "a real confirmed quantity."
+                    ),
                 )
                 edit_size = st.text_input(
                     "Container Size",
@@ -2735,7 +2905,11 @@ def _render_active_pending_order_draft_panel(
                     "booking_number": edit_booking,
                     "reference_number": edit_reference,
                     "container_number": edit_container,
-                    "container_qty": int(edit_qty),
+                    "container_qty": _resolve_confirmed_container_qty(
+                        existing_qty=container_qty,
+                        edited_qty=edit_qty,
+                        confirmed=edit_qty_confirmed,
+                    ),
                     "container_size": edit_size,
                     "service_flow": edit_service_flow,
                     "origin_port": edit_origin,
@@ -2751,6 +2925,7 @@ def _render_active_pending_order_draft_panel(
                 latest_subject=subject,
                 latest_sender=sender,
                 request_stage="Dispatcher Confirmed Draft",
+                dispatcher_confirmed=True,
             )
 
             if saved:
@@ -2764,11 +2939,16 @@ def _render_active_pending_order_draft_panel(
 
         # Recalculate from the values loaded for this render. After saving, the
         # page reruns and reloads the newest values.
-        container_qty = max(_safe_int(draft.get("container_qty"), 1), 1)
+        container_qty = _normalize_container_qty(draft.get("container_qty"))
         containers_created = max(_safe_int(draft.get("containers_created"), 0), 0)
-        remaining_to_create = max(container_qty - containers_created, 0)
+        remaining_to_create = max((container_qty or 0) - containers_created, 0)
 
-        if container_qty > 1:
+        if container_qty is None:
+            st.warning(
+                "Containers Required: Needs Review. Set a valid container count "
+                "(1-10) above before creating container work orders."
+            )
+        elif container_qty > 1:
             st.info(
                 f"This booking requires {container_qty} container moves. "
                 f"{containers_created} have been created; {remaining_to_create} remain."
@@ -2791,7 +2971,8 @@ def _render_active_pending_order_draft_panel(
             )
 
         create_child_loads_disabled = (
-            remaining_to_create <= 0
+            container_qty is None
+            or remaining_to_create <= 0
             or bool(creation_missing)
         )
 
@@ -2801,167 +2982,18 @@ def _render_active_pending_order_draft_panel(
             use_container_width=True,
             disabled=create_child_loads_disabled,
         ):
-            created_load_ids = []
-            creation_errors = []
+            creation_result = create_container_work_orders(
+                intake_id=int(selected_id),
+                draft=draft,
+                conversation_key=draft_conversation_key,
+                subject=subject,
+                sender=sender,
+                container_qty=container_qty,
+                containers_created=containers_created,
+            )
 
-            for sequence in range(containers_created + 1, container_qty + 1):
-                try:
-                    existing_df = ops.read_df(
-                        """
-                        select id
-                        from public.loads
-                        where parent_booking_key = :parent_booking_key
-                          and container_sequence = :container_sequence
-                        limit 1
-                        """,
-                        {
-                            "parent_booking_key": draft_conversation_key,
-                            "container_sequence": sequence,
-                        },
-                    )
-                except Exception:
-                    existing_df = None
-
-                if existing_df is not None and not existing_df.empty:
-                    continue
-
-                child_notes = (
-                    f"Created from multi-container booking draft {draft_conversation_key}. "
-                    f"Container {sequence} of {container_qty}."
-                )
-
-                try:
-                    result = create_load_from_inbox_item(
-                        int(selected_id),
-                        {
-                            "TYPE": ops._safe_str(draft.get("service_flow", "")) or "Export",
-                            "Booking Number": ops._safe_str(draft.get("booking_number", "")),
-                            "Reference Number": ops._safe_str(draft.get("reference_number", "")),
-                            "Customer": ops._safe_str(draft.get("customer", "")),
-                            "Container Number": "",
-                            "Port": (
-                                ops._safe_str(draft.get("full_return_terminal", ""))
-                                or ops._safe_str(draft.get("port_of_loading", ""))
-                            ),
-                            "Warehouse": (
-                                ops._safe_str(draft.get("destination_warehouse", ""))
-                                or ops._safe_str(draft.get("empty_pickup_location", ""))
-                            ),
-                            "Address": ops._safe_str(draft.get("delivery_address", "")),
-                            "Document Cutoff": ops._safe_str(draft.get("document_cutoff", "")),
-                            "Delivery Need Date": ops._safe_str(draft.get("delivery_need_date", "")),
-                            "LFD": ops._safe_str(draft.get("lfd", "")),
-                            "Size": ops._safe_str(draft.get("container_size", "")),
-                            "Status": "New",
-                            "Dispatcher Notes": child_notes,
-                            "Commodity": ops._safe_str(draft.get("commodity", "")),
-                        },
-                        conversation_key=draft_conversation_key,
-                        request_type="New Booking",
-                        subject=subject,
-                        sender=sender,
-                        body=(
-                            f"Multi-container booking placeholder. "
-                            f"Container {sequence} of {container_qty}."
-                        ),
-                        case_id=None,
-                        case_priority="Normal",
-                    )
-
-                    result = result if isinstance(result, dict) else {}
-                    load_id = result.get("load_id")
-
-                    if not load_id:
-                        creation_errors.append(
-                            f"Container {sequence}: no load ID was returned."
-                        )
-                        continue
-
-                    load_id = int(load_id)
-                    created_load_ids.append(load_id)
-
-                    ops._execute(
-                        """
-                        update public.loads
-                        set parent_booking_key = :parent_booking_key,
-                            container_sequence = :container_sequence,
-                            container_total = :container_total,
-                            is_placeholder_container = true,
-                            commodity = :commodity,
-                            empty_pickup_location = :empty_pickup_location,
-                            full_return_terminal = :full_return_terminal,
-                            port_of_loading = :port_of_loading,
-                            port_of_discharge = :port_of_discharge,
-                            vessel_name = :vessel_name,
-                            steamship_line = :steamship_line
-                        where id = :load_id
-                        """,
-                        {
-                            "load_id": load_id,
-                            "parent_booking_key": draft_conversation_key,
-                            "container_sequence": sequence,
-                            "container_total": container_qty,
-                            "commodity": ops._safe_str(draft.get("commodity", "")),
-                            "empty_pickup_location": ops._safe_str(
-                                draft.get("empty_pickup_location", "")
-                            ),
-                            "full_return_terminal": ops._safe_str(
-                                draft.get("full_return_terminal", "")
-                            ),
-                            "port_of_loading": ops._safe_str(
-                                draft.get("port_of_loading", "")
-                            ),
-                            "port_of_discharge": ops._safe_str(
-                                draft.get("port_of_discharge", "")
-                            ),
-                            "vessel_name": ops._safe_str(draft.get("vessel_name", "")),
-                            "steamship_line": ops._safe_str(
-                                draft.get("steamship_line", "")
-                            ),
-                        },
-                    )
-                except Exception as exc:
-                    creation_errors.append(f"Container {sequence}: {exc}")
-
-            try:
-                count_df = ops.read_df(
-                    """
-                    select count(*)::int as created_count
-                    from public.loads
-                    where parent_booking_key = :parent_booking_key
-                    """,
-                    {"parent_booking_key": draft_conversation_key},
-                )
-                actual_created_count = (
-                    _safe_int(count_df.iloc[0].get("created_count"), 0)
-                    if count_df is not None and not count_df.empty
-                    else containers_created + len(created_load_ids)
-                )
-
-                ops._execute(
-                    """
-                    update public.order_intake_drafts
-                    set containers_created = :created_count,
-                        draft_status = case
-                            when :created_count >= coalesce(container_qty, 1)
-                            then 'Container Work Orders Created'
-                            else 'Container Work Orders Partially Created'
-                        end,
-                        request_stage = case
-                            when :created_count >= coalesce(container_qty, 1)
-                            then 'Container Work Orders Created'
-                            else 'Container Work Orders Partially Created'
-                        end,
-                        updated_at = now()
-                    where conversation_key = :conversation_key
-                    """,
-                    {
-                        "conversation_key": draft_conversation_key,
-                        "created_count": actual_created_count,
-                    },
-                )
-            except Exception as exc:
-                creation_errors.append(f"Could not update draft count: {exc}")
+            created_load_ids = creation_result.get("created_load_ids", [])
+            creation_errors = creation_result.get("errors", [])
 
             if created_load_ids:
                 st.success(
@@ -3016,6 +3048,36 @@ def _ops_new_outbound_message_id(selected_id: int) -> str:
     """
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
     return f"tms-reply-{selected_id}-{timestamp}-{uuid4().hex[:8]}"
+
+
+def build_control_level_counts(inbox_df: pd.DataFrame | None) -> dict[str, int]:
+    """Small plain-dict snapshot of inbox_df's control_level counts, built
+    while inbox_df is still in the caller's scope. The selected-item dialog
+    renders in its own top-level function and must never reference inbox_df
+    directly - it only ever sees this derived payload."""
+    if not isinstance(inbox_df, pd.DataFrame) or "control_level" not in inbox_df.columns:
+        return {}
+    return {
+        str(level): int(count)
+        for level, count in inbox_df["control_level"].dropna().value_counts().to_dict().items()
+    }
+
+
+def build_dispatcher_queue_counts(inbox_df: pd.DataFrame | None) -> dict[str, int]:
+    if not isinstance(inbox_df, pd.DataFrame) or "dispatcher_queue" not in inbox_df.columns:
+        return {}
+    return {
+        str(queue): int(count)
+        for queue, count in inbox_df["dispatcher_queue"].dropna().value_counts().to_dict().items()
+    }
+
+
+def count_critical_priority(inbox_df: pd.DataFrame | None) -> int:
+    if not isinstance(inbox_df, pd.DataFrame) or "priority_label" not in inbox_df.columns:
+        return 0
+    return int(inbox_df["priority_label"].eq("Critical").sum())
+
+
 def render_operations_inbox() -> None:
     st.markdown(
         """
@@ -3100,6 +3162,27 @@ def render_operations_inbox() -> None:
     with c5:
         selected_flow = render_service_flow_filter("operations_inbox_service_flow")
 
+    if st.button("Test IMAP Connections", key="operations_test_imap_connections"):
+        with st.spinner("Testing IMAP login for each configured mailbox..."):
+            st.session_state["operations_imap_diagnostic_result"] = ops.diagnose_operations_email_accounts()
+
+    imap_diagnostic_result = st.session_state.get("operations_imap_diagnostic_result")
+    if imap_diagnostic_result:
+        with st.expander("IMAP Connection Test Result", expanded=True):
+            for account_diag in imap_diagnostic_result:
+                if account_diag.get("login_success"):
+                    st.success(
+                        f"{account_diag.get('email', '-')}: login OK, folder '{account_diag.get('selected_folder', '-')}', "
+                        f"{account_diag.get('messages_found', 0)} message(s) in mailbox"
+                    )
+                elif not account_diag.get("credentials_configured"):
+                    st.warning(f"{account_diag.get('email', '-')}: no app password configured")
+                else:
+                    st.error(
+                        f"{account_diag.get('email', '-')}: login failed "
+                        f"({account_diag.get('error_type', 'Error')}: {account_diag.get('error_message', '-')})"
+                    )
+
     with st.expander("Latest Email Sync Result", expanded=False):
         result = st.session_state.get("operations_email_import_result")
         if result:
@@ -3133,6 +3216,24 @@ def render_operations_inbox() -> None:
                     st.caption("Quick sync skips full attachment downloads by default. Set OPERATIONS_SYNC_ATTACHMENTS_ENABLED=true for a deeper document sync.")
                 for diag_error in diagnostics.get("errors", [])[:5]:
                     st.caption(f"Mailbox diagnostic: {diag_error}")
+                for account_diag in diagnostics.get("per_account", []):
+                    status_note = "login OK" if account_diag.get("login_success") else "login failed"
+                    test_note = (
+                        f", {account_diag.get('test_sync_matches', 0)} [TMS-TEST] match(es)"
+                        if account_diag.get("test_sync_matches")
+                        else ""
+                    )
+                    st.caption(
+                        f"{account_diag.get('email', '-')}: {status_note}, "
+                        f"folder '{account_diag.get('selected_folder', '-')}', "
+                        f"{account_diag.get('messages_found', 0)} found / {account_diag.get('messages_fetched', 0)} fetched"
+                        f"{test_note}"
+                        + (
+                            f" — {account_diag.get('error_type')}: {account_diag.get('error_message')}"
+                            if account_diag.get("error_type")
+                            else ""
+                        )
+                    )
             if fetched == 0 and not result.get("error"):
                 st.warning("Email sync completed, but no messages were returned from the recent mailbox scan.")
             elif fetched > 0:
@@ -3658,6 +3759,81 @@ def render_operations_inbox() -> None:
 
     selected_tab_name = selected_queue
 
+    # inbox_df is only in scope in this function. The selected-item dialog
+    # renders in its own top-level function (so it can be opened via
+    # st.dialog), so it must receive these as small explicit payloads
+    # rather than reaching back for inbox_df, which does not exist there.
+    level_counts_payload = build_control_level_counts(inbox_df)
+    queue_counts_payload = build_dispatcher_queue_counts(inbox_df)
+    critical_priority_count = count_critical_priority(inbox_df)
+
+    def _close_operations_work_item_dialog() -> None:
+        st.session_state.pop("selected_operations_request_id", None)
+
+    dialog_subject = ""
+    if "source_subject" in tab_df.columns and not tab_df.empty:
+        subject_matches = tab_df.loc[tab_df["id"] == selected_id, "source_subject"]
+        if not subject_matches.empty:
+            dialog_subject = ops._safe_str(subject_matches.iloc[0])
+    dialog_title = f"Work Item #{selected_id}"
+    if dialog_subject:
+        dialog_title += f" - {dialog_subject[:60]}"
+
+    @st.dialog(dialog_title, width="large", on_dismiss=_close_operations_work_item_dialog)
+    def _operations_work_item_dialog(
+        selected_id: int,
+        selected_tab_name: str,
+        level_counts_payload: dict[str, int] | None = None,
+        queue_counts_payload: dict[str, int] | None = None,
+        critical_priority_count: int = 0,
+    ) -> None:
+        size_labels = list(DIALOG_SIZE_PRESETS.keys())
+        current_size = st.session_state.get("operations_inbox_dialog_size", "Large")
+        if current_size not in DIALOG_SIZE_PRESETS:
+            current_size = "Large"
+        header_cols = st.columns([2, 1])
+        with header_cols[0]:
+            if st.button("Back to Queue", key="clear_operations_inbox_selection", use_container_width=True):
+                _close_operations_work_item_dialog()
+                st.rerun()
+        with header_cols[1]:
+            selected_size = st.radio(
+                "Popup size",
+                size_labels,
+                index=size_labels.index(current_size),
+                horizontal=True,
+                key="operations_inbox_dialog_size",
+                label_visibility="collapsed",
+            )
+        dialog_width, dialog_height = DIALOG_SIZE_PRESETS[selected_size]
+        st.markdown(
+            '<style>div[data-testid="stDialog"]{width:' + dialog_width + ' !important;height:' + dialog_height + ' !important;}</style>',
+            unsafe_allow_html=True,
+        )
+        _render_selected_operations_work_item(
+            int(selected_id),
+            selected_tab_name,
+            level_counts_payload=level_counts_payload,
+            queue_counts_payload=queue_counts_payload,
+            critical_priority_count=critical_priority_count,
+        )
+
+    _operations_work_item_dialog(
+        int(selected_id),
+        selected_tab_name,
+        level_counts_payload,
+        queue_counts_payload,
+        critical_priority_count,
+    )
+
+
+def _render_selected_operations_work_item(
+    selected_id: int,
+    selected_tab_name: str,
+    level_counts_payload: dict[str, int] | None = None,
+    queue_counts_payload: dict[str, int] | None = None,
+    critical_priority_count: int = 0,
+) -> None:
     record_df = _load_operations_inbox_record(int(selected_id))
 
     if record_df.empty:
@@ -4889,8 +5065,8 @@ def render_operations_inbox() -> None:
             else:
                 st.info("No obvious non-dispatch emails matched the cleanup rules.")
     with st.expander("Control Center Snapshot", expanded=False):
-        level_counts = inbox_df["control_level"].value_counts() if "control_level" in inbox_df.columns else pd.Series(dtype=int)
-        queue_counts = inbox_df["dispatcher_queue"].value_counts() if "dispatcher_queue" in inbox_df.columns else pd.Series(dtype=int)
+        level_counts = pd.Series(level_counts_payload or {}, dtype="int64")
+        queue_counts = pd.Series(queue_counts_payload or {}, dtype="int64")
 
         m1, m2, m3, m4, m5 = st.columns(5)
         with m1:
@@ -4902,7 +5078,7 @@ def render_operations_inbox() -> None:
         with m4:
             ops._render_ops_metric_card("Needs Review", int(level_counts.get("Needs Review", 0)), "Human decision")
         with m5:
-            ops._render_ops_metric_card("Critical", int(inbox_df["priority_label"].eq("Critical").sum()), "Escalations")
+            ops._render_ops_metric_card("Critical", int(critical_priority_count), "Escalations")
 
         q1, q2, q3, q4 = st.columns(4)
         q1.metric("New Orders", int(queue_counts.get("New Orders", 0)))

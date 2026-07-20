@@ -4,8 +4,9 @@ import email
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 
 try:
     from dotenv import load_dotenv
@@ -367,7 +368,7 @@ def _password_for_email_account(email_address):
     return ""
 
 
-def _operations_email_accounts():
+def _configured_operations_email_addresses():
     raw_accounts = (
         get_setting("OPERATIONS_CASE_MAILBOXES")
         or get_setting("OPERATIONS_EMAIL_ACCOUNTS")
@@ -390,18 +391,80 @@ def _operations_email_accounts():
     if default_email and default_email not in configured_accounts:
         configured_accounts.insert(0, default_email)
 
-    accounts = []
+    addresses = []
     seen = set()
     for email_address in configured_accounts:
         normalized = email_address.lower()
         if normalized in seen:
             continue
         seen.add(normalized)
+        addresses.append(email_address)
+    return addresses
+
+
+def _operations_email_accounts():
+    accounts = []
+    for email_address in _configured_operations_email_addresses():
         password = _password_for_email_account(email_address)
         if not password:
             continue
         accounts.append({"email": email_address, "password": password})
     return accounts
+
+
+def diagnose_operations_email_accounts():
+    """Test IMAP connection/login/folder-select for every configured mailbox
+    without importing or parsing any email content. Safe to call from a UI
+    diagnostic button - never logs passwords or message bodies."""
+    imap_server = get_setting("IMAP_SERVER", "imap.mail.yahoo.com")
+    imap_port = _get_int_setting("IMAP_PORT", 993)
+    selected_mailbox_setting = get_setting("EMAIL_INBOX_FOLDER", "INBOX")
+    mailbox_candidates = _split_mailbox_candidates(
+        get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+    )
+
+    results = []
+    for email_address in _configured_operations_email_addresses():
+        password = _password_for_email_account(email_address)
+        diag = {
+            "email": email_address,
+            "credentials_configured": bool(password),
+            "login_success": False,
+            "selected_folder": None,
+            "messages_found": 0,
+            "error_type": "",
+            "error_message": "",
+        }
+        results.append(diag)
+
+        if not password:
+            diag["error_type"] = "MissingCredentials"
+            diag["error_message"] = "No app password configured for this mailbox"
+            continue
+
+        mail = None
+        try:
+            try:
+                mail = imaplib.IMAP4_SSL(imap_server, imap_port, timeout=8)
+            except TypeError:
+                mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+            mail.login(email_address, password)
+            diag["login_success"] = True
+            diag["selected_folder"] = _select_mailbox(mail, selected_mailbox_setting, mailbox_candidates)
+            status, data = mail.search(None, "ALL")
+            if status == "OK" and data and data[0]:
+                diag["messages_found"] = len(data[0].split())
+        except Exception as exc:
+            diag["error_type"] = type(exc).__name__
+            diag["error_message"] = str(exc)
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+    return results
 
 
 def _select_mailbox(mail, selected_mailbox, fallback_mailboxes=None):
@@ -450,6 +513,7 @@ def _fetch_recent_emails(
     include_attachments=True,
     max_fetch_bytes=None,
     deadline=None,
+    diagnostics=None,
 ):
     email_address = email_address or get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS")
     email_password = email_password or get_setting("YAHOO_APP_PASSWORD") or get_setting("EMAIL_APP_PASSWORD")
@@ -479,13 +543,19 @@ def _fetch_recent_emails(
         if _deadline_expired(deadline):
             return []
         mail.login(email_address, email_password)
+        if diagnostics is not None:
+            diagnostics["login_success"] = True
         if _deadline_expired(deadline):
             return []
         selected_mailbox = _select_mailbox(mail, selected_mailbox, mailbox_candidates)
+        if diagnostics is not None:
+            diagnostics["selected_folder"] = selected_mailbox
 
         if _deadline_expired(deadline):
             return []
         email_ids = _search_message_ids(mail, search_query)
+        if diagnostics is not None:
+            diagnostics["messages_found"] = len(email_ids)
         if not email_ids:
             return []
 
@@ -598,7 +668,62 @@ def get_last_operations_email_sync_diagnostics():
     return dict(LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS or {})
 
 
-def fetch_operations_email_sync(limit=12):
+def _fetch_test_sync_messages(*, account_email, account_password, deadline):
+    """Dedicated lookback for OPERATIONS_TEST_SYNC_* messages. A busy
+    production mailbox can push a just-sent test message past the normal
+    per-mailbox top-N fetch within minutes, so this runs a separate,
+    sender-scoped search that isn't subject to that cutoff."""
+    if not _get_bool_setting("OPERATIONS_TEST_SYNC_ENABLED", False):
+        return []
+
+    allowed_sender = get_setting("OPERATIONS_TEST_SYNC_ALLOWED_SENDER", "")
+    subject_contains = get_setting("OPERATIONS_TEST_SYNC_SUBJECT_CONTAINS", "")
+    if not allowed_sender or not subject_contains:
+        return []
+
+    lookback_minutes = _get_int_setting("OPERATIONS_TEST_SYNC_LOOKBACK_MINUTES", 180)
+
+    messages = _fetch_recent_emails(
+        limit=10,
+        search_query=f'HEADER FROM "{allowed_sender}"',
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=[subject_contains.lower()],
+        require_terms=True,
+        scan_window=50,
+        email_address=account_email,
+        email_password=account_password,
+        include_attachments=False,
+        deadline=deadline,
+    )
+
+    if lookback_minutes <= 0:
+        return messages
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    filtered = []
+    for item in messages:
+        received_at = item.get("received_at")
+        received_dt = None
+        if received_at:
+            try:
+                received_dt = datetime.fromisoformat(received_at)
+            except ValueError:
+                received_dt = None
+        if received_dt is None:
+            filtered.append(item)
+            continue
+        if received_dt.tzinfo is None:
+            received_dt = received_dt.replace(tzinfo=timezone.utc)
+        if received_dt >= cutoff:
+            filtered.append(item)
+    return filtered
+
+
+def fetch_operations_email_sync(limit=12, time_budget_seconds=None):
     global LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS
 
     terms = get_setting(
@@ -616,7 +741,7 @@ def fetch_operations_email_sync(limit=12):
         ]
     account_count = max(1, len(accounts))
     requested_limit = max(1, int(limit or 12))
-    default_per_account_limit = min(8, max(3, (requested_limit + account_count - 1) // account_count))
+    default_per_account_limit = min(10, max(6, (requested_limit + account_count - 1) // account_count))
     per_mailbox_limit = _get_int_setting("OPERATIONS_EMAIL_PER_ACCOUNT_LIMIT", default_per_account_limit)
     sent_limit = min(per_mailbox_limit, _get_int_setting("OPERATIONS_SENT_SYNC_LIMIT", 2))
     inbox_scan_window = _get_int_setting("OPERATIONS_EMAIL_SCAN_WINDOW", max(per_mailbox_limit * 3, 20))
@@ -624,7 +749,13 @@ def fetch_operations_email_sync(limit=12):
     sync_sent = _get_bool_setting("OPERATIONS_SYNC_SENT_ENABLED", False)
     include_attachments = _get_bool_setting("OPERATIONS_SYNC_ATTACHMENTS_ENABLED", False)
     max_fetch_bytes = 0 if include_attachments else _get_int_setting("OPERATIONS_EMAIL_FAST_FETCH_BYTES", 80000)
-    time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
+    if time_budget_seconds is None:
+        time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
+    else:
+        try:
+            time_budget_seconds = max(0, int(time_budget_seconds))
+        except (TypeError, ValueError):
+            time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
     deadline = time.monotonic() + time_budget_seconds if time_budget_seconds > 0 else None
     timed_out = False
 
@@ -657,8 +788,16 @@ def fetch_operations_email_sync(limit=12):
         account_password = account.get("password")
         account_diag = {
             "email": account_email or "",
+            "credentials_configured": bool(account_email and account_password),
+            "login_success": False,
+            "selected_folder": None,
+            "messages_found": 0,
+            "messages_fetched": 0,
             "inbox_fetched": 0,
             "sent_fetched": 0,
+            "test_sync_matches": 0,
+            "error_type": "",
+            "error_message": "",
             "errors": [],
         }
         diagnostics["per_account"].append(account_diag)
@@ -671,11 +810,14 @@ def fetch_operations_email_sync(limit=12):
                 missing.append("password/app password")
             error_message = "Missing " + " and ".join(missing)
             account_diag["errors"].append(error_message)
+            account_diag["error_type"] = "MissingCredentials"
+            account_diag["error_message"] = error_message
             diagnostics["errors"].append(f"{account_email or 'account'}: {error_message}")
             continue
 
         diagnostics["accounts_attempted"] += 1
 
+        fetch_diag = {"login_success": False, "selected_folder": None, "messages_found": 0}
         try:
             inbox_batch = _fetch_recent_emails(
                 limit=per_mailbox_limit,
@@ -693,13 +835,38 @@ def fetch_operations_email_sync(limit=12):
                 include_attachments=include_attachments,
                 max_fetch_bytes=max_fetch_bytes,
                 deadline=deadline,
+                diagnostics=fetch_diag,
             )
+            account_diag.update(fetch_diag)
             account_diag["inbox_fetched"] = len(inbox_batch)
+            account_diag["messages_fetched"] = len(inbox_batch)
             inbox_messages.extend(inbox_batch)
         except Exception as exc:
+            account_diag.update(fetch_diag)
             error_message = f"Inbox sync failed: {exc}"
             account_diag["errors"].append(error_message)
+            account_diag["error_type"] = type(exc).__name__
+            account_diag["error_message"] = str(exc)
             diagnostics["errors"].append(f"{account_email}: {error_message}")
+
+        if not _deadline_expired(deadline):
+            try:
+                test_batch = _fetch_test_sync_messages(
+                    account_email=account_email,
+                    account_password=account_password,
+                    deadline=deadline,
+                )
+                if test_batch:
+                    existing_ids = {m.get("message_id") for m in inbox_messages}
+                    new_test_messages = [m for m in test_batch if m.get("message_id") not in existing_ids]
+                    account_diag["test_sync_matches"] = len(new_test_messages)
+                    # Prepend rather than append: under time pressure the
+                    # insert loop processes messages in order and stops when
+                    # it runs out of budget, so a test message appended at
+                    # the end is exactly the one most likely to get cut off.
+                    inbox_messages[0:0] = new_test_messages
+            except Exception as exc:
+                account_diag["errors"].append(f"Test-sync lookback failed: {exc}")
 
         if _deadline_expired(deadline):
             timed_out = True
@@ -745,6 +912,72 @@ def fetch_operations_email_sync(limit=12):
     LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS = diagnostics
 
     return inbox_messages + sent_messages
+
+
+def fetch_operations_email_near_date(*, sender="", received_at=None, limit=15, window_days=2):
+    """Targeted search bounded by sender + a date window around a known
+    received timestamp. Used to re-find an already-imported message's
+    attachments without scanning a huge chunk of a high-volume mailbox -
+    fetch_recent_operations_emails(limit=250) was observed to abort the IMAP
+    connection outright (socket EOF) rather than reliably find the target
+    message, and fetch_operations_email_by_message_id's HEADER Message-ID
+    search silently falls back to scanning ALL when it finds no exact
+    match, burning tens of seconds without ever finding the message."""
+    accounts = _operations_email_accounts()
+    if not accounts:
+        return []
+
+    since = ""
+    before = ""
+    parsed_date = received_at
+    if isinstance(parsed_date, str):
+        try:
+            parsed_date = datetime.fromisoformat(parsed_date)
+        except ValueError:
+            parsed_date = None
+    if parsed_date is not None:
+        try:
+            since = (parsed_date - timedelta(days=window_days)).strftime("%d-%b-%Y")
+            before = (parsed_date + timedelta(days=window_days + 1)).strftime("%d-%b-%Y")
+        except (TypeError, OverflowError):
+            since = ""
+            before = ""
+
+    sender_address = parseaddr(sender or "")[1] or sender or ""
+
+    query_parts = []
+    if since:
+        query_parts.append(f"SINCE {since}")
+    if before:
+        query_parts.append(f"BEFORE {before}")
+    if sender_address:
+        query_parts.append(f'FROM "{sender_address}"')
+    search_query = " ".join(query_parts) or "ALL"
+
+    results = []
+    for account in accounts:
+        try:
+            results.extend(
+                _fetch_recent_emails(
+                    limit=limit,
+                    search_query=search_query,
+                    mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+                    mailbox_candidates=_split_mailbox_candidates(
+                        get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+                    ),
+                    direction="inbound",
+                    terms=[],
+                    require_terms=False,
+                    scan_window=max(limit * 3, 30),
+                    email_address=account.get("email"),
+                    email_password=account.get("password"),
+                    include_attachments=True,
+                )
+            )
+        except Exception:
+            continue
+
+    return results
 
 
 def fetch_operations_email_by_message_id(message_id, limit=5):

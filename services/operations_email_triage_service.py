@@ -105,22 +105,6 @@ BUSINESS_TERMS = [
     "sales lead",
 ]
 
-BILLING_TERMS = [
-    "invoice",
-    "billing",
-    "payment",
-    "statement",
-    "accessorial",
-    "detention",
-    "demurrage",
-    "lumper",
-    "factura",
-    "facturacion",
-    "facturación",
-    "pago",
-    "cobro",
-]
-
 DOCUMENT_TERMS = [
     "pod",
     "proof of delivery",
@@ -294,7 +278,142 @@ def _attachment_count(attachments: list[dict] | None, parsed: dict | None = None
     return count
 
 
-def _request_type_from_rules(text: str, baseline_type: str, has_reference: bool, attachments_present: bool) -> str:
+def is_booking_confirmation(
+    subject: str,
+    body: str,
+    parsed: dict | None = None,
+) -> bool:
+    """
+    Return True when the message is clearly a booking/order confirmation.
+
+    Booking evidence must take priority over passive invoice language,
+    bill-of-lading labels, and rate-sheet terminology. This is the single
+    canonical booking-confirmation signal shared by every classification
+    entry point (fast triage, insertion, recheck batch, and on-demand
+    review) — do not reimplement this check elsewhere.
+    """
+
+    parsed = parsed if isinstance(parsed, dict) else {}
+
+    subject_text = _safe_str(subject).lower()
+    body_text = _safe_str(body).lower()
+    combined = f"{subject_text}\n{body_text}"
+
+    booking_number = _safe_str(
+        parsed.get("Booking Number")
+        or parsed.get("booking_number")
+        or parsed.get("Booking")
+    )
+
+    container_qty = _safe_str(
+        parsed.get("Container Qty")
+        or parsed.get("container_qty")
+        or parsed.get("Container Quantity")
+        or parsed.get("Number Of Containers")
+    )
+
+    parse_profile = _safe_str(
+        parsed.get("_parse_profile")
+        or parsed.get("parse_profile")
+    ).lower()
+
+    explicit_subject_signals = [
+        "new booking",
+        "booking confirmation",
+        "new order",
+        "load order",
+        "delivery order",
+    ]
+
+    explicit_body_signals = [
+        "booking confirmation",
+        "number of cntrs",
+        "container qty",
+        "containers required",
+        "please see the attached booking confirmation",
+        "please arrange drayage",
+        "please arrange transportation",
+    ]
+
+    if any(signal in subject_text for signal in explicit_subject_signals):
+        return True
+
+    if any(signal in combined for signal in explicit_body_signals):
+        return True
+
+    if parsed.get("_booking_confirmation") is True:
+        return True
+
+    if "booking" in parse_profile:
+        return True
+
+    if booking_number and container_qty:
+        return True
+
+    if booking_number and any(
+        signal in combined
+        for signal in [
+            "vessel:",
+            "cargo cut off",
+            "vgm cut off",
+            "port of loading",
+            "port of discharge",
+            "empty pick up",
+            "full return",
+        ]
+    ):
+        return True
+
+    return False
+
+
+def has_actual_billing_request(
+    subject: str,
+    body: str,
+) -> bool:
+    """
+    Detect an actionable billing request.
+
+    Passive terms inside a booking confirmation do not make the message Billing.
+    Examples excluded:
+    - bill of lading
+    - charges will be invoiced
+    - invoice should be sent to
+    - this document is not an invoice
+    """
+
+    text = f"{_safe_str(subject)}\n{_safe_str(body)}".lower()
+
+    actual_billing_patterns = [
+        r"\bplease\s+(?:send|submit|review|correct|revise|approve)\s+(?:the\s+)?invoice\b",
+        r"\bplease\s+invoice\b",
+        r"\binvoice\s+(?:request|status|correction|revision|dispute|question|issue)\b",
+        r"\bmissing\s+invoice\b",
+        r"\bincorrect\s+invoice\b",
+        r"\bpayment\s+(?:request|status|due|issue|question)\b",
+        r"\bbilling\s+(?:request|question|issue|correction|dispute)\b",
+        r"\bdetention\s+(?:invoice|charge|billing)\b",
+        r"\bdemurrage\s+(?:invoice|charge|billing)\b",
+        r"\baccessorial\s+(?:invoice|charge|billing)\b",
+        r"\blumper\s+(?:receipt|invoice|charge)\b",
+        r"\bfactura\s+(?:solicitud|correccion|corrección|problema|pendiente)\b",
+        r"\bsolicitud\s+de\s+factura\b",
+    ]
+
+    return any(
+        re.search(pattern, text, flags=re.I)
+        for pattern in actual_billing_patterns
+    )
+
+
+def _request_type_from_rules(
+    text: str,
+    baseline_type: str,
+    has_reference: bool,
+    attachments_present: bool,
+    booking_confirmation: bool = False,
+    actual_billing_request: bool = False,
+) -> str:
     baseline_type = _safe_str(baseline_type)
     if baseline_type not in KNOWN_REQUEST_TYPES:
         baseline_type = "Customer Request"
@@ -308,11 +427,14 @@ def _request_type_from_rules(text: str, baseline_type: str, has_reference: bool,
     if _contains_any(text, NO_ACTION_TERMS) and not has_reference and not _contains_any(text, SHIPMENT_TERMS):
         return "No Action / FYI"
 
-    if _contains_any(text, BILLING_TERMS):
-        return "Billing"
-
-    if _contains_any(text, QUOTE_TERMS):
+    if _contains_any(text, QUOTE_TERMS) and not booking_confirmation:
         return "Quote Request"
+
+    if booking_confirmation and not actual_billing_request:
+        return "New Booking"
+
+    if actual_billing_request:
+        return "Billing"
 
     if _contains_any(text, NEW_ORDER_TERMS) and (has_reference or attachments_present):
         return "New Booking"
@@ -464,7 +586,16 @@ def triage_operations_email(
     attachments_present = _attachment_count(attachments, parsed) > 0
 
     baseline_type = _safe_str(classification.get("request_type")) or "Customer Request"
-    request_type = _request_type_from_rules(text, baseline_type, has_reference, attachments_present)
+    booking_confirmation = is_booking_confirmation(subject, body, parsed)
+    actual_billing_request = has_actual_billing_request(subject, body)
+    request_type = _request_type_from_rules(
+        text,
+        baseline_type,
+        has_reference,
+        attachments_present,
+        booking_confirmation=booking_confirmation,
+        actual_billing_request=actual_billing_request,
+    )
 
     baseline_confidence = classification.get("confidence_score", 0)
     try:
