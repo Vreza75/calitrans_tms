@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from email_client import fetch_recent_operations_emails
+from services.email_client import fetch_recent_operations_emails
 
 
 def main() -> None:
