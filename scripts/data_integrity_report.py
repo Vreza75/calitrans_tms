@@ -103,13 +103,16 @@ def check_invalid_load_statuses(engine, findings: list[str]) -> None:
 
 
 def check_invalid_service_flows(engine, findings: list[str]) -> None:
+    # order_intake has no top-level service_flow column - move/service type
+    # for raw intake records lives inside parsed_data JSONB, not a column.
+    # order_intake_drafts (multi-container bookings) does have one.
     with engine.connect() as conn:
         rows = conn.execute(
-            text("select distinct service_flow from order_intake where service_flow is not null")
+            text("select distinct service_flow from order_intake_drafts where service_flow is not null")
         ).fetchall()
     unknown = sorted(row[0] for row in rows if row[0] not in _VALID_SERVICE_FLOWS)
     if unknown:
-        findings.append(f"REVIEW  order_intake.service_flow has values outside {_VALID_SERVICE_FLOWS}: {unknown}")
+        findings.append(f"REVIEW  order_intake_drafts.service_flow has values outside {_VALID_SERVICE_FLOWS}: {unknown}")
 
 
 def check_duplicate_email_message_ids(engine, findings: list[str]) -> None:

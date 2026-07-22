@@ -89,6 +89,13 @@ def test_parse_expected_schema_finds_core_tables_and_columns():
     assert "triage_status" in expected["tables"]["order_intake"]
     assert "llm_review_required" in expected["tables"]["order_intake"]
 
+    # order_intake has no top-level service_flow column - that only exists
+    # on order_intake_drafts (multi_container_migration.sql). Locks in a bug
+    # fix in scripts/data_integrity_report.py that originally queried the
+    # wrong table and crashed with UndefinedColumn against the real DB.
+    assert "service_flow" not in expected["tables"]["order_intake"]
+    assert "service_flow" in expected["tables"]["order_intake_drafts"]
+
     # communications_foundation_migration.sql ALTERs dispatch_messages, created
     # by operations_email_workflow_migration.sql.
     assert "dispatch_messages" in expected["tables"]
