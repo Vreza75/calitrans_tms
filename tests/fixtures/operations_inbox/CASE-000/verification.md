@@ -34,15 +34,16 @@ harness itself works end to end before any real case is attempted.
   existing_load_match_accuracy 100%, queue_resolution PASS,
   exact_record_pass True.
 
-## Known limitation
+## Known limitation (resolved)
 
-`references.contact_name` captures `"Thank you,"` instead of the sender name
-that follows it on the next line - `_signature_contact_name` in
-`services/email_parser.py` mis-reads the closing-line-plus-name signature
-block when there is no explicit `Contact:` label in the body. Not fixed here:
-CASE-000 is infrastructure-only, and real cases that include an explicit
-`Contact:` label (e.g. CASE-001) don't hit this fallback path at all. Tracked
-for whichever real case first depends on signature-derived contact names.
+Originally `references.contact_name` captured `"Thank you,"` instead of the
+sender name - `_signature_contact_name` mis-read the closing-line-plus-name
+signature block when there was no explicit `Contact:` label. Fixed as a
+side effect of CASE-002's certification: `services/operations_inbox_service.py`
+now passes `sender` into `parse_email_text(...)`, so `Contact Name`/
+`Contact Email` resolve from the `From` header identity first
+(`"Qa Harness"` / `qa-harness@fixtures.calitrans.test`) instead of falling
+back to the buggy signature-line scan.
 
 ## Decision
 

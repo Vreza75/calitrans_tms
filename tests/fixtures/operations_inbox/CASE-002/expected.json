@@ -1,0 +1,31 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Export",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "LSF-EXP-260802",
+  "order_numbers": ["LSF-EXP-260802"],
+  "container_count": 1,
+  "containers": ["TGHU7654321"],
+  "customer": "Lone Star Foods",
+  "pickup": {
+    "terminal": "Barbours Cut Terminal",
+    "empty_pickup": "Barbours Cut Empty Depot",
+    "customer_pickup": "Lone Star Foods Export Warehouse",
+    "customer_pickup_address": "2200 Navigation Boulevard, Houston, TX 77003"
+  },
+  "delivery": {},
+  "dates": {
+    "pickup_date": "August 5, 2026",
+    "document_cutoff": "August 7, 2026"
+  },
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Thomas Lee",
+    "contact_email": "thomas.lee@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_critical_fields": ["intent", "service_flow", "customer", "booking_number", "containers", "pickup", "dates", "references"]
+}

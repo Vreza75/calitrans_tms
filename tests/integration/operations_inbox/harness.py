@@ -290,6 +290,14 @@ def process_fixture_email(fixture: Fixture) -> dict:
         return operations_inbox_service.sync_operations_email_engine(limit=5, time_budget_seconds=30)
 
 
+def _sparse(mapping: dict) -> dict:
+    """Drop empty values so pickup/delivery/dates/references only report the
+    fields a given case's email actually populated - keeps expected.json
+    stable as new location/date concepts are added for later cases instead
+    of forcing every earlier accepted case to be reshaped."""
+    return {k: v for k, v in mapping.items() if v not in (None, "", [])}
+
+
 def capture_actual_result(fixture: Fixture) -> dict:
     """Read back the order_intake row(s) created for this case and translate
     them into the expected.json schema. This mapping is intentionally
@@ -330,26 +338,37 @@ def capture_actual_result(fixture: Fixture) -> dict:
         "container_count": len(containers) or None,
         "containers": containers,
         "customer": parsed.get("Customer") or None,
-        "pickup": {
-            "terminal": parsed.get("Port") or None,
-            "warehouse": parsed.get("Loading Warehouse") or None,
-            "address": parsed.get("Loading Address") or None,
-        },
-        "delivery": {
-            "warehouse": parsed.get("Warehouse") or None,
-            "address": parsed.get("Address") or None,
-        },
-        "dates": {
-            "delivery_need_date": parsed.get("Delivery Need Date") or None,
-            "last_free_day": parsed.get("LFD") or None,
-        },
-        "references": {
-            "reference_number": parsed.get("Reference Number") or None,
-            "container_size": parsed.get("Size") or None,
-            "contact_name": parsed.get("Contact Name") or None,
-            "contact_email": parsed.get("Contact Email") or None,
-            "contact_phone": parsed.get("Contact Phone") or None,
-        },
+        "pickup": _sparse(
+            {
+                "terminal": parsed.get("Port"),
+                "empty_pickup": parsed.get("Empty Pickup"),
+                "customer_pickup": parsed.get("Customer Pickup"),
+                "customer_pickup_address": parsed.get("Customer Pickup Address"),
+            }
+        ),
+        "delivery": _sparse(
+            {
+                "warehouse": parsed.get("Warehouse"),
+                "address": parsed.get("Address"),
+            }
+        ),
+        "dates": _sparse(
+            {
+                "delivery_need_date": parsed.get("Delivery Need Date"),
+                "last_free_day": parsed.get("LFD"),
+                "pickup_date": parsed.get("Pickup Date"),
+                "document_cutoff": parsed.get("Document Cutoff"),
+            }
+        ),
+        "references": _sparse(
+            {
+                "reference_number": parsed.get("Reference Number"),
+                "container_size": parsed.get("Size"),
+                "contact_name": parsed.get("Contact Name"),
+                "contact_email": parsed.get("Contact Email"),
+                "contact_phone": parsed.get("Contact Phone"),
+            }
+        ),
         "missing_required_fields": [],
         # True whenever a dispatcher decision is still pending (no order/update
         # committed yet) - AI never creates or changes operational records

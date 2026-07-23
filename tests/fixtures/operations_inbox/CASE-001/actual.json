@@ -14,9 +14,7 @@
   ],
   "customer": "Gulf Coast Retail Distribution",
   "pickup": {
-    "terminal": "Bayport Container Terminal",
-    "warehouse": null,
-    "address": null
+    "terminal": "Bayport Container Terminal"
   },
   "delivery": {
     "warehouse": "Gulf Coast Retail DC",
@@ -27,7 +25,6 @@
     "last_free_day": "August 3, 2026"
   },
   "references": {
-    "reference_number": null,
     "container_size": "40HC",
     "contact_name": "Elena Martinez",
     "contact_email": "elena.martinez@example.com",

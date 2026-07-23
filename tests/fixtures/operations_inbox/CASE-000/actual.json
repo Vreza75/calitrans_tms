@@ -14,24 +14,19 @@
   ],
   "customer": "Harness Smoke Test Customer",
   "pickup": {
-    "terminal": "Test Terminal",
-    "warehouse": null,
-    "address": null
+    "terminal": "Test Terminal"
   },
   "delivery": {
     "warehouse": "Test Warehouse",
     "address": "1 Test Way, Houston, TX 77001"
   },
   "dates": {
-    "delivery_need_date": "January 1, 2027",
-    "last_free_day": null
+    "delivery_need_date": "January 1, 2027"
   },
   "references": {
-    "reference_number": null,
     "container_size": "40HC",
-    "contact_name": "Thank you,",
-    "contact_email": null,
-    "contact_phone": null
+    "contact_name": "Qa Harness",
+    "contact_email": "qa-harness@fixtures.calitrans.test"
   },
   "missing_required_fields": [],
   "requires_human_review": true,

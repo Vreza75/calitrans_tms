@@ -1,0 +1,27 @@
+Subject: New Export Booking - LSF-EXP-260802
+From: Thomas Lee <thomas.lee@example.com>
+Message-ID: <case-002@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello CaliTrans,
+
+Please enter the following export booking.
+
+Customer: Lone Star Foods
+Booking Number: LSF-EXP-260802
+Container Number: TGHU7654321
+Container Size: 40HC
+Steamship Line: Maersk
+
+Empty Pickup Location: Barbours Cut Empty Depot
+Customer Pickup Location: Lone Star Foods Export Warehouse
+Customer Pickup Address: 2200 Navigation Boulevard, Houston, TX 77003
+Export Terminal: Barbours Cut Terminal
+
+Empty Pickup Date: August 5, 2026
+Port Cutoff: August 7, 2026
+
+Please confirm when entered.
+
+Regards,
+Thomas Lee
