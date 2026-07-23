@@ -383,9 +383,20 @@ def _signature_block(body: str, sender_identity: dict[str, str] | None = None) -
     return best
 
 
+_BUSINESS_NAME_TERMS = re.compile(
+    r"\b(?:inc|llc|corp|corporation|co|company|ltd|group|industries|industrial|packaging|"
+    r"supply|supplies|products|solutions|services|systems|enterprises|logistics|"
+    r"distribution|warehouse|warehousing|trucking|transport|transportation|freight|"
+    r"forwarding|brokerage|dc|center|centre|depot|terminal|yard|facility|plant)\b",
+    re.I,
+)
+
+
 def _looks_like_person_name(value: str) -> bool:
     value = _clean(value)
     if not value or "@" in value or re.search(r"\d", value):
+        return False
+    if _BUSINESS_NAME_TERMS.search(value):
         return False
     words = value.split()
     return 2 <= len(words) <= 4 and all(len(word.strip(".,|")) >= 2 for word in words)
