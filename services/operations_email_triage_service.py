@@ -232,7 +232,18 @@ def _safe_str(value: Any) -> str:
 
 
 def _lower_blob(*parts: Any) -> str:
-    return "\n".join(_safe_str(part) for part in parts if _safe_str(part)).lower()
+    """Join parts into one lowercase keyword-search blob. A dict part
+    contributes its VALUES only, never its Python repr - str({"Port": ""})
+    contains the literal word "port" as a dict key even when the field is
+    blank, which silently made every message "mention" every parser field
+    name (Port, Warehouse, Delivery, Container, ...) regardless of content."""
+    flattened: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            flattened.extend(_safe_str(value) for value in part.values())
+        else:
+            flattened.append(_safe_str(part))
+    return "\n".join(text for text in flattened if text).lower()
 
 
 _CONTAINS_ANY_PATTERN_CACHE: dict[str, "re.Pattern"] = {}
@@ -437,6 +448,7 @@ def _request_type_from_rules(
     attachments_present: bool,
     booking_confirmation: bool = False,
     actual_billing_request: bool = False,
+    already_matched_load: bool = False,
 ) -> str:
     baseline_type = _safe_str(baseline_type)
     if baseline_type not in KNOWN_REQUEST_TYPES:
@@ -454,7 +466,11 @@ def _request_type_from_rules(
     if _contains_any(text, QUOTE_TERMS) and not booking_confirmation:
         return "Quote Request"
 
-    if booking_confirmation and not actual_billing_request:
+    # A message that already matches a real existing load is an update to
+    # that load, never a new booking - even if it also carries strong
+    # booking-confirmation signals (e.g. a booking number + container
+    # number, which for a *new* booking is exactly the right signal).
+    if booking_confirmation and not actual_billing_request and not already_matched_load:
         return "New Booking"
 
     if actual_billing_request:
@@ -612,6 +628,7 @@ def triage_operations_email(
     baseline_type = _safe_str(classification.get("request_type")) or "Customer Request"
     booking_confirmation = is_booking_confirmation(subject, body, parsed)
     actual_billing_request = has_actual_billing_request(subject, body)
+    already_matched_load = classification.get("matched_load_id") is not None
     request_type = _request_type_from_rules(
         text,
         baseline_type,
@@ -619,6 +636,7 @@ def triage_operations_email(
         attachments_present,
         booking_confirmation=booking_confirmation,
         actual_billing_request=actual_billing_request,
+        already_matched_load=already_matched_load,
     )
 
     baseline_confidence = classification.get("confidence_score", 0)

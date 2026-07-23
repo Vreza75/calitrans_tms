@@ -25,7 +25,7 @@ LABEL_ALIASES = {
     "Port": ["Port", "Terminal", "Port/Terminal", "Pickup Terminal", "Export Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
     "Warehouse": ["Warehouse", "Delivery Warehouse", "Delivery Location", "Deliver To", "Delivery To", "Destination", "Destination Location", "Consignee", "Loading At", "Load At"],
     "Address": ["Address", "Delivery Address", "Warehouse Address", "Destination Address", "Consignee Address"],
-    "Delivery Need Date": ["Delivery Need Date", "Delivery Date Needed", "Delivery Date", "Requested Date", "Need Date", "Appointment Date", "Loading / Date", "Load Date"],
+    "Delivery Need Date": ["Delivery Need Date", "Delivery Date Needed", "New Delivery Date", "Delivery Date", "Requested Date", "Need Date", "Appointment Date", "Loading / Date", "Load Date"],
     "Document Cutoff": ["Document Cutoff", "Cutoff Date", "Doc Cutoff", "Doc Cut-Off", "Port Cut", "Port Cutoff", "Port Cut-Off", "Cargo Cutoff", "Cargo Cut-Off"],
     "LFD": ["LFD", "Last Free Day"],
     "Contact Name": ["Contact", "Contact Name"],

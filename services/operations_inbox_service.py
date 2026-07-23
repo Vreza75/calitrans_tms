@@ -190,14 +190,24 @@ def enforce_authoritative_booking_triage(
     body: str,
     parsed: dict | None,
     triage: dict | None,
+    already_matched_load: bool = False,
 ) -> dict:
     """
     Prevent clear booking confirmations from being overwritten by broad
     Billing or Documents classifications.
+
+    already_matched_load: when this message already matches a real existing
+    load, it's an update to that load, never a new booking - even if it
+    also carries strong booking-confirmation signals (booking number +
+    container number). Skips the New Booking override in that case so an
+    upstream Booking Update classification survives.
     """
 
     parsed = parsed if isinstance(parsed, dict) else {}
     corrected = dict(triage or {})
+
+    if already_matched_load:
+        return corrected
 
     booking_confirmation = is_booking_confirmation(
         subject,
@@ -4211,6 +4221,7 @@ def _prepare_operations_email_record(message: dict) -> dict:
             body=latest_body,
             parsed=parsed,
             triage=triage,
+            already_matched_load=classification.get("matched_load_id") is not None,
         )
     except Exception as exc:
         triage = {}
