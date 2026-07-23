@@ -172,14 +172,16 @@ EXISTING_LOAD_TERMS = [
 ]
 
 DRIVER_PORT_TERMS = [
-    "driver",
-    "truck",
-    "chassis",
+    "driver issue",
+    "truck issue",
+    "chassis issue",
     "breakdown",
+    "flat tire",
+    "late driver",
     "accident",
     "no show",
-    "port",
-    "terminal",
+    "port hold",
+    "terminal hold",
     "customs hold",
     "line hold",
     "exam",
@@ -485,7 +487,7 @@ def _request_type_from_rules(
         return baseline_type if baseline_type in {"New Booking", "Booking Update", "POD Request"} else "Booking Update"
 
     if _contains_any(text, DRIVER_PORT_TERMS) and has_reference:
-        if _contains_any(text, ["driver", "truck", "chassis", "breakdown", "accident", "no show"]):
+        if _contains_any(text, ["driver issue", "truck issue", "chassis issue", "breakdown", "flat tire", "late driver", "accident", "no show"]):
             return "Driver Issue"
         return "Port Issue"
 
