@@ -4142,7 +4142,7 @@ def _prepare_operations_email_record(message: dict) -> dict:
     processing_errors: list[str] = []
 
     try:
-        parsed = parse_email_text(subject, latest_body)
+        parsed = parse_email_text(subject, latest_body, sender)
     except Exception as exc:
         parsed = {}
         processing_errors.append(f"parse_email_text failed: {exc}")

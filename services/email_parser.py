@@ -11,6 +11,7 @@ FIELDS = [
     "Container Qty", "Size", "Port", "Warehouse", "Address", "Delivery Need Date",
     "Document Cutoff", "LFD", "Contact Name", "Contact Email", "Contact Phone",
     "Contact Company", "Dispatcher Notes",
+    "Empty Pickup", "Customer Pickup", "Customer Pickup Address", "Pickup Date",
 ]
 
 LABEL_ALIASES = {
@@ -21,7 +22,7 @@ LABEL_ALIASES = {
     "Container Number": ["Container Number", "Container #", "Container", "Cntr", "Container No"],
     "Container Qty": ["Number Of Cntrs", "Number Of Containers", "Container Qty", "Containers Required", "Ctr Qty", "Qty Containers"],
     "Size": ["Size", "Container Size", "Equipment", "Container Type", "Ctr QTY/Size", "Ctr Qty/Size", "Qty/Size"],
-    "Port": ["Port", "Terminal", "Port/Terminal", "Pickup Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
+    "Port": ["Port", "Terminal", "Port/Terminal", "Pickup Terminal", "Export Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
     "Warehouse": ["Warehouse", "Delivery Warehouse", "Delivery Location", "Deliver To", "Delivery To", "Destination", "Destination Location", "Consignee", "Loading At", "Load At"],
     "Address": ["Address", "Delivery Address", "Warehouse Address", "Destination Address", "Consignee Address"],
     "Delivery Need Date": ["Delivery Need Date", "Delivery Date Needed", "Delivery Date", "Requested Date", "Need Date", "Appointment Date", "Loading / Date", "Load Date"],
@@ -32,6 +33,13 @@ LABEL_ALIASES = {
     "Contact Phone": ["Contact Phone", "Phone", "Tel", "Telephone", "Mobile", "Cell"],
     "Contact Company": ["Contact Company", "Company Name", "Organization"],
     "Dispatcher Notes": ["Notes", "Dispatcher Notes", "Instructions", "Special Instructions"],
+    # Export-flow locations. Kept distinct from Warehouse/Address (which mean
+    # the final LOCAL DELIVERY point) so an export's shipper/empty-depot
+    # locations never get misread as a delivery destination.
+    "Empty Pickup": ["Empty Pickup Location", "Empty Pickup", "Empty Return Location", "Empty Depot"],
+    "Customer Pickup": ["Customer Pickup Location", "Customer Pickup", "Shipper Pickup Location", "Shipper Pickup"],
+    "Customer Pickup Address": ["Customer Pickup Address", "Shipper Pickup Address", "Shipper Address"],
+    "Pickup Date": ["Empty Pickup Date", "Pickup Date"],
 }
 
 OWN_COMPANY_DOMAINS = {"calitranscorp.com"}
