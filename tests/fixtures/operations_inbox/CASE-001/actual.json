@@ -4,34 +4,34 @@
   "queue": "New Orders",
   "decision": "Create New Order",
   "existing_load_match": null,
-  "booking_number": "SMOKE-000",
+  "booking_number": "GCR-IMP-260801",
   "order_numbers": [
-    "SMOKE-000"
+    "GCR-IMP-260801"
   ],
   "container_count": 1,
   "containers": [
-    "TEST0000001"
+    "MSCU1234567"
   ],
-  "customer": "Harness Smoke Test Customer",
+  "customer": "Gulf Coast Retail Distribution",
   "pickup": {
-    "terminal": "Test Terminal",
+    "terminal": "Bayport Container Terminal",
     "warehouse": null,
     "address": null
   },
   "delivery": {
-    "warehouse": "Test Warehouse",
-    "address": "1 Test Way, Houston, TX 77001"
+    "warehouse": "Gulf Coast Retail DC",
+    "address": "4100 Market Center Drive, Houston, TX 77020"
   },
   "dates": {
-    "delivery_need_date": "January 1, 2027",
-    "last_free_day": null
+    "delivery_need_date": "August 4, 2026",
+    "last_free_day": "August 3, 2026"
   },
   "references": {
     "reference_number": null,
     "container_size": "40HC",
-    "contact_name": "Thank you,",
-    "contact_email": null,
-    "contact_phone": null
+    "contact_name": "Elena Martinez",
+    "contact_email": "elena.martinez@example.com",
+    "contact_phone": "713-555-0101"
   },
   "missing_required_fields": [],
   "requires_human_review": true,

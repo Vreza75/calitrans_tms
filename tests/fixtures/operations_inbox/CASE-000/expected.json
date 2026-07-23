@@ -10,6 +10,7 @@
   "containers": ["TEST0000001"],
   "customer": "Harness Smoke Test Customer",
   "pickup": {
+    "terminal": "Test Terminal",
     "warehouse": null,
     "address": null
   },
@@ -22,9 +23,13 @@
     "last_free_day": null
   },
   "references": {
-    "reference_number": null
+    "reference_number": null,
+    "container_size": "40HC",
+    "contact_name": "Thank you,",
+    "contact_email": null,
+    "contact_phone": null
   },
   "missing_required_fields": [],
-  "requires_human_review": false,
+  "requires_human_review": true,
   "_critical_fields": ["intent", "service_flow", "customer", "booking_number", "containers"]
 }

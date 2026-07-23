@@ -34,8 +34,27 @@ harness itself works end to end before any real case is attempted.
   existing_load_match_accuracy 100%, queue_resolution PASS,
   exact_record_pass True.
 
+## Known limitation
+
+`references.contact_name` captures `"Thank you,"` instead of the sender name
+that follows it on the next line - `_signature_contact_name` in
+`services/email_parser.py` mis-reads the closing-line-plus-name signature
+block when there is no explicit `Contact:` label in the body. Not fixed here:
+CASE-000 is infrastructure-only, and real cases that include an explicit
+`Contact:` label (e.g. CASE-001) don't hit this fallback path at all. Tracked
+for whichever real case first depends on signature-derived contact names.
+
 ## Decision
 
 ACCEPTED (infrastructure smoke case only - does not certify any of the 10
 business cases in Part 3, which each require their own fixture, approval,
 and acceptance audit before being marked Passed).
+
+## Addendum (CASE-001 pass)
+
+`expected.json`/`actual.json` shape evolved while certifying CASE-001:
+added `pickup.terminal`, `references.container_size` /
+`contact_name`/`contact_email`/`contact_phone`, and switched
+`requires_human_review` to the "no order approved yet" gate instead of the
+narrow `llm_review_required` flag. Re-verified PASSED with the new shape;
+harmless since this fixture isn't one of the ten certified business cases.

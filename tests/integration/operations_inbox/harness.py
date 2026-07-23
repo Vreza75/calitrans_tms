@@ -331,6 +331,7 @@ def capture_actual_result(fixture: Fixture) -> dict:
         "containers": containers,
         "customer": parsed.get("Customer") or None,
         "pickup": {
+            "terminal": parsed.get("Port") or None,
             "warehouse": parsed.get("Loading Warehouse") or None,
             "address": parsed.get("Loading Address") or None,
         },
@@ -340,13 +341,22 @@ def capture_actual_result(fixture: Fixture) -> dict:
         },
         "dates": {
             "delivery_need_date": parsed.get("Delivery Need Date") or None,
-            "last_free_day": parsed.get("Last Free Day") or None,
+            "last_free_day": parsed.get("LFD") or None,
         },
         "references": {
             "reference_number": parsed.get("Reference Number") or None,
+            "container_size": parsed.get("Size") or None,
+            "contact_name": parsed.get("Contact Name") or None,
+            "contact_email": parsed.get("Contact Email") or None,
+            "contact_phone": parsed.get("Contact Phone") or None,
         },
         "missing_required_fields": [],
-        "requires_human_review": bool(primary.get("llm_review_required")),
+        # True whenever a dispatcher decision is still pending (no order/update
+        # committed yet) - AI never creates or changes operational records
+        # without confirmation, so this is the general "not yet approved" gate,
+        # not just the narrower low-confidence llm_review_required flag.
+        "requires_human_review": bool(primary.get("llm_review_required"))
+        or (str(primary.get("review_status") or "") == "Open" and not primary.get("linked_load_id")),
         "_row_count": len(rows),
         "_row_ids": [row.get("id") for row in rows],
     }
