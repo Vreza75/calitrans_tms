@@ -21,7 +21,7 @@ LABEL_ALIASES = {
     "Container Number": ["Container Number", "Container #", "Container", "Cntr", "Container No"],
     "Container Qty": ["Number Of Cntrs", "Number Of Containers", "Container Qty", "Containers Required", "Ctr Qty", "Qty Containers"],
     "Size": ["Size", "Container Size", "Equipment", "Container Type", "Ctr QTY/Size", "Ctr Qty/Size", "Qty/Size"],
-    "Port": ["Port", "Terminal", "Port/Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
+    "Port": ["Port", "Terminal", "Port/Terminal", "Pickup Terminal", "Pickup", "Pickup Location", "Pickup From", "Origin", "Origin Location", "Rail Ramp", "Ramp", "POL"],
     "Warehouse": ["Warehouse", "Delivery Warehouse", "Delivery Location", "Deliver To", "Delivery To", "Destination", "Destination Location", "Consignee", "Loading At", "Load At"],
     "Address": ["Address", "Delivery Address", "Warehouse Address", "Destination Address", "Consignee Address"],
     "Delivery Need Date": ["Delivery Need Date", "Delivery Date Needed", "Delivery Date", "Requested Date", "Need Date", "Appointment Date", "Loading / Date", "Load Date"],
@@ -729,8 +729,14 @@ def _invalid_location_value(value: str) -> bool:
         return True
     location_hint = bool(
         "," in value
-        or re.search(r"\b(?:port|terminal|ramp|rail|yard|warehouse|whse|crossdock|depot|street|st\.?|road|rd\.?|avenue|ave\.?|hwy|highway)\b", value, re.I)
-        or re.search(r"\b(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|IL|IN|LA|MD|MI|MN|MO|NC|NJ|NM|NV|NY|OH|OK|OR|PA|SC|TN|TX|VA|WA|WI)\b", value)
+        or re.search(
+            r"\b(?:port|terminal|ramp|rail|yard|warehouse|whse|crossdock|depot|street|st\.?|road|rd\.?|"
+            r"avenue|ave\.?|hwy|highway|dc|distribution|fulfillment|logistics|facility|plant|receiving|"
+            r"center|centre)\b",
+            value,
+            re.I,
+        )
+        or re.search(r"\b(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|IL|IN|LA|MD|MI|MN|MO|NC|NJ|NM|NV|NY|OH|OK|OR|PA|SC|TN|TX|VA|WA|WI|DC)\b", value)
     )
     if _looks_like_person_name(value) and not location_hint:
         return True

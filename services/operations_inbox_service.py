@@ -159,9 +159,23 @@ def parse_date_or_none(value: Any):
     return parsed.date()
 
 
+_CONTAINS_ANY_PATTERN_CACHE: dict[str, "re.Pattern"] = {}
+
+
 def contains_any(text: str, terms: list[str]) -> bool:
+    """Word-boundary substring check. Plain `term in lowered` previously let
+    short terms like "exam" false-positive inside unrelated text such as the
+    "example.com" placeholder domain used by every test fixture address."""
     lowered = str(text or "").lower()
-    return any(term in lowered for term in terms)
+    for term in terms:
+        term_lower = term.lower()
+        pattern = _CONTAINS_ANY_PATTERN_CACHE.get(term_lower)
+        if pattern is None:
+            pattern = re.compile(r"\b" + re.escape(term_lower) + r"\b")
+            _CONTAINS_ANY_PATTERN_CACHE[term_lower] = pattern
+        if pattern.search(lowered):
+            return True
+    return False
 VALID_SERVICE_FLOWS = {
     "Import",
     "Export",
@@ -550,6 +564,8 @@ INFORMATION_UPDATE_TERMS = [
 NEW_ORDER_INTENT_TERMS = [
     "new booking",
     "new load",
+    "new import order",
+    "new export order",
     "load order",
     "delivery order",
     "work order",
@@ -573,6 +589,8 @@ NEW_ORDER_INTENT_TERMS = [
 ORDER_PLACEMENT_TERMS = [
     "new booking",
     "new load",
+    "new import order",
+    "new export order",
     "create order",
     "create load",
     "please book",
@@ -644,7 +662,7 @@ BILLING_TERMS = [
     "problema de facturacion",
     "problema de facturación",]
 DRIVER_ISSUE_TERMS = ["driver", "truck", "chassis", "flat tire", "breakdown", "accident", "late driver", "no show", "chofer", "conductor", "camion", "chasis", "accidente"]
-PORT_ISSUE_TERMS = ["port", "terminal", "hold", "customs hold", "line hold", "exam", "x-ray", "gate", "trouble ticket", "puerto", "retenido", "aduana", "inspeccion"]
+PORT_ISSUE_TERMS = ["port hold", "terminal hold", "hold", "customs hold", "line hold", "exam", "x-ray", "gate issue", "trouble ticket", "puerto", "retenido", "aduana", "inspeccion"]
 SPAM_MARKETING_TERMS = ["unsubscribe", "newsletter", "marketing", "promotion", "webinar", "seo", "lead generation", "limited time offer", "sales outreach"]
 
 SPANISH_LANGUAGE_TERMS = [
@@ -2317,7 +2335,7 @@ def has_order_placement_signal(text: str) -> bool:
 
     return bool(
         re.search(
-            r"\b(?:please|pls)\b.{0,60}\b(?:arrange|book|schedule|dispatch|pickup|pick up|deliver|handle|process)\b",
+            r"\b(?:please|pls)\b.{0,60}\b(?:arrange|book|schedule|dispatch|pickup|pick up|deliver|handle|process|create|enter)\b",
             lowered,
             re.I,
         )

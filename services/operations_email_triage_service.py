@@ -235,8 +235,23 @@ def _lower_blob(*parts: Any) -> str:
     return "\n".join(_safe_str(part) for part in parts if _safe_str(part)).lower()
 
 
+_CONTAINS_ANY_PATTERN_CACHE: dict[str, "re.Pattern"] = {}
+
+
 def _contains_any(text: str, terms: list[str]) -> bool:
-    return any(term in text for term in terms)
+    """Word-boundary substring check - a plain `term in text` let short terms
+    like "exam" or "port" false-positive inside unrelated text such as the
+    "example.com" placeholder domain used by every test fixture address."""
+    lowered = str(text or "").lower()
+    for term in terms:
+        term_lower = term.lower()
+        pattern = _CONTAINS_ANY_PATTERN_CACHE.get(term_lower)
+        if pattern is None:
+            pattern = re.compile(r"\b" + re.escape(term_lower) + r"\b")
+            _CONTAINS_ANY_PATTERN_CACHE[term_lower] = pattern
+        if pattern.search(lowered):
+            return True
+    return False
 
 
 def _extract_tokens(subject: str, body: str, parsed: dict | None = None) -> dict[str, str]:
@@ -312,6 +327,11 @@ def is_booking_confirmation(
         or parsed.get("Number Of Containers")
     )
 
+    container_number = _safe_str(
+        parsed.get("Container Number")
+        or parsed.get("container_number")
+    )
+
     parse_profile = _safe_str(
         parsed.get("_parse_profile")
         or parsed.get("parse_profile")
@@ -323,6 +343,10 @@ def is_booking_confirmation(
         "new order",
         "load order",
         "delivery order",
+        "new import order",
+        "new export order",
+        "new import booking",
+        "new export booking",
     ]
 
     explicit_body_signals = [
@@ -347,7 +371,7 @@ def is_booking_confirmation(
     if "booking" in parse_profile:
         return True
 
-    if booking_number and container_qty:
+    if booking_number and (container_qty or container_number):
         return True
 
     if booking_number and any(
