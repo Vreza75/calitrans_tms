@@ -1,0 +1,37 @@
+case_id: CASE-006
+name: One Booking with Four Containers (RICGX1235800 - Continental Industries Group)
+request_type: New Booking
+service_flow: Export
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Create New Order
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - container_count
+  - references
+noncritical_fields:
+  - queue
+  - pickup
+  - delivery
+  - dates
+
+# Scope note: the booking-level pending draft (order_intake_drafts row) is
+# only ever created by a dispatcher clicking a button in
+# pages_app/operations_inbox.py - the automated sync_operations_email_engine
+# pipeline this harness drives never inserts one. This case therefore
+# certifies two things separately:
+#   1. Automated intake correctly parses container_qty=4/size=40HC and keeps
+#      New Booking classification despite passive BOL/invoice language
+#      (via the real pipeline, in expected.json below).
+#   2. services.operations_multi_container_service.create_container_work_orders
+#      (the dispatcher-confirmed child-load-creation function) is idempotent
+#      and creates exactly 4 correctly-sequenced child loads, called directly
+#      against the real scratch DB (see
+#      test_case_006_one_booking_four_containers.py) - simulating dispatcher
+#      confirmation the same way CASE-001..005 simulate dispatcher order
+#      approval via create_load_from_inbox_item, without driving the
+#      Streamlit page itself.

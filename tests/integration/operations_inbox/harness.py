@@ -330,6 +330,17 @@ def capture_actual_result(fixture: Fixture) -> dict:
     containers = [container_number] if container_number else []
     booking_number = parsed.get("Booking Number") or ""
 
+    # For a multi-container booking, "Container Qty" (a stated count, e.g.
+    # "4 X 40HC") is known before any physical container numbers are -
+    # container_count must reflect that stated quantity, not silently
+    # collapse to len(containers)==0/1, per the "never default an unknown
+    # quantity to 1, never treat the quantity as a container number" rule.
+    try:
+        container_qty = int(str(parsed.get("Container Qty") or "").strip())
+    except ValueError:
+        container_qty = None
+    container_count = container_qty if container_qty else (len(containers) or None)
+
     decision = "Create New Order"
     if primary.get("matched_load_id"):
         decision = "Update Existing Order"
@@ -342,7 +353,7 @@ def capture_actual_result(fixture: Fixture) -> dict:
         "existing_load_match": primary.get("matched_load_id"),
         "booking_number": booking_number,
         "order_numbers": [booking_number] if booking_number else [],
-        "container_count": len(containers) or None,
+        "container_count": container_count,
         "containers": containers,
         "customer": parsed.get("Customer") or None,
         "pickup": _sparse(
