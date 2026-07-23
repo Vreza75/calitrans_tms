@@ -16,7 +16,7 @@ FIELDS = [
 
 LABEL_ALIASES = {
     "TYPE": ["Order Type", "Type", "Load Type", "Move Type", "Shipment Type"],
-    "Customer": ["Customer", "Customer Name", "Account", "Bill To"],
+    "Customer": ["Customer", "Customer Name", "Account", "Bill To", "Local Client"],
     "Booking Number": ["Booking Number", "Booking #", "Booking", "Booking Ref", "Booking Reference", "Booking No", "BKG", "BKG Ref", "Order Number", "Order #", "Order No"],
     "Reference Number": ["Reference Number", "Reference #", "Reference", "Ref", "Ref #", "Load Reference", "Shipment Reference", "PME Ref", "PINC Ref", "Customer Ref"],
     "Container Number": ["Container Number", "Container #", "Container", "Cntr", "Container No"],
