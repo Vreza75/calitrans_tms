@@ -1,0 +1,20 @@
+case_id: CASE-003
+name: New Local Import
+request_type: New Booking
+service_flow: Local Import
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Create New Order
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - containers
+  - pickup
+  - delivery
+noncritical_fields:
+  - queue
+  - dates
+  - references
