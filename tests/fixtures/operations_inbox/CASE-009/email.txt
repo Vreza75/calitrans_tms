@@ -1,0 +1,21 @@
+Subject: Delivery Address Change - GCR-IMP-260801
+From: Elena Martinez <elena.martinez@example.com>
+Message-ID: <case-009@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+The delivery location has changed for this container.
+
+Booking Number: GCR-IMP-260801
+Container Number: MSCU1234567
+
+Do not deliver to the original address.
+
+New Delivery Warehouse: Gulf Coast Retail North DC
+New Delivery Address: 16200 North Freeway, Houston, TX 77090
+
+Please confirm that the driver receives the updated address.
+
+Thank you,
+Elena Martinez
