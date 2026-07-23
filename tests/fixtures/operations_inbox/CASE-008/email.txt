@@ -1,0 +1,21 @@
+Subject: Delivery Date Change - GCR-IMP-260801
+From: Elena Martinez <elena.martinez@example.com>
+Message-ID: <case-008@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please change the delivery date for the following import order.
+
+Booking Number: GCR-IMP-260801
+Container Number: MSCU1234567
+
+Current Delivery Date: August 4, 2026
+New Delivery Date: August 6, 2026
+
+All other order information remains unchanged.
+
+Please confirm once updated.
+
+Thank you,
+Elena Martinez

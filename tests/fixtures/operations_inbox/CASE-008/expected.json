@@ -1,0 +1,24 @@
+{
+  "intent": "Booking Update",
+  "service_flow": "Import",
+  "queue": "Existing Loads",
+  "decision": "Update Existing Order",
+  "existing_load_match": 1,
+  "booking_number": "GCR-IMP-260801",
+  "order_numbers": ["GCR-IMP-260801"],
+  "container_count": 1,
+  "containers": ["MSCU1234567"],
+  "customer": "Example",
+  "pickup": {},
+  "delivery": {},
+  "dates": {
+    "delivery_need_date": "August 6, 2026"
+  },
+  "references": {
+    "contact_name": "Elena Martinez",
+    "contact_email": "elena.martinez@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_critical_fields": ["intent", "decision", "booking_number", "containers"]
+}
