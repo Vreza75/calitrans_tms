@@ -243,7 +243,14 @@ def load_fixture(case_id: str) -> Fixture:
         message["attachments"] = dir_attachments
 
     expected_path = case_dir / "expected.json"
-    expected = json.loads(expected_path.read_text(encoding="utf-8")) if expected_path.exists() else {}
+    if not expected_path.exists():
+        raise FileNotFoundError(f"Case {case_id} has no expected.json - write it before running the case.")
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    if not expected:
+        raise ValueError(
+            f"Case {case_id}'s expected.json is empty - a case may not be marked Passed unless the "
+            "expected output was defined before processing. Populate it (see CASE_TEMPLATE.md)."
+        )
 
     return Fixture(
         case_id=case_id,
