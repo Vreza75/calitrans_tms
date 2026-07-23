@@ -1,0 +1,20 @@
+case_id: CASE-007
+name: Container Quantity Mismatch
+request_type: New Booking
+service_flow: Import
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Human Review Required (quantity mismatch - 4 declared, 3 container numbers listed)
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - container_count
+  - containers
+  - requires_human_review
+noncritical_fields:
+  - queue
+  - delivery
+  - references

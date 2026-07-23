@@ -1,0 +1,34 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "QTY-260807",
+  "order_numbers": [
+    "QTY-260807"
+  ],
+  "container_count": 1,
+  "containers": [
+    "TEMU2000001"
+  ],
+  "customer": "Summit Furniture Imports",
+  "pickup": {
+    "terminal": "Barbours Cut Terminal"
+  },
+  "delivery": {
+    "address": "7200 West Road, Houston, TX 77086"
+  },
+  "dates": {},
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Aaron Wilson",
+    "contact_email": "aaron.wilson@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}

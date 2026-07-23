@@ -1,0 +1,26 @@
+Subject: Import Booking - QTY-260807
+From: Aaron Wilson <aaron.wilson@example.com>
+Message-ID: <case-007@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please create this import booking for four containers.
+
+Customer: Summit Furniture Imports
+Booking Number: QTY-260807
+Terminal: Barbours Cut Terminal
+Delivery Address: 7200 West Road, Houston, TX 77086
+
+Containers:
+
+TEMU2000001 - 40HC
+TEMU2000002 - 40HC
+TEMU2000003 - 40HC
+
+Total quantity: 4 containers.
+
+Please confirm when entered.
+
+Thank you,
+Aaron Wilson
