@@ -1,0 +1,36 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "APEX-260810",
+  "order_numbers": [
+    "APEX-260810"
+  ],
+  "container_count": 1,
+  "containers": [
+    "HLXU3000001"
+  ],
+  "customer": "Example",
+  "pickup": {
+    "terminal": "Bayport Container Terminal"
+  },
+  "delivery": {
+    "address": "3400 Commerce Street, Houston, TX 77002"
+  },
+  "dates": {
+    "delivery_need_date": "August 12, 2026"
+  },
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Nathan Brooks",
+    "contact_email": "nathan.brooks@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}
