@@ -17,7 +17,7 @@ FIELDS = [
 LABEL_ALIASES = {
     "TYPE": ["Order Type", "Type", "Load Type", "Move Type", "Shipment Type"],
     "Customer": ["Customer", "Customer Name", "Account", "Bill To"],
-    "Booking Number": ["Booking Number", "Booking #", "Booking", "Booking Ref", "Booking Reference", "Booking No", "BKG", "BKG Ref"],
+    "Booking Number": ["Booking Number", "Booking #", "Booking", "Booking Ref", "Booking Reference", "Booking No", "BKG", "BKG Ref", "Order Number", "Order #", "Order No"],
     "Reference Number": ["Reference Number", "Reference #", "Reference", "Ref", "Ref #", "Load Reference", "Shipment Reference", "PME Ref", "PINC Ref", "Customer Ref"],
     "Container Number": ["Container Number", "Container #", "Container", "Cntr", "Container No"],
     "Container Qty": ["Number Of Cntrs", "Number Of Containers", "Container Qty", "Containers Required", "Ctr Qty", "Qty Containers"],
@@ -38,7 +38,7 @@ LABEL_ALIASES = {
     # locations never get misread as a delivery destination.
     "Empty Pickup": ["Empty Pickup Location", "Empty Pickup", "Empty Return Location", "Empty Depot"],
     "Customer Pickup": ["Customer Pickup Location", "Customer Pickup", "Shipper Pickup Location", "Shipper Pickup"],
-    "Customer Pickup Address": ["Customer Pickup Address", "Shipper Pickup Address", "Shipper Address"],
+    "Customer Pickup Address": ["Customer Pickup Address", "Shipper Pickup Address", "Shipper Address", "Pickup Address"],
     "Pickup Date": ["Empty Pickup Date", "Pickup Date"],
 }
 
