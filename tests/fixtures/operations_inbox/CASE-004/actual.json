@@ -1,0 +1,39 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Local Export",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "LE-260804",
+  "order_numbers": [
+    "LE-260804"
+  ],
+  "container_count": 1,
+  "containers": [
+    "OOLU1357913"
+  ],
+  "customer": "Texas Industrial Packaging",
+  "pickup": {
+    "terminal": "Texas Industrial Packaging",
+    "customer_pickup_address": "1200 Industrial Parkway, Pasadena, TX 77503"
+  },
+  "delivery": {
+    "warehouse": "Southeast Container Yard",
+    "address": "9500 Old Galveston Road, Houston, TX 77034"
+  },
+  "dates": {
+    "pickup_date": "August 7, 2026"
+  },
+  "references": {
+    "reference_number": "LE-260804",
+    "container_size": "20FT",
+    "contact_name": "Carlos Ramirez",
+    "contact_email": "carlos.ramirez@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}

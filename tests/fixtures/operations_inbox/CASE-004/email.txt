@@ -1,0 +1,26 @@
+Subject: Local Export Move - LE-260804
+From: Carlos Ramirez <carlos.ramirez@example.com>
+Message-ID: <case-004@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Good afternoon,
+
+Please schedule this local export move.
+
+Customer: Texas Industrial Packaging
+Order Number: LE-260804
+Container Number: OOLU1357913
+Container Size: 20FT
+
+Pickup Location: Texas Industrial Packaging
+Pickup Address: 1200 Industrial Parkway, Pasadena, TX 77503
+
+Delivery Location: Southeast Container Yard
+Delivery Address: 9500 Old Galveston Road, Houston, TX 77034
+
+Pickup Date: August 7, 2026
+
+This is a local warehouse-to-yard move. No port appointment or PIN is needed.
+
+Thank you,
+Carlos Ramirez
