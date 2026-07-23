@@ -1,0 +1,37 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "SMOKE-000",
+  "order_numbers": [
+    "SMOKE-000"
+  ],
+  "container_count": 1,
+  "containers": [
+    "TEST0000001"
+  ],
+  "customer": "Harness Smoke Test Customer",
+  "pickup": {
+    "warehouse": null,
+    "address": null
+  },
+  "delivery": {
+    "warehouse": "Test Warehouse",
+    "address": "1 Test Way, Houston, TX 77001"
+  },
+  "dates": {
+    "delivery_need_date": "January 1, 2027",
+    "last_free_day": null
+  },
+  "references": {
+    "reference_number": null
+  },
+  "missing_required_fields": [],
+  "requires_human_review": false,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}
