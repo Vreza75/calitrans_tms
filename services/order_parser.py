@@ -282,7 +282,7 @@ def parse_order_text(text):
             r"Destination:\s*([^\n]+)",
         ]),
         "Size": find_pattern(text, [
-            r"\b(?:\d+\s*x\s*)?(20|40|45)\s*'?\s*(?:ft|hc|hq|std|container)?\b",
+            r"\b(?:\d+\s*x\s*)?((?:20|40|45)\s*'?\s*(?:ft|hc|hq|std)?)\b",
         ]),
         "Document Cutoff": find_pattern(text, [
             r"Document Cutoff[:\s]+(.+)",
@@ -290,7 +290,7 @@ def parse_order_text(text):
             r"Port Cut-Off Date:\s*([^\n]+)",
         ]),
         "LFD": find_pattern(text, [
-            r"LFD:\s*([^\n]+)"
+            r"LFD:\s*([^\n]+)",
             r"Last Free Day[:\s]+(.+)",
         ]),
         "Dispatcher Notes": "Parsed from generic order PDF",

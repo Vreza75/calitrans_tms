@@ -4155,7 +4155,13 @@ def _prepare_operations_email_record(message: dict) -> dict:
 
     if saved_attachments:
         try:
-            parsed = merge_saved_attachment_fields(parsed, saved_attachments)
+            # force=True: `parsed` here only ever holds this same message's
+            # own weak email-body guesses (e.g. Customer inferred from the
+            # sender's domain) - never a separately dispatcher-confirmed
+            # value - so the specialized document/PDF parser must be allowed
+            # to win per the documented parsing precedence (specialized
+            # document parser > generic email-body parser).
+            parsed = merge_saved_attachment_fields(parsed, saved_attachments, force=True)
         except Exception as exc:
             processing_errors.append(f"attachment field merge failed: {exc}")
 

@@ -525,15 +525,26 @@ def merge_operations_body_parsed_fields(current: dict, reparsed: dict) -> tuple[
     return updated, changed
 
 
+_ATTACHMENT_MERGE_IDENTITY_FIELDS = {"Contact Name", "Contact Email", "Contact Phone", "Contact Company"}
+
+
 def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], force: bool = False) -> dict:
     """force=False (default): only fill fields that are currently blank -
     used when an attachment is first saved/imported. force=True: an
-    already-populated field may be replaced by a fresh non-blank reparse
-    result - used only for an explicit dispatcher "Parse / Reparse" click,
-    so a parser fix can actually correct a previously-wrong stored value.
-    order_intake.parsed_data has no field-level dispatcher-confirmed
-    tracking of its own (that lives on the separate pending-draft table),
-    so this is safe to force-overwrite on an explicit reparse action."""
+    already-populated order/route field may be replaced by a fresh
+    non-blank reparse result - used both for the initial merge (the
+    email-body-only parse's values are just weak fallback guesses, not
+    dispatcher-confirmed, so the specialized document parser should win
+    per the documented parsing precedence) and for an explicit dispatcher
+    "Parse / Reparse" click. order_intake.parsed_data has no field-level
+    dispatcher-confirmed tracking of its own (that lives on the separate
+    pending-draft table), so this is safe to force-overwrite.
+
+    Contact identity fields are always fill-blank-only regardless of
+    `force`: the sender's own email header is a more reliable identity
+    signal than a document-text scan, which can easily mis-capture an
+    unrelated line (e.g. a steamship line or warehouse name) as a contact
+    name in a document that has no real signature block."""
     updated = dict(parsed or {})
 
     for attachment in saved_attachments:
@@ -551,6 +562,10 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], f
                 if existing_value and attachment_value not in existing_value:
                     updated[field] = f"{existing_value}\n{attachment_value}"
                 elif not existing_value:
+                    updated[field] = attachment_value
+
+            elif field in _ATTACHMENT_MERGE_IDENTITY_FIELDS:
+                if not safe_str(updated.get(field, "")):
                     updated[field] = attachment_value
 
             elif force or not safe_str(updated.get(field, "")):

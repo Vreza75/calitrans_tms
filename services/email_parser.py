@@ -906,7 +906,11 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
             subject,
             re.I,
         )
-        if booking_subject:
+        # Require a digit in the captured token - a real booking number is an
+        # alphanumeric code (e.g. "GCR-IMP-260801"), so this guards against
+        # an ordinary word after "Booking" in the subject (e.g. "Attached
+        # Booking Document") being misread as the booking number.
+        if booking_subject and re.search(r"\d", booking_subject.group(1)):
             parsed["Booking Number"] = booking_subject.group(1).upper()
 
     if not parsed["Booking Number"]:
