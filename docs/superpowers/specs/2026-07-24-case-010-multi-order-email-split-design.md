@@ -81,9 +81,20 @@ Verified by reading the code:
   consulted only when no `Customer:` label matched and no reliable
   signature-derived company exists (same guard shape as the existing
   `Contact Company` fallback chain). Not general customer-name NER.
-- **Surfacing**: reuse existing fields only, same as CASE-007 -
-  `llm_review_required=True`, `work_queue="Review"`, and a specific
-  `action_required` message per split row. No new schema/enum.
+- **Surfacing**: unlike CASE-007, a clean split is not routed through the
+  `Review` queue. `expected.json` requires `queue: "New Orders"` and
+  `decision: "Create New Order"` - a detected split is a routine multi-order
+  email, not a flagged problem. Every fresh `order_intake` row already gets
+  `review_status='Open'` at insert time, and the harness's existing
+  `requires_human_review` formula (`review_status=='Open' and no linked
+  load`) already evaluates `true` for any new, not-yet-approved order with
+  no extra flagging needed - "Human review remains authoritative" is
+  already satisfied by the normal new-order approval flow. No
+  `llm_review_required`/`work_queue="Review"`/`action_required` override is
+  added for the split case itself (this was reconsidered after the initial
+  brainstorm - the first pass mirrored CASE-007's mismatch-flagging pattern,
+  but that contradicts `expected.json`, which was written from the business
+  requirement before any code existed and takes precedence).
 - **Enforcement**: flagging only. No hard block added to
   `create_load_from_inbox_item()` - matches how every other
   human-review-required case already works in this codebase.
@@ -173,30 +184,23 @@ Each call reuses `_prepare_operations_email_record()` completely unchanged -
 parsing, attachment saving (block 0 only), classification, and triage all
 run exactly as they do today, just once per block instead of once per email.
 
-### 4. Row identity and human-review flagging
+### 4. Row identity assignment
 
 Inside the new per-block loop (replacing the single-record body of
-`_insert_operations_email_message()`), for each record at index `n`:
+`_insert_operations_email_message()`), for each record at index `n`,
+**only when more than one record was produced** (a single-record result is
+left completely untouched, so no existing certified case can regress):
 
 ```python
 base_message_id = _email_sync_unique_message_id(message)
-block_message_id = base_message_id if n == 0 else f"{base_message_id}::order-{n + 1}"
-record["message_id"] = block_message_id
-record["thread_id"] = base_message_id  # forced, overrides the normal fallback
-
 if len(records) > 1:
-    booking_numbers = [r["parsed"].get("Booking Number", "") for r in records if r["parsed"].get("Booking Number")]
-    record["triage"]["llm_review_required"] = True
-    record["triage"]["work_queue"] = "Review"
-    message_text = (
-        f"Email contains {len(records)} separate order blocks "
-        f"({', '.join(booking_numbers)}) - confirm split before creating orders."
-    )
-    record["triage"]["action_required"] = message_text
-    record["triage"]["triage_reason"] = message_text
+    for n, record in enumerate(records):
+        record["message_id"] = base_message_id if n == 0 else f"{base_message_id}::order-{n + 1}"
+        record["thread_id"] = base_message_id  # forced, overrides the normal fallback
 ```
 
-`conversation_key` is left untouched - it's already computed per-record
+No triage/queue/review-flag fields are touched - see the "Surfacing"
+decision above. `conversation_key` is left untouched - it's already computed per-record
 inside `_prepare_operations_email_record()` from that record's own `parsed`
 dict (via `build_operations_email_classification`), so each block's own
 Booking Number already produces a distinct conversation key with no extra
@@ -222,12 +226,17 @@ record in the loop instead of once per message.
 - `container_count` = sum of each row's own per-row `container_count` value
   (same stated-qty-first-else-len(containers) logic as today, summed across
   rows).
-- `decision` gains a new highest-priority branch, checked before the
-  existing `matched_load_id` and mismatch branches: if any row has
-  `llm_review_required` and an `action_required` containing "separate order
-  blocks", `decision = "Human Review Required"`.
-- `requires_human_review` becomes `any(bool(r.get("llm_review_required")) for r in rows)`
-  instead of reading only `primary`.
+- `decision` derivation is unchanged - a clean split still resolves to
+  `"Create New Order"` (or whatever the existing `matched_load_id`/mismatch
+  branches already produce), matching `expected.json`'s
+  `decision: "Create New Order"`. No new branch is added for the split case
+  itself.
+- `requires_human_review` becomes
+  `any(bool(r.get("llm_review_required")) for r in rows) or (str(primary.get("review_status") or "") == "Open" and not primary.get("linked_load_id"))`
+  - the second disjunct (unchanged from today's single-row formula) already
+    evaluates `true` for any freshly inserted, not-yet-approved row, which
+    is what actually makes `expected.json`'s `requires_human_review: true`
+    reachable for CASE-010 with no new flagging logic.
 - `intent`, `service_flow`, `customer`, `queue` continue to read from `rows[0]`
   (`primary`) only - these are expected to agree across all rows from one
   split email (same customer, same import/export flow), so no aggregation
