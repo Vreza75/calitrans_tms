@@ -69,3 +69,35 @@ def test_returns_none_above_ten_blocks():
 
 def test_returns_none_for_empty_body():
     assert detect_order_blocks("") is None
+
+
+from services.email_parser import _customer_from_prose, parse_email_text
+
+
+def test_customer_from_prose_matches_trailing_for_phrase():
+    text = "Please enter these two separate import orders for Apex Retail."
+    assert _customer_from_prose(text) == "Apex Retail"
+
+
+def test_customer_from_prose_no_trailing_period():
+    text = "Booking Number: A\nPlease ship this for Continental Industries Group\n"
+    assert _customer_from_prose(text) == "Continental Industries Group"
+
+
+def test_customer_from_prose_no_match_returns_empty():
+    assert _customer_from_prose("No company mentioned here at all.") == ""
+
+
+def test_parse_email_text_uses_prose_fallback_when_no_customer_label():
+    body = (
+        "Please enter these two separate import orders for Apex Retail.\n"
+        "Booking Number: APEX-260810\n"
+    )
+    parsed = parse_email_text("", body)
+    assert parsed["Customer"] == "Apex Retail"
+
+
+def test_parse_email_text_label_still_wins_over_prose_fallback():
+    body = "Customer: Real Customer Inc\nPlease enter this for Apex Retail.\n"
+    parsed = parse_email_text("", body)
+    assert parsed["Customer"] == "Real Customer Inc"

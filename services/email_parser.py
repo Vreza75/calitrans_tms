@@ -893,6 +893,18 @@ def _container_correction(text: str) -> tuple[str, str]:
     return "", ""
 
 
+_CUSTOMER_PROSE_RE = re.compile(r"\bfor\s+([A-Z][\w&,.\- ]{2,40})\.?\s*$", re.M)
+
+
+def _customer_from_prose(text: str) -> str:
+    """Fallback for a company name stated in prose ("...orders for Apex
+    Retail.") when no Customer: label exists. Only consulted when the
+    label-based lookup and signature-derived company both come up empty -
+    a narrow pattern, not general name extraction."""
+    match = _CUSTOMER_PROSE_RE.search(text or "")
+    return match.group(1).strip().rstrip(".") if match else ""
+
+
 def parse_email_text(subject: str | None = None, body: str | None = None, sender: str | None = None) -> dict[str, str]:
     """Parse load order fields from email text.
 
@@ -939,6 +951,8 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
         parsed["Contact Company"] = _domain_company(parsed["Contact Email"])
     if (not parsed["Customer"] or _is_own_company_value(parsed["Customer"])) and parsed["Contact Company"]:
         parsed["Customer"] = parsed["Contact Company"]
+    if not parsed["Customer"]:
+        parsed["Customer"] = _customer_from_prose(combined)
 
     destination_value = _find_labeled_value(
         combined,
