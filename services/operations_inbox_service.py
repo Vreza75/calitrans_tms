@@ -14,7 +14,11 @@ import streamlit as st
 import services.operations_attachment_service as attachment_service
 
 from db_client import column_exists, execute, read_df
-from services.email_parser import extract_latest_email_body, parse_email_text
+from services.email_parser import (
+    detect_container_quantity_mismatch,
+    extract_latest_email_body,
+    parse_email_text,
+)
 from services.order_intake import create_load_from_intake
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
@@ -274,6 +278,27 @@ def enforce_authoritative_booking_triage(
 
     corrected["tags"] = tags
 
+    return corrected
+
+
+def enforce_container_quantity_mismatch_review(parsed: dict, triage: dict | None) -> dict:
+    """Correction pass, same shape as enforce_authoritative_booking_triage:
+    runs after triage and overrides specific fields when a declared
+    container quantity disagrees with how many container numbers were
+    actually found (see detect_container_quantity_mismatch)."""
+    corrected = dict(triage or {})
+    mismatch = detect_container_quantity_mismatch(parsed)
+    if mismatch is None:
+        return corrected
+
+    corrected.update(
+        {
+            "llm_review_required": True,
+            "work_queue": "Review",
+            "action_required": mismatch["message"],
+            "triage_reason": mismatch["message"],
+        }
+    )
     return corrected
 
 
@@ -4223,6 +4248,7 @@ def _prepare_operations_email_record(message: dict) -> dict:
             triage=triage,
             already_matched_load=classification.get("matched_load_id") is not None,
         )
+        triage = enforce_container_quantity_mismatch_review(parsed, triage)
     except Exception as exc:
         triage = {}
         processing_errors.append(f"triage failed: {exc}")

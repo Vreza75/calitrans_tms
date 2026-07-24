@@ -146,3 +146,35 @@ def test_singular_container_word_in_message():
         "Quantity mismatch: 2 declared, 1 container number found - "
         "confirm before creating order."
     )
+
+
+from services.operations_inbox_service import enforce_container_quantity_mismatch_review
+
+
+def test_enforce_review_sets_review_fields_on_mismatch():
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C"]}
+    triage = {"request_type": "New Booking", "work_queue": "New Orders", "llm_review_required": False}
+
+    result = enforce_container_quantity_mismatch_review(parsed, triage)
+
+    assert result["llm_review_required"] is True
+    assert result["work_queue"] == "Review"
+    assert "4 declared, 3 container numbers found" in result["action_required"]
+    assert "4 declared, 3 container numbers found" in result["triage_reason"]
+    # Request type itself is left alone - only the review-routing fields change.
+    assert result["request_type"] == "New Booking"
+
+
+def test_enforce_review_is_a_no_op_when_no_mismatch():
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C", "D"]}
+    triage = {"request_type": "New Booking", "work_queue": "New Orders", "llm_review_required": False}
+
+    result = enforce_container_quantity_mismatch_review(parsed, triage)
+
+    assert result == triage
+
+
+def test_enforce_review_handles_none_triage():
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C"]}
+    result = enforce_container_quantity_mismatch_review(parsed, None)
+    assert result["llm_review_required"] is True
