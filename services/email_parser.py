@@ -12,6 +12,7 @@ FIELDS = [
     "Document Cutoff", "LFD", "Contact Name", "Contact Email", "Contact Phone",
     "Contact Company", "Dispatcher Notes",
     "Empty Pickup", "Customer Pickup", "Customer Pickup Address", "Pickup Date",
+    "Container Numbers",
 ]
 
 LABEL_ALIASES = {
@@ -510,6 +511,17 @@ def _first_container(text: str) -> str:
     return match.group(0).upper() if match else ""
 
 
+def _all_container_numbers(text: str) -> list[str]:
+    """Every distinct container-number-shaped token in the message, in
+    the order first seen. Unlike _first_container(), this does not stop
+    at the first match - a stated quantity can be compared against how
+    many were actually listed (see detect_container_quantity_mismatch)."""
+    seen: dict[str, None] = {}
+    for match in re.finditer(r"\b[A-Z]{4}\d{7}\b", (text or "").upper()):
+        seen.setdefault(match.group(0), None)
+    return list(seen.keys())
+
+
 def _subject_reference(subject: str) -> str:
     subject = _normalize_text(subject)
     patterns = [
@@ -899,6 +911,8 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
 
     if not parsed["Container Number"]:
         parsed["Container Number"] = _first_container(combined)
+
+    parsed["Container Numbers"] = _all_container_numbers(combined)
 
     if not parsed["Booking Number"]:
         booking_subject = re.search(
