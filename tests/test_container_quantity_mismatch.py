@@ -178,3 +178,25 @@ def test_enforce_review_handles_none_triage():
     parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C"]}
     result = enforce_container_quantity_mismatch_review(parsed, None)
     assert result["llm_review_required"] is True
+
+
+def test_enforce_review_does_not_override_unrelated_request_types():
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C"]}
+    triage = {"request_type": "Billing", "work_queue": "Billing", "llm_review_required": False}
+
+    result = enforce_container_quantity_mismatch_review(parsed, triage)
+
+    assert result == triage
+
+
+def test_lower_blob_flattens_list_values_without_python_repr_syntax():
+    from services.operations_email_triage_service import _lower_blob
+
+    parsed = {"Container Numbers": ["TEMU2000001", "TEMU2000002"], "Port": ""}
+    blob = _lower_blob("subject", "body", parsed)
+
+    assert "[" not in blob
+    assert "]" not in blob
+    assert "'" not in blob
+    assert "temu2000001" in blob
+    assert "temu2000002" in blob

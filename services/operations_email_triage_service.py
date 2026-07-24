@@ -238,11 +238,19 @@ def _lower_blob(*parts: Any) -> str:
     contributes its VALUES only, never its Python repr - str({"Port": ""})
     contains the literal word "port" as a dict key even when the field is
     blank, which silently made every message "mention" every parser field
-    name (Port, Warehouse, Delivery, Container, ...) regardless of content."""
+    name (Port, Warehouse, Delivery, Container, ...) regardless of content.
+    A list/tuple value (e.g. parsed["Container Numbers"]) is flattened
+    element-by-element for the same reason - str(["A", "B"]) is
+    "['A', 'B']", not "A B", and would leak Python list syntax into the
+    keyword-search text instead of the actual container tokens."""
     flattened: list[str] = []
     for part in parts:
         if isinstance(part, dict):
-            flattened.extend(_safe_str(value) for value in part.values())
+            for value in part.values():
+                if isinstance(value, (list, tuple)):
+                    flattened.extend(_safe_str(item) for item in value)
+                else:
+                    flattened.append(_safe_str(value))
         else:
             flattened.append(_safe_str(part))
     return "\n".join(text for text in flattened if text).lower()

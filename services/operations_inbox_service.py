@@ -15,6 +15,7 @@ import services.operations_attachment_service as attachment_service
 
 from db_client import column_exists, execute, read_df
 from services.email_parser import (
+    _append_note,
     detect_container_quantity_mismatch,
     extract_latest_email_body,
     parse_email_text,
@@ -285,8 +286,17 @@ def enforce_container_quantity_mismatch_review(parsed: dict, triage: dict | None
     """Correction pass, same shape as enforce_authoritative_booking_triage:
     runs after triage and overrides specific fields when a declared
     container quantity disagrees with how many container numbers were
-    actually found (see detect_container_quantity_mismatch)."""
+    actually found (see detect_container_quantity_mismatch).
+
+    Gated to booking-shaped request types only - an unrelated message
+    (a billing question, a POD request, a driver update) that happens to
+    quote an old booking confirmation containing a quantity/container
+    mismatch in its body must not have its real classification's routing
+    silently overwritten."""
     corrected = dict(triage or {})
+    if safe_str(corrected.get("request_type")) not in {"New Booking", "Booking Update", "Customer Request", "Missing Information", "Other", ""}:
+        return corrected
+
     mismatch = detect_container_quantity_mismatch(parsed)
     if mismatch is None:
         return corrected
@@ -295,8 +305,8 @@ def enforce_container_quantity_mismatch_review(parsed: dict, triage: dict | None
         {
             "llm_review_required": True,
             "work_queue": "Review",
-            "action_required": mismatch["message"],
-            "triage_reason": mismatch["message"],
+            "action_required": _append_note(corrected.get("action_required", ""), mismatch["message"]),
+            "triage_reason": _append_note(corrected.get("triage_reason", ""), mismatch["message"]),
         }
     )
     return corrected
@@ -1798,6 +1808,7 @@ def apply_fast_triage_to_intake(
         parsed=parsed_data,
         triage=triage,
     )
+    triage = enforce_container_quantity_mismatch_review(parsed_data, triage)
 
     parsed_data["_fast_triage"] = triage or {}
 
@@ -3772,6 +3783,7 @@ def auto_classify_open_inbox_items(
                 parsed=parsed,
                 triage=triage,
             )
+            triage = enforce_container_quantity_mismatch_review(parsed, triage)
             if not triage.get("conversation_key"):
                 triage["conversation_key"] = classification.get("conversation_key", "")
             if triage.get("matched_load_id") is None:

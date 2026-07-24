@@ -167,7 +167,7 @@ one more correction pass in the chain.
   else []`) - CASE-000 through CASE-006/008/009's expected output is
   single-element lists, byte-identical to the current fallback, so this
   is additive.
-- `decision` gains a third branch, checked before the existing
+- `decision` gains a third branch, checked as an `elif` after the existing
   `matched_load_id` check: if `detect_container_quantity_mismatch`-style
   evidence is present (i.e. `llm_review_required` is true **and**
   `action_required` contains `"mismatch"`), set `decision = "Human Review
