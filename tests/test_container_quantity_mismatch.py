@@ -89,3 +89,60 @@ def test_parse_email_text_label_still_wins_over_sentence_fallback():
     body = "Number Of Cntrs: 4 X 40HC\nWe are shipping 6 containers total this week."
     parsed = parse_email_text("", body)
     assert parsed["Container Qty"] == "4"
+
+
+from services.email_parser import detect_container_quantity_mismatch
+
+
+def test_no_mismatch_when_quantity_stated_and_zero_numbers_found():
+    # RICGX1235800 / CASE-006's shape: quantity known, carrier hasn't
+    # issued physical numbers yet. This must NOT be flagged.
+    parsed = {"Container Qty": "4", "Container Numbers": []}
+    assert detect_container_quantity_mismatch(parsed) is None
+
+
+def test_mismatch_when_fewer_numbers_found_than_declared():
+    # CASE-007's shape: 4 declared, 3 listed.
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C"]}
+    result = detect_container_quantity_mismatch(parsed)
+    assert result == {
+        "declared": 4,
+        "found": 3,
+        "message": (
+            "Quantity mismatch: 4 declared, 3 container numbers found - "
+            "confirm before creating order."
+        ),
+    }
+
+
+def test_no_mismatch_when_fully_specified():
+    parsed = {"Container Qty": "4", "Container Numbers": ["A", "B", "C", "D"]}
+    assert detect_container_quantity_mismatch(parsed) is None
+
+
+def test_mismatch_when_more_numbers_found_than_declared():
+    parsed = {"Container Qty": "3", "Container Numbers": ["A", "B", "C", "D"]}
+    result = detect_container_quantity_mismatch(parsed)
+    assert result == {
+        "declared": 3,
+        "found": 4,
+        "message": (
+            "Quantity mismatch: 3 declared, 4 container numbers found - "
+            "confirm before creating order."
+        ),
+    }
+
+
+def test_no_mismatch_when_no_quantity_stated_at_all():
+    parsed = {"Container Qty": "", "Container Numbers": ["A"]}
+    assert detect_container_quantity_mismatch(parsed) is None
+
+
+def test_singular_container_word_in_message():
+    result = detect_container_quantity_mismatch(
+        {"Container Qty": "2", "Container Numbers": ["A"]}
+    )
+    assert result["message"] == (
+        "Quantity mismatch: 2 declared, 1 container number found - "
+        "confirm before creating order."
+    )

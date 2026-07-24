@@ -539,6 +539,35 @@ def _container_qty_from_sentence(text: str) -> str:
     return ""
 
 
+def detect_container_quantity_mismatch(parsed: dict) -> dict | None:
+    """Pure function, no DB/IO. Returns None when there's no mismatch to
+    flag - a stated quantity with zero container numbers found yet is the
+    normal pre-assignment state (e.g. RICGX1235800/CASE-006), not a
+    mismatch."""
+    try:
+        declared = int(str(parsed.get("Container Qty") or "").strip())
+    except ValueError:
+        return None
+    if declared <= 0:
+        return None
+
+    found_numbers = parsed.get("Container Numbers") or []
+    found = len(found_numbers)
+
+    if found == 0 or found == declared:
+        return None
+
+    return {
+        "declared": declared,
+        "found": found,
+        "message": (
+            f"Quantity mismatch: {declared} declared, {found} container "
+            f"number{'s' if found != 1 else ''} found - confirm before "
+            f"creating order."
+        ),
+    }
+
+
 def _subject_reference(subject: str) -> str:
     subject = _normalize_text(subject)
     patterns = [
