@@ -568,6 +568,30 @@ def detect_container_quantity_mismatch(parsed: dict) -> dict | None:
     }
 
 
+_ORDER_BLOCK_HEADER_RE = re.compile(r"^\s*Order\s+(\d{1,2})\s*$", re.I | re.M)
+_MAX_ORDER_BLOCKS = 10
+
+
+def detect_order_blocks(body: str) -> list[str] | None:
+    """Split a message body into per-order text segments when it contains
+    2+ explicit "Order N" block headers. Returns None (meaning: use the
+    existing single-pass parse, unchanged) when fewer than 2 headers are
+    found, or more than _MAX_ORDER_BLOCKS - this function is purely
+    additive and never overrides the current path for a normal
+    single-order email."""
+    matches = list(_ORDER_BLOCK_HEADER_RE.finditer(body or ""))
+    if len(matches) < 2 or len(matches) > _MAX_ORDER_BLOCKS:
+        return None
+
+    preamble = body[: matches[0].start()]
+    blocks = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        blocks.append(f"{preamble}\n{body[start:end]}")
+    return blocks
+
+
 def _subject_reference(subject: str) -> str:
     subject = _normalize_text(subject)
     patterns = [
