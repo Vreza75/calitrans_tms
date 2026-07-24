@@ -1300,5 +1300,155 @@ The review is complete when:
 * Local and Streamlit Cloud deployment are documented.
 * A prioritized backlog remains for deferred work.
 
+---
+
+## 38. Lessons From Operations Inbox Certification (CASE-000 through CASE-010)
+
+Real defects found and fixed while certifying `docs/operations_inbox_certification/`
+cases 000-010 against a real database. Check for these specific patterns
+before touching classification, parsing, or triage code again - each one
+already caused a wrong result in production-shaped test data, not a
+hypothetical.
+
+### Keyword matching must be word-boundary safe
+
+`contains_any()`/`_contains_any()` (both copies -
+`services/operations_inbox_service.py` and
+`services/operations_email_triage_service.py`) used plain
+`term in text.lower()`. A short term like `"exam"` matched inside
+`"example.com"` - the placeholder domain every test fixture address uses.
+Both are now `\bterm\b` regex matches. If you add a new term list, use the
+existing `contains_any`/`_contains_any` helper, never `in`, directly.
+
+### Single-word terms in an intent/issue term list are almost always too broad
+
+`PORT_ISSUE_TERMS` had bare `"port"`/`"terminal"`; `DRIVER_PORT_TERMS` had
+bare `"driver"`/`"truck"`/`"chassis"`/`"port"`/`"terminal"`. Any booking
+email that simply *mentions* a terminal name, or asks "please confirm the
+driver receives this," scored as a Port Issue / Driver Issue. Fixed by
+requiring an actual problem phrase (`"port hold"`, `"driver issue"`,
+`"breakdown"`, `"no show"`, ...). When adding a term to any
+`*_TERMS`/`*_INTENT_TERMS` list, ask: would a normal, uneventful booking
+email plausibly contain this single word on its own? If yes, it needs a
+qualifying phrase, not a bare word.
+
+### Never stringify a parsed-fields dict into a keyword-search blob
+
+`_lower_blob()` in `operations_email_triage_service.py` included
+`str(parsed)` - the dict's Python repr - not just its values.
+`str({"Port": "", ...})` contains the literal word `"port"` as a **dict
+key**, even when the field is completely blank. This silently made every
+message "contain" every parser field name (Port, Warehouse, Delivery,
+Container, Customer, Booking, Reference, Contact, Notes, Size, Address)
+regardless of actual content, masked for a long time by classification
+short-circuits landing first. Fixed to flatten only `parsed.values()`.
+Never pass a dict straight into a text-join/blob helper - flatten to
+values explicitly.
+
+### A booking-confirmation signal must yield to an existing-load match
+
+Three independent places short-circuited to `"New Booking"` purely from
+`is_booking_confirmation()` (booking number + container number present),
+with zero awareness of whether the message already matched a real
+existing load: `classify_customer_request()`,
+`_request_type_from_rules()`, and `enforce_authoritative_booking_triage()`.
+A booking number + container number is the right new-booking signal when
+there is *no* match - and exactly the wrong signal to force "New Booking"
+when there already *is* one (an update to an existing order always
+restates its own booking/container numbers). The triage-layer functions
+now take an `already_matched_load` flag and skip the override when set.
+`classify_customer_request()` runs *before* load matching in
+`build_operations_email_classification()` and still doesn't get this
+signal - if a future case needs it there too, matching would need to move
+earlier or the function would need a second pass.
+
+### `find_pattern`'s `re.DOTALL` + a missing comma is a silent multi-line bug
+
+`services/order_parser.py` has (still has, deliberately left as-is - see
+below) list literals like:
+
+```python
+"Port": find_pattern(text, [
+    r"Port:\s*([^\n]+)"
+    r"Terminal[:\s]+(.+)",     # <- no comma above: silently concatenated
+    r"Port of Lading:\s*([^\n]+)",
+]),
+```
+
+Two adjacent string literals with no comma become **one** regex via
+Python string concatenation. Combined with `find_pattern`'s `re.DOTALL`
+flag, a `(.+)`-ending pattern that *does* fire greedily swallows the rest
+of the entire document, not just the rest of the line. Fixing the missing
+comma alone (tried during CASE-005) turned a previously-inert
+concatenated pattern into a real match that then greedy-swallowed
+everything after it - a regression, not a fix. **Do not add a bare
+comma fix here without also making every pattern in the list
+line-bounded (`[^\n]+`, not `.+`)** - fix both at once or not at all.
+
+### A "looks like a person's name" heuristic will reject real business names
+
+`_looks_like_person_name()` (used by both `_signature_contact_name()` and
+`_invalid_location_value()`) flagged any 2-4 title-case-word value with no
+recognized location keyword as a person's name - silently stripping
+legitimate facility names like `"Gulf Coast Retail DC"` and
+`"Texas Industrial Packaging"` from `Warehouse`/`Port`. Fixed at the root
+with a `_BUSINESS_NAME_TERMS` check (inc/llc/corp/group/industries/
+packaging/supply/logistics/distribution/warehouse/...) rather than
+endlessly appending individual company-name words to the separate
+location-keyword list. If a real customer's facility name gets rejected
+again, extend `_BUSINESS_NAME_TERMS`, don't patch `_invalid_location_value`
+directly.
+
+### Attachment-derived fields must be allowed to overwrite weak body guesses - except identity fields
+
+`merge_saved_attachment_fields()` defaulted to fill-blank-only
+(`force=False`), so a weak email-body-only guess (e.g. `Customer`
+inferred from the sender's own domain) permanently blocked the PDF's
+correct, explicitly-labeled value - backwards from the documented parsing
+precedence (specialized document parser > generic email-body parser).
+The initial merge in `_prepare_operations_email_record` now uses
+`force=True`. But `Contact Name`/`Email`/`Phone`/`Company` are carved out
+(`_ATTACHMENT_MERGE_IDENTITY_FIELDS`) to stay fill-blank-only always - a
+document with no real signature block can misread an unrelated line
+(e.g. a steamship line name) as a contact name, and the sender's own
+`From` header is always a more reliable identity signal than a
+document-text scan. If you add a new identity-like field, add it to that
+set rather than letting `force` apply to it.
+
+### `parse_email_text` needs `sender` passed explicitly - check every call site
+
+`_prepare_operations_email_record()`'s call to `parse_email_text(subject,
+latest_body)` didn't pass `sender`, even though every *other* call site
+(`operations_case_service.py`, `order_intake.py`) already did - so
+`Contact Email`/`Contact Name` could only ever come from an explicit body
+label, never the `From` header, on the single most important pipeline
+call site. When adding a new call to `parse_email_text`, always pass
+`sender` unless there's a specific reason not to.
+
+### Real customer phrasing rarely matches the first label alias you think of
+
+Every one of CASE-001 through CASE-009 needed at least one new
+`LABEL_ALIASES` entry for wording a real customer actually uses:
+`"Pickup Terminal"`/`"Export Terminal"` (Port), `"Order Number"` (Booking
+Number, for Local Import/Export - not an ocean booking), `"Pickup
+Address"` (Customer Pickup Address), `"Local Client"` (Customer, real
+freight-forwarder format), `"New Delivery Date"`/`"New Delivery
+Warehouse"`/`"New Delivery Address"` (a correction email labels the *new*
+value, not the field name alone). Don't assume the aliases list is
+complete for a "should obviously work" real-world phrasing - check it
+against the actual fixture text before assuming a gap is a parser logic
+bug rather than a missing alias.
+
+### A stated quantity with zero known items yet is not the same as zero
+
+`container_count` in the certification harness (and, by extension,
+anything that summarizes a multi-container booking) must never collapse
+to `len(container_numbers)` when a stated quantity exists but no physical
+container numbers have been assigned yet (RICGX1235800: quantity 4,
+containers `[]`, is normal and expected - not zero, not one). Any future
+"count" derivation for a multi-item field needs to check for a stated
+quantity first, falling back to a literal count only when no quantity was
+stated at all.
+
 ````
 
