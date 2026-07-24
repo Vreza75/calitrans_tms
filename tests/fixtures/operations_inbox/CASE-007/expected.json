@@ -1,7 +1,7 @@
 {
   "intent": "New Booking",
   "service_flow": "Import",
-  "queue": "New Orders",
+  "queue": "Review",
   "decision": "Human Review Required",
   "existing_load_match": null,
   "booking_number": "QTY-260807",
@@ -21,7 +21,7 @@
     "contact_name": "Aaron Wilson",
     "contact_email": "aaron.wilson@example.com"
   },
-  "missing_required_fields": ["containers[3]"],
+  "missing_required_fields": [],
   "requires_human_review": true,
   "_critical_fields": ["intent", "service_flow", "customer", "booking_number", "container_count", "containers", "requires_human_review"]
 }

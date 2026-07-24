@@ -327,7 +327,8 @@ def capture_actual_result(fixture: Fixture) -> dict:
         parsed = json.loads(parsed) if parsed else {}
 
     container_number = parsed.get("Container Number") or ""
-    containers = [container_number] if container_number else []
+    container_numbers_list = parsed.get("Container Numbers") or []
+    containers = container_numbers_list or ([container_number] if container_number else [])
     booking_number = parsed.get("Booking Number") or ""
 
     # For a multi-container booking, "Container Qty" (a stated count, e.g.
@@ -344,6 +345,8 @@ def capture_actual_result(fixture: Fixture) -> dict:
     decision = "Create New Order"
     if primary.get("matched_load_id"):
         decision = "Update Existing Order"
+    elif primary.get("llm_review_required") and "mismatch" in str(primary.get("action_required") or "").lower():
+        decision = "Human Review Required"
 
     actual = {
         "intent": primary.get("request_type"),
