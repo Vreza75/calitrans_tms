@@ -45,3 +45,47 @@ def test_parse_email_text_single_container_still_works():
     parsed = parse_email_text("", body)
     assert parsed["Container Numbers"] == ["MSCU1234567"]
     assert parsed["Container Number"] == "MSCU1234567"
+
+
+from services.email_parser import _container_qty_from_sentence
+
+
+def test_container_qty_from_sentence_total_quantity_phrasing():
+    text = "Containers:\nTEMU2000001 - 40HC\n\nTotal quantity: 4 containers."
+    assert _container_qty_from_sentence(text) == "4"
+
+
+def test_container_qty_from_sentence_n_containers_total_phrasing():
+    assert _container_qty_from_sentence("We are shipping 6 containers total this week.") == "6"
+
+
+def test_container_qty_from_sentence_bare_quantity_label():
+    assert _container_qty_from_sentence("Quantity: 3\nRest of the email.") == "3"
+
+
+def test_container_qty_from_sentence_no_match_returns_empty():
+    assert _container_qty_from_sentence("No quantity mentioned anywhere here.") == ""
+
+
+def test_parse_email_text_uses_sentence_fallback_only_when_label_is_absent():
+    # CASE-007's actual fixture body: no "Container Qty:"/"Number Of Cntrs:"
+    # label, only the free-text closing sentence.
+    body = (
+        "Customer: Summit Furniture Imports\n"
+        "Booking Number: QTY-260807\n"
+        "Terminal: Barbours Cut Terminal\n"
+        "Delivery Address: 7200 West Road, Houston, TX 77086\n\n"
+        "Containers:\n\n"
+        "TEMU2000001 - 40HC\n"
+        "TEMU2000002 - 40HC\n"
+        "TEMU2000003 - 40HC\n\n"
+        "Total quantity: 4 containers.\n"
+    )
+    parsed = parse_email_text("", body)
+    assert parsed["Container Qty"] == "4"
+
+
+def test_parse_email_text_label_still_wins_over_sentence_fallback():
+    body = "Number Of Cntrs: 4 X 40HC\nWe are shipping 6 containers total this week."
+    parsed = parse_email_text("", body)
+    assert parsed["Container Qty"] == "4"

@@ -522,6 +522,23 @@ def _all_container_numbers(text: str) -> list[str]:
     return list(seen.keys())
 
 
+def _container_qty_from_sentence(text: str) -> str:
+    """Fallback quantity extraction for free-text phrasing that isn't a
+    labeled field (e.g. "Total quantity: 4 containers."). Only consulted
+    when the label-based Container Qty lookup (LABEL_ALIASES) found
+    nothing - a label always wins when present."""
+    patterns = [
+        r"\btotal\s+quantity\s*:?\s*(\d{1,2})\s+containers?\b",
+        r"\b(\d{1,2})\s+containers?\s+total\b",
+        r"\bquantity\s*:?\s*(\d{1,2})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def _subject_reference(subject: str) -> str:
     subject = _normalize_text(subject)
     patterns = [
@@ -968,6 +985,9 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
         # Reject anything that isn't a clean number or an "N x SIZE" pair
         # (e.g. "TBD", or a value that swallowed an unrelated label).
         parsed["Container Qty"] = ""
+
+    if not parsed["Container Qty"]:
+        parsed["Container Qty"] = _container_qty_from_sentence(combined)
 
     if not parsed["Size"]:
         # Require an explicit equipment suffix here so a bare "20"/"40"/"45"
