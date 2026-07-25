@@ -313,6 +313,29 @@ def enforce_container_quantity_mismatch_review(parsed: dict, triage: dict | None
     return corrected
 
 
+def _assign_split_row_identity(records: list[dict], base_message_id: str) -> list[dict]:
+    """Assigns row-identity fields (message_id, thread_id) when more than
+    one record was produced (a detected multi-order split). A single-record
+    result is returned completely untouched - order_intake's unique index
+    on source_message_id is never an issue for today's single-order path,
+    so nothing about it changes.
+
+    Block 0 keeps the real base_message_id (source_message_id) so the
+    single rerun-dedupe check in sync_operations_email_engine, which is
+    keyed on that same base id, still finds it and skips the whole email
+    on rerun. Block N>=1 gets a synthetic suffix to satisfy order_intake's
+    unique index on source_message_id. Every record's thread_id is forced
+    to base_message_id so a query for "all rows from this email" is
+    email_thread_id = base_message_id. Pure - no DB/IO."""
+    if len(records) <= 1:
+        return records
+
+    for index, record in enumerate(records):
+        record["message_id"] = base_message_id if index == 0 else f"{base_message_id}::order-{index + 1}"
+        record["thread_id"] = base_message_id
+    return records
+
+
 # Compatibility aliases used by the Streamlit page.
 _is_booking_confirmation = is_booking_confirmation
 _has_actual_billing_request = has_actual_billing_request
@@ -4336,9 +4359,7 @@ def _prepare_operations_email_records(message: dict) -> list[dict]:
     return records
 
 
-def _insert_operations_email_message(message: dict) -> dict:
-    record = _prepare_operations_email_record(message)
-
+def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     subject = record["subject"]
     sender = record["sender"]
     received_at = record["received_at"]
@@ -4474,6 +4495,21 @@ def _insert_operations_email_message(message: dict) -> dict:
         "store_only": bool(triage.get("store_only")),
         "work_level": triage.get("work_level"),
         "work_queue": triage.get("work_queue"),
+    }
+
+
+def _insert_operations_email_message(message: dict) -> dict:
+    records = _prepare_operations_email_records(message)
+    base_message_id = _email_sync_unique_message_id(message)
+    records = _assign_split_row_identity(records, base_message_id)
+
+    results = [_insert_operations_email_record_row(message, record) for record in records]
+
+    primary = results[0]
+    return {
+        **primary,
+        "conversation_keys": [result["conversation_key"] for result in results],
+        "split_row_count": len(results),
     }
 
 
@@ -4651,8 +4687,9 @@ def sync_operations_email_engine(
                     result["llm_required"] += 1
                 if inserted.get("store_only"):
                     result["store_only"] += 1
-                if inserted.get("conversation_key"):
-                    touched_conversations.add(inserted["conversation_key"])
+                touched_conversations.update(
+                    key for key in inserted.get("conversation_keys") or [inserted.get("conversation_key")] if key
+                )
                 result["messages"].append(
                     {
                         "subject": subject,

@@ -169,3 +169,33 @@ def test_prepare_records_calls_once_per_detected_block_with_scoped_body():
     # Attachments only attach to block 0.
     assert calls[0]["attachments"] == message["attachments"]
     assert calls[1]["attachments"] == []
+
+
+from services.operations_inbox_service import _assign_split_row_identity
+
+
+def test_assign_split_identity_is_noop_for_single_record():
+    records = [{"message_id": "orig-id", "thread_id": "orig-thread", "parsed": {}, "triage": {}}]
+    result = _assign_split_row_identity(records, "base-id")
+    assert result[0]["message_id"] == "orig-id"
+    assert result[0]["thread_id"] == "orig-thread"
+
+
+def test_assign_split_identity_sets_suffixed_ids_for_two_blocks():
+    records = [
+        {"parsed": {"Booking Number": "APEX-260810"}, "triage": {}},
+        {"parsed": {"Booking Number": "APEX-260811"}, "triage": {}},
+    ]
+    result = _assign_split_row_identity(records, "base-id")
+    assert result[0]["message_id"] == "base-id"
+    assert result[1]["message_id"] == "base-id::order-2"
+    assert result[0]["thread_id"] == "base-id"
+    assert result[1]["thread_id"] == "base-id"
+
+
+def test_assign_split_identity_handles_more_than_two_blocks():
+    records = [{"parsed": {}, "triage": {}} for _ in range(4)]
+    result = _assign_split_row_identity(records, "base-id")
+    assert [r["message_id"] for r in result] == [
+        "base-id", "base-id::order-2", "base-id::order-3", "base-id::order-4",
+    ]
