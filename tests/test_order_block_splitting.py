@@ -111,3 +111,61 @@ def test_customer_from_prose_stops_before_trailing_prose():
 def test_customer_from_prose_stops_before_a_trailing_reason_clause():
     text = "Please book this for Apex Retail transport for October."
     assert _customer_from_prose(text) == "Apex Retail"
+
+
+from unittest import mock
+
+from services import operations_inbox_service
+
+
+def test_prepare_records_returns_single_record_when_no_split():
+    message = {"subject": "Test", "body": "Booking Number: A\n"}
+    with mock.patch.object(
+        operations_inbox_service,
+        "_prepare_operations_email_record",
+        return_value={"parsed": {}, "triage": {}},
+    ) as mocked:
+        records = operations_inbox_service._prepare_operations_email_records(message)
+    assert len(records) == 1
+    mocked.assert_called_once_with(message)
+
+
+def test_prepare_records_calls_once_per_detected_block_with_scoped_body():
+    message = {
+        "subject": "Two New Import Bookings",
+        "body": (
+            "Order 1\nBooking Number: APEX-260810\n\n"
+            "Order 2\nBooking Number: APEX-260811\n"
+        ),
+        "attachments": [{"filename": "x.pdf", "content": b"stub"}],
+    }
+    calls = []
+
+    def fake_prepare(block_message):
+        calls.append(block_message)
+        return {"parsed": {}, "triage": {}}
+
+    with mock.patch.object(
+        operations_inbox_service,
+        "_prepare_operations_email_record",
+        side_effect=fake_prepare,
+    ):
+        records = operations_inbox_service._prepare_operations_email_records(message)
+
+    assert len(records) == 2
+    assert records[0]["_order_block_index"] == 0
+    assert records[1]["_order_block_index"] == 1
+    assert records[0]["_order_block_count"] == 2
+    assert records[1]["_order_block_count"] == 2
+    assert "APEX-260810" in calls[0]["body"]
+    assert "APEX-260811" not in calls[0]["body"]
+    assert "APEX-260811" in calls[1]["body"]
+    assert "APEX-260810" not in calls[1]["body"]
+    # Original message dict is never mutated in place.
+    assert message["body"] == (
+        "Order 1\nBooking Number: APEX-260810\n\n"
+        "Order 2\nBooking Number: APEX-260811\n"
+    )
+    # Attachments only attach to block 0.
+    assert calls[0]["attachments"] == message["attachments"]
+    assert calls[1]["attachments"] == []

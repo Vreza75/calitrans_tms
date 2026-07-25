@@ -17,6 +17,7 @@ from db_client import column_exists, execute, read_df
 from services.email_parser import (
     _append_note,
     detect_container_quantity_mismatch,
+    detect_order_blocks,
     extract_latest_email_body,
     parse_email_text,
 )
@@ -4307,6 +4308,32 @@ def _prepare_operations_email_record(message: dict) -> dict:
         "conversation_status": conversation_status,
         "processing_errors": processing_errors,
     }
+
+
+def _prepare_operations_email_records(message: dict) -> list[dict]:
+    """Returns one prepared record per detected order block (see
+    services.email_parser.detect_order_blocks), or a single-element list -
+    today's unchanged behavior - when the message has no multi-order
+    split. Each record is produced by the existing, unmodified
+    _prepare_operations_email_record(), called once per block; the only
+    difference per call is the "body" (and, for block 1+, "attachments")
+    field of the message dict it's given."""
+    raw_body = safe_str(message.get("body"))
+    blocks = detect_order_blocks(raw_body)
+    if not blocks:
+        return [_prepare_operations_email_record(message)]
+
+    records = []
+    for index, block_text in enumerate(blocks):
+        block_message = dict(message)
+        block_message["body"] = block_text
+        if index > 0:
+            block_message["attachments"] = []
+        record = _prepare_operations_email_record(block_message)
+        record["_order_block_index"] = index
+        record["_order_block_count"] = len(blocks)
+        records.append(record)
+    return records
 
 
 def _insert_operations_email_message(message: dict) -> dict:
