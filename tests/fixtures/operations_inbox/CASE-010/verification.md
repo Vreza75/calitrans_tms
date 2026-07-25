@@ -266,6 +266,28 @@ transactional (no guaranteed all-or-nothing). Not fixed here - flagging
 for a separate scoping conversation if CASE-010-shaped emails turn out
 to fail mid-split often enough in production to matter.
 
+## Known limitation (2)
+
+`_customer_from_prose` (`services/email_parser.py`) searches the
+combined subject+body text for the first `for <Title-Case words>`
+match. It only fires in the narrow fallback path (no `Customer:` label,
+no signature-derived company, `Customer` still empty), but within that
+path an early unrelated phrase - a subject like "New bookings for
+August" or body prose like "...pickup scheduled for Monday..." - could
+be mis-read as the customer name (e.g. `Customer: "August"`).
+
+Identified during the final whole-branch review. The user was asked
+directly; the decision was to merge as-is and track this as a
+follow-up rather than narrow the regex now. Blast radius is bounded:
+this only affects the rare case of a customer name available in prose
+but nowhere else, and every new order still requires dispatcher
+approval (`requires_human_review: true`) before it becomes a real
+booking, so a wrong guess here is caught before it does anything.
+Suggested follow-up if this needs tightening later: restrict the
+search to body-only text (drop the subject), and/or require the
+"N orders for X" phrasing shape rather than bare "for", plus a
+regression test for a date/place word following "for".
+
 ## Decision
 
 **ACCEPTED**

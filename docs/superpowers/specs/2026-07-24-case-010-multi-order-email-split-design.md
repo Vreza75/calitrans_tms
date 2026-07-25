@@ -107,7 +107,7 @@ Verified by reading the code:
 _ORDER_BLOCK_HEADER_RE = re.compile(r"^\s*Order\s+(\d{1,2})\s*$", re.I | re.M)
 _MAX_ORDER_BLOCKS = 10
 
-def detect_order_blocks(subject: str, body: str) -> list[str] | None:
+def detect_order_blocks(body: str) -> list[str] | None:
     """Split a message body into per-order text segments when it contains
     2+ explicit "Order N" block headers. Returns None (meaning: use the
     existing single-pass parse, unchanged) when fewer than 2 headers are
@@ -138,7 +138,7 @@ def detect_order_blocks(subject: str, body: str) -> list[str] | None:
 ### 2. Customer prose fallback (`services/email_parser.py`)
 
 ```python
-_CUSTOMER_PROSE_RE = re.compile(r"\bfor\s+([A-Z][\w&,.\- ]{2,40})\.?\s*$", re.M)
+_CUSTOMER_PROSE_RE = re.compile(r"\bfor\s+([A-Z][\w&]*(?:\s+[A-Z][\w&]*){0,5})", re.M)
 
 def _customer_from_prose(text: str) -> str:
     """Fallback for a company name stated in prose ("...orders for Apex
@@ -148,6 +148,16 @@ def _customer_from_prose(text: str) -> str:
     match = _CUSTOMER_PROSE_RE.search(text or "")
     return match.group(1).strip().rstrip(".") if match else ""
 ```
+
+(Shipped form, revised during implementation: the original char-class
+version above was found during Task 2's review to over-capture trailing
+prose after the company name, e.g. "...for Apex Retail using our
+standard rate." captured the whole trailing clause. The shipped regex
+instead captures a run of Title-Case tokens after "for," stopping
+naturally at the first lowercase word - see commit `fc9431f`. This in
+turn means the fallback can misfire on an early unrelated "for
+<Capitalized Word>" phrase, e.g. a subject like "New bookings for
+August" - see CASE-010's `verification.md`, "Known limitation (2)".)
 
 Wired into `parse_email_text()` right after the existing
 `if (not parsed["Customer"] or _is_own_company_value(parsed["Customer"])) and parsed["Contact Company"]:`
@@ -162,8 +172,7 @@ def _prepare_operations_email_records(message: dict) -> list[dict]:
     single-element list (today's unchanged behavior) when the message
     has no multi-order split."""
     raw_body = safe_str(message.get("body"))
-    subject = safe_str(message.get("subject")) or "(no subject)"
-    blocks = detect_order_blocks(subject, raw_body)
+    blocks = detect_order_blocks(raw_body)
     if not blocks:
         return [_prepare_operations_email_record(message)]
 
