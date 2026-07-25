@@ -893,7 +893,7 @@ def _container_correction(text: str) -> tuple[str, str]:
     return "", ""
 
 
-_CUSTOMER_PROSE_RE = re.compile(r"\bfor\s+([A-Z][\w&,.\- ]{2,40})\.?\s*$", re.M)
+_CUSTOMER_PROSE_RE = re.compile(r"\bfor\s+([A-Z][\w&]*(?:\s+[A-Z][\w&]*){0,5})", re.M)
 
 
 def _customer_from_prose(text: str) -> str:

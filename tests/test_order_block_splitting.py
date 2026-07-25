@@ -101,3 +101,13 @@ def test_parse_email_text_label_still_wins_over_prose_fallback():
     body = "Customer: Real Customer Inc\nPlease enter this for Apex Retail.\n"
     parsed = parse_email_text("", body)
     assert parsed["Customer"] == "Real Customer Inc"
+
+
+def test_customer_from_prose_stops_before_trailing_prose():
+    text = "Please enter this order for Apex Retail using our standard rate."
+    assert _customer_from_prose(text) == "Apex Retail"
+
+
+def test_customer_from_prose_stops_before_a_trailing_reason_clause():
+    text = "Please book this for Apex Retail transport for October."
+    assert _customer_from_prose(text) == "Apex Retail"
