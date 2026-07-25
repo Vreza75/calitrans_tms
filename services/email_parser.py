@@ -930,6 +930,12 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
     sender_identity = _sender_identity(sender or "")
     signature = latest_signature or _signature_block(contact_body, sender_identity)
     for field, value in sender_identity.items():
+        # "Contact Company" is handled separately below: sender_identity's
+        # version is domain-derived (e.g. "example.com" -> "Example"), which
+        # is the weakest signal available and must not pre-empt the
+        # signature-derived company or the prose fallback for Customer.
+        if field == "Contact Company":
+            continue
         if value and (not parsed[field] or _is_own_company_value(parsed[field])):
             parsed[field] = value
     signature_email = _first_email(signature)
@@ -947,12 +953,20 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
     signature_company = _find_labeled_value(signature, ["Company Name", "Organization"]) or _signature_company(signature, parsed["Contact Name"])
     if signature_company and not _is_own_company_value(signature_company):
         parsed["Contact Company"] = signature_company
-    elif not parsed["Contact Company"]:
-        parsed["Contact Company"] = _domain_company(parsed["Contact Email"])
     if (not parsed["Customer"] or _is_own_company_value(parsed["Customer"])) and parsed["Contact Company"]:
         parsed["Customer"] = parsed["Contact Company"]
     if not parsed["Customer"]:
         parsed["Customer"] = _customer_from_prose(combined)
+    # Domain-derived company (e.g. "example.com" -> "Example") is the
+    # weakest signal - only used as a last resort, after both the
+    # signature-derived company and the prose fallback have had a chance.
+    if not parsed["Customer"] or not parsed["Contact Company"]:
+        domain_company = _domain_company(parsed["Contact Email"])
+        if domain_company:
+            if not parsed["Contact Company"]:
+                parsed["Contact Company"] = domain_company
+            if not parsed["Customer"]:
+                parsed["Customer"] = domain_company
 
     destination_value = _find_labeled_value(
         combined,
