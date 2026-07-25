@@ -6,13 +6,15 @@
   "existing_load_match": null,
   "booking_number": "APEX-260810",
   "order_numbers": [
-    "APEX-260810"
+    "APEX-260810",
+    "APEX-260811"
   ],
-  "container_count": 1,
+  "container_count": 2,
   "containers": [
-    "HLXU3000001"
+    "HLXU3000001",
+    "HLXU3000002"
   ],
-  "customer": "Example",
+  "customer": "Apex Retail",
   "pickup": {
     "terminal": "Bayport Container Terminal"
   },
@@ -29,8 +31,9 @@
   },
   "missing_required_fields": [],
   "requires_human_review": true,
-  "_row_count": 1,
+  "_row_count": 2,
   "_row_ids": [
-    1
+    1,
+    2
   ]
 }

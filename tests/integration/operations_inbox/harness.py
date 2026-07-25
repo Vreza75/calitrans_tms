@@ -305,31 +305,17 @@ def _sparse(mapping: dict) -> dict:
     return {k: v for k, v in mapping.items() if v not in (None, "", [])}
 
 
-def capture_actual_result(fixture: Fixture) -> dict:
-    """Read back the order_intake row(s) created for this case and translate
-    them into the expected.json schema. This mapping is intentionally
-    centralized here so per-case tuning (as real cases are certified) happens
-    in one place instead of scattering ad hoc field lookups."""
-    import db_client
-
-    df = db_client.read_df(
-        "select * from order_intake where source_message_id = :message_id order by id asc",
-        {"message_id": _stable_message_id(fixture.message)},
-    )
-
-    if df.empty:
-        return {field_name: None for field_name in EXPECTED_SCHEMA_FIELDS} | {"_row_count": 0}
-
-    rows = [row.to_dict() for _, row in df.iterrows()]
-    primary = rows[0]
-    parsed = primary.get("parsed_data") or {}
+def _row_parsed_data(row: dict) -> dict:
+    parsed = row.get("parsed_data") or {}
     if isinstance(parsed, str):
         parsed = json.loads(parsed) if parsed else {}
+    return parsed
 
+
+def _row_containers_and_count(parsed: dict) -> tuple[list[str], int | None]:
     container_number = parsed.get("Container Number") or ""
     container_numbers_list = parsed.get("Container Numbers") or []
     containers = container_numbers_list or ([container_number] if container_number else [])
-    booking_number = parsed.get("Booking Number") or ""
 
     # For a multi-container booking, "Container Qty" (a stated count, e.g.
     # "4 X 40HC") is known before any physical container numbers are -
@@ -341,6 +327,54 @@ def capture_actual_result(fixture: Fixture) -> dict:
     except ValueError:
         container_qty = None
     container_count = container_qty if container_qty else (len(containers) or None)
+    return containers, container_count
+
+
+def capture_actual_result(fixture: Fixture) -> dict:
+    """Read back the order_intake row(s) created for this case and translate
+    them into the expected.json schema. This mapping is intentionally
+    centralized here so per-case tuning (as real cases are certified) happens
+    in one place instead of scattering ad hoc field lookups.
+
+    A case whose email contains multiple detected order blocks (CASE-010)
+    produces more than one order_intake row, linked by a shared
+    email_thread_id - order_numbers/containers/container_count are
+    aggregated across every row from this email; the remaining fields are
+    read from the first row only (intent/service_flow/customer/queue are
+    expected to agree across every row from one split email)."""
+    import db_client
+
+    df = db_client.read_df(
+        """
+        select * from order_intake
+        where email_thread_id = :message_id or source_message_id = :message_id
+        order by id asc
+        """,
+        {"message_id": _stable_message_id(fixture.message)},
+    )
+
+    if df.empty:
+        return {field_name: None for field_name in EXPECTED_SCHEMA_FIELDS} | {"_row_count": 0}
+
+    rows = [row.to_dict() for _, row in df.iterrows()]
+    primary = rows[0]
+    parsed = _row_parsed_data(primary)
+
+    order_numbers: list[str] = []
+    containers: list[str] = []
+    container_counts: list[int] = []
+    for row in rows:
+        row_parsed = _row_parsed_data(row)
+        booking = row_parsed.get("Booking Number") or ""
+        if booking:
+            order_numbers.append(booking)
+        row_containers, row_count = _row_containers_and_count(row_parsed)
+        containers.extend(row_containers)
+        if row_count:
+            container_counts.append(row_count)
+
+    booking_number = order_numbers[0] if order_numbers else ""
+    container_count = sum(container_counts) if container_counts else None
 
     decision = "Create New Order"
     if primary.get("matched_load_id"):
@@ -355,7 +389,7 @@ def capture_actual_result(fixture: Fixture) -> dict:
         "decision": decision,
         "existing_load_match": primary.get("matched_load_id"),
         "booking_number": booking_number,
-        "order_numbers": [booking_number] if booking_number else [],
+        "order_numbers": order_numbers,
         "container_count": container_count,
         "containers": containers,
         "customer": parsed.get("Customer") or None,
@@ -395,7 +429,7 @@ def capture_actual_result(fixture: Fixture) -> dict:
         # committed yet) - AI never creates or changes operational records
         # without confirmation, so this is the general "not yet approved" gate,
         # not just the narrower low-confidence llm_review_required flag.
-        "requires_human_review": bool(primary.get("llm_review_required"))
+        "requires_human_review": any(bool(row.get("llm_review_required")) for row in rows)
         or (str(primary.get("review_status") or "") == "Open" and not primary.get("linked_load_id")),
         "_row_count": len(rows),
         "_row_ids": [row.get("id") for row in rows],

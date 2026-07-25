@@ -9,10 +9,20 @@
   "container_count": 2,
   "containers": ["HLXU3000001", "HLXU3000002"],
   "customer": "Apex Retail",
-  "pickup": {},
-  "delivery": {},
-  "dates": {},
-  "references": {},
+  "pickup": {
+    "terminal": "Bayport Container Terminal"
+  },
+  "delivery": {
+    "address": "3400 Commerce Street, Houston, TX 77002"
+  },
+  "dates": {
+    "delivery_need_date": "August 12, 2026"
+  },
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Nathan Brooks",
+    "contact_email": "nathan.brooks@example.com"
+  },
   "missing_required_fields": [],
   "requires_human_review": true,
   "_critical_fields": ["intent", "order_numbers", "container_count", "containers"]
