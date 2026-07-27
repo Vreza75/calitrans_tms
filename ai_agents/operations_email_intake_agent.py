@@ -7,6 +7,8 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from services.email_parser import extract_latest_email_body
+from services.operations_field_service import extract_operational_fields
 
 
 INTAKE_MODEL = "gpt-4.1-mini"
@@ -36,26 +38,14 @@ def detect_language(subject: str, body: str) -> str:
 
 
 def extract_quick_references(subject: str, body: str) -> dict:
-    text = f"{subject}\n{body}"
-
-    booking = re.search(
-        r"\b(?:booking|bkg|bk|reserva)\s*(?:number|no|#)?\s*[:#-]?\s*([A-Z0-9-]{5,})",
-        text,
-        re.I,
-    )
-
-    container = re.search(r"\b[A-Z]{4}\d{7}\b", text, re.I)
-
-    reference = re.search(
-        r"\b(?:ref|reference|po|referencia)\s*(?:number|no|#)?\s*[:#-]?\s*([A-Z0-9-]{4,})",
-        text,
-        re.I,
-    )
+    latest = extract_latest_email_body(body, include_signature=False) or body
+    shared = extract_operational_fields(subject=subject, newest_message=latest)
+    fields = shared["fields"]
 
     return {
-        "booking_number": booking.group(1).upper() if booking else "",
-        "container_number": container.group(0).upper() if container else "",
-        "reference_number": reference.group(1).upper() if reference else "",
+        "booking_number": str(fields.get("Booking Number") or "").upper(),
+        "container_number": str(fields.get("Container Number") or "").upper(),
+        "reference_number": str(fields.get("Reference Number") or "").upper(),
     }
 
 

@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Dict
 
 from services.order_parser import parse_order_text
+from services.operations_field_service import (
+    SHARED_OPERATION_FIELDS,
+    derive_review_state,
+    extract_operational_fields,
+    validate_field_value,
+)
 from ai_agents.document_parser_agent import DocumentParserAgent
 
 
@@ -73,12 +79,35 @@ def parse_document_hybrid(
     """
 
     rule_parsed = parse_order_text(document_text or "")
-    rule_confidence = _rule_confidence(rule_parsed)
+    shared = extract_operational_fields(document_text=document_text or "")
+    for field in SHARED_OPERATION_FIELDS:
+        if shared["fields"].get(field) not in (None, "", []):
+            rule_parsed[field] = shared["fields"][field]
+        elif rule_parsed.get(field) not in (None, "", []):
+            if not validate_field_value(
+                field,
+                rule_parsed[field],
+                source="document",
+                method="legacy_document_parser",
+            )[0]:
+                rule_parsed[field] = [] if field == "Container Numbers" else ""
+    rule_parsed["_field_candidates"] = shared["candidates"]
+    rule_parsed["_candidate_conflicts"] = shared.get("conflicts", [])
+    rule_parsed["_confidence"] = shared["confidence"]
+    review = derive_review_state(
+        rule_parsed,
+        conflicts=shared.get("conflicts", []),
+        parser_failures=list(rule_parsed.get("_parser_failures") or []),
+    )
+    rule_confidence = min(
+        _rule_confidence(rule_parsed),
+        review["confidence"] or 1.0,
+    )
 
     result = {
         "parser_used": "rule_parser",
         "confidence": rule_confidence,
-        "needs_review": rule_confidence < 0.85,
+        "needs_review": review["needs_review"],
         "parsed_fields": rule_parsed,
         "rule_parser_output": rule_parsed,
         "document_parser_agent": {},

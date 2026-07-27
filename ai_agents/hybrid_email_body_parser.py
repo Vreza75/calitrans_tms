@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Dict
 
 from services.email_parser import parse_email_text
+from services.operations_field_service import derive_review_state, validate_field_value
 from ai_agents.operations_parser_agent import OperationsParserAgent
 
 
@@ -46,6 +47,8 @@ def _field_count(parsed: Dict) -> int:
 
 
 def _rule_confidence(parsed: Dict) -> float:
+    if "_confidence" in parsed:
+        return float(parsed.get("_confidence") or 0)
     count = _field_count(parsed)
 
     if count >= 8:
@@ -66,7 +69,13 @@ def _merge_rule_and_ai(rule_parsed: Dict, ai_updates: Dict) -> Dict:
         rule_value = _safe_str(merged.get(field))
         ai_value = _safe_str(ai_updates.get(field))
 
-        if ai_value and not rule_value:
+        ai_valid = validate_field_value(
+            field,
+            ai_value,
+            source="operations_parser_agent",
+            method="ai_suggestion",
+        )[0]
+        if ai_value and ai_valid and not rule_value:
             merged[field] = ai_value
 
     current_notes = _safe_str(merged.get("Dispatcher Notes"))
@@ -99,11 +108,12 @@ def parse_email_body_hybrid(
 
     rule_parsed = parse_email_text(subject or "", body or "")
     rule_confidence = _rule_confidence(rule_parsed)
+    review = derive_review_state(rule_parsed)
 
     result = {
         "parser_used": "email_rule_parser",
         "confidence": rule_confidence,
-        "needs_review": rule_confidence < 0.85,
+        "needs_review": review["needs_review"],
         "parsed_fields": rule_parsed,
         "rule_parser_output": rule_parsed,
         "operations_parser_agent": {},

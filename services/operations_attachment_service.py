@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -20,10 +21,17 @@ from config import DOCUMENT_STORAGE_DIR
 from db_client import execute, read_df
 from services.load_matching_service import existing_load_columns
 from services.order_parser import extract_text_from_pdf
+from services.operations_field_service import (
+    derive_review_state,
+    extract_operational_fields,
+    reconcile_parsed_sources,
+    validate_field_value,
+)
 
 
 OPERATIONS_ATTACHMENTS_KEY = "_operations_attachments"
 OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
+logger = logging.getLogger(__name__)
 
 OPERATIONS_ORDER_FIELDS = [
     "TYPE",
@@ -31,14 +39,19 @@ OPERATIONS_ORDER_FIELDS = [
     "Booking Number",
     "Reference Number",
     "Container Number",
+    "Container Numbers",
+    "Container Qty",
     "Size",
     "Port",
+    "Terminal",
+    "Port PIN",
     "Warehouse",
     "Address",
     "Delivery Need Date",
     "Document Cutoff",
     "LFD",
     "Contact Name",
+    "Contact Title",
     "Contact Email",
     "Contact Phone",
     "Contact Company",
@@ -202,6 +215,17 @@ def parse_operations_pdf_bytes(content: bytes, filename: str) -> tuple[str, dict
     )
 
     parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
+    shared = extract_operational_fields(document_text=pdf_text)
+    for field, value in shared["fields"].items():
+        if value not in ("", None, []):
+            parsed[field] = value
+    for field in OPERATIONS_ORDER_FIELDS:
+        if field not in shared["fields"] and parsed.get(field) not in ("", None, []):
+            if not validate_field_value(field, parsed[field], source="document", method="legacy_document_parser")[0]:
+                parsed[field] = [] if field == "Container Numbers" else ""
+    parsed["_field_candidates"] = shared["candidates"]
+    parsed["_confidence"] = shared["confidence"]
+    parsed["_candidate_conflicts"] = shared.get("conflicts", [])
     parsed["_hybrid_document_parser"] = hybrid_doc_result
 
     return pdf_text, parsed
@@ -233,6 +257,17 @@ def parse_operations_attachment_bytes(
         )
 
         parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
+        shared = extract_operational_fields(document_text=text)
+        for field, value in shared["fields"].items():
+            if value not in ("", None, []):
+                parsed[field] = value
+        for field in OPERATIONS_ORDER_FIELDS:
+            if field not in shared["fields"] and parsed.get(field) not in ("", None, []):
+                if not validate_field_value(field, parsed[field], source="document", method="legacy_document_parser")[0]:
+                    parsed[field] = [] if field == "Container Numbers" else ""
+        parsed["_field_candidates"] = shared["candidates"]
+        parsed["_confidence"] = shared["confidence"]
+        parsed["_candidate_conflicts"] = shared.get("conflicts", [])
         parsed["_hybrid_document_parser"] = hybrid_doc_result
 
         return text, parsed
@@ -252,6 +287,17 @@ def parse_operations_attachment_bytes(
         )
 
         parsed = dict(hybrid_doc_result.get("parsed_fields", {}) or {})
+        shared = extract_operational_fields(document_text=text)
+        for field, value in shared["fields"].items():
+            if value not in ("", None, []):
+                parsed[field] = value
+        for field in OPERATIONS_ORDER_FIELDS:
+            if field not in shared["fields"] and parsed.get(field) not in ("", None, []):
+                if not validate_field_value(field, parsed[field], source="document", method="legacy_document_parser")[0]:
+                    parsed[field] = [] if field == "Container Numbers" else ""
+        parsed["_field_candidates"] = shared["candidates"]
+        parsed["_confidence"] = shared["confidence"]
+        parsed["_candidate_conflicts"] = shared.get("conflicts", [])
         parsed["_hybrid_document_parser"] = hybrid_doc_result
 
         return text, parsed
@@ -452,45 +498,11 @@ def extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | 
 
 
 def merge_operations_order_fields(body_parsed: dict, document_parsed: dict) -> tuple[dict, list[dict], list[str]]:
-    final_data = {}
-    rows = []
-    conflicts = []
-
-    body_parsed = coerce_json_dict(body_parsed)
-    document_parsed = coerce_json_dict(document_parsed)
-
-    for field in OPERATIONS_ORDER_FIELDS:
-        body_value = safe_str(body_parsed.get(field, ""))
-        document_value = safe_str(document_parsed.get(field, ""))
-
-        if field == "Dispatcher Notes" and body_value and document_value:
-            final_value = body_value if document_value in body_value else f"{body_value}\n{document_value}"
-        else:
-            final_value = document_value or body_value
-
-        final_data[field] = final_value
-
-        if field == "Dispatcher Notes" and body_value and document_value:
-            status = "Combined"
-        elif body_value and document_value and body_value.lower() != document_value.lower():
-            status = "Review mismatch"
-            conflicts.append(field)
-        elif final_value:
-            status = "Found"
-        else:
-            status = "Blank"
-
-        rows.append(
-            {
-                "Field": field,
-                "Email Body": body_value,
-                "Document": document_value,
-                "Final Value": final_value,
-                "Status": status,
-            }
-        )
-
-    return final_data, rows, conflicts
+    return reconcile_parsed_sources(
+        coerce_json_dict(body_parsed),
+        coerce_json_dict(document_parsed),
+        fields=OPERATIONS_ORDER_FIELDS,
+    )
 
 
 def merge_operations_body_parsed_fields(current: dict, reparsed: dict) -> tuple[dict, bool]:
@@ -549,27 +561,24 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], f
 
     for attachment in saved_attachments:
         attachment_parsed = coerce_json_dict(attachment.get("parsed_data") or {})
+        eligible_document_fields = dict(attachment_parsed)
+        if not force:
+            for field in OPERATIONS_ORDER_FIELDS:
+                existing_value = updated.get(field, "")
+                existing_valid = validate_field_value(
+                    field,
+                    existing_value,
+                    source="persisted_email",
+                    method="parsed_value",
+                )[0]
+                if existing_value and existing_valid and field != "Dispatcher Notes":
+                    eligible_document_fields[field] = ""
 
-        for field in OPERATIONS_ORDER_FIELDS:
-            attachment_value = safe_str(attachment_parsed.get(field, ""))
-
-            if not attachment_value:
-                continue
-
-            if field == "Dispatcher Notes":
-                existing_value = safe_str(updated.get(field, ""))
-
-                if existing_value and attachment_value not in existing_value:
-                    updated[field] = f"{existing_value}\n{attachment_value}"
-                elif not existing_value:
-                    updated[field] = attachment_value
-
-            elif field in _ATTACHMENT_MERGE_IDENTITY_FIELDS:
-                if not safe_str(updated.get(field, "")):
-                    updated[field] = attachment_value
-
-            elif force or not safe_str(updated.get(field, "")):
-                updated[field] = attachment_value
+        updated, _, _ = reconcile_parsed_sources(
+            updated,
+            eligible_document_fields,
+            fields=OPERATIONS_ORDER_FIELDS,
+        )
 
     if saved_attachments:
         updated[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
@@ -587,19 +596,57 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], f
 
 
 def store_operations_parsed_data(intake_id: int, parsed_data: dict, action_required: str | None = None) -> None:
-    execute(
-        """
-        update order_intake
-        set parsed_data = cast(:parsed_data as jsonb),
-            action_required = coalesce(:action_required, action_required)
-        where id = :intake_id
-        """,
-        {
-            "intake_id": int(intake_id),
-            "parsed_data": json_dump(parsed_data),
-            "action_required": action_required,
-        },
+    parsed_data = dict(parsed_data or {})
+    reconciliation = parsed_data.get("_reconciliation") if isinstance(parsed_data.get("_reconciliation"), dict) else {}
+    review = derive_review_state(
+        parsed_data,
+        conflicts=list(
+            dict.fromkeys(
+                [
+                    *(reconciliation.get("conflicts") or []),
+                    *(parsed_data.get("_candidate_conflicts") or []),
+                ]
+            )
+        ),
+        parser_failures=list(parsed_data.get("_parser_failures") or []),
     )
+    parsed_data["_needs_review"] = review["needs_review"]
+    parsed_data["_confidence"] = review["confidence"]
+    parsed_data["_review_reasons"] = review
+    params = {
+        "intake_id": int(intake_id),
+        "parsed_data": json_dump(parsed_data),
+        "action_required": action_required,
+        "confidence_score": int(round(review["confidence"] * 100)),
+        "needs_review": review["needs_review"],
+        "review_reason": "; ".join(
+            [
+                *(f"Conflict: {field}" for field in review["conflicts"]),
+                *(f"Missing: {field}" for field in review["missing_required_fields"]),
+                *(f"Invalid: {field}" for field in review["invalid_selected_fields"]),
+                *review["parser_failures"],
+            ]
+        ),
+    }
+    try:
+        execute(
+            """
+            update order_intake
+            set parsed_data = cast(:parsed_data as jsonb),
+                action_required = coalesce(:action_required, action_required),
+                confidence_score = :confidence_score,
+                llm_review_required = :needs_review,
+                llm_review_reason = :review_reason
+            where id = :intake_id
+            """,
+            params,
+        )
+    except Exception:
+        logger.exception(
+            "operations parsed_data persistence failed",
+            extra={"intake_id": int(intake_id), "stage": "store_operations_parsed_data"},
+        )
+        raise
 
 
 # Compatibility aliases

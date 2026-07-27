@@ -9,6 +9,7 @@ import streamlit as st
 
 from db_client import column_exists, execute, read_df
 from services.email_parser import extract_latest_email_body, parse_email_text
+from services.operations_field_service import extract_operational_fields
 
 
 OPERATIONS_CASE_STATUSES = [
@@ -1420,23 +1421,17 @@ _format_case_sla_label = format_case_sla_label
 
 
 def extract_reference_tokens(text: str) -> dict:
-    text = str(text or "")
-    upper = text.upper()
-    tokens = {}
-
-    container_match = re.search(r"\b([A-Z]{4}\d{6,7})\b", upper)
-    if container_match:
-        tokens["container_number"] = container_match.group(1)
-
-    booking_match = re.search(r"\b(?:BOOKING|BK|BKG|RESERVATION)\s*[:#-]?\s*([A-Z0-9-]{5,})", upper)
-    if booking_match:
-        tokens["booking_number"] = booking_match.group(1).strip("- ")
-
-    ref_match = re.search(r"\b(?:REF|REFERENCE|PO|ORDER)\s*[:#-]?\s*([A-Z0-9-]{4,})", upper)
-    if ref_match:
-        tokens["reference_number"] = ref_match.group(1).strip("- ")
-
-    return tokens
+    fields = extract_operational_fields(newest_message=str(text or ""))["fields"]
+    mapping = {
+        "booking_number": fields.get("Booking Number"),
+        "container_number": fields.get("Container Number"),
+        "reference_number": fields.get("Reference Number"),
+    }
+    return {
+        key: str(value).upper()
+        for key, value in mapping.items()
+        if value
+    }
 
 
 def feedback_sender_domain(sender: str) -> str:

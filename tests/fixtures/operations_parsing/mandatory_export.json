@@ -1,0 +1,42 @@
+{
+  "subject": "[TMS-TEST]- New booking",
+  "sender": "Marcus Hill <marcus.hill@lonestarpolymer.example>",
+  "body": "Calitrans Team,\n\nAttached is our export dispatch order for booking LSP-EXP-080426. Please\nspot the container at our Pasadena warehouse on August 4 and return the\nloaded container to Barbours Cut no later than 11:00 AM on August 5.\n\nThe port PIN, terminal cutoff, seal, and gross weight are on the attached\norder. Please send the driver name and ETA once assigned.\n\nRegards,\nMarcus Hill\nExport Shipping Supervisor\nLone Star Polymer LLC\n(281) 555-0194",
+  "attachment_text": "EXPORT DISPATCH ORDER\nCustomer: Lone Star Polymer LLC\nBooking Number: LSP-EXP-080426\nReference Number: SO 784221\nContainer Number: CMAU2468101\nContainer Size: 40HC\nPort: Barbours Cut Container Terminal\nPort PIN: 771204\nWarehouse: Lone Star Polymer Warehouse\nContact Phone:\n",
+  "expected_email": {
+    "Booking Number": "LSP-EXP-080426",
+    "Reference Number": "",
+    "Customer": "Lone Star Polymer LLC",
+    "Contact Name": "Marcus Hill",
+    "Contact Title": "Export Shipping Supervisor",
+    "Contact Company": "Lone Star Polymer LLC",
+    "Contact Phone": "(281) 555-0194",
+    "TYPE": "Export",
+    "Warehouse": "Pasadena warehouse",
+    "Port": "Barbours Cut"
+  },
+  "expected_document": {
+    "Booking Number": "LSP-EXP-080426",
+    "Reference Number": "SO 784221",
+    "Container Number": "CMAU2468101",
+    "Size": "40HC",
+    "Customer": "Lone Star Polymer LLC",
+    "Port": "Barbours Cut Container Terminal",
+    "Port PIN": "771204",
+    "Warehouse": "Lone Star Polymer Warehouse"
+  },
+  "expected_final": {
+    "Booking Number": "LSP-EXP-080426",
+    "Reference Number": "SO 784221",
+    "Container Number": "CMAU2468101",
+    "Size": "40HC",
+    "Customer": "Lone Star Polymer LLC",
+    "Contact Phone": "(281) 555-0194",
+    "TYPE": "Export",
+    "Port": "Barbours Cut Container Terminal",
+    "Warehouse": "Lone Star Polymer Warehouse"
+  },
+  "expected_conflicts": [],
+  "expected_queue": "New Orders",
+  "expected_needs_review": false
+}

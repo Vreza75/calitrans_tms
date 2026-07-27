@@ -1,7 +1,10 @@
+import logging
 import re
 import pdfplumber
 
 from services.email_parser import parse_email_text
+
+logger = logging.getLogger(__name__)
 
 
 def _append_note(existing, note):
@@ -306,8 +309,15 @@ def parse_order_text(text):
     # 2) Run older email parser as fallback only.
     try:
         email_style_parsed = parse_email_text("", text)
-    except Exception:
+    except Exception as exc:
+        logger.exception(
+            "email-style document fallback parser failed",
+            extra={"stage": "parse_order_text_email_fallback"},
+        )
         email_style_parsed = {}
+        failures = list(parsed.get("_parser_failures") or [])
+        failures.append(f"parse_order_text_email_fallback: {type(exc).__name__}")
+        parsed["_parser_failures"] = failures
 
     for field, value in email_style_parsed.items():
         if field == "Dispatcher Notes":

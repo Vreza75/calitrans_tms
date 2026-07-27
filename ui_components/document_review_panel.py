@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
+from services.operations_field_service import reconcile_parsed_sources
 
 DOCUMENT_ORDER_FIELDS = [
     "TYPE",
@@ -14,9 +15,12 @@ DOCUMENT_ORDER_FIELDS = [
     "Booking Number",
     "Reference Number",
     "Container Number",
+    "Container Numbers",
+    "Container Qty",
     "Size",
     "Port",
     "Terminal",
+    "Port PIN",
     "Warehouse",
     "Address",
     "Delivery Need Date",
@@ -27,6 +31,8 @@ DOCUMENT_ORDER_FIELDS = [
     "Reefer Temperature",
     "Commodity",
     "Contact Name",
+    "Contact Title",
+    "Contact Company",
     "Contact Email",
     "Contact Phone",
     "Dispatcher Notes",
@@ -75,43 +81,11 @@ def build_document_comparison_rows(
     - conflict field names
     - final merged values
     """
-    fields = fields or DOCUMENT_ORDER_FIELDS
-    rows: List[Dict[str, str]] = []
-    conflicts: List[str] = []
-    final_values: Dict[str, str] = {}
-
-    for field in fields:
-        email_value = _safe_str(email_parsed.get(field, ""))
-        document_value = _safe_str(document_parsed.get(field, ""))
-
-        if field == "Dispatcher Notes" and email_value and document_value:
-            final_value = email_value if document_value in email_value else f"{email_value}\n{document_value}"
-            status = "Combined"
-        elif email_value and document_value and email_value.lower() != document_value.lower():
-            final_value = document_value
-            status = "Review mismatch"
-            conflicts.append(field)
-        elif document_value:
-            final_value = document_value
-            status = "Document"
-        elif email_value:
-            final_value = email_value
-            status = "Email"
-        else:
-            final_value = ""
-            status = "Blank"
-
-        final_values[field] = final_value
-        rows.append(
-            {
-                "Field": field,
-                "Email Body": email_value,
-                "Document": document_value,
-                "Final Value": final_value,
-                "Status": status,
-            }
-        )
-
+    final_values, rows, conflicts = reconcile_parsed_sources(
+        email_parsed,
+        document_parsed,
+        fields=fields or DOCUMENT_ORDER_FIELDS,
+    )
     return rows, conflicts, final_values
 
 
@@ -158,11 +132,21 @@ def render_document_review_panel(
 
         meta = _extract_doc_agent_meta(document_parsed)
 
+        rows, conflicts, final_values = build_document_comparison_rows(
+            email_parsed=email_parsed,
+            document_parsed=document_parsed,
+        )
+        effective_needs_review = bool(
+            meta.get("needs_review", False)
+            or conflicts
+            or final_values.get("_needs_review", False)
+        )
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Parser", _safe_str(meta.get("parser_used", "rule/parser")) or "rule/parser")
         confidence = meta.get("confidence", "")
         m2.metric("Confidence", f"{int(float(confidence) * 100)}%" if isinstance(confidence, float) and confidence <= 1 else (_safe_str(confidence) or "-"))
-        m3.metric("Needs Review", "Yes" if meta.get("needs_review", False) else "No")
+        m3.metric("Needs Review", "Yes" if effective_needs_review else "No")
         m4.metric("Fields Found", sum(1 for field in DOCUMENT_ORDER_FIELDS if _safe_str(document_parsed.get(field, ""))))
 
         if meta.get("summary"):
@@ -177,12 +161,9 @@ def render_document_review_panel(
         if warnings:
             st.warning("Warnings: " + "; ".join([_safe_str(w) for w in warnings if _safe_str(w)]))
 
-        rows, conflicts, final_values = build_document_comparison_rows(
-            email_parsed=email_parsed,
-            document_parsed=document_parsed,
-        )
         result["conflicts"] = conflicts
         result["final_values"] = final_values
+        result["needs_review"] = effective_needs_review
 
         if conflicts:
             st.error("Review mismatches: " + ", ".join(conflicts))
@@ -190,7 +171,7 @@ def render_document_review_panel(
             st.success("No document/email field conflicts detected.")
 
         comparison_df = pd.DataFrame(rows)
-        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+        st.dataframe(comparison_df, width="stretch", hide_index=True)
 
         if allow_edit:
             st.markdown("#### Final Values")
@@ -206,6 +187,22 @@ def render_document_review_panel(
                             height=90,
                             key=f"doc_review_{intake_id}_{field}",
                         )
+                    elif field == "Container Numbers":
+                        container_values = final_values.get(field, [])
+                        if isinstance(container_values, list):
+                            container_text = ", ".join(str(value) for value in container_values)
+                        else:
+                            container_text = _safe_str(container_values)
+                        edited_container_text = st.text_input(
+                            field,
+                            value=container_text,
+                            key=f"doc_review_{intake_id}_{field}",
+                        )
+                        edited_values[field] = [
+                            value.strip().upper()
+                            for value in edited_container_text.split(",")
+                            if value.strip()
+                        ]
                     else:
                         edited_values[field] = st.text_input(
                             field,
@@ -217,13 +214,13 @@ def render_document_review_panel(
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("Approve Document Fields", key=f"approve_document_fields_{intake_id}", use_container_width=True):
+            if st.button("Approve Document Fields", key=f"approve_document_fields_{intake_id}", width="stretch"):
                 result["action"] = "save"
         with c2:
-            if st.button("Mark Needs Review", key=f"document_needs_review_{intake_id}", use_container_width=True):
+            if st.button("Mark Needs Review", key=f"document_needs_review_{intake_id}", width="stretch"):
                 result["action"] = "needs_review"
         with c3:
-            if st.button("Reject Document Parse", key=f"reject_document_parse_{intake_id}", use_container_width=True):
+            if st.button("Reject Document Parse", key=f"reject_document_parse_{intake_id}", width="stretch"):
                 result["action"] = "reject"
 
         with st.expander("Raw Document Parser Data", expanded=False):

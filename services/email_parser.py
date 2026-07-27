@@ -4,13 +4,19 @@ import re
 from email.utils import parseaddr
 from typing import Any
 
+from services.operations_field_service import (
+    SHARED_OPERATION_FIELDS,
+    derive_review_state,
+    extract_operational_fields,
+    validate_field_value,
+)
 from services.workflow_constants import normalize_service_flow
 
 FIELDS = [
     "TYPE", "Customer", "Booking Number", "Reference Number", "Container Number",
     "Container Qty", "Size", "Port", "Warehouse", "Address", "Delivery Need Date",
     "Document Cutoff", "LFD", "Contact Name", "Contact Email", "Contact Phone",
-    "Contact Company", "Dispatcher Notes",
+    "Contact Title", "Contact Company", "Terminal", "Port PIN", "Dispatcher Notes",
     "Empty Pickup", "Customer Pickup", "Customer Pickup Address", "Pickup Date",
     "Container Numbers",
 ]
@@ -232,6 +238,15 @@ def extract_latest_email_body(body: str | None, include_signature: bool = True) 
     if include_signature and signature:
         return f"{message}\n\n{signature}".strip() if message else signature
     return message.strip()
+
+
+def extract_quoted_email_history(body: str | None) -> str:
+    """Return quoted/forwarded history separately from the newest message."""
+    lines = _normalize_text(body or "").splitlines()
+    for index, line in enumerate(lines):
+        if _looks_like_outlook_separator(line) or _looks_like_reply_header(lines, index):
+            return "\n".join(lines[index:]).strip()
+    return ""
 
 
 def _title_from_token(value: str) -> str:
@@ -809,6 +824,7 @@ def _append_labeled_notes(parsed: dict[str, str], combined: str) -> None:
 def _append_contact_notes(parsed: dict[str, str]) -> None:
     for field, label in [
         ("Contact Name", "Contact"),
+        ("Contact Title", "Contact title"),
         ("Contact Email", "Contact email"),
         ("Contact Phone", "Contact phone"),
         ("Contact Company", "Contact company"),
@@ -918,6 +934,7 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
     subject = _normalize_text(subject or "")
     body = _normalize_text(body or "")
     latest_message, latest_signature = _split_latest_message_and_signature(body)
+    quoted_history = extract_quoted_email_history(body)
     latest_body = f"{latest_message}\n\n{latest_signature}".strip() if latest_signature else latest_message
     field_body = latest_message or latest_body or body
     contact_body = latest_body or body
@@ -1109,6 +1126,44 @@ def parse_email_text(subject: str | None = None, body: str | None = None, sender
     _append_labeled_notes(parsed, combined)
     _append_schedule_notes(parsed, combined)
     _sanitize_parsed(parsed, sender_identity, signature)
+
+    shared_result = extract_operational_fields(
+        subject=subject,
+        newest_message=latest_message or field_body,
+        signature=signature,
+        quoted_history=quoted_history,
+        sender=sender or "",
+    )
+    shared_fields = shared_result["fields"]
+    for field in SHARED_OPERATION_FIELDS:
+        if field in shared_fields and shared_fields[field] not in ("", None, []):
+            parsed[field] = shared_fields[field]
+            continue
+        existing_value = parsed.get(field, "")
+        if existing_value not in ("", None, []):
+            valid, _ = validate_field_value(
+                field,
+                existing_value,
+                source="legacy_email_parser",
+                method="legacy_fallback",
+            )
+            if not valid:
+                parsed[field] = [] if field == "Container Numbers" else ""
+
+    parsed["_field_candidates"] = shared_result["candidates"]
+    parsed["_source_values"] = {
+        "subject": subject,
+        "newest_message": latest_message,
+        "signature": signature,
+        "quoted_history_present": bool(quoted_history),
+        "sender": sender or "",
+    }
+    parsed["_confidence"] = shared_result["confidence"]
+    parsed["_candidate_conflicts"] = shared_result.get("conflicts", [])
+    review = derive_review_state(parsed, conflicts=parsed["_candidate_conflicts"])
+    parsed["_confidence"] = review["confidence"]
+    parsed["_needs_review"] = review["needs_review"]
+    parsed["_review_reasons"] = review
     _append_contact_notes(parsed)
 
     return parsed
