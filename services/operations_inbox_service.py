@@ -22,6 +22,7 @@ from services.email_parser import (
     parse_email_text,
 )
 from services.order_intake import create_load_from_intake
+from services.operations_field_service import derive_review_state, extract_operational_fields
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
     has_actual_billing_request,
@@ -2326,40 +2327,10 @@ def normalize_reference_token(value: str) -> str:
 
 
 def extract_reference_tokens(text: str) -> dict:
-    text = str(text or "")
-
-    subject_pair_match = re.search(r"\b(\d{5,})\s*/\s*([A-Z]{4}\d{7})\b", text, re.I)
-
-    booking_match = (
-        re.search(r"\b(?:booking|bkg|bk)\s*(?:number|no\.?|#)?\s*[:#-]\s*([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
-        or re.search(r"\bbooking\s+(?:confirmation|ref(?:erence)?|number|no\.?)\b[^A-Z0-9]{0,20}([A-Z0-9][A-Z0-9-]{4,})\b", text, re.I)
-        or re.search(r"\b(?:IMP|EXP|IML|EXL)[-\s]?[A-Z0-9-]{4,}\b", text, re.I)
-        or re.search(r"\b(?:MAEU|ONEY|COSU|ZIMU|HLCU|MSCU|OOLU|CMDU|EGLV|YMLU|HMMU|SUDU)[A-Z0-9-]{4,}\b", text, re.I)
-    )
-
-    container_match = re.search(r"\b[A-Z]{4}\d{6,7}\b", text, re.I)
-
-    ref_match = re.search(
-        r"\b(?:ref|reference|po)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})\b",
-        text,
-        re.I,
-    )
-
-    booking_value = ""
-    if booking_match:
-        booking_value = booking_match.group(1) if booking_match.lastindex else booking_match.group(0)
-
-    ref_value = ""
-    if ref_match:
-        ref_value = ref_match.group(1) if ref_match.lastindex else ref_match.group(0)
-    elif subject_pair_match:
-        ref_value = subject_pair_match.group(1)
-
-    container_value = ""
-    if container_match:
-        container_value = container_match.group(0).upper()
-    elif subject_pair_match:
-        container_value = subject_pair_match.group(2).upper()
+    fields = extract_operational_fields(newest_message=str(text or ""))["fields"]
+    booking_value = safe_str(fields.get("Booking Number"))
+    container_value = safe_str(fields.get("Container Number")).upper()
+    ref_value = safe_str(fields.get("Reference Number"))
 
     return {
         "booking_number": normalize_reference_token(booking_value) if booking_value else "",
@@ -2773,6 +2744,11 @@ def build_operations_email_classification(
     if intent_scores:
         top_score = int(max(intent_scores.values()))
         confidence = max(confidence, min(95, top_score))
+    if parsed.get("_confidence") is not None:
+        try:
+            confidence = min(confidence, int(round(float(parsed["_confidence"]) * 100)))
+        except (TypeError, ValueError):
+            pass
 
     conversation_key = (
         tokens.get("booking_number")
@@ -4217,6 +4193,11 @@ def _prepare_operations_email_record(message: dict) -> dict:
     except Exception as exc:
         parsed = {}
         processing_errors.append(f"parse_email_text failed: {exc}")
+    parsed["_email_parsed"] = {
+        key: value
+        for key, value in parsed.items()
+        if key != "_email_parsed"
+    }
 
     try:
         saved_attachments = _save_operations_email_attachments(message, message_id)
@@ -4235,6 +4216,25 @@ def _prepare_operations_email_record(message: dict) -> dict:
             parsed = merge_saved_attachment_fields(parsed, saved_attachments, force=True)
         except Exception as exc:
             processing_errors.append(f"attachment field merge failed: {exc}")
+
+    reconciliation = parsed.get("_reconciliation") if isinstance(parsed.get("_reconciliation"), dict) else {}
+    if processing_errors:
+        parsed["_parser_failures"] = list(processing_errors)
+    review_state = derive_review_state(
+        parsed,
+        conflicts=list(
+            dict.fromkeys(
+                [
+                    *(reconciliation.get("conflicts") or []),
+                    *(parsed.get("_candidate_conflicts") or []),
+                ]
+            )
+        ),
+        parser_failures=processing_errors,
+    )
+    parsed["_needs_review"] = review_state["needs_review"]
+    parsed["_confidence"] = review_state["confidence"]
+    parsed["_review_reasons"] = review_state
 
     sync_metadata = {
         "source": "imap",
@@ -4285,6 +4285,17 @@ def _prepare_operations_email_record(message: dict) -> dict:
             already_matched_load=classification.get("matched_load_id") is not None,
         )
         triage = enforce_container_quantity_mismatch_review(parsed, triage)
+        if review_state["needs_review"]:
+            triage["llm_required"] = True
+            triage["llm_review_required"] = True
+            triage["llm_reason"] = "; ".join(
+                [
+                    *(f"Conflict: {field}" for field in review_state["conflicts"]),
+                    *(f"Missing: {field}" for field in review_state["missing_required_fields"]),
+                    *(f"Invalid: {field}" for field in review_state["invalid_selected_fields"]),
+                    *review_state["parser_failures"],
+                ]
+            ) or "Validated parsing requires dispatcher review."
     except Exception as exc:
         triage = {}
         processing_errors.append(f"triage failed: {exc}")
@@ -4779,7 +4790,7 @@ def render_operations_pdf_panel(
     pdf_attachments = extract_operations_pdf_attachments(parsed, record_dict)
 
     expanded = bool(attachments or pdf_attachments)
-    with st.expander("Operations Attachments / PDF Review", expanded=expanded):
+    with st.expander("Attachments / Document Review", expanded=expanded):
         st.caption("Review saved email attachments, parse PDFs/documents, approve fields, and attach or apply them to loads.")
 
         rescan_cols = st.columns([3, 1])
@@ -4875,7 +4886,7 @@ def render_operations_pdf_panel(
         selected_label = st.selectbox(
             "Saved attachment",
             labels,
-            key=f"ops_attachment_select_{intake_id}",
+            key=f"operations_attachment_selection_{intake_id}",
         )
         selected_index = labels.index(selected_label)
         selected_attachment = attachments[selected_index]
@@ -4947,7 +4958,7 @@ def render_operations_pdf_panel(
                 intake_id=intake_id,
                 parsed=parsed,
                 attachment=selected_attachment,
-                email_parsed=parsed,
+                email_parsed=coerce_json_dict(parsed.get("_email_parsed")) or parsed,
                 document_parsed=document_parsed,
                 expanded=True,
                 allow_edit=True,

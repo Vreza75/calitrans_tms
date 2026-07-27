@@ -1,5 +1,5 @@
 import json
-import os
+import logging
 import re
 from datetime import datetime
 
@@ -8,14 +8,21 @@ import streamlit as st
 import services.operations_inbox_service as ops
 
 from uuid import uuid4
-from ai_core.llm import get_llm
 from ai_agents.hybrid_email_body_parser import parse_email_body_hybrid
 from services.email_parser import extract_latest_email_body
+from services.operations_field_service import reconcile_parsed_sources, validate_field_value
 from services.operations_multi_container_service import create_container_work_orders
 from services.workflow_constants import normalize_service_flow
 from config import get_config_source
 from ui_components.dialog_presets import DIALOG_SIZE_PRESETS
 from ui_components.flow_filters import apply_service_flow_filter, extract_service_flow_value, render_service_flow_filter
+from ui_components.operations_inbox_state import (
+    WORK_ITEM_DIALOG_OPEN,
+    close_work_item,
+    initialize_work_item_state,
+    open_work_item,
+    should_show_contextual_load_match as _should_show_contextual_load_match,
+)
 
 # Temporary compatibility aliases while Operations Inbox is extracted from app.py.
 REQUEST_TYPES = ops.REQUEST_TYPES
@@ -23,8 +30,7 @@ REPLY_LANGUAGE_OPTIONS = ops.REPLY_LANGUAGE_OPTIONS
 REPLY_TONE_OPTIONS = ops.REPLY_TONE_OPTIONS
 OPERATIONS_CONTROL_LEVEL_DESCRIPTIONS = ops.OPERATIONS_CONTROL_LEVEL_DESCRIPTIONS
 OPERATIONS_CONTROL_LEVELS = ops.OPERATIONS_CONTROL_LEVELS
-BUSINESS_REQUEST_TYPES = ops.BUSINESS_REQUEST_TYPES
-SHOW_AI_DEBUG_TOOLS = os.getenv("OPERATIONS_SHOW_AI_DEBUG", "false").strip().lower() == "true"
+logger = logging.getLogger(__name__)
 
 
 _safe_str = ops._safe_str
@@ -85,6 +91,8 @@ def _ops_is_truthy(value) -> bool:
         return value
     text = ops._safe_str(value).strip().lower()
     return text in {"true", "1", "yes", "y", "required", "needed"}
+
+
 def _ops_text_blob(*values) -> str:
     return " ".join(
         ops._safe_str(value)
@@ -134,12 +142,7 @@ def _complete_operations_email_action(
         "subject": reply_subject,
     }
 
-    # Force table widget to reset selection on next rerun.
-    st.session_state["operations_table_reset_token"] = (
-        int(st.session_state.get("operations_table_reset_token", 0)) + 1
-    )
-    st.session_state.pop("selected_operations_request_id", None)
-    st.session_state.pop("selected_operations_tab", None)
+    close_work_item(st.session_state)
     # Clear selected action and reply widgets for this email.
     selected_id_text = str(selected_id)
 
@@ -422,25 +425,11 @@ def _ops_parse_structured_email_fields(subject: str, body: str) -> dict:
 
     if not ops._safe_str(fields.get("Booking Number", "")):
         booking = tokens.get("booking_number")
-        if not booking:
-            booking_match = re.search(
-                r"\b(?:booking|bkg)\s*(?:#|no\.?|number)?\s*:?\s*([A-Z0-9-]{5,})",
-                raw_text,
-                re.I,
-            )
-            booking = booking_match.group(1).strip() if booking_match else ""
         if booking:
             fields["Booking Number"] = booking
 
     if not ops._safe_str(fields.get("Container Number", "")):
         container = tokens.get("container_number")
-        if not container:
-            container_match = re.search(
-                r"\bcontainer\s*(?:#|no\.?|number)?\s*:?\s*([A-Z]{4}\d{4,7})\b",
-                raw_text,
-                re.I,
-            )
-            container = container_match.group(1).strip().upper() if container_match else ""
         if container:
             fields["Container Number"] = container
 
@@ -761,7 +750,7 @@ def _ops_pending_draft_fields_from_parsed(parsed: dict) -> dict:
         return ""
 
     fields = {
-        "customer": pick("Customer", "customer", "Contact Company", "Contact Name"),
+        "customer": pick("Customer", "customer", "Contact Company"),
         "booking_number": pick("Booking Number", "booking_number", "Booking"),
         "container_number": pick("Container Number", "container_number", "Container"),
         "service_flow": pick("TYPE", "Type", "Service Flow", "service_flow"),
@@ -919,8 +908,8 @@ def _ops_merge_parsed_fields(base: dict, source: dict, *, force: bool = False) -
     merged = dict(base or {})
     source = source if isinstance(source, dict) else {}
 
-    weak_values = {"", "none", "nan", "null", "-", "service flow:"}
-
+    candidate_fields = []
+    normalized_source = {}
     for key, value in source.items():
         if str(key).startswith("_"):
             continue
@@ -929,12 +918,39 @@ def _ops_merge_parsed_fields(base: dict, source: dict, *, force: bool = False) -
         if not clean_value:
             continue
 
-        if key in {"Customer", "customer"} and _ops_is_customer_service_phrase(clean_value):
+        canonical_key = "Customer" if key == "customer" else key
+        if canonical_key == "Customer" and _ops_is_customer_service_phrase(clean_value):
             continue
 
-        existing_value = ops._safe_str(merged.get(key, "")).strip()
+        incoming_valid = validate_field_value(
+            canonical_key,
+            clean_value,
+            source="structured_email" if force else "hybrid_email",
+            method="structured_field" if force else "hybrid_field",
+        )[0]
+        if not incoming_valid:
+            continue
+        candidate_fields.append(canonical_key)
+        normalized_source[canonical_key] = clean_value
 
-        if force or existing_value.lower() in weak_values:
+    if force and candidate_fields:
+        merged, _, _ = reconcile_parsed_sources(
+            merged,
+            normalized_source,
+            fields=list(dict.fromkeys(candidate_fields)),
+        )
+        return merged
+
+    for key in candidate_fields:
+        clean_value = normalized_source[key]
+        existing_value = merged.get(key, "")
+        existing_valid = validate_field_value(
+            key,
+            existing_value,
+            source="persisted",
+            method="parsed_value",
+        )[0]
+        if not existing_value or not existing_valid:
             merged[key] = clean_value
 
     return merged
@@ -1327,7 +1343,7 @@ def _ops_action_buttons_for_record(
     )
 
     return decision["action_buttons"]
-def _render_dispatcher_decision_card(
+def _build_dispatcher_decision(
     *,
     selected_id: int,
     record,
@@ -1341,7 +1357,7 @@ def _render_dispatcher_decision_card(
     confidence: int,
     conversation_key: str,
 ) -> dict:
-    decision = _ops_final_dispatcher_decision(
+    return _ops_final_dispatcher_decision(
         record=record,
         parsed=parsed,
         tokens=tokens,
@@ -1352,148 +1368,6 @@ def _render_dispatcher_decision_card(
         confidence=int(confidence or 0),
     )
 
-    evidence = decision.get("evidence", {}) or {}
-
-    customer = (
-        _ops_blank(evidence.get("customer"), "")
-        or _ops_blank(record.get("customer_hint"), "")
-        or _ops_sender_name(sender)
-        or "-"
-    )
-
-    service_flow = (
-        _ops_blank(record.get("service_flow"), "")
-        or _ops_blank(record.get("Service Flow"), "")
-        or _ops_blank(record.get("TYPE"), "-")
-    )
-
-    queue = decision.get("queue") or "-"
-    work_level = _ops_blank(record.get("control_level"), "-")
-    booking = _ops_blank(evidence.get("booking"), "-")
-    container = _ops_blank(evidence.get("container"), "-")
-    status = _ops_blank(record.get("status_label"), "-")
-    priority = _ops_blank(record.get("priority_label"), "-")
-    primary_action = decision.get("recommended_action") or "Review / Reply"
-    llm_required = bool(decision.get("llm_required"))
-    confidence_label = ops._operations_confidence_label(confidence)
-
-    st.markdown("### Dispatcher Decision")
-
-    with st.container(border=True):
-        st.markdown(
-            f"""
-            <div style="font-size:1.15rem; font-weight:700; margin-bottom:0.15rem;">
-                {decision.get("work_type") or detected_type or queue or "Work Item"} — {customer}
-            </div>
-            <div style="color:#6b7280; font-size:0.92rem; margin-bottom:0.75rem;">
-                {_ops_compact_subject(subject)}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Recommended Action", primary_action)
-        m2.metric("Queue", queue)
-        m3.metric("Service Flow", service_flow)
-        m4.metric("AI Review", "Required" if llm_required else "Not Required")
-
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Booking", booking)
-        d2.metric("Container", container)
-        d3.metric("Matched Load", matched_load_id or "-")
-        d4.metric("Priority", priority)
-        d5.metric("Status", status)
-
-        st.caption(
-            f"Work level: {work_level} | Confidence: {confidence_label} ({confidence}%) | Conversation: {conversation_key or '-'}"
-        )
-
-        evidence_bits = []
-        if evidence.get("customer"):
-            evidence_bits.append(f"Customer: {evidence.get('customer')}")
-        if evidence.get("booking"):
-            evidence_bits.append(f"Booking: {evidence.get('booking')}")
-        if evidence.get("container"):
-            evidence_bits.append(f"Container: {evidence.get('container')}")
-        if evidence.get("reference"):
-            evidence_bits.append(f"Reference: {evidence.get('reference')}")
-        if evidence.get("pickup"):
-            evidence_bits.append(f"Pickup: {evidence.get('pickup')}")
-        if evidence.get("delivery"):
-            evidence_bits.append(f"Delivery: {evidence.get('delivery')}")
-
-        if evidence_bits:
-            st.caption("Order evidence found: " + " | ".join(evidence_bits))
-        else:
-            st.caption("Order evidence found: none yet.")
-
-        if decision.get("reason"):
-            st.info(decision["reason"])
-
-        if llm_required:
-            st.warning(
-                decision.get("llm_reason")
-                or "Deep AI Review is recommended before taking action."
-            )
-        else:
-            st.success(
-                "AI review is not required for this item unless the dispatcher wants a second opinion."
-            )
-
-        action_labels = decision.get("action_buttons") or ["Close / No Action"]
-
-        # Email replies are handled in the Primary Email Action Center.
-        # Do not show Reply/Draft Reply as top dispatcher decision buttons.
-        action_labels = [
-            label for label in action_labels
-            if label not in {"Reply", "Draft Reply"}
-        ]
-
-        if not action_labels:
-            action_labels = ["Close / No Action"]
-        action_cols = st.columns(len(action_labels))
-
-        selected_action_key = f"operations_selected_primary_action_{selected_id}"
-
-        # Clear stale selected action if the decision changed and the old
-        # action is no longer available for this work item.
-        current_selected_action = st.session_state.get(selected_action_key, "")
-        if current_selected_action and current_selected_action not in action_labels:
-            st.session_state.pop(selected_action_key, None)
-
-        for action_col, action_label in zip(action_cols, action_labels):
-            safe_action = re.sub(r"[^a-z0-9]+", "_", action_label.lower()).strip("_")
-
-            if action_col.button(
-                action_label,
-                key=f"ops_decision_action_{selected_id}_{safe_action}",
-                use_container_width=True,
-            ):
-                st.session_state[selected_action_key] = action_label
-
-        selected_action = st.session_state.get(selected_action_key, "")
-
-        if selected_action:
-            action_hint_map = {
-                "Find Load Match": "Open the Load Match Suggestions section below and accept the correct load match.",
-                "Update Load": "Use the Update Load action below after confirming the matched load and extracted details.",
-                "Reply": "Use the Primary Email Action Center below to send or record the reply.",
-                "Attach Document": "Open Attachments / PDF Review below to review and attach documents.",
-                "Create Quote": "Use the quote action below after confirming quote details.",
-                "Draft Reply": "Use the Primary Email Action Center below to edit and send the draft.",
-                "Run Deep AI Review": "Open Advanced Triage / AI Details and run Deep AI Review.",
-                "Close / No Action": "Use Routing Actions below to close or archive this item.",
-                "Archive": "Use Routing Actions below to close or archive this item.",
-                "Open Case": "Open a case only for exceptions, escalations, or follow-up that requires case tracking.",
-            }
-
-            st.info(
-                f"Selected action: {selected_action}. "
-                f"{action_hint_map.get(selected_action, 'Review the available sections below for this action.')}"
-            )
-
-    return decision
 execute = ops.execute
 refresh_data = ops.refresh_data
 find_load_match_candidates = ops.find_load_match_candidates
@@ -1977,8 +1851,17 @@ def _bulk_archive_obvious_non_dispatch_emails(*, dry_run: bool = True, limit: in
                 correction_type="bulk_rule_archive",
                 feedback_notes=f"Bulk cleanup rule applied: {row.get('matched_pattern', '')} -> {action_required}",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception(
+                "operations parsed_data persistence failed",
+                extra={"intake_id": int(selected_id), "stage": "review_reparse_persistence"},
+            )
+            failures = list(parsed.get("_parser_failures") or [])
+            failures.append(f"review_reparse_persistence: {type(exc).__name__}")
+            parsed["_parser_failures"] = failures
+            parsed["_needs_review"] = True
+            parsed["_confidence"] = min(float(parsed.get("_confidence", 0) or 0), 0.40)
+            record["persistence_error"] = "Parsed values could not be saved; dispatcher review is required."
 
         updated += 1
 
@@ -2434,6 +2317,7 @@ def _render_new_order_review_panel(
     body: str,
     conversation_key: str,
     final_decision: dict,
+    matched_load_id=None,
 ) -> None:
     """
     Review extracted order fields and create a load/order only after dispatcher confirmation.
@@ -2455,15 +2339,27 @@ def _render_new_order_review_panel(
         left_col, right_col = st.columns([1.1, 1.2])
 
         with left_col:
-            st.markdown("#### Original Email")
+            st.markdown("#### Original Source Review")
             st.write(f"**From:** {sender}")
+            st.write(f"**Sender email:** {_extract_email_address(sender) or '-'}")
             st.write(f"**Subject:** {subject}")
             st.text_area(
-                "Customer Message",
+                "Original latest customer message",
                 value=body,
                 height=300,
                 disabled=True,
                 key=f"new_order_original_email_{selected_id}",
+            )
+            st.markdown("##### Attachments / Document Review")
+            _render_operations_pdf_panel(
+                selected_id=int(selected_id),
+                record=record,
+                parsed=parsed,
+                subject=subject,
+                sender=sender,
+                body=body,
+                matched_load_id=matched_load_id,
+                conversation_key=conversation_key,
             )
 
         with right_col:
@@ -2494,6 +2390,12 @@ def _render_new_order_review_panel(
                 key=f"new_order_booking_{selected_id}",
             )
 
+            reference = st.text_input(
+                "Reference Number",
+                value=ops._safe_str(parsed.get("Reference Number", "") or tokens.get("reference_number", "")),
+                key=f"new_order_reference_{selected_id}",
+            )
+
             container = st.text_input(
                 "Container Number",
                 value=ops._safe_str(order_evidence.get("container") or parsed.get("Container Number", "") or tokens.get("container_number", "")),
@@ -2512,23 +2414,61 @@ def _render_new_order_review_panel(
                 key=f"new_order_port_{selected_id}",
             )
 
+            terminal = st.text_input(
+                "Terminal",
+                value=ops._safe_str(parsed.get("Terminal", "")),
+                key=f"new_order_terminal_{selected_id}",
+            )
+
             warehouse = st.text_input(
                 "Destination / Warehouse",
                 value=ops._safe_str(parsed.get("Warehouse", "")),
                 key=f"new_order_warehouse_{selected_id}",
             )
 
-            address = st.text_area(
+            pickup_address = st.text_area(
+                "Pickup Address",
+                value=ops._safe_str(parsed.get("Pickup Address", "")),
+                height=80,
+                key=f"new_order_pickup_address_{selected_id}",
+            )
+
+            delivery_address = st.text_area(
                 "Delivery Address",
                 value=ops._safe_str(parsed.get("Address", "")),
                 height=80,
-                key=f"new_order_address_{selected_id}",
+                key=f"new_order_delivery_address_{selected_id}",
             )
 
             delivery_need_date = st.text_input(
                 "Delivery Need Date",
                 value=ops._safe_str(parsed.get("Delivery Need Date", "")),
                 key=f"new_order_delivery_need_date_{selected_id}",
+            )
+
+            document_cutoff = st.text_input(
+                "Document Cutoff",
+                value=ops._safe_str(parsed.get("Document Cutoff", "")),
+                key=f"new_order_document_cutoff_{selected_id}",
+            )
+
+            lfd = st.text_input(
+                "LFD",
+                value=ops._safe_str(parsed.get("LFD", "")),
+                key=f"new_order_lfd_{selected_id}",
+            )
+
+            port_pin = st.text_input(
+                "Port PIN",
+                value=ops._safe_str(parsed.get("Port PIN", "")),
+                key=f"new_order_port_pin_{selected_id}",
+            )
+
+            dispatcher_notes = st.text_area(
+                "Notes",
+                value=ops._safe_str(parsed.get("Dispatcher Notes", "")),
+                height=100,
+                key=f"new_order_notes_{selected_id}",
             )
 
             missing_fields = []
@@ -2538,7 +2478,7 @@ def _render_new_order_review_panel(
                 missing_fields.append("Booking or Container")
             if not port.strip():
                 missing_fields.append("Origin / Port")
-            if not warehouse.strip() and not address.strip():
+            if not warehouse.strip() and not delivery_address.strip():
                 missing_fields.append("Destination / Address")
 
             if missing_fields:
@@ -2551,25 +2491,28 @@ def _render_new_order_review_panel(
             if st.button(
                 "Create Order From Reviewed Draft",
                 key=f"create_order_from_reviewed_draft_{selected_id}",
-                use_container_width=True,
+                width="stretch",
                 disabled=create_disabled,
             ):
-                creation_notes = f"Created from Operations Inbox request #{selected_id}"
+                creation_notes = dispatcher_notes.strip() or f"Created from Operations Inbox request #{selected_id}"
 
                 result = create_load_from_inbox_item(
                     int(selected_id),
                     {
                         "TYPE": service_flow,
                         "Booking Number": booking.strip(),
-                        "Reference Number": ops._safe_str(parsed.get("Reference Number", "")) or tokens.get("reference_number"),
+                        "Reference Number": reference.strip(),
                         "Customer": customer.strip(),
                         "Container Number": container.strip(),
                         "Port": port.strip(),
+                        "Terminal": terminal.strip(),
                         "Warehouse": warehouse.strip(),
-                        "Address": address.strip(),
-                        "Document Cutoff": ops._safe_str(parsed.get("Document Cutoff", "")),
+                        "Pickup Address": pickup_address.strip(),
+                        "Address": delivery_address.strip(),
+                        "Document Cutoff": document_cutoff.strip(),
                         "Delivery Need Date": delivery_need_date.strip(),
-                        "LFD": ops._safe_str(parsed.get("LFD", "")),
+                        "LFD": lfd.strip(),
+                        "Port PIN": port_pin.strip(),
                         "Size": size.strip(),
                         "Status": "New",
                         "Dispatcher Notes": creation_notes,
@@ -2587,6 +2530,7 @@ def _render_new_order_review_panel(
 
                 refresh_data()
                 st.success(f"Created order/load ID {load_id}.")
+                close_work_item(st.session_state)
                 st.rerun()
 
 
@@ -2706,7 +2650,7 @@ def _render_active_pending_order_draft_panel(
             st.warning(f"Could not load pending order draft: {exc}")
         return
 
-    with st.expander("Active Pending Order Draft", expanded=True):
+    with st.expander("Active Pending Order Draft", expanded=False):
         if draft_df is None or draft_df.empty:
             st.info("No pending order draft has been created yet for this conversation.")
             return
@@ -3079,6 +3023,7 @@ def count_critical_priority(inbox_df: pd.DataFrame | None) -> int:
 
 
 def render_operations_inbox() -> None:
+    initialize_work_item_state(st.session_state)
     st.markdown(
         """
         <div class="ops-header">
@@ -3140,11 +3085,13 @@ def render_operations_inbox() -> None:
                 st.session_state["operations_email_sync_running"] = False
 
             if sync_completed:
+                close_work_item(st.session_state)
                 ops.refresh_data()
                 st.rerun()
 
     with c2:
-        if st.button("Refresh Inbox", key="operations_refresh_inbox", use_container_width=True):
+        if st.button("Refresh Inbox", key="operations_refresh_inbox", width="stretch"):
+            close_work_item(st.session_state)
             ops.refresh_data()
             st.rerun()
 
@@ -3153,6 +3100,7 @@ def render_operations_inbox() -> None:
             with st.spinner("Running fast triage on the next small batch..."):
                 triage_result = ops.auto_classify_open_inbox_items(limit=25, time_budget_seconds=8)
                 st.session_state["operations_smart_group_update_result"] = triage_result
+                close_work_item(st.session_state)
                 st.rerun()
 
     with c4:
@@ -3162,101 +3110,6 @@ def render_operations_inbox() -> None:
     with c5:
         selected_flow = render_service_flow_filter("operations_inbox_service_flow")
 
-    if st.button("Test IMAP Connections", key="operations_test_imap_connections"):
-        with st.spinner("Testing IMAP login for each configured mailbox..."):
-            st.session_state["operations_imap_diagnostic_result"] = ops.diagnose_operations_email_accounts()
-
-    imap_diagnostic_result = st.session_state.get("operations_imap_diagnostic_result")
-    if imap_diagnostic_result:
-        with st.expander("IMAP Connection Test Result", expanded=True):
-            for account_diag in imap_diagnostic_result:
-                if account_diag.get("login_success"):
-                    st.success(
-                        f"{account_diag.get('email', '-')}: login OK, folder '{account_diag.get('selected_folder', '-')}', "
-                        f"{account_diag.get('messages_found', 0)} message(s) in mailbox"
-                    )
-                elif not account_diag.get("credentials_configured"):
-                    st.warning(f"{account_diag.get('email', '-')}: no app password configured")
-                else:
-                    st.error(
-                        f"{account_diag.get('email', '-')}: login failed "
-                        f"({account_diag.get('error_type', 'Error')}: {account_diag.get('error_message', '-')})"
-                    )
-
-    with st.expander("Latest Email Sync Result", expanded=False):
-        result = st.session_state.get("operations_email_import_result")
-        if result:
-            if result.get("error"):
-                st.error(f"Email sync did not complete: {result.get('error')}")
-                for error_message in result.get("error_messages", [])[:5]:
-                    st.caption(f"Import error: {error_message}")
-            fetched = int(result.get("fetched", 0))
-            imported = int(result.get("imported", 0))
-            skipped = int(result.get("skipped", 0))
-            errors = int(result.get("errors", 0))
-            pdf_updated = int(result.get("pdf_updated", 0))
-            triaged = int(result.get("triaged", 0) or 0)
-            llm_required_count = int(result.get("llm_required", 0) or 0)
-            store_only_count = int(result.get("store_only", 0) or 0)
-            diagnostics = result.get("diagnostics") or {}
-            if diagnostics:
-                accounts_attempted = int(diagnostics.get("accounts_attempted", 0) or 0)
-                accounts_configured = int(diagnostics.get("accounts_configured", 0) or 0)
-                st.caption(
-                    f"Email diagnostics: {accounts_attempted}/{accounts_configured} account(s) attempted; "
-                    f"scan window {diagnostics.get('inbox_scan_window', '-')}; "
-                    f"per mailbox limit {diagnostics.get('per_mailbox_limit', '-')}; "
-                    f"time budget {diagnostics.get('time_budget_seconds', '-')}s"
-                )
-                if diagnostics.get("timed_out"):
-                    st.warning("Email sync stopped early to keep the app responsive. Run it again or increase OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS for a deeper scan.")
-                if diagnostics.get("sync_sent") is False:
-                    st.caption("Quick sync is inbox-only by default. Set OPERATIONS_SYNC_SENT_ENABLED=true when you are ready to include Sent mail.")
-                if diagnostics.get("sync_attachments") is False:
-                    st.caption("Quick sync skips full attachment downloads by default. Set OPERATIONS_SYNC_ATTACHMENTS_ENABLED=true for a deeper document sync.")
-                for diag_error in diagnostics.get("errors", [])[:5]:
-                    st.caption(f"Mailbox diagnostic: {diag_error}")
-                for account_diag in diagnostics.get("per_account", []):
-                    status_note = "login OK" if account_diag.get("login_success") else "login failed"
-                    test_note = (
-                        f", {account_diag.get('test_sync_matches', 0)} [TMS-TEST] match(es)"
-                        if account_diag.get("test_sync_matches")
-                        else ""
-                    )
-                    st.caption(
-                        f"{account_diag.get('email', '-')}: {status_note}, "
-                        f"folder '{account_diag.get('selected_folder', '-')}', "
-                        f"{account_diag.get('messages_found', 0)} found / {account_diag.get('messages_fetched', 0)} fetched"
-                        f"{test_note}"
-                        + (
-                            f" — {account_diag.get('error_type')}: {account_diag.get('error_message')}"
-                            if account_diag.get("error_type")
-                            else ""
-                        )
-                    )
-            if fetched == 0 and not result.get("error"):
-                st.warning("Email sync completed, but no messages were returned from the recent mailbox scan.")
-            elif fetched > 0:
-                pdf_note = f", updated {pdf_updated} email attachment(s)" if pdf_updated else ""
-                inbound = int(result.get("inbound_fetched", 0))
-                outbound = int(result.get("outbound_fetched", 0))
-                threads = int(result.get("threads_synced", 0))
-                cases = int(result.get("cases_touched", 0))
-                accounts = int(result.get("accounts_synced", 0))
-                elapsed = result.get("elapsed_seconds")
-                account_note = f" across {accounts} account(s)" if accounts else ""
-                elapsed_note = f" in {elapsed}s" if elapsed is not None else ""
-                st.success(
-                    f"Email sync fetched {fetched} message(s) "
-                    f"({inbound} inbox, {outbound} sent){account_note}{elapsed_note}, "
-                    f"imported {imported}, skipped {skipped}, errors {errors}, "
-                    f"triaged {triaged}, LLM needed {llm_required_count}, store-only {store_only_count}, "
-                    f"threaded {threads} conversation(s), updated {cases} case(s){pdf_note}."
-                )
-                for error_message in result.get("error_messages", [])[:5]:
-                    st.caption(f"Import error: {error_message}")
-        else:
-            st.caption("Sync imports recent inbox messages with Message-ID, References, thread IDs, timestamps, and deduplication.")
     completed_action = st.session_state.pop("operations_last_completed_action", None)
 
     if completed_action:
@@ -3265,54 +3118,6 @@ def render_operations_inbox() -> None:
             f"Sent to: {completed_action.get('recipient', '-')}. "
             "The work item was removed from the active review workspace."
         )
-    if SHOW_AI_DEBUG_TOOLS:
-        with st.expander("LLM Wrapper  ", expanded=False):
-            if st.button("Test LLM Wrapper"):
-                llm = get_llm()
-
-                result = llm.generate_json(
-                    task="test_llm_wrapper",
-                    system_prompt="You are a test assistant. Return only valid JSON.",
-                    user_payload={
-                        "instruction": "Return JSON with status='ok' and message='LLM wrapper is working'."
-                    },
-                )
-
-                st.json(result)
-    with st.expander("Email Sync Settings", expanded=False):
-        st.number_input(
-            "Recent email sync limit",
-            min_value=12,
-            max_value=300,
-            value=int(st.session_state.get("operations_email_sync_limit", 75)),
-            step=10,
-            key="operations_email_sync_limit",
-            help="Increase this if recent customer replies are not being pulled into Operations Inbox.",
-        )
-    with st.expander("Email Sync KPIs", expanded=False):
-        s1, s2, s3, s4 = st.columns(4)
-
-        with s1:
-            ops._render_ops_metric_card("Synced Inbox", int(sync_metrics.get("inbound", 0)))
-        with s2:
-            ops._render_ops_metric_card("Synced Sent", int(sync_metrics.get("outbound", 0)))
-        with s3:
-            ops._render_ops_metric_card("Email Threads", int(sync_metrics.get("threads", 0)))
-        with s4:
-            ops._render_ops_metric_card("Last Sync", sync_metrics.get("last_sync") or "-")
-
-        case_metrics = ops._operations_case_metrics()
-        cm1, cm2, cm3, cm4 = st.columns(4)
-
-        with cm1:
-            ops._render_ops_metric_card("Open Cases", int(case_metrics.get("open", 0)))
-        with cm2:
-            ops._render_ops_metric_card("Waiting Dispatch", int(case_metrics.get("waiting_dispatch", 0)))
-        with cm3:
-            ops._render_ops_metric_card("Waiting Customer", int(case_metrics.get("waiting_customer", 0)))
-        with cm4:
-            ops._render_ops_metric_card("Closed Cases", int(case_metrics.get("closed", 0)))
-            
     try:
         where_clause = ops._inbox_review_where_clause()
         inbox_df = ops._load_operations_inbox_df(where_clause)
@@ -3478,7 +3283,7 @@ def render_operations_inbox() -> None:
 - Level 2 is important business communication: billing, insurance, legal, vendor, sales, HR, safety, and management work that should not distract dispatch.
 - Level 3 is no-action or archive work: spam, marketing, newsletters, duplicates, FYI messages, and other mail that should stay searchable but not become a load.
 - `Needs Review` is only for uncertainty. Once a dispatcher classifies a sender/topic, future messages should route faster.
-- Select any row to open the case, timeline, parsed details, documents, reply tools, and order/quote actions.
+- Press Open on a queue row to review the source email, attachments, order draft, and business actions.
             """.strip()
         )
     with st.expander("Control Filters", expanded=False):
@@ -3713,51 +3518,54 @@ def render_operations_inbox() -> None:
 
     st.caption(f"{len(tab_df)} work item(s)")
 
-    selected_id = st.session_state.get("selected_operations_request_id")
-
     if tab_df.empty:
         st.info(f"No {selected_queue.lower()} work items.")
     else:
-        display_df = tab_df[active_display_cols].rename(columns=display_column_labels)
-        safe_level = "queue"
+        queue_columns = [
+            ("email_received", "Received", 1.25),
+            ("customer_hint", "Customer", 1.2),
+            ("Service Flow", "Service Flow", 0.8),
+            ("dispatcher_queue", "Queue", 1.0),
+            ("source_subject", "Subject / Summary", 2.1),
+            ("booking_hint", "Booking", 1.0),
+            ("container_hint", "Container", 1.0),
+        ]
+        header = st.columns([width for _, _, width in queue_columns] + [0.65])
+        for column, (_, label, _) in zip(header, queue_columns):
+            column.caption(label)
+        header[-1].caption("Action")
 
-        safe_queue = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            ops._safe_str(selected_queue).lower(),
-        ).strip("_") or "all"
-                
-        table_reset_token = st.session_state.get("operations_table_reset_token", 0)
-        event = st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            selection_mode="single-row",
-            on_select="rerun",
-            key=f"operations_control_table_{safe_level}_{safe_queue}_{table_reset_token}",
-        )
-
-        selected_rows = event.selection.rows
-
-        if selected_rows:
-            row_id = int(tab_df.iloc[selected_rows[0]]["id"])
-            st.session_state["selected_operations_request_id"] = row_id
-            st.session_state["selected_operations_tab"] = selected_queue
-            selected_id = row_id
+        for _, queue_row in tab_df.iterrows():
+            work_item_id = int(queue_row["id"])
+            row_columns = st.columns([width for _, _, width in queue_columns] + [0.65])
+            for column, (field, _, _) in zip(row_columns, queue_columns):
+                value = ops._safe_str(queue_row.get(field, "")) or "-"
+                if field == "source_subject":
+                    value = _ops_compact_subject(value, max_len=72)
+                column.write(value)
+            if row_columns[-1].button(
+                "Open",
+                key=f"open_work_item_{work_item_id}",
+                width="stretch",
+            ):
+                open_work_item(
+                    st.session_state,
+                    work_item_id=work_item_id,
+                    queue_name=selected_queue,
+                )
 
     st.divider()
-    selected_id = st.session_state.get("selected_operations_request_id")
-    selected_tab_name = st.session_state.get("selected_operations_tab")
+    selected_id = st.session_state.get("selected_work_item_id")
+    selected_tab_name = st.session_state.get("selected_work_item_queue")
 
-    if selected_id is None:
-        st.info("Select a work item row to review the email, routing, reply options, and available actions.")
+    if selected_id is None or not st.session_state.get(WORK_ITEM_DIALOG_OPEN, False):
+        st.info("Press Open on a work item to review the email, order draft, and available actions.")
         return
 
     if int(selected_id) not in visible_review_ids:
-        st.info("Select a work item row in the current queue to review it.")
+        close_work_item(st.session_state)
+        st.info("The selected work item is no longer in this queue.")
         return
-
-    selected_tab_name = selected_queue
 
     # inbox_df is only in scope in this function. The selected-item dialog
     # renders in its own top-level function (so it can be opened via
@@ -3768,7 +3576,7 @@ def render_operations_inbox() -> None:
     critical_priority_count = count_critical_priority(inbox_df)
 
     def _close_operations_work_item_dialog() -> None:
-        st.session_state.pop("selected_operations_request_id", None)
+        close_work_item(st.session_state)
 
     dialog_subject = ""
     if "source_subject" in tab_df.columns and not tab_df.empty:
@@ -3863,6 +3671,7 @@ def _render_selected_operations_work_item(
     body = extract_latest_email_body(body) or body
     hybrid_fields = {}
     structured_fields = {}
+    hybrid_parse_error = ""
 
     try:
         hybrid_email_result = parse_email_body_hybrid(
@@ -3874,7 +3683,12 @@ def _render_selected_operations_work_item(
             conversation_context={},
         )
         hybrid_fields = hybrid_email_result.get("parsed_fields", {}) or {}
-    except Exception:
+    except Exception as exc:
+        hybrid_parse_error = f"review_hybrid_email_parser: {type(exc).__name__}"
+        logger.exception(
+            "operations hybrid email parser failed",
+            extra={"intake_id": int(selected_id), "stage": "review_hybrid_email_parser"},
+        )
         hybrid_fields = {}
 
     structured_fields = _ops_parse_structured_email_fields(subject, body)
@@ -3882,6 +3696,16 @@ def _render_selected_operations_work_item(
     fcl_booking_fields = _ops_parse_fcl_booking_confirmation_fields(subject, body)
 
     parsed_before = dict(parsed or {})
+    if hybrid_parse_error:
+        failures = list(parsed.get("_parser_failures") or [])
+        failures.append(hybrid_parse_error)
+        parsed["_parser_failures"] = list(dict.fromkeys(failures))
+        parsed["_needs_review"] = True
+        try:
+            current_parse_confidence = float(parsed.get("_confidence", 0) or 0)
+        except (TypeError, ValueError):
+            current_parse_confidence = 0.0
+        parsed["_confidence"] = min(current_parse_confidence, 0.40)
 
     # Hybrid parser fills blanks.
     # Explicit key/value fields and FCL booking fields override weak parser results.
@@ -4094,7 +3918,7 @@ def _render_selected_operations_work_item(
         except Exception:
             pass    
 
-    final_decision = _render_dispatcher_decision_card(
+    final_decision = _build_dispatcher_decision(
         selected_id=int(selected_id),
         record=record,
         parsed=parsed,
@@ -4173,6 +3997,7 @@ def _render_selected_operations_work_item(
         body=body,
         conversation_key=conversation_key,
         final_decision=final_decision,
+        matched_load_id=matched_load_id,
 )
     record["llm_review_required"] = bool(final_decision["llm_required"])
     record["llm_review_reason"] = final_decision.get("llm_reason", "")
@@ -4263,35 +4088,6 @@ def _render_selected_operations_work_item(
                     st.success("Operations Case opened for this order email.")
                     st.rerun()
     
-    with st.expander("Email Synchronization Metadata", expanded=False):
-        st.write(f"**Direction:** {ops._safe_str(record.get('email_direction', 'inbound')) or 'inbound'}")
-        st.write(f"**Mailbox:** {ops._safe_str(record.get('email_mailbox', '')) or '-'}")
-        st.write(f"**Message ID:** {ops._safe_str(record.get('source_message_id', '')) or '-'}")
-        st.write(f"**Thread ID:** {ops._safe_str(record.get('email_thread_id', '')) or '-'}")
-        st.write(f"**Conversation Key:** {selected_conversation_key or '-'}")
-        st.write(f"**In Reply To:** {ops._safe_str(record.get('email_in_reply_to', '')) or '-'}")
-        references = record.get("email_references")
-        if isinstance(references, str):
-            try:
-                references = json.loads(references)
-            except Exception:
-                references = []
-        st.write("**References:** " + (", ".join(references or []) if references else "-"))
-    with st.expander("Thread Sync Debug", expanded=False):
-        st.write(f"**Business Conversation Key:** {business_conversation_key or '-'}")
-        st.write(f"**Selected Conversation Key:** {selected_conversation_key or '-'}")
-        st.write(f"**Classification Conversation Key:** {conversation_key or '-'}")
-        st.caption(
-            "If the business key is BK/booking/container based but the selected key is a long message-id, "
-            "the thread may not group correctly until the row is updated."
-        )
-
-        if st.button("Sync Recent Mail Then Refresh This Thread", key=f"sync_selected_thread_{selected_id}"):
-            st.session_state["operations_email_import_result"] = ops.sync_operations_email_engine(
-                limit=int(st.session_state.get("operations_email_sync_limit", 75))
-            )
-            ops.refresh_data()
-            st.rerun()
     selected_booking = (
         ops._safe_str(tokens.get("booking_number"))
         or ops._safe_str(parsed.get("Booking Number"))
@@ -4318,7 +4114,7 @@ def _render_selected_operations_work_item(
         limit=50,
     )
 
-    with st.expander("Communication History", expanded=True):
+    with st.expander("Communication History", expanded=False):
         if history_df is None or history_df.empty:
             st.info("No additional messages found for this booking/conversation yet.")
         else:
@@ -4948,335 +4744,10 @@ def _render_selected_operations_work_item(
                 key=f"operations_original_email_body_{selected_id}",
             )
 
-    with st.expander("Learning / Routing Notes", expanded=False):
-        st.caption(
-            "Use this only when the routing/classification is wrong or when you want future emails from this sender/topic to route better."
-        )
-
-        corrected_request_type = st.selectbox(
-            "Correct Request Type",
-            REQUEST_TYPES,
-            index=REQUEST_TYPES.index(default_request_type) if default_request_type in REQUEST_TYPES else 0,
-            key=f"operations_corrected_request_type_{selected_id}",
-        )
-
-        manual_feedback_notes = st.text_area(
-            "Dispatcher Learning Notes",
-            value="",
-            placeholder="Example: this sender's PRE-ALERT emails are updates for existing loads, not new bookings.",
-            height=80,
-            key=f"operations_manual_learning_notes_{selected_id}",
-        )
-
-        corrected_action_required = _action_required_for_request(
-            corrected_request_type,
-            parsed,
-            body,
-            subject=subject,
-            tokens=tokens,
-            matched_load_id=matched_load_id,
-        )
-
-        if st.button(
-            "Save Routing Feedback",
-            key=f"save_routing_feedback_{selected_id}",
-            use_container_width=True,
-        ):
-            update_intake_classification(
-                int(selected_id),
-                corrected_request_type,
-                conversation_key,
-                matched_load_id,
-                confidence,
-                corrected_action_required,
-            )
-
-            ai_feedback_notes = ops._safe_str(
-                st.session_state.get(f"operations_ai_feedback_notes_{selected_id}", "")
-            )
-            feedback_notes = ai_feedback_notes or ops._safe_str(manual_feedback_notes)
-
-            correction_type = (
-                "manual_classification_corrected"
-                if corrected_request_type != default_request_type
-                else "manual_classification_saved"
-            )
-
-            ops._save_operations_ai_feedback(
-                intake_id=int(selected_id),
-                load_id=matched_load_id,
-                source_subject=subject,
-                source_sender=sender,
-                ai_suggestion=ai_suggestion if ai_suggestion and ai_suggestion.get("success") else None,
-                final_request_type=corrected_request_type,
-                final_action_required=corrected_action_required,
-                correction_type=correction_type,
-                feedback_notes=feedback_notes,
-            )
-
-            st.success("Routing feedback saved. Future classification can use this correction.")
-            refresh_data()
-            st.rerun()
-    with st.expander("Bulk Cleanup / Learning Tools", expanded=False):
-        st.caption(
-            "Use this to clean obvious spam, newsletters, promos, holiday greetings, and out-of-office replies. "
-            "Preview first before applying."
-            )
-
-        cleanup_limit = st.number_input(
-            "Cleanup scan limit",
-            min_value=10,
-            max_value=500,
-            value=100,
-            step=10,
-            key="operations_bulk_cleanup_limit",
-        )
-
-        preview_col, apply_col = st.columns(2)
-
-        with preview_col:
-            if st.button("Preview Non-Dispatch Cleanup", use_container_width=True):
-                result = _bulk_archive_obvious_non_dispatch_emails(
-                    dry_run=True,
-                    limit=int(cleanup_limit),
-                )
-                st.session_state["operations_bulk_cleanup_preview"] = result
-
-        with apply_col:
-            if st.button("Apply Non-Dispatch Cleanup", use_container_width=True):
-                result = _bulk_archive_obvious_non_dispatch_emails(
-                    dry_run=False,
-                    limit=int(cleanup_limit),
-                )
-                st.success(f"Bulk cleanup archived {result.get('updated', 0)} item(s).")
-                st.session_state["operations_bulk_cleanup_preview"] = result
-                st.rerun()
-
-        preview_result = st.session_state.get("operations_bulk_cleanup_preview")
-        if preview_result:
-            st.write(
-                f"Matched: {preview_result.get('matched', 0)} | "
-                f"Updated: {preview_result.get('updated', 0)}"
-            )
-
-            preview_df = preview_result.get("preview")
-            if isinstance(preview_df, pd.DataFrame) and not preview_df.empty:
-                st.dataframe(preview_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No obvious non-dispatch emails matched the cleanup rules.")
-    with st.expander("Control Center Snapshot", expanded=False):
-        level_counts = pd.Series(level_counts_payload or {}, dtype="int64")
-        queue_counts = pd.Series(queue_counts_payload or {}, dtype="int64")
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        with m1:
-            ops._render_ops_metric_card("Operational Work", int(level_counts.get("Level 1 - Operational Cases", 0)), "Level 1")
-        with m2:
-            ops._render_ops_metric_card("Business Comms", int(level_counts.get("Level 2 - Business Communications", 0)), "Level 2")
-        with m3:
-            ops._render_ops_metric_card("Archive / No Action", int(level_counts.get("Level 3 - No Action / Archive", 0)), "Level 3")
-        with m4:
-            ops._render_ops_metric_card("Needs Review", int(level_counts.get("Needs Review", 0)), "Human decision")
-        with m5:
-            ops._render_ops_metric_card("Critical", int(critical_priority_count), "Escalations")
-
-        q1, q2, q3, q4 = st.columns(4)
-        q1.metric("New Orders", int(queue_counts.get("New Orders", 0)))
-        q2.metric("Quotes", int(queue_counts.get("Quotes", 0)))
-        q3.metric("Existing Updates", int(queue_counts.get("Existing Load Updates", 0)))
-        q4.metric("Appointments / PIN", int(queue_counts.get("Appointments / PIN", 0)))
-        q5, q6, q7, q8 = st.columns(4)
-        q5.metric("Documents", int(queue_counts.get("Documents", 0)))
-        q6.metric("Billing", int(queue_counts.get("Billing", 0)))
-        q7.metric("Needs Review", int(queue_counts.get("Needs Review", 0)))
-        q8.metric("Store / Archive", int(queue_counts.get("Store Only / Archive", 0)))
-        smart_group_result = st.session_state.pop("operations_smart_group_update_result", None)
-    if smart_group_result is not None:
-        if isinstance(smart_group_result, dict):
-            updated_count = int(smart_group_result.get('updated', smart_group_result.get('classified', 0)) or 0)
-            remaining_count = smart_group_result.get('remaining_estimate')
-            elapsed = smart_group_result.get('elapsed_seconds')
-            st.success(
-                f"Fast triage updated {updated_count} item(s) "
-                f"without opening new case records. LLM needed: {int(smart_group_result.get('llm_required', 0))}; "
-                f"store-only: {int(smart_group_result.get('store_only', 0))}; elapsed: {elapsed}s."
-            )
-            if smart_group_result.get('stopped_early'):
-                st.warning("Recheck stopped early to avoid a Streamlit timeout. Click Recheck Next Batch again to continue.")
-            if remaining_count is not None and int(remaining_count or 0) > 0:
-                st.info(f"Estimated items still needing fast triage: {int(remaining_count)}. Run the next batch when ready.")
-            if smart_group_result.get('error_messages'):
-                with st.expander("Fast triage errors", expanded=False):
-                    st.write(smart_group_result.get('error_messages'))
-        else:
-            st.success(f"Smart groups updated {int(smart_group_result)} item(s).")
-
-    st.caption("Routine inbox clicks stay fast. Recheck Next Batch runs fast non-LLM triage on up to 25 older messages, then stops so Streamlit does not time out.")
-
-    with st.expander("Extracted Fields", expanded=False):
-        dispatcher_fields = {
-            key: value
-            for key, value in parsed.items()
-            if not str(key).startswith("_")
-        } if isinstance(parsed, dict) else {}
-        st.json(dispatcher_fields or parsed)
-
-    fast_triage = parsed.get("_fast_triage") if isinstance(parsed, dict) else {}
-    if not isinstance(fast_triage, dict):
-        fast_triage = ops._fast_triage_for_record(record)
-    llm_required = bool(final_decision.get("llm_required"))
-    llm_reason = ops._safe_str(final_decision.get("llm_reason", ""))
-
-    with st.expander("Advanced Triage / AI Details", expanded=bool(final_decision.get("llm_required"))):
-        st.markdown("### Fast Intake Triage")
-        if fast_triage:
-            t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Fast Triage", ops._safe_str(fast_triage.get("status")) or ops._safe_str(record.get("triage_status", "")) or "Complete")
-            t2.metric("Queue", ops._safe_str(record.get("dispatcher_queue", "")) or ops._safe_str(fast_triage.get("work_queue")) or ops._safe_str(record.get("work_queue", "")) or "-")
-            t3.metric("LLM Review", "Required" if llm_required else "Not Required")
-            t4.metric("Storage", "Store Only" if fast_triage.get("store_only") else "Actionable")
-            triage_reason = (
-                ops._safe_str(fast_triage.get("triage_reason"))
-                or ops._safe_str(record.get("triage_reason", ""))
-            )
-            if triage_reason:
-                st.caption(f"Fast triage reason: {triage_reason}")
-            if llm_reason:
-                if llm_required:
-                    st.warning(f"LLM review recommended: {llm_reason}")
-                else:
-                    st.info(f"LLM review not required: {llm_reason}")
-            with st.expander("Fast triage details", expanded=False):
-                st.json(fast_triage)
-        else:
-            st.info("Fast triage has not been saved on this older email yet. Use Recheck Groups or run Sync Email Engine for new mail.")
-
-        st.markdown("### Deep AI Review")
-        intake_id = int(record.get("id", 0))
-        required_agent_keys = [
-            "_intent_agent",
-            "_operations_parser_agent",
-            "_load_intelligence_agent",
-            "_workflow_agent",
-            "_response_agent",
-        ]
-        optional_agent_keys = [
-            "_supervisor_agent",
-        ]
-        agent_keys_present = [key for key in required_agent_keys if key in parsed]
-        deep_ai_complete = len(agent_keys_present) == len(required_agent_keys)
-        deep_ai_partial = bool(agent_keys_present) and not deep_ai_complete
-
-        if deep_ai_complete:
-            st.success("Deep AI Review Complete")
-        elif deep_ai_partial:
-            st.warning(
-                f"Deep AI Review Partially Complete: {len(agent_keys_present)} of {len(required_agent_keys)} agents have run."
-            )
-        elif llm_required:
-            st.warning(
-                f"Deep AI Review Recommended: {llm_reason or 'This work item needs additional review before action.'}"
-            )
-        else:
-            st.info("Deep AI Review Not Required")
-
-        if st.button("Run Deep AI Review", key=f"run_agents_now_{intake_id}"):
-            subject = ops._safe_str(record.get("source_subject", ""))
-            body = ops._safe_str(record.get("raw_text", ""))
-            sender = ops._safe_str(record.get("source_sender", ""))
-            parsed = ops._coerce_json_dict(record.get("parsed_data"))
-
-            intent_result = intent_agent.analyze(
-                subject=subject,
-                body=body,
-                sender=sender,
-            )
-
-            parser_result = operations_parser_agent.analyze(
-                subject=subject,
-                body=body,
-                intent_result=intent_result,
-                existing_load=None,
-            )
-
-            tokens = ops._extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
-
-            load_candidates = find_load_match_candidates(
-                tokens,
-                parsed=parsed,
-                subject=subject,
-                body=body,
-                limit=5,
-            )
-
-            load_intelligence_result = load_intelligence_agent.analyze(
-                intent_result=intent_result,
-                parser_result=parser_result,
-                load_candidates=load_candidates,
-                conversation_context={
-                    "matched_load_id": record.get("matched_load_id"),
-                    "conversation_key": _row_conversation_join_key(record),
-                },
-            )
-
-            workflow_result = workflow_agent.analyze(
-                intent_result=intent_result,
-                parser_result=parser_result,
-                load_intelligence_result=load_intelligence_result,
-                existing_case=None,
-            )
-
-            response_result = response_agent.analyze(
-                subject=subject,
-                body=body,
-                sender=sender,
-                intent_result=intent_result,
-                parser_result=parser_result,
-                load_intelligence_result=load_intelligence_result,
-                workflow_result=workflow_result,
-                existing_load=None,
-                company_memory={},
-            )
-
-            parsed["_intent_agent"] = intent_result
-            parsed["_operations_parser_agent"] = parser_result
-            parsed["_load_intelligence_agent"] = load_intelligence_result
-            parsed["_workflow_agent"] = workflow_result
-            parsed["_response_agent"] = response_result
-            fast_triage_after_ai = parsed.get("_fast_triage") if isinstance(parsed.get("_fast_triage"), dict) else {}
-            fast_triage_after_ai["llm_review_status"] = "Complete"
-            fast_triage_after_ai["llm_required"] = False
-            fast_triage_after_ai["llm_review_required"] = False
-            fast_triage_after_ai["llm_reason"] = "Deep AI agent review completed."
-            parsed["_fast_triage"] = fast_triage_after_ai
-
-            _store_operations_parsed_data(
-                intake_id,
-                parsed,
-                action_required=workflow_result.get("next_action", ""),
-            )
-
-            st.success("Deep AI Review Complete")
-            st.cache_data.clear()
-            st.rerun()
-
-        with st.expander("Advanced AI Debug", expanded=False):
-            missing_agent_keys = []
-            for key in required_agent_keys:
-                if key in parsed:
-                    st.caption(key.replace("_", " ").title())
-                    st.json(parsed[key])
-                else:
-                    missing_agent_keys.append(key)
-
-            if missing_agent_keys:
-                st.write("Not run: " + ", ".join(missing_agent_keys))
-
-            for key in optional_agent_keys:
-                if key in parsed:
-                    st.caption(key.replace("_", " ").title())
-                    st.json(parsed[key])
-    if final_decision.get("allow_attach_document"):
+    if (
+        not final_decision.get("allow_create_order")
+        and final_decision.get("allow_attach_document")
+    ):
         _render_operations_pdf_panel(
             selected_id=int(selected_id),
             record=record,
@@ -5287,9 +4758,6 @@ def _render_selected_operations_work_item(
             matched_load_id=matched_load_id,
             conversation_key=conversation_key,
         )
-    else:
-        with st.expander("Attachments / PDF Review", expanded=False):
-            st.caption("No attachment or document action is required for this work item.")
 
     load_match_candidates = classification.get("load_match_candidates") or ops.find_load_match_candidates(
         tokens,
@@ -5298,206 +4766,101 @@ def _render_selected_operations_work_item(
         body=body,
         limit=5,
     )
-    with st.expander("Find / Match Existing Load", expanded=final_decision.get("recommended_action") == "Find / Match Existing Load"):
-        if matched_load_id is not None:
-            st.success(f"This request is linked to load {matched_load_id}.")
-        if not load_match_candidates:
-            st.info("No load match candidates found from booking, container, reference, customer/date, or vessel details.")
-        else:
-            st.dataframe(pd.DataFrame(load_match_candidates), use_container_width=True, hide_index=True)
-            candidate_options = [None] + load_match_candidates
+    if _should_show_contextual_load_match(
+        final_decision=final_decision,
+        matched_load_id=matched_load_id,
+        load_match_candidates=load_match_candidates,
+    ):
+        with st.expander("Find / Match Existing Load", expanded=final_decision.get("recommended_action") == "Find / Match Existing Load"):
+            if matched_load_id is not None:
+                st.success(f"This request is linked to load {matched_load_id}.")
+            if not load_match_candidates:
+                st.info("No load match candidates found from booking, container, reference, customer/date, or vessel details.")
+            else:
+                st.dataframe(pd.DataFrame(load_match_candidates), use_container_width=True, hide_index=True)
+                candidate_options = [None] + load_match_candidates
 
-            def _load_match_label(option) -> str:
-                if option is None:
-                    return "Select load candidate"
-                return (
-                    f"Load {option.get('Load ID')} | {option.get('Match Score')}% | "
-                    f"{option.get('Booking Number') or option.get('Container Number') or option.get('Reference Number') or '-'} | "
-                    f"{option.get('Customer') or '-'}"
+                def _load_match_label(option) -> str:
+                    if option is None:
+                        return "Select load candidate"
+                    return (
+                        f"Load {option.get('Load ID')} | {option.get('Match Score')}% | "
+                        f"{option.get('Booking Number') or option.get('Container Number') or option.get('Reference Number') or '-'} | "
+                        f"{option.get('Customer') or '-'}"
+                    )
+
+                selected_candidate = st.selectbox(
+                    "Candidate Load",
+                    candidate_options,
+                    format_func=_load_match_label,
+                    key=f"operations_load_match_candidate_{selected_id}",
                 )
-
-            selected_candidate = st.selectbox(
-                "Candidate Load",
-                candidate_options,
-                format_func=_load_match_label,
-                key=f"operations_load_match_candidate_{selected_id}",
-            )
-            c_accept, c_reject = st.columns(2)
-            with c_accept:
-                if st.button(
-                    "Accept Load Match",
-                    key=f"operations_accept_load_match_{selected_id}",
-                    use_container_width=True,
-                    disabled=selected_candidate is None,
-                ):
-                    accepted_load_id = int(selected_candidate["Load ID"])
-                    accepted_key = _conversation_key_from_candidate(selected_candidate, conversation_key)
-                    update_intake_classification(
-                        int(selected_id),
-                        request_type,
-                        accepted_key,
-                        accepted_load_id,
-                        int(selected_candidate.get("Match Score", confidence) or confidence),
-                        f"Dispatcher accepted load match {accepted_load_id}: {selected_candidate.get('Match Reason', '')}",
-                    )
-                    current_case_id = ops._int_or_none(record.get("case_id")) or ops._int_or_none(operations_case.get("id"))
-                    if current_case_id is not None:
-                        ops._update_operations_case(
-                            case_id=current_case_id,
-                            status="Attached to Load",
-                            owner=ops._safe_str(operations_case.get("owner", "Dispatch")) or "Dispatch",
-                            priority=ops._safe_str(operations_case.get("priority", "Normal")) or "Normal",
-                            linked_load_id=accepted_load_id,
-                            next_action=f"Load match accepted for load {accepted_load_id}.",
+                c_accept, c_reject = st.columns(2)
+                with c_accept:
+                    if st.button(
+                        "Accept Load Match",
+                        key=f"operations_accept_load_match_{selected_id}",
+                        use_container_width=True,
+                        disabled=selected_candidate is None,
+                    ):
+                        accepted_load_id = int(selected_candidate["Load ID"])
+                        accepted_key = _conversation_key_from_candidate(selected_candidate, conversation_key)
+                        update_intake_classification(
+                            int(selected_id),
+                            request_type,
+                            accepted_key,
+                            accepted_load_id,
+                            int(selected_candidate.get("Match Score", confidence) or confidence),
+                            f"Dispatcher accepted load match {accepted_load_id}: {selected_candidate.get('Match Reason', '')}",
                         )
-                    refresh_data()
-                    st.success(f"Accepted load match {accepted_load_id}.")
-                    st.rerun()
-            with c_reject:
-                if st.button(
-                    "Reject Suggested Match",
-                    key=f"operations_reject_load_match_{selected_id}",
-                    use_container_width=True,
-                    disabled=matched_load_id is None and selected_candidate is None,
-                ):
-                    execute(
-                        """
-                        update order_intake
-                        set matched_load_id = null,
-                            confidence_score = least(confidence_score, 60),
-                            action_required = 'Dispatcher rejected suggested load match; review manually.'
-                        where id = :intake_id
-                        """,
-                        {"intake_id": int(selected_id)},
-                    )
-                    current_case_id = ops._int_or_none(record.get("case_id")) or ops._int_or_none(operations_case.get("id"))
-                    if current_case_id is not None:
-                        ops._add_operations_case_note(current_case_id, "Dispatcher rejected suggested load match; manual review needed.")
-                    refresh_data()
-                    st.warning("Suggested load match rejected.")
-                    st.rerun()
+                        current_case_id = ops._int_or_none(record.get("case_id")) or ops._int_or_none(operations_case.get("id"))
+                        if current_case_id is not None:
+                            ops._update_operations_case(
+                                case_id=current_case_id,
+                                status="Attached to Load",
+                                owner=ops._safe_str(operations_case.get("owner", "Dispatch")) or "Dispatch",
+                                priority=ops._safe_str(operations_case.get("priority", "Normal")) or "Normal",
+                                linked_load_id=accepted_load_id,
+                                next_action=f"Load match accepted for load {accepted_load_id}.",
+                            )
+                        refresh_data()
+                        st.success(f"Accepted load match {accepted_load_id}.")
+                        st.rerun()
+                with c_reject:
+                    if st.button(
+                        "Reject Suggested Match",
+                        key=f"operations_reject_load_match_{selected_id}",
+                        use_container_width=True,
+                        disabled=matched_load_id is None and selected_candidate is None,
+                    ):
+                        execute(
+                            """
+                            update order_intake
+                            set matched_load_id = null,
+                                confidence_score = least(confidence_score, 60),
+                                action_required = 'Dispatcher rejected suggested load match; review manually.'
+                            where id = :intake_id
+                            """,
+                            {"intake_id": int(selected_id)},
+                        )
+                        current_case_id = ops._int_or_none(record.get("case_id")) or ops._int_or_none(operations_case.get("id"))
+                        if current_case_id is not None:
+                            ops._add_operations_case_note(current_case_id, "Dispatcher rejected suggested load match; manual review needed.")
+                        refresh_data()
+                        st.warning("Suggested load match rejected.")
+                        st.rerun()
 
     ai_suggestion_key = f"operations_ai_suggestion_{selected_id}"
     ai_version_key = f"operations_ai_suggestion_version_{selected_id}"
     ai_suggestion = st.session_state.get(ai_suggestion_key)
 
-    if not can_open_operations_case:
-        st.markdown("### Routing Actions")
-        action_record = record.copy()
-        action_record["request_type_clean"] = request_type
-        action_record["control_level"] = _operations_control_level_for_row(action_record)
-        action_record["department_lane"] = _operations_department_lane_for_row(action_record)
-        selected_control_level = _safe_str(action_record.get("control_level", ""))
-        selected_department_lane = _safe_str(action_record.get("department_lane", ""))
-        can_route_business = selected_control_level == "Level 2 - Business Communications" or request_type in BUSINESS_REQUEST_TYPES
-
-        route_cols = st.columns(3 if can_route_business else 2)
-        route_index = 0
-
-        if can_route_business:
-            with route_cols[route_index]:
-                route_index += 1
-                if st.button("Route Business Email", use_container_width=True):
-                    business_lane = selected_department_lane or "Management"
-                    business_request_type = "Billing" if business_lane == "Accounting" else "Business Communication"
-                    business_note = f"Business communication routed to {business_lane}."
-                    ops._execute(
-                        """
-                        update order_intake
-                        set review_status = 'Open',
-                            request_type = :request_type,
-                            action_required = :action_required,
-                            conversation_key = :conversation_key
-                        where id = :intake_id
-                        """,
-                        {
-                            "intake_id": int(selected_id),
-                            "request_type": business_request_type,
-                            "action_required": business_note,
-                            "conversation_key": conversation_key,
-                        },
-                    )
-                    refresh_data()
-                    st.success(business_note)
-                    st.rerun()
-        with route_cols[route_index]:
-            route_index += 1
-            close_label = "Archive / No Action" if selected_control_level == "Level 3 - No Action / Archive" else "Close / No Action"
-            if st.button(close_label, use_container_width=True):
-                ops._execute(
-                    """
-                    update order_intake
-                    set review_status = 'Closed',
-                        request_type = case
-                            when :control_level = 'Level 3 - No Action / Archive' then 'No Action / FYI'
-                            else request_type
-                        end,
-                        action_required = case
-                            when :control_level = 'Level 3 - No Action / Archive' then 'Archived as no-action / FYI email.'
-                            else coalesce(nullif(action_required, ''), 'Closed from email review.')
-                        end
-                    where id = :intake_id
-                    """,
-                    {"intake_id": int(selected_id), "control_level": selected_control_level},
-                )
-                refresh_data()
-                st.info("Request closed.")
-                st.rerun()
-        with route_cols[route_index]:
-            if st.button("Keep for Review", use_container_width=True):
-                ops._execute(
-                    """
-                    update order_intake
-                    set review_status = 'Open',
-                        action_required = coalesce(nullif(action_required, ''), 'Dispatcher review required.')
-                    where id = :intake_id
-                    """,
-                    {"intake_id": int(selected_id)},
-                )
-                refresh_data()
-                st.success("Request kept in review.")
-                st.rerun()
-        return
-        # -----------------------------------------------------------------
-    # PATCH 3: Proposed Order / Load Evidence Review
-    # -----------------------------------------------------------------
-    order_evidence = _ops_order_evidence(parsed, tokens, subject, body, record)
-
-    with st.expander("Proposed Order / Load Details", expanded=order_evidence.get("new_order_signal", False)):
-        st.caption(
-            "Review these fields before creating or updating an order. "
-            "Create Order should only be used when enough order evidence is present."
-        )
-
-        e1, e2, e3 = st.columns(3)
-        e1.metric("Customer", order_evidence.get("customer") or "-")
-        e2.metric("Booking", order_evidence.get("booking") or "-")
-        e3.metric("Container", order_evidence.get("container") or "-")
-
-        e4, e5, e6 = st.columns(3)
-        e4.metric("Reference", order_evidence.get("reference") or "-")
-        e5.metric("Pickup / Port", order_evidence.get("pickup") or "-")
-        e6.metric("Delivery / Warehouse", order_evidence.get("delivery") or "-")
-
-        checks = {
-            "Has customer": order_evidence.get("has_customer"),
-            "Has booking/container/reference": order_evidence.get("has_identifier"),
-            "Has pickup/delivery lane": order_evidence.get("has_lane"),
-            "Has new order signal": order_evidence.get("new_order_signal"),
-            "Looks like update/reply": order_evidence.get("update_signal"),
-            "Create-order ready": order_evidence.get("create_order_ready"),
-        }
-
-        st.write(checks)
-
-        if not order_evidence.get("create_order_ready"):
-            st.warning(
-                "Create Order should stay hidden for this item until the dispatcher confirms this is a true new order and enough details are available."
-            )
     st.markdown("### Work Item Actions")
     st.caption("Use cases for exceptions, escalations, or follow-up that needs tracking.")
 
-    current_case_id = ops._int_or_none(record.get("case_id")) or ops._int_or_none(ops._get_operations_case_id(ops._get_operations_case(selected_id)))
+    current_case_id = (
+        ops._int_or_none(record.get("case_id"))
+        or ops._int_or_none(operations_case.get("id"))
+    )
     message_text = f"{subject or ''} {body or ''}"
     order_identifier = (
         ops._safe_str(parsed.get("Booking Number", ""))
@@ -5510,7 +4873,7 @@ def _render_selected_operations_work_item(
     order_customer = ops._safe_str(parsed.get("Customer", "")) or ops._safe_str(sender).split("<")[0].strip()
     order_evidence = _ops_order_evidence(parsed, tokens, subject, body, record)
     parsed_has_new_order_details = ops._has_new_order_details(message_text, parsed, tokens)
-    can_create_order = bool(final_decision.get("allow_create_order") and parsed_has_new_order_details)
+    can_create_order = False  # The reviewed-draft panel owns new-order creation.
 
     can_create_quote = request_type == "Quote Request" and ops._has_quote_details(message_text, parsed, tokens)
     fill_order_blanks = True
@@ -5527,11 +4890,9 @@ def _render_selected_operations_work_item(
     action_record["department_lane"] = ops._operations_department_lane_for_row(action_record)
     selected_control_level = ops._safe_str(action_record.get("control_level", ""))
     selected_department_lane = ops._safe_str(action_record.get("department_lane", ""))
-    can_route_business = selected_control_level == "Level 2 - Business Communications" or request_type in BUSINESS_REQUEST_TYPES
+    can_route_business = False  # Internal reassignment is admin-only.
 
     can_update_load_action = bool(final_decision.get("allow_update_load") and matched_load_id is not None)
-    can_open_case_action = bool(final_decision.get("allow_open_case"))
-
     visible_action_count = sum(
         [
             bool(can_create_order),
@@ -5783,4 +5144,5 @@ def _render_selected_operations_work_item(
 
             ops._refresh_data()
             st.info("Request closed.")
+            close_work_item(st.session_state)
             st.rerun()
