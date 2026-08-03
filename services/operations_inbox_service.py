@@ -32,6 +32,14 @@ from services.operations_email_triage_service import (
     triage_operations_email,
 )
 
+# Process-level "schema already confirmed ready" cache, keyed by a short
+# name per ensure_*_schema() function (see ensure_operations_fast_triage_
+# schema/ensure_operations_email_sync_schema). One Streamlit worker
+# process serves many browser sessions; st.session_state alone made every
+# new session pay a column_exists() round trip even right after another
+# session in the same process had just confirmed the schema.
+_SCHEMA_READY_FLAGS: set[str] = set()
+
 
 
 
@@ -351,7 +359,16 @@ def sql_literal_list(values: list[str]) -> str:
 
 
 def refresh_data() -> None:
-    st.cache_data.clear()
+    """Targeted cache invalidation for the Operations Inbox's own cached
+    reads. Deliberately narrower than st.cache_data.clear(): that call
+    wipes every @st.cache_data function across the whole app (Admin,
+    Dispatch Board, Orders Management, Port Houston integration,
+    Documents, order intake) even though only these four read paths ever
+    go stale from an Operations Inbox action."""
+    load_operations_inbox_df.clear()
+    load_operations_inbox_record.clear()
+    load_operations_conversation_summary_df.clear()
+    load_operations_conversation_timeline.clear()
 
 
 def render_ops_caption(text: str) -> None:
@@ -1505,11 +1522,23 @@ def ensure_operations_fast_triage_schema() -> None:
 
     The app still stores the full triage payload inside parsed_data under
     _fast_triage, but these columns make filtering and dashboards fast.
+
+    Readiness is cached at process level (_SCHEMA_READY_FLAGS), not just
+    st.session_state: session state resets on every new browser
+    session/tab, which meant every dispatcher's first page load of the day
+    paid for a fresh column_exists() round trip even though the process
+    already confirmed the schema minutes earlier for someone else. A
+    Streamlit worker process serves many sessions, so a module-level flag
+    is the right scope for "has this process already confirmed the schema
+    is ready" - it still self-heals (re-runs the idempotent ALTER/CREATE
+    INDEX chain) on a fresh worker that has never checked.
     """
-    if st.session_state.get("_operations_fast_triage_schema_ready"):
+    if "fast_triage" in _SCHEMA_READY_FLAGS or st.session_state.get("_operations_fast_triage_schema_ready"):
+        _SCHEMA_READY_FLAGS.add("fast_triage")
         return
 
     if column_exists("order_intake", "llm_review_reason"):
+        _SCHEMA_READY_FLAGS.add("fast_triage")
         st.session_state["_operations_fast_triage_schema_ready"] = True
         return
 
@@ -1529,15 +1558,18 @@ def ensure_operations_fast_triage_schema() -> None:
     execute("create index if not exists idx_order_intake_work_queue on order_intake(work_queue)")
     execute("create index if not exists idx_order_intake_llm_review_required on order_intake(llm_review_required)")
 
+    _SCHEMA_READY_FLAGS.add("fast_triage")
     st.session_state["_operations_fast_triage_schema_ready"] = True
 
 def ensure_operations_email_sync_schema() -> None:
-    if st.session_state.get("_operations_email_sync_schema_ready"):
+    if "email_sync" in _SCHEMA_READY_FLAGS or st.session_state.get("_operations_email_sync_schema_ready"):
+        _SCHEMA_READY_FLAGS.add("email_sync")
         ensure_operations_fast_triage_schema()
         ensure_operations_case_schema()
         return
 
     if column_exists("order_intake", "case_id"):
+        _SCHEMA_READY_FLAGS.add("email_sync")
         st.session_state["_operations_email_sync_schema_ready"] = True
         ensure_operations_fast_triage_schema()
         ensure_operations_case_schema()
@@ -1564,6 +1596,7 @@ def ensure_operations_email_sync_schema() -> None:
 
     ensure_operations_case_schema()
 
+    _SCHEMA_READY_FLAGS.add("email_sync")
     st.session_state["_operations_email_sync_schema_ready"] = True
 
 
@@ -4999,7 +5032,7 @@ def render_operations_pdf_panel(
                         f"Found and saved {rescan_result['saved']} attachment(s): "
                         + ", ".join(rescan_result.get("attachment_names", []))
                     )
-                    st.cache_data.clear()
+                    refresh_data()
                     st.rerun()
                 elif rescan_result.get("matched"):
                     st.info("Matched the source email, but it had no new attachments to save.")
@@ -5042,7 +5075,7 @@ def render_operations_pdf_panel(
                         action_required=order_action_required_from_parsed(updated_parsed),
                     )
                     st.success(f"Imported {len(imported)} attachment(s).")
-                    st.cache_data.clear()
+                    refresh_data()
                     st.rerun()
 
                 if errors:
@@ -5133,7 +5166,7 @@ def render_operations_pdf_panel(
                             action_required=order_action_required_from_parsed(updated_parsed),
                         )
                         st.success("Attachment parsed and saved to this request.")
-                        st.cache_data.clear()
+                        refresh_data()
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Unable to parse attachment: {exc}")
@@ -5166,7 +5199,7 @@ def render_operations_pdf_panel(
                     action_required="Document fields approved by dispatcher.",
                 )
                 st.success("Approved document fields saved to this operations request.")
-                st.cache_data.clear()
+                refresh_data()
                 st.rerun()
 
             elif review_result.get("action") == "needs_review":
@@ -5182,7 +5215,7 @@ def render_operations_pdf_panel(
                     action_required="Document needs dispatcher review.",
                 )
                 st.success("Document marked as needs review.")
-                st.cache_data.clear()
+                refresh_data()
                 st.rerun()
 
             elif review_result.get("action") == "reject":
@@ -5197,7 +5230,7 @@ def render_operations_pdf_panel(
                     action_required="Document parse rejected by dispatcher.",
                 )
                 st.success("Document parse marked rejected.")
-                st.cache_data.clear()
+                refresh_data()
                 st.rerun()
 
         elif document_parsed:
@@ -5257,7 +5290,7 @@ def render_operations_pdf_panel(
                 )
                 if result.get("attached"):
                     st.success("Attachment linked to matched load.")
-                    st.cache_data.clear()
+                    refresh_data()
                     st.rerun()
                 else:
                     st.error(result.get("error") or "Attachment could not be linked to the load.")
@@ -5271,7 +5304,7 @@ def render_operations_pdf_panel(
                 )
                 if result.get("updated_fields"):
                     st.success("Updated load fields: " + ", ".join(result.get("updated_fields", [])))
-                    st.cache_data.clear()
+                    refresh_data()
                     st.rerun()
                 else:
                     st.info(result.get("error") or "No load fields needed updating.")
@@ -5285,7 +5318,7 @@ def render_operations_pdf_panel(
                             merged_for_load[key] = value
                     new_load_id = create_load_from_intake(intake_id, merged_for_load)
                     st.success(f"Created load #{new_load_id} from document fields.")
-                    st.cache_data.clear()
+                    refresh_data()
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Unable to create load from document fields: {exc}")
