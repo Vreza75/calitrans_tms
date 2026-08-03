@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from config import DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
 
@@ -165,6 +166,20 @@ def execute(sql: str, params: dict[str, Any] | None = None) -> None:
         conn.execute(text(sql), params or {})
 
 
+@contextmanager
+def transaction() -> Iterator[Connection]:
+    """One connection/transaction for a multi-statement business command.
+
+    Every statement run through the yielded connection commits together on
+    a clean exit and rolls back together on any exception - callers must
+    execute all writes for one command through this connection instead of
+    calling module-level execute()/read_df() (each of which opens and
+    commits its own separate transaction), or the command is not atomic.
+    """
+    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
+        yield conn
+
+
 def column_exists(table: str, column: str) -> bool:
     """Real DB-state check for schema-readiness guards. A single round trip
     that lets ensure_*_schema() functions skip their idempotent-but-slow
@@ -277,7 +292,14 @@ class DispatchDatabaseClient:
 
         return CreatedRow(int(new_id))
 
-    def update_row_fields(self, row_id: int, updates: dict[str, Any]) -> None:
+    def update_row_fields(self, row_id: int, updates: dict[str, Any], *, conn: Connection | None = None) -> None:
+        """Update editable columns on one loads row.
+
+        `conn` is optional and defaults to None, so every existing caller
+        keeps its current one-call-one-transaction behavior unchanged. Pass
+        an open connection (see db_client.transaction()) to run this update
+        as part of a larger multi-statement business command instead - the
+        write then commits or rolls back with the rest of that command."""
         allowed_db_columns = _editable_db_columns()
         db_updates: dict[str, Any] = {}
 
@@ -300,32 +322,57 @@ class DispatchDatabaseClient:
         if not db_updates:
             return
 
-        old_status = None
-        if "status" in db_updates:
-            old_df = read_df("select status from loads where id = :id", {"id": row_id})
-            if not old_df.empty:
-                old_status = old_df.iloc[0]["status"]
+        status_sql = text("select status from loads where id = :id")
+        update_sql = text(
+            f"""
+            update loads
+            set {", ".join(f"{column} = :{column}" for column in db_updates)},
+                updated_at = now()
+            where id = :id
+            """
+        )
+        audit_sql = text(
+            """
+            insert into status_events (load_id, old_status, new_status, notes, created_by)
+            values (:load_id, :old_status, :new_status, :notes, :created_by)
+            """
+        )
 
-        set_clause = ", ".join([f"{column} = :{column}" for column in db_updates])
         params = dict(db_updates)
         params["id"] = row_id
 
-        execute(
-            f"""
-            update loads
-            set {set_clause},
-                updated_at = now()
-            where id = :id
-            """,
-            params,
-        )
+        if conn is not None:
+            old_status = None
+            if "status" in db_updates:
+                old_row = conn.execute(status_sql, {"id": row_id}).first()
+                old_status = old_row[0] if old_row is not None else None
+
+            conn.execute(update_sql, params)
+
+            if "status" in db_updates and db_updates["status"] != old_status:
+                conn.execute(
+                    audit_sql,
+                    {
+                        "load_id": row_id,
+                        "old_status": old_status,
+                        "new_status": db_updates["status"],
+                        "notes": "Status updated from Streamlit",
+                        "created_by": "streamlit",
+                    },
+                )
+            return
+
+        old_status = None
+        if "status" in db_updates:
+            old_df = read_df(str(status_sql), {"id": row_id})
+            if not old_df.empty:
+                old_status = old_df.iloc[0]["status"]
+
+        execute(str(update_sql), params)
 
         if "status" in db_updates and db_updates["status"] != old_status:
             execute(
-                """
-                insert into status_events (load_id, old_status, new_status, notes, created_by)
-                values (:load_id, :old_status, :new_status, :notes, :created_by)
-                """,
+                str(audit_sql),
                 {
                     "load_id": row_id,
                     "old_status": old_status,
