@@ -22,20 +22,32 @@ app_smartsheet_legacy_backup.py
 
 ## Recommended architecture
 
-```text
-Streamlit app
-   ↓
-db_client.py
-   ↓
-Supabase PostgreSQL
+As of the Phase 1 backend-boundary work (see
+`docs/architecture/BACKEND_BOUNDARY_PHASE_1.md` for the full design), both
+the Streamlit UI and the FastAPI API call the same framework-neutral
+`application/` layer instead of duplicating business logic:
 
-Future custom integrations:
-External systems / customer apps / webhooks
-   ↓
-FastAPI API layer
-   ↓
-Supabase PostgreSQL
+```text
+Streamlit dispatcher/admin UI      FastAPI (api/main.py, /api/v1/*)
+   |                                    |
+   +------------------+  +--------------+
+                      |  |
+                      v  v
+              application/*  (framework-neutral: no streamlit import)
+                      |
+                      v
+              repositories/*  (SQL only)
+                      |
+                      v
+              db_client.py
+                      |
+                      v
+              Supabase PostgreSQL
 ```
+
+`api/main.py` also still exposes two legacy unversioned endpoints
+(`/health`, `/loads`) kept for backward compatibility - new work goes
+through `/api/v1/*` (`api/routers/`).
 
 ## Setup
 
@@ -94,6 +106,37 @@ Then visit:
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+The API has no authentication yet (see
+`docs/architecture/BACKEND_BOUNDARY_PHASE_1.md`, "Known limitations") - do
+not expose it outside a trusted network. Cross-origin requests are blocked
+by default; set `CORS_ALLOWED_ORIGINS` (comma-separated) to allow a specific
+frontend origin.
+
+### 7. Schema migrations
+
+Run migrations explicitly, not by loading a page:
+
+```bash
+python scripts/run_migrations.py
+```
+
+Normal Streamlit/FastAPI page/request handling does not run `CREATE TABLE`,
+`ALTER TABLE`, or `CREATE INDEX` - a lightweight readiness check
+(`db_client.column_exists`) verifies the schema once per process instead.
+
+### 8. Tests
+
+```bash
+python -m compileall .
+pytest -q
+```
+
+50 tests are skipped by default - they require `MIGRATION_TEST_DATABASE_URL`
+and/or `INBOX_CERTIFICATION_DATABASE_URL` pointing at a disposable,
+empty PostgreSQL database (never the app's real `DATABASE_URL`). See
+`tests/test_migration_runner.py` and
+`tests/integration/operations_inbox/harness.py`.
 
 ## Notes
 

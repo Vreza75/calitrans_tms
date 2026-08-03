@@ -54,3 +54,15 @@ subagent-driven-implementation cycle CASE-007 went through. See
   independently verified.
 
 Full detail on all of the above: `docs/handoffs/CURRENT_SESSION_HANDOFF.md`.
+
+## Backend Boundary Phase 1 (`docs/architecture/BACKEND_BOUNDARY_PHASE_1.md`)
+
+Branch: `architecture/backend-boundary-phase-1`. Adds a framework-neutral
+`application/` layer + expanded `/api/v1` FastAPI surface backed by the same
+services Streamlit uses, server-side Operations Queue pagination, targeted
+(not global) cache invalidation for Operations Inbox actions, transactional
+`dispatch_transition_service.apply_transition()`, and removes the plaintext
+Motive password field from Admin. Full detail, known limitations, and Phase 2
+recommendations in the architecture doc. Does not touch the Operations Inbox
+classification/parsing pipeline, does not add authentication, does not add
+Next.js, does not touch Motive integration.
