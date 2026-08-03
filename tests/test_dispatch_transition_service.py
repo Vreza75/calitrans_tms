@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import pandas as pd
 import pytest
 
@@ -10,19 +12,23 @@ class _FakeDb:
         self.update_calls = []
         self.closeout_calls = []
         self.audit_notes = []
+        self.conns_seen = []
 
     def read_load(self, load_id: int) -> pd.DataFrame:
         return pd.DataFrame([self.load])
 
-    def update_row_fields(self, load_id: int, updates: dict) -> None:
+    def update_row_fields(self, load_id: int, updates: dict, *, conn=None) -> None:
+        self.conns_seen.append(conn)
         self.update_calls.append(dict(updates))
         self.load.update(updates)
 
-    def set_closeout_stage(self, load_id: int, closeout_stage: str) -> None:
+    def set_closeout_stage(self, load_id: int, closeout_stage: str, *, conn=None) -> None:
+        self.conns_seen.append(conn)
         self.closeout_calls.append(closeout_stage)
         self.load["closeout_stage"] = closeout_stage
 
-    def insert_assignment_audit(self, load_id: int, current_status: str, notes: str) -> None:
+    def insert_assignment_audit(self, load_id: int, current_status: str, notes: str, *, conn=None) -> None:
+        self.conns_seen.append(conn)
         self.audit_notes.append(notes)
 
 
@@ -40,11 +46,17 @@ def import_load():
     }
 
 
+@contextmanager
+def _fake_transaction():
+    yield object()
+
+
 def _wire(fake, monkeypatch):
     monkeypatch.setattr(svc, "_load_row", fake.read_load)
     monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
     monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
     monkeypatch.setattr(svc, "_insert_assignment_audit", fake.insert_assignment_audit)
+    monkeypatch.setattr(svc, "transaction", _fake_transaction)
 
 
 def test_assign_and_start_writes_driver_truck_and_status_in_separate_calls(import_load, monkeypatch):
@@ -59,6 +71,38 @@ def test_assign_and_start_writes_driver_truck_and_status_in_separate_calls(impor
     assert {"Status": "En Route to Pickup"} in fake.update_calls
     assert len(fake.audit_notes) == 1
     assert "Alex" in fake.audit_notes[0]
+
+
+def test_assignment_status_and_audit_share_one_transaction(import_load, monkeypatch):
+    fake = _FakeDb(import_load)
+    _wire(fake, monkeypatch)
+
+    svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
+
+    assert len(fake.conns_seen) == 3
+    assert len(set(id(c) for c in fake.conns_seen)) == 1
+
+
+def test_forced_failure_mid_transaction_rolls_back_status_write(import_load, monkeypatch):
+    fake = _FakeDb(import_load)
+    monkeypatch.setattr(svc, "_load_row", fake.read_load)
+    monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
+    monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(svc, "_insert_assignment_audit", _boom)
+    monkeypatch.setattr(svc, "transaction", _fake_transaction)
+
+    with pytest.raises(RuntimeError):
+        svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
+
+    # The status write must never happen once the assignment audit inside
+    # the same transaction fails - proving apply_transition doesn't fall
+    # back to committing partial work if a later step in the command
+    # raises.
+    assert {"Status": "En Route to Pickup"} not in fake.update_calls
 
 
 def test_start_en_route_with_existing_driver_needs_no_assignment_write(monkeypatch):
