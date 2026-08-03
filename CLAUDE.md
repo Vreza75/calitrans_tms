@@ -74,6 +74,8 @@ app.py — application entry point and routing
 pages_app/ — page orchestration and Streamlit page logic
 ui_components/ — reusable Streamlit interface sections
 services/ — business workflows and domain logic
+application/ — framework-neutral query/command services shared by Streamlit and FastAPI (no streamlit import; see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md)
+api/ — FastAPI routers/schemas calling application/, versioned under /api/v1
 repositories/ — database queries and persistence
 database/ — database configuration, migrations, and compatibility wrappers
 models/ — typed domain models when introduced

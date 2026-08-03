@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pandas as pd
+from sqlalchemy import text
 
-from db_client import DispatchDatabaseClient, execute, read_df
+from db_client import DispatchDatabaseClient, read_df, transaction
 from services.dispatch_stages import COMPLETION_STATUS, validate_transition
 from services.workflow_constants import normalize_service_flow
 
@@ -22,27 +23,29 @@ def _load_row(load_id: int) -> pd.DataFrame:
     )
 
 
-def _update_load(load_id: int, updates: dict) -> None:
-    DispatchDatabaseClient().update_row_fields(load_id, updates)
+def _update_load(load_id: int, updates: dict, *, conn) -> None:
+    DispatchDatabaseClient().update_row_fields(load_id, updates, conn=conn)
 
 
-def _set_closeout_stage(load_id: int, closeout_stage: str) -> None:
-    execute(
-        "update loads set closeout_stage = :closeout_stage where id = :load_id",
+def _set_closeout_stage(load_id: int, closeout_stage: str, *, conn) -> None:
+    conn.execute(
+        text("update loads set closeout_stage = :closeout_stage where id = :load_id"),
         {"load_id": load_id, "closeout_stage": closeout_stage},
     )
 
 
-def _insert_assignment_audit(load_id: int, current_status: str, notes: str) -> None:
+def _insert_assignment_audit(load_id: int, current_status: str, notes: str, *, conn) -> None:
     """Driver/truck assignment gets its own status_events row, distinct
     from the status-change row — old_status == new_status == the load's
     status at the time of assignment, so this reads clearly as an
     assignment event rather than a fake status transition."""
-    execute(
-        """
-        insert into status_events (load_id, old_status, new_status, notes, created_by)
-        values (:load_id, :status, :status, :notes, 'dispatcher')
-        """,
+    conn.execute(
+        text(
+            """
+            insert into status_events (load_id, old_status, new_status, notes, created_by)
+            values (:load_id, :status, :status, :notes, 'dispatcher')
+            """
+        ),
         {"load_id": load_id, "status": current_status, "notes": notes},
     )
 
@@ -102,26 +105,35 @@ def apply_transition(
     if truck and truck.strip() and truck.strip() != existing_truck:
         assignment_updates["Truck Assigned"] = truck.strip()
 
-    if assignment_updates:
-        _update_load(load_id, assignment_updates)
-        parts = []
-        if "Driver Name" in assignment_updates:
-            parts.append(f"Driver assigned: {assignment_updates['Driver Name']}")
-        if "Truck Assigned" in assignment_updates:
-            parts.append(f"Truck assigned: {assignment_updates['Truck Assigned']}")
-        _insert_assignment_audit(load_id, current_status, "; ".join(parts))
-
     status_updates: dict = {"Status": new_status}
     final_note = note.strip()
     if override:
         final_note = f"{final_note} [override: {override_reason.strip()}]".strip()
     if final_note:
         status_updates["Dispatcher Notes"] = final_note
-    _update_load(load_id, status_updates)
 
     closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
-    if new_status == COMPLETION_STATUS and closeout_stage == "Not Started":
-        closeout_stage = "POD Needed"
-        _set_closeout_stage(load_id, closeout_stage)
+    should_set_closeout = new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
+
+    # Assignment write + its audit row, the status write, and the closeout
+    # write all share one connection/transaction - this is the only place
+    # loads.status changes, so a crash partway through must never leave an
+    # assignment written without its audit row, or a status change without
+    # the closeout stage it implies.
+    with transaction() as conn:
+        if assignment_updates:
+            _update_load(load_id, assignment_updates, conn=conn)
+            parts = []
+            if "Driver Name" in assignment_updates:
+                parts.append(f"Driver assigned: {assignment_updates['Driver Name']}")
+            if "Truck Assigned" in assignment_updates:
+                parts.append(f"Truck assigned: {assignment_updates['Truck Assigned']}")
+            _insert_assignment_audit(load_id, current_status, "; ".join(parts), conn=conn)
+
+        _update_load(load_id, status_updates, conn=conn)
+
+        if should_set_closeout:
+            closeout_stage = "POD Needed"
+            _set_closeout_stage(load_id, closeout_stage, conn=conn)
 
     return {"ok": True, "reason": "", "status": new_status, "closeout_stage": closeout_stage}

@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime
@@ -3341,6 +3342,7 @@ def render_operations_inbox() -> None:
             f"Sent to: {completed_action.get('recipient', '-')}. "
             "The work item was removed from the active review workspace."
         )
+    _queue_query_started = time.perf_counter()
     try:
         where_clause = ops._inbox_review_where_clause()
         inbox_df = ops._load_operations_inbox_df(where_clause)
@@ -3349,6 +3351,7 @@ def render_operations_inbox() -> None:
         st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
         st.info("If this is the first time using Operations Inbox email, run database/operations_email_workflow_migration.sql in Supabase.")
         return
+    queue_query_ms = round((time.perf_counter() - _queue_query_started) * 1000, 2)
 
     if inbox_df.empty:
         st.success("No open customer requests.")
@@ -3761,11 +3764,57 @@ def render_operations_inbox() -> None:
             direction=sort_direction,
         )
 
-    st.caption(f"{len(tab_df)} work item(s)")
-
     if tab_df.empty:
+        st.caption("0 work item(s)")
         st.info(f"No {selected_queue.lower()} work items.")
     else:
+        # Server-side pagination of the render, not just a caption: only
+        # the current page's rows get an Open button. Filtering/sorting
+        # above this point still runs over the full queue (that pipeline
+        # is Python/Pandas-based business logic this phase does not
+        # redesign - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md,
+        # "Known limitations"); only the render step is now bounded.
+        total_items = len(tab_df)
+        page_size_col, page_info_col, prev_col, next_col = st.columns([1, 2.4, 0.6, 0.6])
+        with page_size_col:
+            page_size = st.selectbox(
+                "Page size",
+                [10, 25, 50],
+                index=1,
+                key="operations_queue_page_size",
+            )
+        total_pages = max(math.ceil(total_items / page_size), 1)
+        page_state_key = f"operations_queue_page__{selected_queue}"
+        current_page = min(max(int(st.session_state.get(page_state_key, 1)), 1), total_pages)
+        with prev_col:
+            if st.button(
+                "< Prev",
+                key=f"operations_queue_prev_{selected_queue}",
+                disabled=current_page <= 1,
+                use_container_width=True,
+            ):
+                current_page -= 1
+        with next_col:
+            if st.button(
+                "Next >",
+                key=f"operations_queue_next_{selected_queue}",
+                disabled=current_page >= total_pages,
+                use_container_width=True,
+            ):
+                current_page += 1
+        st.session_state[page_state_key] = current_page
+
+        page_start_index = (current_page - 1) * page_size
+        page_df = tab_df.iloc[page_start_index : page_start_index + page_size]
+
+        with page_info_col:
+            page_first_item = page_start_index + 1
+            page_last_item = min(page_start_index + page_size, total_items)
+            st.caption(
+                f"Showing {page_first_item}-{page_last_item} of {total_items} work item(s) "
+                f"- page {current_page} of {total_pages}"
+            )
+
         st.markdown(
             """
             <style>
@@ -3804,7 +3853,7 @@ def render_operations_inbox() -> None:
                 column.caption(label)
             header[-1].caption("Action")
 
-        for _, queue_row in tab_df.iterrows():
+        for _, queue_row in page_df.iterrows():
             work_item_id = int(queue_row["id"])
             with st.container(
                 border=True,
@@ -3865,11 +3914,15 @@ def render_operations_inbox() -> None:
         dialog_title += f" - {dialog_subject[:60]}"
 
     if queue_rerender_started is not None:
+        full_queue_rerender_ms = round((time.perf_counter() - queue_rerender_started) * 1000, 2)
         st.session_state["_operations_open_prerender_stages"] = {
-            "full_queue_rerender": round(
-                (time.perf_counter() - queue_rerender_started) * 1000,
-                2,
-            )
+            "queue_query": queue_query_ms,
+            # Transform (classification/sort/pagination slice) and render
+            # (drawing the queue table) aren't split further yet - see
+            # docs/architecture/BACKEND_BOUNDARY_PHASE_1.md, "Known
+            # limitations". This is everything after the DB query returns.
+            "queue_transform_and_render": round(full_queue_rerender_ms - queue_query_ms, 2),
+            "full_queue_rerender": full_queue_rerender_ms,
         }
 
     @st.dialog(dialog_title, width="large", on_dismiss=_close_operations_work_item_dialog)

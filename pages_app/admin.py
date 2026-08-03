@@ -99,6 +99,13 @@ def _upsert_carrier(row: dict) -> None:
 
 
 def _upsert_driver(row: dict) -> None:
+    # motive_password is deliberately not written here (Phase 1 backend-
+    # boundary security cleanup): the column still exists on `drivers`
+    # (dropping it is a separate, approved migration) but the app no
+    # longer collects or persists a new plaintext value for it. Existing
+    # values are untouched by this statement and should be rotated
+    # manually. See docs/architecture/BACKEND_BOUNDARY_PHASE_1.md,
+    # "Known limitations".
     execute(
         """
         with updated as (
@@ -119,7 +126,6 @@ def _upsert_driver(row: dict) -> None:
                 truck_value = :truck_value,
                 hire_date = :hire_date,
                 motive_id = :motive_id,
-                motive_password = coalesce(:motive_password, motive_password),
                 status = coalesce(:status, 'Active'),
                 notes = :notes
             where lower(driver_name) = lower(:driver_name)
@@ -144,7 +150,6 @@ def _upsert_driver(row: dict) -> None:
             truck_value,
             hire_date,
             motive_id,
-            motive_password,
             status,
             notes
         )
@@ -166,7 +171,6 @@ def _upsert_driver(row: dict) -> None:
             :truck_value,
             :hire_date,
             :motive_id,
-            :motive_password,
             coalesce(:status, 'Active'),
             :notes
         where not exists (select 1 from updated)
@@ -319,8 +323,8 @@ def render_drivers_admin() -> None:
             d.motive_id,
             case
                 when coalesce(d.motive_password, '') = '' then 'No'
-                else 'Yes'
-            end as motive_password_saved,
+                else 'Yes - rotate manually'
+            end as legacy_motive_credential,
             d.notes,
             d.updated_at
         from drivers d
@@ -336,6 +340,12 @@ def render_drivers_admin() -> None:
         """
     )
     st.dataframe(drivers, use_container_width=True, hide_index=True)
+    if (drivers["legacy_motive_credential"] == "Yes - rotate manually").any():
+        st.caption(
+            "Some drivers still have a legacy Motive password stored from before this "
+            "field was retired. The app no longer reads, displays, or writes it - "
+            "rotate those credentials directly in Motive when convenient."
+        )
 
     carriers = read_df("select id, company_name from carriers order by company_name")
     carrier_options = {"No Carrier": None}
@@ -364,9 +374,10 @@ def render_drivers_admin() -> None:
             hire_date = col10.text_input("Hire Date")
             dashcam_number = col11.text_input("DashCam #")
             connector_type = col12.text_input("Connector Type")
-            col13, col14 = st.columns(2)
-            motive_id = col13.text_input("Motive ID")
-            motive_password = col14.text_input("Motive Password", type="password")
+            motive_id = st.text_input("Motive ID")
+            # Motive Password is deliberately not collected here (Phase 1
+            # security cleanup) - see docs/architecture/
+            # BACKEND_BOUNDARY_PHASE_1.md, "Known limitations".
             notes = st.text_area("Notes")
             submitted = st.form_submit_button("Save Driver")
 
@@ -393,7 +404,6 @@ def render_drivers_admin() -> None:
                         "truck_value": _optional_decimal(truck_value),
                         "hire_date": _optional_date(hire_date),
                         "motive_id": _blank_to_none(motive_id),
-                        "motive_password": _blank_to_none(motive_password),
                         "status": status,
                         "notes": _blank_to_none(notes),
                     }

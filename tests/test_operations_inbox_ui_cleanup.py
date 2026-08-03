@@ -60,7 +60,7 @@ def test_close_clears_temporary_attachment_state_for_only_that_work_item() -> No
 def test_queue_is_button_driven_not_dataframe_selection_driven() -> None:
     assert "open_work_item_{work_item_id}" in INBOX_SOURCE
     assert 'selection_mode="single-row"' not in INBOX_SOURCE[
-        INBOX_SOURCE.index('st.caption(f"{len(tab_df)} work item(s)")') :
+        INBOX_SOURCE.index("if tab_df.empty:") :
         INBOX_SOURCE.index("def _render_selected_operations_work_item")
     ]
 
