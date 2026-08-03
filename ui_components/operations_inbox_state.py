@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping
+import time
 from typing import Any
 
 
 SELECTED_WORK_ITEM_ID = "selected_work_item_id"
 SELECTED_WORK_ITEM_QUEUE = "selected_work_item_queue"
 WORK_ITEM_DIALOG_OPEN = "work_item_dialog_open"
+WORK_ITEM_OPEN_STARTED_AT = "work_item_open_started_at"
 
 
 def initialize_work_item_state(state: MutableMapping[str, Any]) -> None:
@@ -26,6 +28,7 @@ def open_work_item(
     state[SELECTED_WORK_ITEM_ID] = int(work_item_id)
     state[SELECTED_WORK_ITEM_QUEUE] = str(queue_name)
     state[WORK_ITEM_DIALOG_OPEN] = True
+    state[WORK_ITEM_OPEN_STARTED_AT] = time.perf_counter()
 
 
 def close_work_item(state: MutableMapping[str, Any]) -> None:
@@ -43,6 +46,7 @@ def close_work_item(state: MutableMapping[str, Any]) -> None:
     state[SELECTED_WORK_ITEM_ID] = None
     state[SELECTED_WORK_ITEM_QUEUE] = None
     state[WORK_ITEM_DIALOG_OPEN] = False
+    state.pop(WORK_ITEM_OPEN_STARTED_AT, None)
 
 
 def should_show_contextual_load_match(

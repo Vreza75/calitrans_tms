@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -35,6 +37,7 @@ from services.operations_email_triage_service import (
 
 extract_operations_attachments = attachment_service.extract_operations_attachments
 extract_operations_pdf_attachments = attachment_service.extract_operations_pdf_attachments
+group_operations_source_documents = attachment_service.group_operations_source_documents
 merge_operations_order_fields = attachment_service.merge_operations_order_fields
 merge_operations_body_parsed_fields = attachment_service.merge_operations_body_parsed_fields
 parse_saved_operations_attachment = attachment_service.parse_saved_operations_attachment
@@ -55,6 +58,7 @@ merge_saved_attachment_fields = attachment_service.merge_saved_attachment_fields
 
 _extract_operations_attachments = extract_operations_attachments
 _extract_operations_pdf_attachments = extract_operations_pdf_attachments
+_group_operations_source_documents = group_operations_source_documents
 _merge_operations_order_fields = merge_operations_order_fields
 _merge_operations_body_parsed_fields = merge_operations_body_parsed_fields
 _parse_saved_operations_attachment = parse_saved_operations_attachment
@@ -1416,6 +1420,7 @@ def load_operations_business_conversation_timeline(
                 source_sender,
                 source_subject,
                 raw_text,
+                parsed_data,
                 ''::text as message_preview,
                 conversation_key
             from order_intake
@@ -1458,6 +1463,7 @@ def load_operations_business_conversation_timeline(
             coalesce(source_sender, '') as source_sender,
             coalesce(source_subject, '') as source_subject,
             coalesce(raw_text, '') as raw_text,
+            parsed_data,
             left(coalesce(raw_text, ''), 180) as message_preview,
             coalesce(conversation_key, '') as conversation_key
         from order_intake
@@ -4144,20 +4150,36 @@ def operations_email_already_imported(
 
 def _save_operations_email_attachments(message: dict, message_id: str) -> list[dict]:
     saved_attachments = []
+    seen_hashes: set[str] = set()
     for index, attachment in enumerate(message.get("attachments") or [], start=1):
         content = attachment.get("content")
         if not content:
             continue
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        if content_sha256 in seen_hashes:
+            continue
+        seen_hashes.add(content_sha256)
         try:
-            saved_attachments.append(
-                save_operations_attachment(
-                    content=content,
-                    filename=safe_str(attachment.get("filename")) or f"attachment_{index}",
-                    message_id=message_id or "operations_email",
-                    attachment_index=index,
-                    content_type=safe_str(attachment.get("content_type")),
-                )
+            saved = save_operations_attachment(
+                content=content,
+                filename=safe_str(attachment.get("filename")) or f"attachment_{index}",
+                message_id=message_id or "operations_email",
+                attachment_index=index,
+                content_type=safe_str(attachment.get("content_type")),
             )
+            saved["original_filename"] = (
+                safe_str(attachment.get("filename")) or f"attachment_{index}"
+            )
+            saved["source_message_id"] = message_id
+            saved["source_mime_part_id"] = (
+                safe_str(attachment.get("content_id"))
+                or safe_str(attachment.get("part_id"))
+                or str(index)
+            )
+            saved["content_sha256"] = (
+                safe_str(saved.get("content_sha256")) or content_sha256
+            )
+            saved_attachments.append(saved)
         except Exception as exc:
             saved_attachments.append(
                 {
@@ -4323,6 +4345,22 @@ def _prepare_operations_email_record(message: dict) -> dict:
     thread_id = safe_str(message.get("thread_id")) or conversation_key or message_id
     normalized_subject = safe_str(message.get("normalized_subject")) or subject.lower()
     conversation_status = "Waiting Customer" if direction.lower() == "outbound" else "Customer Replied"
+    matched_load_id = int_or_none(classification.get("matched_load_id"))
+
+    for attachment in saved_attachments:
+        attachment["source_subject"] = subject
+        attachment["source_received_at"] = received_at
+        attachment["conversation_key"] = conversation_key
+        attachment["matched_load_id"] = matched_load_id
+        attachment["mailbox_account"] = safe_str(message.get("mailbox_account"))
+    if saved_attachments:
+        parsed[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
+        parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = [
+            item
+            for item in saved_attachments
+            if is_pdf_filename(item.get("filename", ""), item.get("content_type", ""))
+            or bool(item.get("is_pdf"))
+        ]
 
     return {
         "subject": subject,
@@ -4753,6 +4791,149 @@ def render_operations_case_panel(*args, **kwargs) -> None:
     st.info("Operations case panel has not been moved from app.py yet.")
 
 
+def render_operations_attachment_preview(
+    *,
+    selected_id: int,
+    record=None,
+    parsed: dict | None = None,
+    timing=None,
+) -> None:
+    """Render saved source documents without recovery or parsing controls."""
+    parsed = coerce_json_dict(parsed or {})
+    record_dict = record.to_dict() if hasattr(record, "to_dict") else dict(record or {})
+
+    try:
+        intake_id = int(selected_id)
+    except (TypeError, ValueError):
+        st.info("No source documents are available for this work item.")
+        return
+
+    metadata_stage = (
+        timing.stage("attachment_metadata_loading")
+        if timing is not None
+        else nullcontext()
+    )
+    with metadata_stage:
+        try:
+            conversation_timeline = load_operations_business_conversation_timeline(
+                conversation_key=safe_str(record_dict.get("conversation_key")),
+                booking_number=safe_str(parsed.get("Booking Number")),
+                container_number=safe_str(parsed.get("Container Number")),
+                reference_number=safe_str(parsed.get("Reference Number")),
+                limit=50,
+            )
+        except Exception:
+            conversation_timeline = pd.DataFrame()
+        document_groups = group_operations_source_documents(
+            record_dict,
+            parsed,
+            conversation_timeline,
+        )
+
+    st.markdown("##### Source Documents")
+    current_documents = document_groups["current"]
+    prior_documents = document_groups["prior"]
+    record_identity = " ".join(
+        [
+            safe_str(record_dict.get("request_type")),
+            safe_str(record_dict.get("request_type_clean")),
+            safe_str(record_dict.get("work_queue")),
+            safe_str(record_dict.get("dispatcher_queue")),
+        ]
+    ).lower()
+    is_update = "update" in record_identity or "existing load" in record_identity
+
+    if not current_documents and not prior_documents and not is_update:
+        st.info("No source documents are available for this work item.")
+        return
+
+    def render_document_group(title: str, documents: list[dict], group_key: str) -> None:
+        st.markdown(f"**{title}**")
+        if not documents:
+            if group_key == "current" and is_update:
+                st.info("No new attachment was received with this update.")
+            elif group_key == "prior":
+                st.caption("No earlier load or conversation documents are available.")
+            return
+
+        for index, attachment in enumerate(documents):
+            filename = (
+                safe_str(attachment.get("original_filename"))
+                or safe_str(attachment.get("filename"))
+                or f"Attachment {index + 1}"
+            )
+            received = safe_str(attachment.get("source_received_at"))
+            source_subject = safe_str(attachment.get("source_subject"))
+            source_details = " · ".join(
+                value for value in [received, source_subject] if value
+            )
+            if source_details:
+                st.caption(source_details)
+
+            document_expander = st.expander(
+                f"Open / Download Original — {filename}",
+                key=f"source_document_{intake_id}_{group_key}_{index}",
+                on_change="rerun",
+            )
+            if not document_expander.open:
+                continue
+
+            with document_expander:
+                file_path = safe_str(attachment.get("file_path"))
+                content_type = (
+                    safe_str(attachment.get("content_type"))
+                    or "application/octet-stream"
+                )
+                if not file_path:
+                    st.info("The original document file is not available in attachment storage.")
+                    continue
+                try:
+                    file_stage = (
+                        timing.stage("attachment_file_access")
+                        if timing is not None
+                        else nullcontext()
+                    )
+                    with file_stage:
+                        file_bytes = read_operations_attachment_bytes(file_path)
+                except Exception:
+                    st.warning("The original document could not be opened from attachment storage.")
+                    continue
+
+                st.download_button(
+                    "Download Original",
+                    data=file_bytes,
+                    file_name=filename,
+                    mime=content_type,
+                    key=f"download_original_attachment_{intake_id}_{group_key}_{index}",
+                    width="stretch",
+                )
+                is_pdf = (
+                    is_pdf_filename(filename, content_type)
+                    or bool(attachment.get("is_pdf"))
+                )
+                if is_pdf and render_pdf_preview is not None:
+                    pdf_stage = (
+                        timing.stage("pdf_preparation_and_render")
+                        if timing is not None
+                        else nullcontext()
+                    )
+                    with pdf_stage:
+                        render_pdf_preview(
+                            file_bytes,
+                            key=f"source_pdf_preview_{intake_id}_{group_key}_{index}",
+                        )
+                elif not is_pdf:
+                    st.caption("Use Download Original to open this source document.")
+
+    render_document_group("Attached to This Message", current_documents, "current")
+    if is_update or prior_documents:
+        render_document_group(
+            "Existing Load / Conversation Documents",
+            prior_documents,
+            "prior",
+        )
+
+
 def render_operations_pdf_panel(
     *,
     selected_id: int,
@@ -4765,7 +4946,7 @@ def render_operations_pdf_panel(
     conversation_key: str = "",
 ) -> None:
     """
-    Dispatcher-facing attachment/PDF review panel for Operations Inbox.
+    Admin attachment/PDF recovery and parsing panel for Operations Inbox.
 
     This replaces the old placeholder and keeps all document actions close to
     the Operations Inbox service:
@@ -4790,7 +4971,7 @@ def render_operations_pdf_panel(
     pdf_attachments = extract_operations_pdf_attachments(parsed, record_dict)
 
     expanded = bool(attachments or pdf_attachments)
-    with st.expander("Attachments / Document Review", expanded=expanded):
+    with st.expander("Attachment recovery, parsing, and reconciliation", expanded=expanded):
         st.caption("Review saved email attachments, parse PDFs/documents, approve fields, and attach or apply them to loads.")
 
         rescan_cols = st.columns([3, 1])
@@ -4825,13 +5006,13 @@ def render_operations_pdf_panel(
                 else:
                     st.warning(
                         "Could not find a matching source email with attachments. "
-                        "Quick sync does not download attachments by default, so a message "
-                        "imported before its attachment was fetched may need another look. "
+                        "The message may no longer be available in the configured mailbox, "
+                        "or it may not have contained a supported attachment. "
                         "You can also upload the file manually below."
                     )
 
         uploaded_files = st.file_uploader(
-            "Add attachment to this operations request",
+            "Manually Add Missing Attachment",
             type=["pdf", "docx", "txt", "csv"],
             accept_multiple_files=True,
             key=f"ops_attachment_upload_{intake_id}",
@@ -4923,7 +5104,11 @@ def render_operations_pdf_panel(
 
         action_cols = st.columns(4)
         with action_cols[0]:
-            if st.button("Parse / Reparse", key=f"parse_ops_attachment_{intake_id}_{selected_index}", use_container_width=True):
+            if st.button(
+                "Parse / Reparse / Repair",
+                key=f"parse_ops_attachment_{intake_id}_{selected_index}",
+                use_container_width=True,
+            ):
                 if not file_path:
                     st.error("This attachment has no saved file path.")
                 else:
@@ -5023,6 +5208,43 @@ def render_operations_pdf_panel(
         else:
             st.info("This attachment has not produced parsed document fields yet. Use Parse / Reparse above.")
 
+        with st.expander("Parser metadata and raw output", expanded=False):
+            parser_details = coerce_json_dict(
+                document_parsed.get("_hybrid_document_parser")
+                if isinstance(document_parsed, dict)
+                else {}
+            )
+            st.write(
+                f"**Parser:** "
+                f"{safe_str(parser_details.get('parser_name')) or safe_str(selected_attachment.get('parser_name')) or 'Stored document parser'}"
+            )
+            st.write(
+                f"**Parse status:** "
+                f"{'Error' if safe_str(selected_attachment.get('parse_error')) else 'Complete' if document_parsed else 'Not parsed'}"
+            )
+            st.write(
+                f"**Last parsed/imported:** "
+                f"{safe_str(selected_attachment.get('parsed_at')) or safe_str(selected_attachment.get('imported_at')) or '-'}"
+            )
+            st.write(
+                f"**Extraction confidence:** "
+                f"{safe_str(document_parsed.get('_confidence')) if isinstance(document_parsed, dict) else '-'}"
+            )
+            st.write(
+                f"**Storage identifier:** "
+                f"{Path(file_path).name if file_path else '-'}"
+            )
+            st.markdown("**Raw extracted fields**")
+            st.json(document_parsed or {})
+            st.markdown("**Conflict and reconciliation details**")
+            st.json(
+                {
+                    "reconciliation": parsed.get("_reconciliation") or {},
+                    "document_review": parsed.get("_document_review") or {},
+                    "processing_errors": parsed.get("_parser_failures") or [],
+                }
+            )
+
         document_fields = document_parsed or coerce_json_dict(selected_attachment.get("parsed_data", {}))
 
         load_cols = st.columns(3)
@@ -5073,6 +5295,7 @@ def render_operations_pdf_panel(
 _sync_operations_email_engine = sync_operations_email_engine
 _render_operations_case_summary_header = render_operations_case_summary_header
 _render_operations_case_panel = render_operations_case_panel
+_render_operations_attachment_preview = render_operations_attachment_preview
 _render_operations_pdf_panel = render_operations_pdf_panel
 _render_ops_caption = render_ops_caption
 _render_ops_metric_card = render_ops_metric_card

@@ -483,14 +483,14 @@ def _select_mailbox(mail, selected_mailbox, fallback_mailboxes=None):
     raise ValueError(f"Could not open email folder. Tried: {', '.join(attempted)}")
 
 
-def _search_message_ids(mail, search_query):
+def _search_message_ids(mail, search_query, *, fallback_to_all=True):
     query = search_query or "ALL"
     status, data = mail.search(None, query)
 
     if status == "OK" and data and data[0]:
         return data[0].split()
 
-    if query != "ALL":
+    if fallback_to_all and query != "ALL":
         status, data = mail.search(None, "ALL")
         if status == "OK" and data and data[0]:
             return data[0].split()
@@ -511,6 +511,7 @@ def _fetch_recent_emails(
     email_address=None,
     email_password=None,
     include_attachments=True,
+    fallback_search_to_all=True,
     max_fetch_bytes=None,
     deadline=None,
     diagnostics=None,
@@ -553,7 +554,11 @@ def _fetch_recent_emails(
 
         if _deadline_expired(deadline):
             return []
-        email_ids = _search_message_ids(mail, search_query)
+        email_ids = _search_message_ids(
+            mail,
+            search_query,
+            fallback_to_all=fallback_search_to_all,
+        )
         if diagnostics is not None:
             diagnostics["messages_found"] = len(email_ids)
         if not email_ids:
@@ -696,7 +701,7 @@ def _fetch_test_sync_messages(*, account_email, account_password, deadline):
         scan_window=50,
         email_address=account_email,
         email_password=account_password,
-        include_attachments=False,
+        include_attachments=True,
         deadline=deadline,
     )
 
@@ -747,7 +752,7 @@ def fetch_operations_email_sync(limit=12, time_budget_seconds=None):
     inbox_scan_window = _get_int_setting("OPERATIONS_EMAIL_SCAN_WINDOW", max(per_mailbox_limit * 3, 20))
     sent_scan_window = _get_int_setting("OPERATIONS_SENT_SCAN_WINDOW", max(sent_limit * 2, 8))
     sync_sent = _get_bool_setting("OPERATIONS_SYNC_SENT_ENABLED", False)
-    include_attachments = _get_bool_setting("OPERATIONS_SYNC_ATTACHMENTS_ENABLED", False)
+    include_attachments = _get_bool_setting("OPERATIONS_SYNC_ATTACHMENTS_ENABLED", True)
     max_fetch_bytes = 0 if include_attachments else _get_int_setting("OPERATIONS_EMAIL_FAST_FETCH_BYTES", 80000)
     if time_budget_seconds is None:
         time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
@@ -972,6 +977,7 @@ def fetch_operations_email_near_date(*, sender="", received_at=None, limit=15, w
                     email_address=account.get("email"),
                     email_password=account.get("password"),
                     include_attachments=True,
+                    fallback_search_to_all=False,
                 )
             )
         except Exception:
@@ -1012,6 +1018,7 @@ def fetch_operations_email_by_message_id(message_id, limit=5):
                     email_address=account_email,
                     email_password=account_password,
                     include_attachments=True,
+                    fallback_search_to_all=False,
                 )
             )
         except Exception:
@@ -1035,6 +1042,7 @@ def fetch_operations_email_by_message_id(message_id, limit=5):
                     email_address=account_email,
                     email_password=account_password,
                     include_attachments=False,
+                    fallback_search_to_all=False,
                 )
             )
         except Exception:

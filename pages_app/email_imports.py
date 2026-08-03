@@ -107,6 +107,30 @@ def _render_operations_diagnostics() -> None:
 
     record = record_df.iloc[0].to_dict()
     parsed = ops._coerce_json_dict(record.get("parsed_data"))
+    st.markdown("### Document Parsing & Attachment Diagnostics")
+    st.caption(
+        "Admin recovery tools for attachment discovery, manual upload, parsing, "
+        "comparison, and reconciliation."
+    )
+    ops.render_operations_pdf_panel(
+        selected_id=intake_id,
+        record=record,
+        parsed=parsed,
+        subject=str(record.get("source_subject") or ""),
+        sender=str(record.get("source_sender") or ""),
+        body=str(record.get("raw_text") or ""),
+        matched_load_id=record.get("matched_load_id"),
+        conversation_key=str(record.get("conversation_key") or ""),
+    )
+    with st.expander("Latest Work-Item Opening Timing", expanded=False):
+        timing = st.session_state.get("operations_open_timing_last")
+        if timing:
+            st.json(timing)
+        else:
+            st.caption(
+                "Open a dispatcher work item in this session to capture a timing breakdown."
+            )
+
     with st.expander("Thread Sync Debug", expanded=False):
         st.write(f"**Message ID:** {record.get('source_message_id') or '-'}")
         st.write(f"**Thread ID:** {record.get('email_thread_id') or '-'}")

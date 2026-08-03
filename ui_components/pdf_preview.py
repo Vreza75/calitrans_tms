@@ -7,6 +7,7 @@ import base64
 import streamlit as st
 
 
+@st.cache_data(show_spinner=False, ttl=900, max_entries=32)
 def build_pdf_preview_html(file_bytes: bytes, *, height: int = 650) -> str:
     """Base64 data-URI iframe embed. Streamlit's native st.pdf needs the
     streamlit-pdf component package, which in turn needs a pyproject.toml

@@ -186,7 +186,12 @@ def validate_field_value(
             re.I,
         ):
             return False, "labeled operational field cannot be used as a company/customer"
-        if _JOB_TITLE_RE.fullmatch(text) or (
+        if _JOB_TITLE_RE.fullmatch(text) or re.search(
+            r"\b(?:coordinator|director|dispatcher|manager|representative|"
+            r"specialist|supervisor)\s*$",
+            text,
+            re.I,
+        ) or (
             _JOB_TITLE_RE.search(text) and len(text.split()) <= 5 and not _COMPANY_SUFFIX_RE.search(text)
         ):
             return False, "job title cannot be used as a company/customer"
@@ -217,6 +222,10 @@ def validate_field_value(
                 "contact name",
                 "contact phone",
                 "contact email",
+                "thank you",
+                "thanks",
+                "regards",
+                "sincerely",
                 "phone",
                 "email",
             }
@@ -298,7 +307,15 @@ def _extract_signature_candidates(signature: str) -> list[FieldCandidate]:
         phone = _PHONE_RE.search(line)
         if phone:
             candidates.append(_candidate("Contact Phone", phone.group(1), "email_signature", "signature_phone", 0.96, signature, line_start, line_start + len(line)))
-        if _JOB_TITLE_RE.search(line) and not _COMPANY_SUFFIX_RE.search(line):
+        if _JOB_TITLE_RE.search(line) and (
+            not _COMPANY_SUFFIX_RE.search(line)
+            or re.search(
+                r"\b(?:coordinator|director|dispatcher|manager|representative|"
+                r"specialist|supervisor)\s*$",
+                line,
+                re.I,
+            )
+        ):
             candidates.append(_candidate("Contact Title", line, "email_signature", "signature_title", 0.94, signature, line_start, line_start + len(line)))
             continue
         if _COMPANY_SUFFIX_RE.search(line):
@@ -427,9 +444,19 @@ def generate_field_candidates(
 
         lowered = text.lower()
         flow = ""
-        if "local import" in lowered:
+        if re.search(r"\blocal[\s_-]+import\b", lowered):
             flow = "Local Import"
-        elif "local export" in lowered:
+        elif re.search(r"\blocal[\s_-]+export\b", lowered):
+            flow = "Local Export"
+        elif re.search(r"\blocal\s+inbound(?:\s+transfer)?\b", lowered):
+            flow = "Local Import"
+        elif re.search(r"\blocal\s+outbound(?:\s+transfer)?\b", lowered):
+            flow = "Local Export"
+        elif (
+            "local forwarder" in lowered
+            and re.search(r"\b(?:outbound|export)\b", lowered)
+            and re.search(r"\b(?:does not|doesn't|no)\s+(?:enter|require).{0,30}\b(?:port|terminal|pin)\b", lowered)
+        ):
             flow = "Local Export"
         elif "importación local" in lowered or "importacion local" in lowered:
             flow = "Local Import"
@@ -445,6 +472,8 @@ def generate_field_candidates(
             flow = "Import"
         if flow:
             start = lowered.find(flow.lower())
+            if start < 0 and flow.startswith("Local "):
+                start = lowered.find("local")
             candidates.append(_candidate("TYPE", flow, source, "service_flow_phrase", source_confidence - 0.04, text, start, start + len(flow)))
 
     candidates.extend(_extract_signature_candidates(signature))

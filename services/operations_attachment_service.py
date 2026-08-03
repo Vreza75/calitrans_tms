@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -324,17 +325,19 @@ def save_operations_attachment(
     attachment_index: int,
     content_type: str = "",
 ) -> dict:
+    content = content or b""
+    content_sha256 = hashlib.sha256(content).hexdigest()
     safe_message = safe_storage_name(message_id, "operations_email")[:90]
 
     fallback_extension = ".pdf" if safe_str(content_type).lower() == "application/pdf" else ""
     safe_filename = safe_storage_name(filename, f"attachment_{attachment_index}{fallback_extension}")
 
     stored_path = operations_attachment_storage_dir() / f"{safe_message}_{attachment_index}_{safe_filename}"
-    stored_path.write_bytes(content or b"")
+    stored_path.write_bytes(content)
 
     try:
         attachment_text, attachment_parsed = parse_operations_attachment_bytes(
-            content or b"",
+            content,
             safe_filename,
             content_type,
         )
@@ -355,7 +358,10 @@ def save_operations_attachment(
         "fields_found": field_count(attachment_parsed),
         "text_preview": attachment_text[:1800],
         "parse_error": parse_error,
-        "size_bytes": len(content or b""),
+        "size_bytes": len(content),
+        "content_sha256": content_sha256,
+        "source_message_id": safe_str(message_id),
+        "attachment_index": int(attachment_index),
         "imported_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -495,6 +501,75 @@ def extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | 
         for item in extract_operations_attachments(parsed, record)
         if is_pdf_filename(item.get("filename", ""), item.get("content_type", "")) or bool(item.get("is_pdf"))
     ]
+
+
+def group_operations_source_documents(
+    current_record,
+    current_parsed: dict,
+    timeline_rows: pd.DataFrame | list[dict] | None = None,
+) -> dict[str, list[dict]]:
+    """Separate exact-message attachments from earlier conversation documents."""
+    record_dict = (
+        current_record.to_dict()
+        if hasattr(current_record, "to_dict")
+        else dict(current_record or {})
+    )
+    current_id = safe_str(record_dict.get("id"))
+    current_message_id = safe_str(record_dict.get("source_message_id"))
+
+    def with_source_metadata(attachment: dict, source: dict) -> dict:
+        item = dict(attachment or {})
+        item["source_work_item_id"] = source.get("id")
+        item["source_message_id"] = (
+            safe_str(item.get("source_message_id"))
+            or safe_str(source.get("source_message_id"))
+        )
+        item["source_subject"] = safe_str(source.get("source_subject"))
+        item["source_received_at"] = safe_str(source.get("source_received_at"))
+        return item
+
+    current = [
+        with_source_metadata(item, record_dict)
+        for item in extract_operations_attachments(current_parsed, record_dict)
+    ]
+    current_identities = {
+        (
+            safe_str(item.get("source_message_id")),
+            safe_str(item.get("content_sha256"))
+            or safe_str(item.get("file_path")),
+        )
+        for item in current
+    }
+    prior: list[dict] = []
+    prior_identities: set[tuple[str, str]] = set()
+
+    if isinstance(timeline_rows, pd.DataFrame):
+        rows = timeline_rows.to_dict(orient="records")
+    else:
+        rows = list(timeline_rows or [])
+
+    for row in rows:
+        row_dict = dict(row or {})
+        row_id = safe_str(row_dict.get("id"))
+        row_message_id = safe_str(row_dict.get("source_message_id"))
+        if (current_id and row_id == current_id) or (
+            current_message_id and row_message_id == current_message_id
+        ):
+            continue
+        row_parsed = coerce_json_dict(row_dict.get("parsed_data"))
+        for attachment in extract_operations_attachments(row_parsed, row_dict):
+            item = with_source_metadata(attachment, row_dict)
+            identity = (
+                safe_str(item.get("source_message_id")),
+                safe_str(item.get("content_sha256"))
+                or safe_str(item.get("file_path")),
+            )
+            if identity in current_identities or identity in prior_identities:
+                continue
+            prior_identities.add(identity)
+            prior.append(item)
+
+    return {"current": current, "prior": prior}
 
 
 def merge_operations_order_fields(body_parsed: dict, document_parsed: dict) -> tuple[dict, list[dict], list[str]]:
@@ -652,6 +727,7 @@ def store_operations_parsed_data(intake_id: int, parsed_data: dict, action_requi
 # Compatibility aliases
 _extract_operations_attachments = extract_operations_attachments
 _extract_operations_pdf_attachments = extract_operations_pdf_attachments
+_group_operations_source_documents = group_operations_source_documents
 _merge_operations_order_fields = merge_operations_order_fields
 _merge_operations_body_parsed_fields = merge_operations_body_parsed_fields
 _merge_saved_attachment_fields = merge_saved_attachment_fields
@@ -742,17 +818,18 @@ def backfill_operations_email_attachments(
     parsed = coerce_json_dict(existing_record.get("parsed_data"))
     existing_attachments = extract_operations_attachments(parsed, existing_record)
 
-    existing_names = {
-        safe_str(item.get("filename", "")).lower()
-        for item in existing_attachments
-    }
-
     existing_paths = {
         safe_str(item.get("file_path", ""))
         for item in existing_attachments
     }
+    existing_hashes = {
+        safe_str(item.get("content_sha256", "")).lower()
+        for item in existing_attachments
+        if safe_str(item.get("content_sha256", ""))
+    }
 
     new_attachments = []
+    new_hashes: set[str] = set()
 
     for attachment_index, attachment in enumerate(email_item.get("attachments", []) or [], start=1):
         filename = safe_str(attachment.get("filename", ""))
@@ -762,7 +839,8 @@ def backfill_operations_email_attachments(
         if not filename or not content:
             continue
 
-        if filename.lower() in existing_names:
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        if content_sha256 in existing_hashes or content_sha256 in new_hashes:
             continue
 
         saved = save_operations_attachment(
@@ -776,6 +854,16 @@ def backfill_operations_email_attachments(
         if safe_str(saved.get("file_path", "")) in existing_paths:
             continue
 
+        saved["source_message_id"] = message_id
+        saved["content_sha256"] = (
+            safe_str(saved.get("content_sha256")) or content_sha256
+        )
+        saved["source_work_item_id"] = existing_record.get("id")
+        saved["source_subject"] = safe_str(existing_record.get("source_subject"))
+        saved["source_received_at"] = safe_str(existing_record.get("source_received_at"))
+        saved["conversation_key"] = safe_str(existing_record.get("conversation_key"))
+        saved["matched_load_id"] = existing_record.get("matched_load_id")
+        new_hashes.add(content_sha256)
         new_attachments.append(saved)
 
     if not new_attachments:
@@ -783,6 +871,13 @@ def backfill_operations_email_attachments(
 
     merged_attachments = existing_attachments + new_attachments
     updated_parsed = merge_saved_attachment_fields(parsed, merged_attachments)
+    sync_metadata = coerce_json_dict(updated_parsed.get("_email_sync"))
+    sync_metadata["source_attachment_count"] = max(
+        int(sync_metadata.get("source_attachment_count") or 0),
+        len(email_item.get("attachments", []) or []),
+    )
+    sync_metadata["saved_attachment_count"] = len(merged_attachments)
+    updated_parsed["_email_sync"] = sync_metadata
 
     primary = next(
         (

@@ -28,6 +28,7 @@ def test_open_work_item_requires_an_explicit_open_action() -> None:
     assert state["selected_work_item_id"] == 42
     assert state["selected_work_item_queue"] == "New Orders"
     assert state["work_item_dialog_open"] is True
+    assert isinstance(state["work_item_open_started_at"], float)
 
 
 def test_closed_work_item_does_not_reopen_on_an_unrelated_rerun() -> None:
@@ -39,6 +40,7 @@ def test_closed_work_item_does_not_reopen_on_an_unrelated_rerun() -> None:
 
     assert state["selected_work_item_id"] is None
     assert state["work_item_dialog_open"] is False
+    assert "work_item_open_started_at" not in state
 
 
 def test_close_clears_temporary_attachment_state_for_only_that_work_item() -> None:
@@ -103,7 +105,7 @@ def test_admin_diagnostics_owns_email_sync_panels() -> None:
 def test_order_review_combines_source_attachment_and_draft() -> None:
     assert "### Order Draft Review" in INBOX_SOURCE
     assert "#### Original Source Review" in INBOX_SOURCE
-    assert "Attachments / Document Review" in INBOX_SOURCE
+    assert "_render_operations_attachment_preview(" in INBOX_SOURCE
     assert "#### Extracted Order Draft" in INBOX_SOURCE
     assert "Create Order From Reviewed Draft" in INBOX_SOURCE
 
