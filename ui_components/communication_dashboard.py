@@ -7,6 +7,7 @@ import streamlit as st
 
 import services.operations_case_service as case_service
 import services.operations_inbox_service as ops
+from db_client import check_schema_readiness
 
 
 def _service_attr(module, public_name: str, private_name: str | None = None):
@@ -64,11 +65,15 @@ def render_communication_dashboard() -> None:
     st.markdown("### Communication Dashboard")
     st.caption("Operations Case visibility across Dispatch, Management, Billing, and Customer Service.")
 
-    try:
-        if hasattr(ops, "ensure_operations_email_sync_schema"):
-            ops.ensure_operations_email_sync_schema()
-    except Exception as exc:
-        st.info(f"Communication dashboard will be available after the Operations Inbox migration is ready: {exc}")
+    # Phase 1 correction: read-only readiness check, no DDL from render
+    # (see pages_app/operations_inbox.py for the same pattern/rationale).
+    schema_readiness = check_schema_readiness("order_intake", "case_id")
+    if schema_readiness.reason != "ready":
+        st.info(
+            "Communication dashboard will be available after the Operations Inbox "
+            f"schema is ready ({schema_readiness.reason}). "
+            "Ask an administrator to run scripts/run_migrations.py if this persists."
+        )
         return
 
     _refresh_case_sla_statuses()

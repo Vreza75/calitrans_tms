@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from config import DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
 
@@ -184,7 +187,15 @@ def column_exists(table: str, column: str) -> bool:
     """Real DB-state check for schema-readiness guards. A single round trip
     that lets ensure_*_schema() functions skip their idempotent-but-slow
     ALTER/CREATE INDEX chains once already applied, instead of relying only
-    on an in-memory session flag that doesn't survive process restarts."""
+    on an in-memory session flag that doesn't survive process restarts.
+
+    Used only by the explicit migration/admin DDL path (ensure_*_schema()
+    functions, scripts/run_migrations.py) - callers there already intend
+    to run DDL if the column turns out to be missing, so collapsing every
+    exception to "not found" is an acceptable, narrow simplification.
+    Normal page-render/request-path readiness checks must use
+    check_schema_readiness() instead, which does not make that
+    assumption - see its docstring."""
     try:
         with get_engine(get_secret("DATABASE_URL")).connect() as conn:
             result = conn.execute(
@@ -197,6 +208,71 @@ def column_exists(table: str, column: str) -> bool:
             return result.first() is not None
     except Exception:
         return False
+
+
+_CREDENTIAL_PATTERN = re.compile(r"//[^/@\s]+:[^/@\s]+@")
+
+
+def _redact(message: str) -> str:
+    """Strip a user:password@ segment (as would appear in a DSN echoed
+    into a driver error message) out of free-text error text."""
+    return _CREDENTIAL_PATTERN.sub("//***@", str(message or ""))
+
+
+# Postgres SQLSTATE class prefixes: '08' = connection exception, '28' =
+# invalid authorization, '42501' = insufficient_privilege. See
+# https://www.postgresql.org/docs/current/errcodes-appendix.html
+_CONNECTION_SQLSTATE_PREFIXES = ("08",)
+_PERMISSION_SQLSTATES = {"42501"}
+_PERMISSION_SQLSTATE_PREFIXES = ("28",)
+
+
+@dataclass(frozen=True)
+class SchemaReadiness:
+    """Result of a non-mutating schema readiness check.
+
+    `reason` is one of "ready", "schema_missing", "connection_error",
+    "permission_error", or "unknown_error" - callers must not treat
+    connection_error/permission_error/unknown_error as proof the schema
+    is missing (that was the Phase 1 correction: column_exists() used to
+    collapse every exception, including a dropped connection, into
+    "column not found", which could make a render-path readiness check
+    look like a fresh-install case when the real problem was network or
+    credentials)."""
+
+    ready: bool
+    reason: str
+    detail: str = ""
+
+
+def check_schema_readiness(table: str, column: str) -> SchemaReadiness:
+    """Read-only readiness check for interactive render/request paths.
+
+    Never runs DDL, and never assumes a connection failure or permission
+    error means the schema is missing - each is reported as its own
+    reason so the caller can show an accurate message (and, for
+    connection/permission problems, must not suggest running migrations,
+    since that wouldn't fix either)."""
+    try:
+        with get_engine(get_secret("DATABASE_URL")).connect() as conn:
+            result = conn.execute(
+                text(
+                    "select 1 from information_schema.columns "
+                    "where table_name = :table and column_name = :column limit 1"
+                ),
+                {"table": table, "column": column},
+            )
+            found = result.first() is not None
+            return SchemaReadiness(ready=found, reason="ready" if found else "schema_missing")
+    except (OperationalError, ProgrammingError) as exc:
+        pgcode = getattr(getattr(exc, "orig", None), "pgcode", None) or ""
+        if pgcode in _PERMISSION_SQLSTATES or pgcode.startswith(_PERMISSION_SQLSTATE_PREFIXES):
+            return SchemaReadiness(ready=False, reason="permission_error", detail=_redact(str(exc)))
+        if pgcode.startswith(_CONNECTION_SQLSTATE_PREFIXES) or isinstance(exc, OperationalError):
+            return SchemaReadiness(ready=False, reason="connection_error", detail=_redact(str(exc)))
+        return SchemaReadiness(ready=False, reason="unknown_error", detail=_redact(str(exc)))
+    except Exception as exc:
+        return SchemaReadiness(ready=False, reason="unknown_error", detail=_redact(str(exc)))
 
 
 class DispatchDatabaseClient:

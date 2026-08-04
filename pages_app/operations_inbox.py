@@ -10,6 +10,7 @@ import streamlit as st
 import services.operations_inbox_service as ops
 
 from uuid import uuid4
+from db_client import check_schema_readiness
 from services.email_parser import extract_latest_email_body
 from services.operations_field_service import reconcile_parsed_sources, validate_field_value
 from services.operations_multi_container_service import create_container_work_orders
@@ -3260,11 +3261,37 @@ def render_operations_inbox() -> None:
         """,
         unsafe_allow_html=True,
     )
-    try:
-        ops.ensure_operations_email_sync_schema()
-    except Exception as exc:
-        st.warning(f"Email sync schema is not ready yet: {exc}")
+    # Phase 1 correction (Codex finding): normal rendering must not run
+    # DDL. This is a read-only readiness check - it never calls
+    # ensure_operations_email_sync_schema() (which ALTERs/CREATE INDEXes)
+    # from the interactive path anymore. DDL only runs via
+    # scripts/run_migrations.py, deployment startup, or an explicit
+    # Admin migration action.
+    schema_readiness = check_schema_readiness("order_intake", "case_id")
+    if schema_readiness.reason == "schema_missing":
+        st.error(
+            "Operations Inbox schema is not set up yet. Ask an administrator to run "
+            "`python scripts/run_migrations.py` against the configured database - "
+            "it is not applied automatically from this page."
+        )
         st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
+        return
+    if schema_readiness.reason == "connection_error":
+        st.error(
+            "Could not connect to the database. This is a connectivity issue, not a "
+            "missing-schema issue - check DATABASE_URL and network access, not migrations."
+        )
+        st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
+        return
+    if schema_readiness.reason == "permission_error":
+        st.error(
+            "The configured database credentials do not have permission to read the "
+            "Operations Inbox schema. Check the database role's grants, not migrations."
+        )
+        st.caption(f"Database config source: {get_config_source('DATABASE_URL')}")
+        return
+    if schema_readiness.reason == "unknown_error":
+        st.warning(f"Could not verify Operations Inbox schema readiness: {schema_readiness.detail}")
 
     try:
         sync_metrics = ops._operations_email_sync_metrics()
