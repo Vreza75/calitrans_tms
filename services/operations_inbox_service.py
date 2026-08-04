@@ -575,6 +575,7 @@ QUOTE_INTENT_TERMS = [
     "please quote",
     "need a quote",
     "need rate",
+    "need pricing",
     "send rate",
     "pricing request",
     "price this load",
@@ -583,12 +584,18 @@ QUOTE_INTENT_TERMS = [
     "rate this",
     "cotizacion",
     "cotización",
+    "cotizar",
     "tarifa",
     "precio",
     "solicitud de tarifa",
     "pueden cotizar",
     "necesito tarifa",
 ]
+
+# "Quote <origin> to/→/a <dest>" is a common dispatcher/customer shorthand
+# that never phrases the request as one of the fixed QUOTE_INTENT_TERMS
+# phrases above - the word "quote" itself immediately introduces a lane.
+_QUOTE_LANE_SHORTHAND_RE = re.compile(r"\bquote\b\s+[A-Za-z][\w .,'-]{0,40}?\s(?:to|→|a)\s", re.I)
 
 UPDATE_INTENT_TERMS = [
     "any update",
@@ -2468,7 +2475,85 @@ def has_reference_details(tokens: dict, parsed: dict) -> bool:
     )
 
 
+_QUOTE_INTENT_WORD_RE = re.compile(
+    r"\b(?:quote|quoting|quoted|rate|pricing|price|cotiz\w*|tarifa|presupuesto)\b", re.I
+)
+_EQUIPMENT_SIZE_RE = re.compile(r"\b(?:20|40|45)\s*'?\s*(?:ft|hc|hq|gp|rf|std|dv)?\b", re.I)
+
+# Words that can appear on either side of "<X> to <Y>" without being a lane -
+# days/times/people-handoff/routing phrases that are structurally identical
+# to "Houston to Dallas" but never a shipping origin/destination.
+_LANE_STOP_WORDS = {
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "am", "pm", "reply", "send", "forward", "forwarded", "respond", "back",
+    "us", "me", "him", "her", "them", "you", "accounting", "dispatch",
+    "support", "billing", "team", "customer", "driver",
+}
+
+_LANE_WORD = r"[A-Za-z][A-Za-z.'-]{2,}(?:\s+[A-Za-z][A-Za-z.'-]{2,}){0,2}"
+# English: "<origin> to <dest>" or "<origin> → <dest>".
+_LANE_EN_RE = re.compile(
+    rf"(?P<origin>{_LANE_WORD})\s*(?:to|→)\s*(?P<dest>{_LANE_WORD})", re.I
+)
+# Spanish: "<origin> a <dest>" (optionally preceded by "de") - "a" alone is
+# too ambiguous in English to ever use outside a Spanish-language context, so
+# this pattern is only ever checked when a Spanish quote-intent word is
+# already present in the same sentence (see _sentence_has_plausible_lane).
+_LANE_ES_RE = re.compile(
+    rf"(?:\bde\s+)?(?P<origin>{_LANE_WORD})\s+a\s+(?P<dest>{_LANE_WORD})", re.I
+)
+_SPANISH_QUOTE_WORD_RE = re.compile(r"\b(?:cotiz\w*|tarifa|presupuesto|necesito)\b", re.I)
+
+
+def _lane_words_are_plausible(origin: str, dest: str) -> bool:
+    origin_words = origin.lower().split()
+    dest_words = dest.lower().split()
+    if any(word in _LANE_STOP_WORDS for word in origin_words + dest_words):
+        return False
+    if re.search(r"\d", origin) or re.search(r"\d", dest):
+        return False
+    return True
+
+
+def _sentence_has_plausible_lane(sentence: str) -> bool:
+    """A "<place> to/a <place>" phrase is only trusted as an actual quote
+    lane when the *same sentence* also carries a quote/rate-intent word or an
+    equipment/size token - "John to Maria" and "Monday to Friday" are
+    structurally identical to "Houston to Dallas" and only distinguishable by
+    this kind of contextual proximity, not by capitalization (customer
+    messages routinely arrive all-lowercase or all-caps)."""
+    has_signal = bool(_QUOTE_INTENT_WORD_RE.search(sentence) or _EQUIPMENT_SIZE_RE.search(sentence))
+    if not has_signal:
+        return False
+
+    for match in _LANE_EN_RE.finditer(sentence):
+        if _lane_words_are_plausible(match.group("origin"), match.group("dest")):
+            return True
+
+    if _SPANISH_QUOTE_WORD_RE.search(sentence):
+        for match in _LANE_ES_RE.finditer(sentence):
+            if _lane_words_are_plausible(match.group("origin"), match.group("dest")):
+                return True
+
+    return False
+
+
+def _has_plausible_quote_lane(text: str) -> bool:
+    newest_only = extract_latest_email_body(text) or text
+    for sentence in re.split(r"[.!?;\n]+", newest_only):
+        if _sentence_has_plausible_lane(sentence):
+            return True
+    return False
+
+
 def has_quote_details(text: str, parsed: dict, tokens: dict) -> bool:
+    # All free-text checks below operate on the newest message only - a
+    # quote request that only exists inside quoted/forwarded history (e.g.
+    # the customer's own earlier message being replied to) must not count as
+    # active quote detail for the *current* message. parsed/tokens are
+    # trusted as-is here since upstream parsing already scopes them to the
+    # newest message in the real intake pipeline.
+    newest_text = extract_latest_email_body(text) or text
     detail_score = 0
 
     if safe_str(parsed.get("Port", "")):
@@ -2477,20 +2562,17 @@ def has_quote_details(text: str, parsed: dict, tokens: dict) -> bool:
     if safe_str(parsed.get("Warehouse", "")) or safe_str(parsed.get("Address", "")):
         detail_score += 1
 
-    if safe_str(parsed.get("Size", "")) or re.search(r"\b(?:20|40|45)\s*(?:ft|hc|hq|dv|std)?\b", text, re.I):
+    if safe_str(parsed.get("Size", "")) or _EQUIPMENT_SIZE_RE.search(newest_text):
         detail_score += 1
 
     if safe_str(parsed.get("Delivery Need Date", "")) or re.search(
         r"\b(?:today|tomorrow|asap|next week|\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b",
-        text,
+        newest_text,
         re.I,
     ):
         detail_score += 1
 
-    if re.search(r"\bfrom\s+.{2,80}\s+\bto\s+.{2,80}", text, re.I) or re.search(
-        r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\s+to\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\b",
-        text,
-    ):
+    if _has_plausible_quote_lane(newest_text):
         detail_score += 2
 
     if has_reference_details(tokens, parsed):
@@ -2543,7 +2625,7 @@ def operations_intent_scores(subject: str, body: str, parsed: dict | None = None
     add("Cancellation", 75, contains_any(text, CANCELLATION_TERMS))
     add("POD Request", 75, contains_any(text, POD_TERMS))
     add("Appointment Update", 70, contains_any(text, APPOINTMENT_INTENT_TERMS))
-    add("Quote Request", 70, contains_any(text, QUOTE_INTENT_TERMS))
+    add("Quote Request", 70, contains_any(text, QUOTE_INTENT_TERMS) or bool(_QUOTE_LANE_SHORTHAND_RE.search(text)))
     add("Booking Update", 60, contains_any(text, UPDATE_INTENT_TERMS))
     add("New Booking", 65, contains_any(text, NEW_ORDER_INTENT_TERMS))
     add("Billing", 75, contains_any(text, BILLING_TERMS) or has_actual_billing_request(subject, body))
@@ -2635,7 +2717,9 @@ def action_required_for_request(
     if request_type == "Customer Request":
         if contains_any(text, UPDATE_INTENT_TERMS) and not has_reference:
             return "Customer is asking for an update but did not include booking, container, or reference. Reply for identifying details."
-        if contains_any(text, QUOTE_INTENT_TERMS) and not has_quote_details(text, parsed, tokens):
+        if (
+            contains_any(text, QUOTE_INTENT_TERMS) or _QUOTE_LANE_SHORTHAND_RE.search(text)
+        ) and not has_quote_details(text, parsed, tokens):
             return "Customer may need pricing but did not include enough lane details. Reply for pickup, delivery, equipment, and date."
         if contains_any(text, NEW_ORDER_INTENT_TERMS) and not has_new_order_details(text, parsed, tokens):
             return "Customer may be sending an order but key load details are missing. Reply for the load order or booking details."
