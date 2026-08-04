@@ -2487,7 +2487,10 @@ def has_quote_details(text: str, parsed: dict, tokens: dict) -> bool:
     ):
         detail_score += 1
 
-    if re.search(r"\bfrom\s+.{2,80}\s+\bto\s+.{2,80}", text, re.I):
+    if re.search(r"\bfrom\s+.{2,80}\s+\bto\s+.{2,80}", text, re.I) or re.search(
+        r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\s+to\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\b",
+        text,
+    ):
         detail_score += 2
 
     if has_reference_details(tokens, parsed):
