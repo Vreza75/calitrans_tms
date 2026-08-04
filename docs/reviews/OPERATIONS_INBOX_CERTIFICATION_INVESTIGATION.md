@@ -2,6 +2,22 @@
 
 Date: 2026-08-04
 
+> **Correction (2026-08-04, edge-correction pass):** this document originally
+> stated CASE-010 was "intentionally unimplemented"/skipped. That was wrong -
+> it was a testing mistake in the original investigation (one specific
+> `pytest` invocation was run without `INBOX_CERTIFICATION_DATABASE_URL` set
+> in that shell call, which made CASE-010's 6 tests skip via their opt-in
+> gate; every other command in this same investigation did have the variable
+> set). CASE-010's multi-order-splitting capability was already implemented
+> and accepted in an earlier session (see
+> `tests/fixtures/operations_inbox/CASE-010/verification.md`, decision
+> **ACCEPTED**) and was already passing 6/6 at this document's own starting
+> HEAD (`0741240`), before any of this document's fixes. Every "CASE-010
+> skipped"/"unsupported" statement below has been corrected in place. See
+> `docs/reviews/OPERATIONS_INBOX_CERTIFICATION_EDGE_CORRECTIONS.md` for the
+> follow-up correction pass (including this fix) made after an independent
+> Codex review of this branch.
+
 ## 1. Starting branch and SHA
 
 - Repository: `C:\GitHub\calitrans_tms_postgres_upgrade_clean`
@@ -29,7 +45,7 @@ Date: 2026-08-04
 
 ## 3. Exact baseline failing cases (before any code change)
 
-Ran `pytest -q tests/integration/operations_inbox` from a freshly reset database, twice independently (dropping/recreating the database between runs), plus once more in reverse file order. All three runs produced **identical results**: same 8 failing tests, same 40 passing, byte-identical diffs. No nondeterminism, no state leakage between cases.
+Ran `pytest -q tests/integration/operations_inbox` from a freshly reset database, twice independently (dropping/recreating the database between runs), plus once more in reverse file order, with `INBOX_CERTIFICATION_DATABASE_URL` set for every run. All three runs produced **identical results**: same 8 failing tests, same 46 passing, byte-identical diffs, zero skipped. No nondeterminism, no state leakage between cases.
 
 | Case | Result | Failing field(s) |
 |---|---|---|
@@ -43,9 +59,9 @@ Ran `pytest -q tests/integration/operations_inbox` from a freshly reset database
 | CASE-007 | pass | — |
 | CASE-008 | FAIL | `references`: extra `reference_number: "information remains unchanged."` |
 | CASE-009 | pass | — |
-| CASE-010 | 6 skipped (by design — see §16) | — |
+| CASE-010 | pass (6/6, already accepted in an earlier session) | — |
 
-Total: 7 of 11 cases failing (8 test failures, since CASE-005 has two tests touching the same field), 3 passing cleanly, 1 intentionally unsupported/skipped.
+Total: 7 of 11 cases failing (8 test failures, since CASE-005 has two tests touching the same field), 4 passing cleanly (CASE-002, CASE-007, CASE-009, CASE-010).
 
 ## 4. Case matrix
 
@@ -198,7 +214,7 @@ Fresh `DROP DATABASE`/`CREATE DATABASE` + full migration run, then `pytest -q te
 48 passed in ~65s
 ```
 
-(48 = all of CASE-000 through CASE-009's tests, including duplicate-rerun and determinism sub-tests; CASE-010's 6 tests are `skipped` by design, see §16.) Repeated 3 times from independently reset databases (including once in reverse file order) — identical result every time. Independently re-ran `python scripts/run_inbox_case.py CASE-005` twice via the CLI: both runs reported `exact_record_pass: True`, `duplicate_protection: PASS`, 100% on every accuracy metric.
+(48 = every test in `tests/integration/operations_inbox/`, CASE-000 through CASE-010 inclusive - CASE-000 through CASE-009's tests plus CASE-010's 6 tests, all passing, zero skipped.) Repeated 3 times from independently reset databases (including once in reverse file order) — identical result every time. Independently re-ran `python scripts/run_inbox_case.py CASE-005` twice via the CLI: both runs reported `exact_record_pass: True`, `duplicate_protection: PASS`, 100% on every accuracy metric.
 
 | Case | Before | Root cause | Change | After | Status |
 |---|---|---|---|---|---|
@@ -212,7 +228,7 @@ Fresh `DROP DATABASE`/`CREATE DATABASE` + full migration run, then `pytest -q te
 | CASE-007 | PASS | — | — | PASS | ACCEPTED (unchanged) |
 | CASE-008 | FAIL | Prose read as reference number | Same fix as CASE-001 | PASS | ACCEPTED |
 | CASE-009 | PASS | — | — | PASS | ACCEPTED (unchanged) |
-| CASE-010 | Skipped (documented unsupported) | Multi-order splitting genuinely unimplemented | None (out of scope) | Skipped | Unsupported, as documented |
+| CASE-010 | PASS (already accepted in an earlier session) | — | — | PASS | ACCEPTED (unchanged) |
 
 ## 14. Full regression results
 
@@ -239,7 +255,9 @@ One transient regression was found and fixed mid-investigation (`test_quote_requ
 
 ## 16. CASE-010 status
 
-CASE-010 (two separate orders in one email / multi-order splitting) remains an **acknowledged, intentionally unimplemented** capability, exactly as documented in `tests/fixtures/operations_inbox/CASE-010/verification.md` from a prior session. Its 6 regression tests are marked `skip` and were confirmed still skipping (not passing, not silently removed) in every run performed during this investigation. No claim is made that CASE-010 passes or is supported.
+**Corrected.** CASE-010 (two separate orders in one email / multi-order splitting) is **implemented and passing 6/6**, and was already accepted in an earlier session - see `tests/fixtures/operations_inbox/CASE-010/verification.md` (decision: **ACCEPTED**). It creates two distinct `order_intake` rows from one source email, preserves both booking numbers (`APEX-260810`, `APEX-260811`) and both container numbers, and passes its duplicate-rerun and determinism checks like every other case.
+
+This document originally claimed CASE-010 was "intentionally unimplemented" and its tests were "skipped by design." That was wrong - a testing mistake, not a real property of the code: one specific `pytest tests/integration/operations_inbox/test_case_010_multi_order_split.py` invocation during the original investigation was run in a shell call that did not have `INBOX_CERTIFICATION_DATABASE_URL` set, which made the case's opt-in-gated tests skip. Every other command in this investigation (and the final full-suite run in §13) did have the variable set correctly and would have shown CASE-010 passing throughout. See the correction note at the top of this document and `docs/reviews/OPERATIONS_INBOX_CERTIFICATION_EDGE_CORRECTIONS.md` §CASE-010 for how this was independently caught and verified.
 
 ## 17. Recommended next architecture task
 
