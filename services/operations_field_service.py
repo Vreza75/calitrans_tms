@@ -165,8 +165,21 @@ def validate_field_value(
             return False, "common word or partial-word match is not a reference"
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9._/ -]{1,44}", text, re.I):
             return False, "reference has an invalid structure"
-        explicit_context = method in {"reference_label", "document_label"} or bool(
-            re.search(r"(?<!\w)(?:po|ref(?:erence)?|order|shipment|customer\s+ref)\b", evidence, re.I)
+        # A bare keyword like "order"/"ref"/"shipment" appearing anywhere in
+        # a sentence (e.g. "the order has been entered") is not an explicit
+        # label - only count it as one when actually followed by a real
+        # label separator, otherwise ordinary prose gets read as a reference
+        # number. "order"/"orden" is additionally restricted to ":"/"#"
+        # (never a bare "-"), since "<Something> Order - <description>" is a
+        # common subject-line title separator, not a reference label.
+        explicit_context = bool(
+            re.search(
+                r"(?<!\w)(?:customer\s+ref(?:erence)?|ref(?:erence)?|po|shipment)"
+                r"\s*(?:number|no\.?|#)?\s*[:#-]",
+                evidence,
+                re.I,
+            )
+            or re.search(r"(?<!\w)orden?\s*(?:number|no\.?|#)?\s*[:#]", evidence, re.I)
         )
         if not re.search(r"\d", text) and not explicit_context:
             return False, "letter-only reference lacks a standalone explicit label"
@@ -211,6 +224,7 @@ def validate_field_value(
             _JOB_TITLE_RE.fullmatch(text)
             or _COMPANY_SUFFIX_RE.search(text)
             or re.search(r"\d|@", text)
+            or ":" in text
             or re.search(r"\b(?:booking|dispatch)\s+order\b", text, re.I)
             or re.match(
                 r"^(?:customer|warehouse|booking|reference|container|port|terminal|address)\s*:",
@@ -418,7 +432,12 @@ def generate_field_candidates(
             method="port_context",
             confidence=source_confidence,
             patterns=[
-                r"^\s*(?:port|puerto|terminal|export\s+terminal|pickup\s+terminal|full\s+return)\s*[:#-]\s*(?P<value>[^\r\n]+)$",
+                # "Full Return" is deliberately excluded: it names where an
+                # empty container is returned after delivery, a distinct
+                # concept from the pickup/POL terminal this field
+                # represents (see full_return_terminal in
+                # operations_multi_container_service.py).
+                r"^\s*(?:port|puerto|terminal|export\s+terminal|pickup\s+terminal)\s*[:#-]\s*(?P<value>[^\r\n]+)$",
                 r"\b(?:return|deliver)(?:\s+the\s+loaded\s+container)?\s+to\s+(?P<value>(?:Barbours\s+Cut|Bayport)(?:\s+Container\s+Terminal|\s+Terminal)?)\b",
                 r"\b(?P<value>(?:Barbours\s+Cut|Bayport)\s+Container\s+Terminal)\b",
             ],
@@ -439,7 +458,11 @@ def generate_field_candidates(
             source=source,
             method="address_label",
             confidence=source_confidence,
-            patterns=[r"^\s*(?:address|delivery\s+address|warehouse\s+address|pickup\s+address)\s*[:#-]\s*(?P<value>[^\r\n]+)$"],
+            # "Pickup Address" is deliberately excluded: it is a distinct
+            # concept (origin/pickup location) tracked by its own
+            # "Customer Pickup Address" field elsewhere in the pipeline, not
+            # a synonym for this destination/delivery Address field.
+            patterns=[r"^\s*(?:address|delivery\s+address|warehouse\s+address)\s*[:#-]\s*(?P<value>[^\r\n]+)$"],
         )
 
         lowered = text.lower()
