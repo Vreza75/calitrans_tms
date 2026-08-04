@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from application.exceptions import CommandFailedError, NotFoundError, ValidationError
+from application.exceptions import CommandFailedError, ConflictError, NotFoundError, ValidationError
 from application.loads.models import CreateLoadResult, TransitionResult, UpdateLoadResult
 
 
@@ -22,7 +22,16 @@ def transition_load(
     which is the one function allowed to change loads.status and, as of
     Phase 1, runs its assignment/status/closeout writes and audit rows in
     a single db_client.transaction() (see
-    tests/test_dispatch_transition_service.py for the atomicity tests)."""
+    tests/test_dispatch_transition_service.py for the atomicity tests).
+
+    Raises NotFoundError / ConflictError instead of returning ok=False
+    with a 200-shaped result - a caller like the API needs a distinct
+    status code for "load not found" (404) vs. "transition not valid from
+    the current state" (409), not a 200 response it has to inspect an
+    `ok` flag on to find out something failed. Streamlit callers that want
+    the old inspect-a-dict shape should call
+    services.dispatch_transition_service.apply_transition directly (e.g.
+    pages_app/dispatch_board.py already does, unaffected by this)."""
     from services.dispatch_transition_service import apply_transition
 
     result = apply_transition(
@@ -34,9 +43,16 @@ def transition_load(
         override=override,
         override_reason=override_reason,
     )
+
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if "not found" in reason.lower():
+            raise NotFoundError(reason)
+        raise ConflictError(reason)
+
     return TransitionResult(
-        ok=bool(result.get("ok")),
-        reason=str(result.get("reason") or ""),
+        ok=True,
+        reason="",
         status=str(result.get("status") or ""),
         closeout_stage=str(result.get("closeout_stage") or ""),
     )

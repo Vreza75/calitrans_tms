@@ -19,3 +19,10 @@ class ValidationError(ApplicationError):
 
 class CommandFailedError(ApplicationError):
     """A business command could not complete; no partial write was made."""
+
+
+class ConflictError(ApplicationError):
+    """The command is well-formed but conflicts with current state (an
+    invalid status transition, a duplicate, a stale expected-state check).
+    Maps to HTTP 409 - distinct from ValidationError (422, bad input) and
+    CommandFailedError (400, an unexpected failure)."""

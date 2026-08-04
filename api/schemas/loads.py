@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
@@ -17,7 +18,7 @@ class LoadSummaryOut(BaseModel):
     status: str
     driver_name: str
     truck_assigned: str
-    updated_at: Any
+    updated_at: datetime | None
 
     @classmethod
     def from_domain(cls, load: LoadSummary) -> "LoadSummaryOut":
@@ -53,3 +54,16 @@ class CreateLoadOut(BaseModel):
     ok: bool
     load_id: int | None
     review_status: str = ""
+
+
+class UpdateLoadIn(BaseModel):
+    load_id: int
+    approved_fields: dict[str, Any]
+    fill_blank_only: bool = True
+
+
+class UpdateLoadOut(BaseModel):
+    ok: bool
+    load_id: int | None
+    updated_fields: list[str] = []
+    skipped_fields: list[str] = []

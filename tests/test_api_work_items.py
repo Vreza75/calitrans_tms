@@ -135,7 +135,7 @@ def test_get_work_item_detail_returns_404_for_missing_item(client: TestClient, m
     r = client.get("/api/v1/work-items/999999")
 
     assert r.status_code == 404
-    assert r.json()["error"] == "not_found"
+    assert r.json()["error"]["code"] == "NOT_FOUND"
 
 
 def test_attachments_response_never_includes_a_raw_file_path(client: TestClient, monkeypatch) -> None:
@@ -191,7 +191,7 @@ def test_create_load_returns_422_on_validation_error(client: TestClient, monkeyp
     r = client.post("/api/v1/work-items/1/create-load", json={"approved_fields": {}})
 
     assert r.status_code == 422
-    assert r.json()["error"] == "validation_error"
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
 def test_unhandled_exception_does_not_leak_internal_detail(monkeypatch) -> None:
@@ -212,7 +212,7 @@ def test_unhandled_exception_does_not_leak_internal_detail(monkeypatch) -> None:
 
     assert r.status_code == 500
     body = r.json()
-    assert body["error"] == "internal_error"
+    assert body["error"]["code"] == "INTERNAL_ERROR"
     assert "hunter2" not in r.text
     assert "postgresql://" not in r.text
 
@@ -244,3 +244,72 @@ def test_loads_list_endpoint(client: TestClient, monkeypatch) -> None:
 
     assert r.status_code == 200
     assert r.json()[0]["booking_number"] == "RICGX1235800"
+
+
+def test_parsed_data_is_allowlisted_not_raw(client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+
+    detail = _sample_detail(
+        parsed_data={
+            "Customer": "Continental Industries Group",
+            "Booking Number": "RICGX1235800",
+            "_operations_attachments": [{"file_path": "/srv/secret.pdf"}],
+            "_hybrid_document_parser": {"raw_dump": "internal parser trace"},
+        }
+    )
+    monkeypatch.setattr(router_module, "get_work_item_detail", lambda work_item_id: detail)
+
+    r = client.get("/api/v1/work-items/1")
+
+    assert r.status_code == 200
+    body = r.json()["parsed_data"]
+    assert body == {"Customer": "Continental Industries Group", "Booking Number": "RICGX1235800"}
+    assert "_operations_attachments" not in r.text
+    assert "_hybrid_document_parser" not in r.text
+
+
+def test_page_size_over_100_is_rejected(client: TestClient) -> None:
+    r = client.get("/api/v1/work-items?page_size=500")
+    assert r.status_code == 422
+
+
+def test_conversation_page_size_over_100_is_rejected(client: TestClient) -> None:
+    r = client.get("/api/v1/work-items/1/conversation?page_size=500")
+    assert r.status_code == 422
+
+
+def test_update_load_route_exists_and_calls_shared_command(client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+    from application.loads.models import UpdateLoadResult
+
+    monkeypatch.setattr(
+        router_module,
+        "update_load_from_work_item",
+        lambda work_item_id, load_id, approved_fields, *, fill_blank_only: UpdateLoadResult(
+            ok=True, load_id=load_id, updated_fields=["Delivery Need Date"], skipped_fields=[]
+        ),
+    )
+
+    r = client.post(
+        "/api/v1/work-items/1/update-load",
+        json={"load_id": 42, "approved_fields": {"Delivery Need Date": "2026-08-10"}},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["load_id"] == 42
+    assert r.json()["updated_fields"] == ["Delivery Need Date"]
+
+
+def test_invalid_transition_returns_409_not_200_with_ok_false(client: TestClient, monkeypatch) -> None:
+    from api.routers import loads as loads_router
+
+    def _fake_apply_transition(load_id, new_status, **kwargs):
+        return {"ok": False, "reason": "Cannot move backward from 'At Pickup' to 'Ready to Dispatch'.", "status": "At Pickup", "closeout_stage": "Not Started"}
+
+    import services.dispatch_transition_service as dts
+    monkeypatch.setattr(dts, "apply_transition", _fake_apply_transition)
+
+    r = client.post("/api/v1/loads/1/transition", json={"new_status": "Ready to Dispatch"})
+
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "CONFLICT"

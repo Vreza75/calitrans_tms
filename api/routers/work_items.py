@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query
 from api.auth import READ_OPERATIONS, require_role
 from api.dependencies import get_current_actor
 from api.schemas.conversations import ConversationPageOut
-from api.schemas.loads import CreateLoadIn, CreateLoadOut
+from api.schemas.loads import CreateLoadIn, CreateLoadOut, UpdateLoadIn, UpdateLoadOut
 from api.schemas.order_drafts import OrderDraftOut, UpdateOrderDraftIn, UpdateOrderDraftOut
 from api.schemas.work_items import (
     AttachmentSummaryOut,
@@ -17,7 +17,7 @@ from api.schemas.work_items import (
 )
 from application.attachments.queries import get_attachments_for_work_item
 from application.conversations.queries import get_conversation_history
-from application.loads.commands import create_load_from_work_item
+from application.loads.commands import create_load_from_work_item, update_load_from_work_item
 from application.order_drafts.commands import update_order_draft
 from application.order_drafts.queries import get_order_draft
 from application.work_items import commands as work_item_commands
@@ -33,7 +33,7 @@ router = APIRouter(
 @router.get("", response_model=WorkItemPageOut)
 def list_work_items(
     page: int = Query(1, ge=1),
-    page_size: int = Query(25),
+    page_size: int = Query(25, ge=1, le=100),
     sort_by: str = Query("received_at"),
     sort_direction: str = Query("desc"),
     queue: str | None = None,
@@ -76,7 +76,7 @@ def get_work_item_attachments(work_item_id: int) -> AttachmentSummaryOut:
 def get_work_item_conversation(
     work_item_id: int,
     page: int = Query(1, ge=1),
-    page_size: int = Query(25),
+    page_size: int = Query(25, ge=1, le=100),
 ) -> ConversationPageOut:
     detail = get_work_item_detail(work_item_id)
     history = get_conversation_history(detail.conversation_key, page=page, page_size=page_size)
@@ -101,6 +101,22 @@ def update_work_item_draft(work_item_id: int, payload: UpdateOrderDraftIn) -> Up
 def create_load(work_item_id: int, payload: CreateLoadIn) -> CreateLoadOut:
     result = create_load_from_work_item(work_item_id, payload.approved_fields)
     return CreateLoadOut(ok=result.ok, load_id=result.load_id, review_status=result.review_status)
+
+
+@router.post("/{work_item_id}/update-load", response_model=UpdateLoadOut)
+def update_load(work_item_id: int, payload: UpdateLoadIn) -> UpdateLoadOut:
+    result = update_load_from_work_item(
+        work_item_id,
+        payload.load_id,
+        payload.approved_fields,
+        fill_blank_only=payload.fill_blank_only,
+    )
+    return UpdateLoadOut(
+        ok=result.ok,
+        load_id=result.load_id,
+        updated_fields=result.updated_fields,
+        skipped_fields=result.skipped_fields,
+    )
 
 
 @router.post("/{work_item_id}/close", response_model=CommandResultOut)

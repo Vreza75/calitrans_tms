@@ -7,6 +7,35 @@ from pydantic import BaseModel
 
 from application.work_items.models import WorkItemDetail, WorkItemPage, WorkItemSummary
 
+# Codex finding: WorkItemDetailOut exposed the full persisted parsed_data
+# dict, including internal reconciliation keys (_operations_attachments,
+# _email_sync, _hybrid_document_parser, _field_candidates, _confidence,
+# parser stack traces under _candidate_conflicts, etc.) that were never
+# meant to leave the server. Only these operational fields are allowlisted
+# into the API response - everything else in parsed_data is dropped.
+ALLOWED_PARSED_DATA_FIELDS = {
+    "Customer",
+    "TYPE",
+    "Booking Number",
+    "Reference Number",
+    "Container Number",
+    "Container Qty",
+    "Size",
+    "Port",
+    "Terminal",
+    "Warehouse",
+    "Address",
+    "Delivery Need Date",
+    "Document Cutoff",
+    "LFD",
+    "Port PIN",
+    "Dispatcher Notes",
+}
+
+
+def _sanitize_parsed_data(parsed_data: dict) -> dict:
+    return {key: value for key, value in (parsed_data or {}).items() if key in ALLOWED_PARSED_DATA_FIELDS}
+
 
 class WorkItemSummaryOut(BaseModel):
     id: int
@@ -142,7 +171,7 @@ class WorkItemDetailOut(BaseModel):
             source_subject=detail.source_subject,
             source_received_at=detail.source_received_at,
             original_email_body=detail.original_email_body,
-            parsed_data=detail.parsed_data,
+            parsed_data=_sanitize_parsed_data(detail.parsed_data),
             request_type=detail.request_type,
             matched_load_id=detail.matched_load_id,
             conversation_key=detail.conversation_key,
