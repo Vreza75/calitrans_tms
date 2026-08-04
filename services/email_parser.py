@@ -18,6 +18,7 @@ FIELDS = [
     "Document Cutoff", "LFD", "Contact Name", "Contact Email", "Contact Phone",
     "Contact Title", "Contact Company", "Terminal", "Port PIN", "Dispatcher Notes",
     "Empty Pickup", "Customer Pickup", "Customer Pickup Address", "Pickup Date",
+    "Full Return Terminal",
     "Container Numbers",
 ]
 
@@ -47,6 +48,10 @@ LABEL_ALIASES = {
     "Customer Pickup": ["Customer Pickup Location", "Customer Pickup", "Shipper Pickup Location", "Shipper Pickup"],
     "Customer Pickup Address": ["Customer Pickup Address", "Shipper Pickup Address", "Shipper Address", "Pickup Address"],
     "Pickup Date": ["Empty Pickup Date", "Pickup Date"],
+    # Where the empty container is returned AFTER delivery/loading - a
+    # distinct concept from Port/Terminal (pickup/POL) and from Empty Pickup
+    # (the empty-depot pickup location before loading).
+    "Full Return Terminal": ["Full Return Terminal", "Full Return", "Return Terminal", "Empty Return Terminal", "Empty Return"],
 }
 
 OWN_COMPANY_DOMAINS = {"calitranscorp.com"}

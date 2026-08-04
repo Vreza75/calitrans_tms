@@ -72,6 +72,7 @@ EXPECTED_SCHEMA_FIELDS = [
     "customer",
     "pickup",
     "delivery",
+    "full_return_terminal",
     "dates",
     "references",
     "missing_required_fields",
@@ -393,6 +394,7 @@ def capture_actual_result(fixture: Fixture) -> dict:
         "container_count": container_count,
         "containers": containers,
         "customer": parsed.get("Customer") or None,
+        "full_return_terminal": parsed.get("Full Return Terminal") or None,
         "pickup": _sparse(
             {
                 "terminal": parsed.get("Port"),
