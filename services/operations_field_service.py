@@ -19,6 +19,7 @@ SHARED_OPERATION_FIELDS = [
     "Port",
     "Terminal",
     "Port PIN",
+    "Full Return Terminal",
     "Warehouse",
     "Address",
     "Delivery Need Date",
@@ -60,6 +61,35 @@ _LOCATION_BAD_PREFIX_RE = re.compile(
     r"^(?:on\s+[a-z]+|and\s+return|deliver\s+the|by\s+\d|no\s+later|please\b)",
     re.I,
 )
+# Labels that, if they appear at the start of a line, mean an address
+# capture must stop there - otherwise a multi-line address would keep
+# absorbing whatever field comes next (Dispatcher Notes, Contact, Port,
+# dates, a signature, ...).
+_ADDRESS_CONTINUATION_STOP_LABELS = (
+    r"address|delivery\s+address|warehouse\s+address|pickup\s+address|"
+    r"customer\s+pickup\s+address|port|terminal|pickup\s+terminal|export\s+terminal|"
+    r"warehouse|delivery\s+warehouse|pickup\s+warehouse|pickup\s+location|origin|"
+    r"destination|contact|contact\s+name|contact\s+phone|contact\s+email|"
+    r"contact\s+company|phone|tel|telephone|mobile|cell|email|e-mail|notes|"
+    r"dispatcher\s+notes|instructions|special\s+instructions|delivery\s+need\s+date|"
+    r"delivery\s+date|need\s+date|reference|reference\s+number|booking\s+number|"
+    r"order\s+number|container\s+number|container\s+size|size|equipment|"
+    r"full\s+return|full\s+return\s+terminal|return\s+terminal|empty\s+return|"
+    r"last\s+free\s+day|lfd|cutoff|document\s+cutoff"
+)
+
+
+def _address_pattern(label_alternation: str) -> str:
+    """A "<Label>: <first line>" capture that also absorbs plausible
+    continuation lines (city/state/ZIP, a suite/unit line, ...) - it stops at
+    the next recognized field label or a blank line, so it never swallows an
+    unrelated field."""
+    return (
+        rf"^\s*(?:{label_alternation})\s*[:#-]\s*"
+        rf"(?P<value>[^\r\n]*(?:\n(?!\s*(?:{_ADDRESS_CONTINUATION_STOP_LABELS})\s*[:#-])(?!\s*$)[^\r\n]+)*)"
+    )
+
+
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _PHONE_RE = re.compile(
     r"(?<!\d)(\+?1?[\s.( -]*\d{3}[\s.) -]*\d{3}[\s.-]*\d{4}"
@@ -167,19 +197,24 @@ def validate_field_value(
             return False, "reference has an invalid structure"
         # A bare keyword like "order"/"ref"/"shipment" appearing anywhere in
         # a sentence (e.g. "the order has been entered") is not an explicit
-        # label - only count it as one when actually followed by a real
-        # label separator, otherwise ordinary prose gets read as a reference
-        # number. "order"/"orden" is additionally restricted to ":"/"#"
-        # (never a bare "-"), since "<Something> Order - <description>" is a
-        # common subject-line title separator, not a reference label.
+        # label - only count it as one when either (a) a real separator
+        # (":"/"#"/"-") follows, or (b) an explicit number-designator word
+        # ("number"/"no."/"#") follows, since that combination alone is
+        # already a strong, specific label signal even without punctuation
+        # (e.g. "Referencia No. ABC", "PO No 12345"). Plain prose never
+        # produces either. "order"/"orden"/"pedido" are additionally
+        # restricted to ":"/"#" for the separator branch (never a bare "-"),
+        # since "<Something> Order - <description>" is a common subject-line
+        # title separator, not a reference label. "orde[rn]" matches English
+        # "order" or Spanish "orden" - a previous "orden?" here was a regex
+        # mistake (matches "orde"/"orden", never "order").
+        _SAFE_REF_KEYWORDS = r"(?<!\w)(?:customer\s+ref(?:erence)?|ref(?:erence)?|po|shipment|referencia)"
+        _AMBIGUOUS_REF_KEYWORDS = r"(?<!\w)(?:orde[rn]|pedido)"
         explicit_context = bool(
-            re.search(
-                r"(?<!\w)(?:customer\s+ref(?:erence)?|ref(?:erence)?|po|shipment)"
-                r"\s*(?:number|no\.?|#)?\s*[:#-]",
-                evidence,
-                re.I,
-            )
-            or re.search(r"(?<!\w)orden?\s*(?:number|no\.?|#)?\s*[:#]", evidence, re.I)
+            re.search(_SAFE_REF_KEYWORDS + r"\s*(?:number|no\.?|#)", evidence, re.I)
+            or re.search(_SAFE_REF_KEYWORDS + r"\s*[:#-]", evidence, re.I)
+            or re.search(_AMBIGUOUS_REF_KEYWORDS + r"\s*(?:number|no\.?|#)", evidence, re.I)
+            or re.search(_AMBIGUOUS_REF_KEYWORDS + r"\s*[:#]", evidence, re.I)
         )
         if not re.search(r"\d", text) and not explicit_context:
             return False, "letter-only reference lacks a standalone explicit label"
@@ -254,7 +289,7 @@ def validate_field_value(
     if field == "Contact Phone":
         return ((True, "") if _PHONE_RE.fullmatch(text) else (False, "invalid phone number"))
 
-    if field in {"Warehouse", "Port", "Terminal"}:
+    if field in {"Warehouse", "Port", "Terminal", "Full Return Terminal"}:
         if _LOCATION_BAD_PREFIX_RE.search(text):
             return False, "scheduling or instruction text is not a location"
         if "@" in text or _PHONE_RE.search(text):
@@ -306,6 +341,15 @@ def _add_pattern_candidates(
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags):
             value = match.group("value")
+            if isinstance(value, str) and "\n" in value:
+                # A multi-line capture (e.g. a delivery address whose city/
+                # state/ZIP continues on the next line) joins with ", " to
+                # match this pipeline's single-line comma-separated address
+                # convention, rather than collapsing to a bare space (which
+                # would silently glue the street and city together) or
+                # keeping raw newlines (which no downstream consumer here
+                # expects).
+                value = ", ".join(line.strip() for line in value.splitlines() if line.strip())
             candidates.append(
                 _candidate(field, value, source, method, confidence, text, match.start(), match.end())
             )
@@ -385,8 +429,17 @@ def generate_field_candidates(
             method="document_label" if source == "document" else "reference_label",
             confidence=source_confidence,
             patterns=[
-                r"(?<!\w)(?:customer[ \t]+ref(?:erence)?|reference|referencia|ref|po|order|orden|shipment)"
-                r"[ \t]*(?:number|no\.?|#)?(?:[ \t]*[:#-][ \t]*|[ \t]+)"
+                # A bare whitespace separator is only trusted right after an
+                # explicit number-designator word ("Number"/"No."/"#") - that
+                # combination is itself the label signal (e.g. "Referencia No.
+                # ABC", "Order # ABC"). Without a designator word, a real
+                # punctuation separator (":"/"#"/"-") is required, otherwise
+                # ordinary prose ("the order has been entered") or a
+                # stringified dict key ("'Reference Number': ''") produces no
+                # match at all instead of capturing the label's own
+                # continuation word as a fake value.
+                r"(?<!\w)(?:customer[ \t]+ref(?:erence)?|reference|referencia|ref|po|order|orden|pedido|shipment)"
+                r"(?:[ \t]*(?:number|no\.?|#)[ \t]*(?:[:#-][ \t]*)?|[ \t]*[:#-][ \t]*)"
                 r"(?P<value>[A-Z0-9][A-Z0-9._/-]*(?:[ \t]+[A-Z0-9][A-Z0-9._/-]*){0,2})",
             ],
         )
@@ -444,6 +497,18 @@ def generate_field_candidates(
         )
         _add_pattern_candidates(
             candidates,
+            field="Full Return Terminal",
+            text=text,
+            source=source,
+            method="document_label" if source == "document" else "full_return_label",
+            confidence=source_confidence,
+            patterns=[
+                r"^\s*(?:full\s+return\s+terminal|full\s+return|return\s+terminal|"
+                r"empty\s+return\s+terminal|empty\s+return)\s*[:#-]\s*(?P<value>[^\r\n]+)$",
+            ],
+        )
+        _add_pattern_candidates(
+            candidates,
             field="Port PIN",
             text=text,
             source=source,
@@ -451,18 +516,41 @@ def generate_field_candidates(
             confidence=source_confidence,
             patterns=[r"^\s*(?:port\s+pin|pin)\s*[:#-]\s*(?P<value>[A-Z0-9-]{4,20})\s*$"],
         )
+        # Address precedence within the same source is explicit/deterministic
+        # (via distinct confidence tiers), not dependent on which label
+        # happens to appear first in the document: an explicit "Delivery
+        # Address:" always outranks a generic "Address:", which always
+        # outranks "Warehouse Address:" (the warehouse's own address is only
+        # meant as a fallback when nothing more specific to the destination
+        # was given). "Pickup Address" is deliberately excluded from all
+        # three: it is a distinct concept (origin/pickup location) tracked by
+        # its own "Customer Pickup Address" field elsewhere in the pipeline.
+        _add_pattern_candidates(
+            candidates,
+            field="Address",
+            text=text,
+            source=source,
+            method="delivery_address_label",
+            confidence=min(source_confidence + 0.02, 0.99),
+            patterns=[_address_pattern(r"delivery\s+address")],
+        )
         _add_pattern_candidates(
             candidates,
             field="Address",
             text=text,
             source=source,
             method="address_label",
+            confidence=min(source_confidence + 0.01, 0.99),
+            patterns=[_address_pattern(r"address")],
+        )
+        _add_pattern_candidates(
+            candidates,
+            field="Address",
+            text=text,
+            source=source,
+            method="warehouse_address_label",
             confidence=source_confidence,
-            # "Pickup Address" is deliberately excluded: it is a distinct
-            # concept (origin/pickup location) tracked by its own
-            # "Customer Pickup Address" field elsewhere in the pipeline, not
-            # a synonym for this destination/delivery Address field.
-            patterns=[r"^\s*(?:address|delivery\s+address|warehouse\s+address)\s*[:#-]\s*(?P<value>[^\r\n]+)$"],
+            patterns=[_address_pattern(r"warehouse\s+address")],
         )
 
         lowered = text.lower()
