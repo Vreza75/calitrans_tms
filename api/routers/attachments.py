@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
 
+from api.auth import READ_OPERATIONS, require_role
 from application.attachments.queries import get_attachment_bytes
 
-router = APIRouter(prefix="/attachments", tags=["attachments"])
+router = APIRouter(
+    prefix="/attachments",
+    tags=["attachments"],
+    dependencies=[Depends(require_role(*READ_OPERATIONS))],
+)
 
 
 @router.get("/{attachment_ref}/content")

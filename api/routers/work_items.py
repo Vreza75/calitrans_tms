@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
+from api.auth import READ_OPERATIONS, require_role
 from api.dependencies import get_current_actor
 from api.schemas.conversations import ConversationPageOut
 from api.schemas.loads import CreateLoadIn, CreateLoadOut
@@ -22,7 +23,11 @@ from application.order_drafts.queries import get_order_draft
 from application.work_items import commands as work_item_commands
 from application.work_items.queries import get_work_item_detail, get_work_item_queue_page
 
-router = APIRouter(prefix="/work-items", tags=["work-items"])
+router = APIRouter(
+    prefix="/work-items",
+    tags=["work-items"],
+    dependencies=[Depends(require_role(*READ_OPERATIONS))],
+)
 
 
 @router.get("", response_model=WorkItemPageOut)

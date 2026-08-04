@@ -19,7 +19,12 @@ from application.work_items.models import (
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(monkeypatch) -> TestClient:
+    # These tests exercise business logic (pagination shape, error
+    # mapping, sanitization) - not auth enforcement, which has its own
+    # dedicated tests in tests/test_api_auth.py. Dev mode is the explicit,
+    # documented opt-in for that (api/auth.py::_dev_mode_enabled).
+    monkeypatch.setenv("API_AUTH_DEV_MODE", "true")
     return TestClient(app)
 
 
@@ -196,6 +201,7 @@ def test_unhandled_exception_does_not_leak_internal_detail(monkeypatch) -> None:
         raise RuntimeError("connection to postgresql://user:hunter2@db.internal:5432/prod failed")
 
     monkeypatch.setattr(router_module, "get_work_item_detail", _boom)
+    monkeypatch.setenv("API_AUTH_DEV_MODE", "true")
 
     # raise_server_exceptions=False: let the registered Exception handler
     # produce its real HTTP response instead of TestClient re-raising the

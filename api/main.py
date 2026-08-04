@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db_client import DispatchDatabaseClient, read_df
 
+from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
 from api.errors import register_error_handlers
 from api.routers import attachments, health, loads, work_items
 
@@ -63,7 +64,7 @@ def health_legacy() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/loads", tags=["legacy"])
+@app.get("/loads", tags=["legacy"], dependencies=[Depends(require_role(*READ_LOADS))])
 def list_loads_legacy(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     """Legacy unversioned loads list. Prefer GET /api/v1/loads."""
     sql = "select * from loads"
@@ -78,7 +79,7 @@ def list_loads_legacy(status: str | None = None, limit: int = 100) -> list[dict[
     return read_df(sql, params).to_dict(orient="records")
 
 
-@app.post("/loads", tags=["legacy"])
+@app.post("/loads", tags=["legacy"], dependencies=[Depends(require_role(*MUTATE_OPERATIONS))])
 def create_load_legacy(payload: LoadCreateRequest) -> dict[str, Any]:
     """Legacy unversioned load creation. Prefer POST /api/v1/work-items/{id}/create-load."""
     client = DispatchDatabaseClient()
