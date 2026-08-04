@@ -11,7 +11,9 @@
   "container_count": 4,
   "containers": [],
   "customer": "CONTINENTAL INDUSTRIES GROUP",
-  "pickup": {},
+  "pickup": {
+    "terminal": "Bayport Terminal"
+  },
   "delivery": {},
   "dates": {},
   "references": {
