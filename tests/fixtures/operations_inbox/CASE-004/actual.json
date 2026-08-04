@@ -13,6 +13,7 @@
     "OOLU1357913"
   ],
   "customer": "Texas Industrial Packaging",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Texas Industrial Packaging",
     "customer_pickup_address": "1200 Industrial Parkway, Pasadena, TX 77503"

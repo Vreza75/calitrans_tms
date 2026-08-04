@@ -13,6 +13,7 @@
     "TEST0000001"
   ],
   "customer": "Harness Smoke Test Customer",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Test Terminal"
   },

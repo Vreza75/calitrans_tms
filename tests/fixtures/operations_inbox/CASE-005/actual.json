@@ -13,6 +13,7 @@
     "CMAU1122334"
   ],
   "customer": "Coastal Appliance Group",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Bayport Container Terminal"
   },

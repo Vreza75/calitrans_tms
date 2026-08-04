@@ -13,6 +13,7 @@
     "HJCU2468101"
   ],
   "customer": "Houston Home Supply",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Houston Transload Warehouse",
     "customer_pickup_address": "8700 Wallisville Road, Houston, TX 77029"

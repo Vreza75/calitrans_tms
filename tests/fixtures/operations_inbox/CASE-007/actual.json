@@ -15,6 +15,7 @@
     "TEMU2000003"
   ],
   "customer": "Summit Furniture Imports",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Barbours Cut Terminal"
   },

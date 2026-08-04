@@ -15,6 +15,7 @@
     "HLXU3000002"
   ],
   "customer": "Apex Retail",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Bayport Container Terminal"
   },

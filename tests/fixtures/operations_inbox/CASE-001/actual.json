@@ -13,6 +13,7 @@
     "MSCU1234567"
   ],
   "customer": "Gulf Coast Retail Distribution",
+  "full_return_terminal": null,
   "pickup": {
     "terminal": "Bayport Container Terminal"
   },

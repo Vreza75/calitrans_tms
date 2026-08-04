@@ -13,6 +13,7 @@
     "MSCU1234567"
   ],
   "customer": "Example",
+  "full_return_terminal": null,
   "pickup": {},
   "delivery": {
     "warehouse": "Gulf Coast Retail North DC",
