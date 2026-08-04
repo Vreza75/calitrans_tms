@@ -1,21 +1,21 @@
 from contextlib import contextmanager
 
-import pandas as pd
 import pytest
 
 from services import dispatch_transition_service as svc
 
 
 class _FakeDb:
-    def __init__(self, load: dict):
-        self.load = dict(load)
+    def __init__(self, load: dict | None):
+        self.load = dict(load) if load is not None else None
         self.update_calls = []
         self.closeout_calls = []
         self.audit_notes = []
         self.conns_seen = []
 
-    def read_load(self, load_id: int) -> pd.DataFrame:
-        return pd.DataFrame([self.load])
+    def read_load_for_update(self, load_id: int, *, conn=None) -> dict | None:
+        self.conns_seen.append(conn)
+        return dict(self.load) if self.load is not None else None
 
     def update_row_fields(self, load_id: int, updates: dict, *, conn=None) -> None:
         self.conns_seen.append(conn)
@@ -52,7 +52,7 @@ def _fake_transaction():
 
 
 def _wire(fake, monkeypatch):
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
+    monkeypatch.setattr(svc, "_load_row_for_update", fake.read_load_for_update)
     monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
     monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
     monkeypatch.setattr(svc, "_insert_assignment_audit", fake.insert_assignment_audit)
@@ -79,13 +79,14 @@ def test_assignment_status_and_audit_share_one_transaction(import_load, monkeypa
 
     svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
 
-    assert len(fake.conns_seen) == 3
+    # locked row read + assignment write + assignment audit + status write
+    assert len(fake.conns_seen) == 4
     assert len(set(id(c) for c in fake.conns_seen)) == 1
 
 
 def test_forced_failure_mid_transaction_rolls_back_status_write(import_load, monkeypatch):
     fake = _FakeDb(import_load)
-    monkeypatch.setattr(svc, "_load_row", fake.read_load)
+    monkeypatch.setattr(svc, "_load_row_for_update", fake.read_load_for_update)
     monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
     monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
 
@@ -159,6 +160,17 @@ def test_override_without_reason_is_rejected(monkeypatch):
     result = svc.apply_transition(4, "En Route to Pickup", override=True, override_reason="")
 
     assert result["ok"] is False
+    assert fake.update_calls == []
+
+
+def test_missing_load_returns_not_found_without_writing(monkeypatch):
+    fake = _FakeDb(None)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(999, "En Route to Pickup")
+
+    assert result["ok"] is False
+    assert "not found" in result["reason"].lower()
     assert fake.update_calls == []
 
 

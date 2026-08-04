@@ -1,26 +1,40 @@
 from __future__ import annotations
 
-import pandas as pd
 from sqlalchemy import text
 
-from db_client import DispatchDatabaseClient, read_df, transaction
+from db_client import DispatchDatabaseClient, transaction
 from services.dispatch_stages import COMPLETION_STATUS, validate_transition
 from services.workflow_constants import normalize_service_flow
 
 
-def _load_row(load_id: int) -> pd.DataFrame:
-    return read_df(
-        """
-        select id as _row_id, type as "TYPE", status as "Status",
-               driver_name as "Driver Name", truck_assigned as "Truck Assigned",
-               port as "Port", warehouse as "Warehouse",
-               empty_return_location, dispatcher_notes as "Dispatcher Notes",
-               coalesce(closeout_stage, 'Not Started') as closeout_stage
-        from loads
-        where id = :load_id
-        """,
+def _load_row_for_update(load_id: int, *, conn) -> dict | None:
+    """Read the load row locked (`SELECT ... FOR UPDATE`) inside the same
+    transaction/connection the rest of apply_transition writes through.
+
+    Phase 1 correction (Codex finding): the row used to be read via a
+    separate, unlocked read_df() call *before* the transaction opened, so
+    the status validate_transition() checked against could already be
+    stale by the time the write happened - two dispatchers racing to
+    transition the same load could both pass validation against the same
+    pre-transition status. Locking the row here blocks a second concurrent
+    apply_transition() on the same load_id until this one commits or rolls
+    back, so the status it validates against is guaranteed current."""
+    row = conn.execute(
+        text(
+            """
+            select id as _row_id, type as "TYPE", status as "Status",
+                   driver_name as "Driver Name", truck_assigned as "Truck Assigned",
+                   port as "Port", warehouse as "Warehouse",
+                   empty_return_location, dispatcher_notes as "Dispatcher Notes",
+                   coalesce(closeout_stage, 'Not Started') as closeout_stage
+            from loads
+            where id = :load_id
+            for update
+            """
+        ),
         {"load_id": load_id},
-    )
+    ).mappings().first()
+    return dict(row) if row is not None else None
 
 
 def _update_load(load_id: int, updates: dict, *, conn) -> None:
@@ -66,61 +80,65 @@ def apply_transition(
     forward. Driver/truck assignment (when provided) is written and
     audited as its own event, separate from the status-change event —
     assignment is data, not a board stage.
+
+    The row read, transition validation, and all writes now happen inside
+    one transaction with the row locked FOR UPDATE (see
+    _load_row_for_update) - validation can no longer run against a status
+    a concurrent transition is about to change out from under it.
     """
     if override and not override_reason.strip():
         return {"ok": False, "reason": "An override requires a reason.", "status": "", "closeout_stage": ""}
 
-    df = _load_row(load_id)
-    if df.empty:
-        return {"ok": False, "reason": f"Load {load_id} not found.", "status": "", "closeout_stage": ""}
-
-    row = df.iloc[0]
-    move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
-    current_status = str(row.get("Status", "") or "New")
-    existing_driver = str(row.get("Driver Name", "") or "").strip()
-    existing_truck = str(row.get("Truck Assigned", "") or "").strip()
-
-    effective_driver = driver.strip() if driver and driver.strip() else existing_driver
-    effective_truck = truck.strip() if truck and truck.strip() else existing_truck
-    has_origin = bool(str(row.get("Port", "") or row.get("Warehouse", "") or "").strip())
-    empty_return_required = bool(str(row.get("empty_return_location", "") or "").strip())
-
-    ok, reason = validate_transition(
-        move_type,
-        current_status,
-        new_status,
-        has_driver=bool(effective_driver),
-        has_truck=bool(effective_truck),
-        has_origin=has_origin,
-        empty_return_required=empty_return_required,
-        override=override,
-    )
-
-    if not ok:
-        return {"ok": False, "reason": reason, "status": current_status, "closeout_stage": str(row.get("closeout_stage", "Not Started"))}
-
-    assignment_updates = {}
-    if driver and driver.strip() and driver.strip() != existing_driver:
-        assignment_updates["Driver Name"] = driver.strip()
-    if truck and truck.strip() and truck.strip() != existing_truck:
-        assignment_updates["Truck Assigned"] = truck.strip()
-
-    status_updates: dict = {"Status": new_status}
-    final_note = note.strip()
-    if override:
-        final_note = f"{final_note} [override: {override_reason.strip()}]".strip()
-    if final_note:
-        status_updates["Dispatcher Notes"] = final_note
-
-    closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
-    should_set_closeout = new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
-
-    # Assignment write + its audit row, the status write, and the closeout
-    # write all share one connection/transaction - this is the only place
-    # loads.status changes, so a crash partway through must never leave an
-    # assignment written without its audit row, or a status change without
-    # the closeout stage it implies.
     with transaction() as conn:
+        row = _load_row_for_update(load_id, conn=conn)
+        if row is None:
+            return {"ok": False, "reason": f"Load {load_id} not found.", "status": "", "closeout_stage": ""}
+
+        move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
+        current_status = str(row.get("Status", "") or "New")
+        existing_driver = str(row.get("Driver Name", "") or "").strip()
+        existing_truck = str(row.get("Truck Assigned", "") or "").strip()
+
+        effective_driver = driver.strip() if driver and driver.strip() else existing_driver
+        effective_truck = truck.strip() if truck and truck.strip() else existing_truck
+        has_origin = bool(str(row.get("Port", "") or row.get("Warehouse", "") or "").strip())
+        empty_return_required = bool(str(row.get("empty_return_location", "") or "").strip())
+
+        ok, reason = validate_transition(
+            move_type,
+            current_status,
+            new_status,
+            has_driver=bool(effective_driver),
+            has_truck=bool(effective_truck),
+            has_origin=has_origin,
+            empty_return_required=empty_return_required,
+            override=override,
+        )
+
+        if not ok:
+            return {
+                "ok": False,
+                "reason": reason,
+                "status": current_status,
+                "closeout_stage": str(row.get("closeout_stage", "Not Started")),
+            }
+
+        assignment_updates = {}
+        if driver and driver.strip() and driver.strip() != existing_driver:
+            assignment_updates["Driver Name"] = driver.strip()
+        if truck and truck.strip() and truck.strip() != existing_truck:
+            assignment_updates["Truck Assigned"] = truck.strip()
+
+        status_updates: dict = {"Status": new_status}
+        final_note = note.strip()
+        if override:
+            final_note = f"{final_note} [override: {override_reason.strip()}]".strip()
+        if final_note:
+            status_updates["Dispatcher Notes"] = final_note
+
+        closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
+        should_set_closeout = new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
+
         if assignment_updates:
             _update_load(load_id, assignment_updates, conn=conn)
             parts = []
