@@ -21,7 +21,7 @@
   },
   "references": {
     "container_size": "40HC",
-    "contact_name": "Qa Harness",
+    "contact_name": "QA Harness",
     "contact_email": "qa-harness@fixtures.calitrans.test"
   },
   "missing_required_fields": [],
