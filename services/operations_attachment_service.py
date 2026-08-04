@@ -522,6 +522,17 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], f
                 if existing_value and existing_valid and field != "Dispatcher Notes":
                     eligible_document_fields[field] = ""
 
+        for field in _ATTACHMENT_MERGE_IDENTITY_FIELDS:
+            existing_value = updated.get(field, "")
+            existing_valid = validate_field_value(
+                field,
+                existing_value,
+                source="persisted_email",
+                method="parsed_value",
+            )[0]
+            if existing_value and existing_valid:
+                eligible_document_fields[field] = ""
+
         updated, _, _ = reconcile_parsed_sources(
             updated,
             eligible_document_fields,

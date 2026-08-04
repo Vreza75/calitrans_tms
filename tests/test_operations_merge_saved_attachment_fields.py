@@ -45,3 +45,26 @@ def test_force_true_still_appends_rather_than_overwrites_dispatcher_notes():
 
     assert "Existing note" in merged["Dispatcher Notes"]
     assert "New note from reparse" in merged["Dispatcher Notes"]
+
+
+def test_force_true_never_lets_a_document_scan_overwrite_a_valid_sender_contact_name():
+    """The sender's own email header is a stronger identity signal than a
+    document-text scan, which can mis-capture an unrelated operational line
+    (e.g. a steamship line or carrier name) as if it were a person's name in
+    a document that has no real signature block. Contact identity fields
+    must stay fill-blank-only regardless of `force`."""
+    parsed = {"Contact Name": "Dana Phillips", "Contact Email": "dana.phillips@example.com"}
+    attachments = [{"parsed_data": {"Contact Name": "Steamship Line: CMA CGM"}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+
+    assert merged["Contact Name"] == "Dana Phillips"
+
+
+def test_force_true_still_fills_a_blank_contact_name_from_the_document():
+    parsed = {"Contact Name": ""}
+    attachments = [{"parsed_data": {"Contact Name": "Maria Gonzalez"}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+
+    assert merged["Contact Name"] == "Maria Gonzalez"
