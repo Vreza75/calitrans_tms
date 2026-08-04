@@ -22,6 +22,16 @@ from config import DOCUMENT_STORAGE_DIR
 from db_client import execute, read_df
 from services.load_matching_service import existing_load_columns
 from services.order_parser import extract_text_from_pdf
+from services.operations_attachment_core import (
+    OPERATIONS_ATTACHMENTS_KEY,
+    OPERATIONS_PDF_ATTACHMENTS_KEY,
+    coerce_json_dict,
+    extract_operations_attachments,
+    extract_operations_pdf_attachments,
+    group_operations_source_documents,
+    is_pdf_filename,
+    safe_str,
+)
 from services.operations_field_service import (
     derive_review_state,
     extract_operational_fields,
@@ -30,8 +40,6 @@ from services.operations_field_service import (
 )
 
 
-OPERATIONS_ATTACHMENTS_KEY = "_operations_attachments"
-OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
 logger = logging.getLogger(__name__)
 
 OPERATIONS_ORDER_FIELDS = [
@@ -81,14 +89,13 @@ PARSED_TO_LOAD_COLUMN_MAP = {
 
 # ============================================================
 # Basic helpers
+#
+# safe_str, coerce_json_dict, is_pdf_filename, and the attachment
+# extraction/grouping functions below live in operations_attachment_core
+# (framework-neutral - see that module's docstring) and are imported
+# above, not redefined here, so there is exactly one implementation of
+# each.
 # ============================================================
-
-def safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
-
 
 def int_or_none(value: Any) -> int | None:
     if value is None:
@@ -110,20 +117,6 @@ def int_or_none(value: Any) -> int | None:
         return None
 
 
-def coerce_json_dict(value: Any) -> dict:
-    if isinstance(value, dict):
-        return value
-
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-            return decoded if isinstance(decoded, dict) else {}
-        except Exception:
-            return {}
-
-    return {}
-
-
 def json_dump(data: dict) -> str:
     return json.dumps(data or {}, default=str)
 
@@ -142,13 +135,6 @@ def operations_attachment_storage_dir() -> Path:
     storage_dir = Path(DOCUMENT_STORAGE_DIR) / "operations_inbox"
     storage_dir.mkdir(parents=True, exist_ok=True)
     return storage_dir
-
-
-def is_pdf_filename(filename: str, content_type: str = "") -> bool:
-    return (
-        safe_str(filename).lower().endswith(".pdf")
-        or safe_str(content_type).lower() == "application/pdf"
-    )
 
 
 # Compatibility aliases
@@ -450,126 +436,13 @@ _parse_saved_operations_pdf = parse_saved_operations_pdf
 
 # ============================================================
 # Attachment extraction / merging
+#
+# extract_operations_attachments, extract_operations_pdf_attachments, and
+# group_operations_source_documents now live in operations_attachment_core
+# (imported above) - kept here only as re-exports so every existing
+# `from services.operations_attachment_service import
+# extract_operations_attachments` (etc.) call site keeps working.
 # ============================================================
-
-def extract_operations_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
-    parsed = coerce_json_dict(parsed)
-
-    attachments = parsed.get(OPERATIONS_ATTACHMENTS_KEY, [])
-    if not isinstance(attachments, list):
-        attachments = []
-
-    normalized = [item for item in attachments if isinstance(item, dict)]
-
-    for pdf_item in parsed.get(OPERATIONS_PDF_ATTACHMENTS_KEY, []) or []:
-        if not isinstance(pdf_item, dict):
-            continue
-
-        pdf_path = safe_str(pdf_item.get("file_path", ""))
-        already_added = any(safe_str(item.get("file_path", "")) == pdf_path for item in normalized)
-
-        if not already_added:
-            normalized.append(pdf_item)
-
-    if record is not None:
-        filename = safe_str(record.get("filename", "") if hasattr(record, "get") else "")
-        file_path = safe_str(record.get("file_path", "") if hasattr(record, "get") else "")
-
-        if filename and file_path:
-            already_added = any(safe_str(item.get("file_path", "")) == file_path for item in normalized)
-
-            if not already_added:
-                normalized.append(
-                    {
-                        "filename": filename,
-                        "file_path": file_path,
-                        "content_type": "application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream",
-                        "is_pdf": filename.lower().endswith(".pdf"),
-                        "parsed_data": {},
-                        "fields_found": 0,
-                        "text_preview": "",
-                        "parse_error": "",
-                    }
-                )
-
-    return normalized
-
-
-def extract_operations_pdf_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
-    return [
-        item
-        for item in extract_operations_attachments(parsed, record)
-        if is_pdf_filename(item.get("filename", ""), item.get("content_type", "")) or bool(item.get("is_pdf"))
-    ]
-
-
-def group_operations_source_documents(
-    current_record,
-    current_parsed: dict,
-    timeline_rows: pd.DataFrame | list[dict] | None = None,
-) -> dict[str, list[dict]]:
-    """Separate exact-message attachments from earlier conversation documents."""
-    record_dict = (
-        current_record.to_dict()
-        if hasattr(current_record, "to_dict")
-        else dict(current_record or {})
-    )
-    current_id = safe_str(record_dict.get("id"))
-    current_message_id = safe_str(record_dict.get("source_message_id"))
-
-    def with_source_metadata(attachment: dict, source: dict) -> dict:
-        item = dict(attachment or {})
-        item["source_work_item_id"] = source.get("id")
-        item["source_message_id"] = (
-            safe_str(item.get("source_message_id"))
-            or safe_str(source.get("source_message_id"))
-        )
-        item["source_subject"] = safe_str(source.get("source_subject"))
-        item["source_received_at"] = safe_str(source.get("source_received_at"))
-        return item
-
-    current = [
-        with_source_metadata(item, record_dict)
-        for item in extract_operations_attachments(current_parsed, record_dict)
-    ]
-    current_identities = {
-        (
-            safe_str(item.get("source_message_id")),
-            safe_str(item.get("content_sha256"))
-            or safe_str(item.get("file_path")),
-        )
-        for item in current
-    }
-    prior: list[dict] = []
-    prior_identities: set[tuple[str, str]] = set()
-
-    if isinstance(timeline_rows, pd.DataFrame):
-        rows = timeline_rows.to_dict(orient="records")
-    else:
-        rows = list(timeline_rows or [])
-
-    for row in rows:
-        row_dict = dict(row or {})
-        row_id = safe_str(row_dict.get("id"))
-        row_message_id = safe_str(row_dict.get("source_message_id"))
-        if (current_id and row_id == current_id) or (
-            current_message_id and row_message_id == current_message_id
-        ):
-            continue
-        row_parsed = coerce_json_dict(row_dict.get("parsed_data"))
-        for attachment in extract_operations_attachments(row_parsed, row_dict):
-            item = with_source_metadata(attachment, row_dict)
-            identity = (
-                safe_str(item.get("source_message_id")),
-                safe_str(item.get("content_sha256"))
-                or safe_str(item.get("file_path")),
-            )
-            if identity in current_identities or identity in prior_identities:
-                continue
-            prior_identities.add(identity)
-            prior.append(item)
-
-    return {"current": current, "prior": prior}
 
 
 def merge_operations_order_fields(body_parsed: dict, document_parsed: dict) -> tuple[dict, list[dict], list[str]]:

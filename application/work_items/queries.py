@@ -18,6 +18,7 @@ from application.work_items.models import (
     WorkItemSummary,
 )
 from repositories import inbox_repo, work_item_repo
+from services import operations_attachment_core as attachment_core
 
 
 def _coerce_json_dict(value: Any) -> dict:
@@ -215,13 +216,9 @@ def get_attachment_summary(
     if parsed is None:
         parsed = _coerce_json_dict(record.get("parsed_data"))
 
-    # Lazy import: services.operations_attachment_service imports
-    # streamlit at module top (it also contains render_* functions). This
-    # keeps that transitive dependency out of application/'s own import
-    # graph while still reusing the one canonical attachment-metadata
-    # extraction function instead of duplicating it.
-    import services.operations_attachment_service as attachment_service
-
+    # operations_attachment_core has no streamlit dependency (directly or
+    # transitively) - imported at module top, no lazy-import trick needed.
+    #
     # Prior-conversation attachment grouping needs each earlier message's
     # own parsed_data, which the lightweight conversation-summary query
     # does not select (by design - Step 3C: don't load full history for a
@@ -229,7 +226,7 @@ def get_attachment_summary(
     # message's attachments; a caller that needs prior-conversation
     # attachments too fetches the full timeline via get_conversation_page()
     # first and re-groups from that.
-    grouped = attachment_service.group_operations_source_documents(record, parsed, [])
+    grouped = attachment_core.group_operations_source_documents(record, parsed, [])
 
     def _to_meta(item: dict) -> AttachmentMeta:
         file_path = str(item.get("file_path") or "")
@@ -257,9 +254,7 @@ def attachment_ref(file_path: str) -> str:
     file-system paths); get_attachment_content() resolves it back to a
     path by re-deriving refs for that work item's own attachments and
     matching, never by accepting a path from the caller."""
-    import hashlib
-
-    return hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:24] if file_path else ""
+    return attachment_core.attachment_ref(file_path)
 
 
 def get_attachment_content(work_item_id: int, attachment_ref_value: str) -> tuple[bytes, AttachmentMeta]:
@@ -273,16 +268,7 @@ def get_attachment_content(work_item_id: int, attachment_ref_value: str) -> tupl
     if match is None or not match.file_path:
         raise NotFoundError(f"Attachment {attachment_ref_value} not found for work item {work_item_id}.")
 
-    # Lazy import for the same reason as above: keeps streamlit out of
-    # application/'s import graph.
-    import services.operations_attachment_service as attachment_service
-
-    read_fn = (
-        attachment_service.read_operations_pdf_bytes
-        if match.is_pdf
-        else attachment_service.read_operations_attachment_bytes
-    )
-    return read_fn(match.file_path), match
+    return attachment_core.read_attachment_bytes(match.file_path), match
 
 
 def get_conversation_page(
