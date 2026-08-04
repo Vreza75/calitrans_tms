@@ -500,11 +500,33 @@ def merge_saved_attachment_fields(parsed: dict, saved_attachments: list[dict], f
     dispatcher-confirmed tracking of its own (that lives on the separate
     pending-draft table), so this is safe to force-overwrite.
 
-    Contact identity fields are always fill-blank-only regardless of
-    `force`: the sender's own email header is a more reliable identity
-    signal than a document-text scan, which can easily mis-capture an
-    unrelated line (e.g. a steamship line or warehouse name) as a contact
-    name in a document that has no real signature block."""
+    IDENTITY FIELD POLICY (Contact Name/Email/Phone/Company) - independent
+    of `force`, and independent of the order/route-field rule above:
+
+      - blank existing value            -> may be filled by a valid document value.
+      - non-blank, VALID existing value -> protected; never replaced by a
+                                            document scan, regardless of `force`.
+      - non-blank, INVALID existing value -> treated the same as blank: may
+                                            be replaced by a valid document value.
+
+    This is deliberately NOT pure "fill-blank-only" - an invalid existing
+    value (e.g. a garbage fragment from an earlier bad parse) is no more
+    trustworthy than a blank one, so it does not block a valid correction.
+    The sender's own email header is a more reliable identity signal than a
+    document-text scan, which can easily mis-capture an unrelated line
+    (e.g. a steamship line or warehouse name) as a contact name in a
+    document that has no real signature block - that is why a *valid*
+    existing identity value is protected even when `force=True` forces
+    every other field to accept the document's value.
+
+    Known limitation: order_intake.parsed_data has no field-level
+    dispatcher-confirmed flag (see above), so "valid existing value" is
+    used as the closest safe proxy for "already trustworthy" - there is no
+    way to distinguish a dispatcher-confirmed identity from an
+    automatically-parsed-but-valid one at this layer. If field-level
+    confirmation metadata is added to this structure in the future, this
+    policy should be tightened to require it explicitly for the "protected"
+    case instead of validity alone."""
     updated = dict(parsed or {})
 
     for attachment in saved_attachments:

@@ -7,6 +7,8 @@ re-uploading the attachment. order_intake.parsed_data has no dispatcher-
 confirmed tracking of its own (that lives on the separate pending-draft
 table), so an explicit Parse/Reparse click is safe to force-overwrite.
 """
+import pytest
+
 from services.operations_attachment_service import merge_saved_attachment_fields
 
 
@@ -68,3 +70,67 @@ def test_force_true_still_fills_a_blank_contact_name_from_the_document():
     merged = merge_saved_attachment_fields(parsed, attachments, force=True)
 
     assert merged["Contact Name"] == "Maria Gonzalez"
+
+
+# --- Identity field merge policy, exhaustive across all four fields --------
+#
+# Policy (see merge_saved_attachment_fields' docstring): blank or invalid
+# existing value -> may be filled by a valid document value; non-blank VALID
+# existing value -> always protected, regardless of `force`. Verified here
+# for Contact Name, Contact Email, Contact Phone, and Contact Company, not
+# just Contact Name.
+
+_IDENTITY_FIELD_EXAMPLES = {
+    "Contact Name": {"valid_a": "Dana Phillips", "valid_b": "Maria Gonzalez", "invalid": "Steamship Line: CMA CGM"},
+    "Contact Email": {"valid_a": "dana.phillips@example.com", "valid_b": "maria.gonzalez@example.com", "invalid": "not-an-email"},
+    "Contact Phone": {"valid_a": "713-555-0101", "valid_b": "281-555-0199", "invalid": "call-the-office"},
+    "Contact Company": {"valid_a": "Gulf Coast Logistics Inc", "valid_b": "Coastal Freight Group", "invalid": "info@example.com"},
+}
+
+
+@pytest.mark.parametrize("field", sorted(_IDENTITY_FIELD_EXAMPLES))
+@pytest.mark.parametrize("force", [True, False])
+def test_identity_field_blank_existing_is_filled_by_valid_document(field, force):
+    examples = _IDENTITY_FIELD_EXAMPLES[field]
+    parsed = {field: ""}
+    attachments = [{"parsed_data": {field: examples["valid_a"]}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=force)
+
+    assert merged[field] == examples["valid_a"]
+
+
+@pytest.mark.parametrize("field", sorted(_IDENTITY_FIELD_EXAMPLES))
+@pytest.mark.parametrize("force", [True, False])
+def test_identity_field_whitespace_only_existing_is_filled_by_valid_document(field, force):
+    examples = _IDENTITY_FIELD_EXAMPLES[field]
+    parsed = {field: "   "}
+    attachments = [{"parsed_data": {field: examples["valid_a"]}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=force)
+
+    assert merged[field] == examples["valid_a"]
+
+
+@pytest.mark.parametrize("field", sorted(_IDENTITY_FIELD_EXAMPLES))
+@pytest.mark.parametrize("force", [True, False])
+def test_identity_field_valid_existing_protected_from_different_valid_document(field, force):
+    examples = _IDENTITY_FIELD_EXAMPLES[field]
+    parsed = {field: examples["valid_a"]}
+    attachments = [{"parsed_data": {field: examples["valid_b"]}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=force)
+
+    assert merged[field] == examples["valid_a"]
+
+
+@pytest.mark.parametrize("field", sorted(_IDENTITY_FIELD_EXAMPLES))
+@pytest.mark.parametrize("force", [True, False])
+def test_identity_field_invalid_existing_is_replaced_by_valid_document(field, force):
+    examples = _IDENTITY_FIELD_EXAMPLES[field]
+    parsed = {field: examples["invalid"]}
+    attachments = [{"parsed_data": {field: examples["valid_a"]}}]
+
+    merged = merge_saved_attachment_fields(parsed, attachments, force=force)
+
+    assert merged[field] == examples["valid_a"]
