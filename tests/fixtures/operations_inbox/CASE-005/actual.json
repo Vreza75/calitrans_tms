@@ -25,9 +25,8 @@
     "last_free_day": "August 7, 2026"
   },
   "references": {
-    "reference_number": "Attached Booking Document",
     "container_size": "40HC",
-    "contact_name": "Steamship Line: CMA CGM",
+    "contact_name": "Dana Phillips",
     "contact_email": "dana.phillips@example.com"
   },
   "missing_required_fields": [],
