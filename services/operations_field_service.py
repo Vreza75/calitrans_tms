@@ -61,32 +61,61 @@ _LOCATION_BAD_PREFIX_RE = re.compile(
     r"^(?:on\s+[a-z]+|and\s+return|deliver\s+the|by\s+\d|no\s+later|please\b)",
     re.I,
 )
-# Labels that, if they appear at the start of a line, mean an address
-# capture must stop there - otherwise a multi-line address would keep
-# absorbing whatever field comes next (Dispatcher Notes, Contact, Port,
-# dates, a signature, ...).
-_ADDRESS_CONTINUATION_STOP_LABELS = (
-    r"address|delivery\s+address|warehouse\s+address|pickup\s+address|"
-    r"customer\s+pickup\s+address|port|terminal|pickup\s+terminal|export\s+terminal|"
-    r"warehouse|delivery\s+warehouse|pickup\s+warehouse|pickup\s+location|origin|"
-    r"destination|contact|contact\s+name|contact\s+phone|contact\s+email|"
-    r"contact\s+company|phone|tel|telephone|mobile|cell|email|e-mail|notes|"
-    r"dispatcher\s+notes|instructions|special\s+instructions|delivery\s+need\s+date|"
-    r"delivery\s+date|need\s+date|reference|reference\s+number|booking\s+number|"
-    r"order\s+number|container\s+number|container\s+size|size|equipment|"
-    r"full\s+return|full\s+return\s+terminal|return\s+terminal|empty\s+return|"
-    r"last\s+free\s+day|lfd|cutoff|document\s+cutoff"
+# Positive address-continuation model (Codex edge-rework finding): a
+# continuation line is accepted only when it positively resembles part of an
+# address, not merely because it fails to match an enumerated blacklist of
+# field labels (that approach missed real labels like "Empty Pickup:"/
+# "Pickup Date:" and could never reject an unlabeled signature line like a
+# bare name or email address, since those never matched any label pattern
+# to begin with).
+_GENERIC_LABEL_LINE_RE = re.compile(r"^\s*[A-Za-z][A-Za-z /]{1,30}\s*[:#-]\s*\S")
+_STREET_SUFFIX_RE = re.compile(
+    r"\b(?:street|st|avenue|ave|road|rd|drive|dr|boulevard|blvd|lane|ln|way|"
+    r"parkway|pkwy|highway|hwy|court|ct|circle|cir|place|pl|terrace|freeway|fwy)\b",
+    re.I,
+)
+_UNIT_LINE_RE = re.compile(r"^\s*(?:suite|ste|unit|building|bldg|floor|fl)\.?\s*\S", re.I)
+_CITY_STATE_ZIP_RE = re.compile(r"[A-Za-z .]+,\s*[A-Z]{2}\s*\d{5}(?:-\d{4})?\s*$")
+_STREET_NUMBER_RE = re.compile(r"^\s*\d{1,6}\s+\S")
+_KNOWN_COUNTRY_LINE_RE = re.compile(
+    r"^\s*(?:united\s+states(?:\s+of\s+america)?|usa|u\.s\.a\.?|canada|mexico|"
+    r"m[eé]xico)\s*$",
+    re.I,
 )
 
 
+def _looks_like_address_continuation(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _GENERIC_LABEL_LINE_RE.match(stripped):
+        return False
+    if _EMAIL_RE.search(stripped):
+        return False
+    if _PHONE_RE.search(stripped):
+        return False
+    if (
+        _STREET_NUMBER_RE.match(stripped)
+        or _UNIT_LINE_RE.match(stripped)
+        or _CITY_STATE_ZIP_RE.search(stripped)
+        or _STREET_SUFFIX_RE.search(stripped)
+        or _KNOWN_COUNTRY_LINE_RE.match(stripped)
+    ):
+        return True
+    # A bare "First Last" name-like line (2-4 capitalized words, no digits,
+    # no comma) reads as a signature, not an address continuation.
+    return False
+
+
 def _address_pattern(label_alternation: str) -> str:
-    """A "<Label>: <first line>" capture that also absorbs plausible
-    continuation lines (city/state/ZIP, a suite/unit line, ...) - it stops at
-    the next recognized field label or a blank line, so it never swallows an
-    unrelated field."""
+    """A "<Label>: <first line>" capture that also absorbs candidate
+    continuation lines up to the next blank line - the *positive*
+    line-by-line filtering (street/unit/city-state-zip shape, rejecting
+    labels/emails/phones/signature-looking lines) happens afterward in
+    _add_pattern_candidates, not in this regex."""
     return (
         rf"^\s*(?:{label_alternation})\s*[:#-]\s*"
-        rf"(?P<value>[^\r\n]*(?:\n(?!\s*(?:{_ADDRESS_CONTINUATION_STOP_LABELS})\s*[:#-])(?!\s*$)[^\r\n]+)*)"
+        rf"(?P<value>[^\r\n]*(?:\n(?!\s*$)[^\r\n]+)*)"
     )
 
 
@@ -342,6 +371,20 @@ def _add_pattern_candidates(
         for match in re.finditer(pattern, text, flags):
             value = match.group("value")
             if isinstance(value, str) and "\n" in value:
+                lines = value.splitlines()
+                if field == "Address":
+                    # Positive continuation filtering: keep the first line
+                    # (the label's own same-line value) unconditionally, then
+                    # stop at the first following line that doesn't
+                    # positively look like part of an address - never
+                    # absorbs a next field label, email, phone, or
+                    # signature-looking line.
+                    kept = [lines[0].strip()] if lines and lines[0].strip() else []
+                    for line in lines[1:]:
+                        if not _looks_like_address_continuation(line):
+                            break
+                        kept.append(line.strip())
+                    lines = kept
                 # A multi-line capture (e.g. a delivery address whose city/
                 # state/ZIP continues on the next line) joins with ", " to
                 # match this pipeline's single-line comma-separated address
@@ -349,7 +392,7 @@ def _add_pattern_candidates(
                 # would silently glue the street and city together) or
                 # keeping raw newlines (which no downstream consumer here
                 # expects).
-                value = ", ".join(line.strip() for line in value.splitlines() if line.strip())
+                value = ", ".join(line.strip() for line in lines if line.strip())
             candidates.append(
                 _candidate(field, value, source, method, confidence, text, match.start(), match.end())
             )
