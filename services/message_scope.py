@@ -62,7 +62,8 @@ _FORWARD_SEPARATOR_RE = re.compile(
 _UNDERSCORE_SEPARATOR_RE = re.compile(r"^\s*_{6,}\s*$")
 
 _ADMINISTRATIVE_ONLY_RE = re.compile(
-    r"^(?:fyi|please\s+handle|please\s+process|please\s+see\s+below|see\s+below|"
+    r"^(?:fyi(?:\s*,?\s*thanks)?|please\s+handle|please\s+process|please\s+see\s+below|see\s+below|"
+    r"(?:please\s+)?see\s+attached|fwd|"
     r"forwarding(?:\s+for\s+(?:your\s+)?(?:review|action|handling))?|forwarded|"
     r"please\s+review|for\s+your\s+action|for\s+your\s+review|"
     r"para\s+su\s+atenci[oó]n|favor\s+revisar|favor\s+atender)[.:!,]*$",
@@ -114,6 +115,15 @@ def is_reply_header_line(lines: list[str], index: int) -> tuple[bool, str]:
     has_to_label = bool(re.search(r"(?im)^\s*(?:to|para|a)\s*:", window))
     has_email_value = bool(_EMAIL_IN_VALUE_RE.search(value)) or bool(_EMAIL_IN_VALUE_RE.search(window))
     has_operational_evidence = bool(_OPERATIONAL_PROXIMITY_RE.search(window))
+    # Sent:/Enviado:/Cc:/Bcc: are pure email-transport vocabulary - no
+    # operational freight lane ever carries them - so their presence is
+    # coherent envelope evidence on its own, independent of whether an
+    # email address happens to be present. This matters because a real
+    # forwarded envelope's Subject: *value* can itself contain domain
+    # vocabulary ("Subject: Quote Request", "Subject: Rate") - that must not
+    # be read as proof of an operational lane when Sent:/Cc:/Bcc: already
+    # prove this is a genuine multi-field envelope, not a bare lane.
+    has_envelope_only_label = bool(re.search(r"(?im)^\s*(?:sent|enviado|cc|bcc)\s*:", window))
 
     # Strong operational-block veto - evaluated BEFORE the Sent/Subject/Date
     # shortcut below, not after (Codex HIGH finding: the previous order let a
@@ -127,8 +137,10 @@ def is_reply_header_line(lines: list[str], index: int) -> tuple[bool, str]:
     # metadata - genuine Outlook/Gmail header blocks carry an actual sender/
     # recipient email address essentially always, which is exactly what
     # distinguishes them from a bare operational lane that merely happens to
-    # sit next to a Date: or Subject: line.
-    if has_to_label and has_operational_evidence and not has_email_value:
+    # sit next to a Date: or Subject: line. The veto is additionally
+    # suppressed by has_envelope_only_label (a display-name-only sender with
+    # no email address, but a Sent:/Cc:/Bcc: label proving a real envelope).
+    if has_to_label and has_operational_evidence and not has_email_value and not has_envelope_only_label:
         return False, label
 
     has_sent_subject_date = bool(_SENT_SUBJECT_DATE_RE.search(window))

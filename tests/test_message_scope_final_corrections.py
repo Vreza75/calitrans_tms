@@ -374,3 +374,113 @@ def test_meaningful_top_level_cancellation_plus_forwarded_booking_stays_authorit
     scope = build_message_scope(body)
     assert scope.scope_type == "forward"
     assert "cancel this booking" in scope.classification_text
+
+
+# =====================================================================
+# Verification-pass regression: an envelope-only header value (Sent:/Cc:/
+# Bcc:) is coherent envelope evidence on its own and must suppress the
+# operational-block veto even when the sender is a bare display name with
+# no email address and the Subject: line's own value happens to contain
+# domain vocabulary (Quote/Rate/Booking/...) - extremely common in this
+# business, since customer subject lines are almost always about exactly
+# those things. Discovered by an independent verification pass adversarial
+# probe; not covered by the original defect-1/defect-2 regression tests
+# above, which happened to always pair a bare operational lane with either
+# an email address or no Sent:/Cc:/Bcc: label at all.
+# =====================================================================
+
+
+def test_forwarded_envelope_without_email_and_operational_subject_still_stripped():
+    body = (
+        "FYI\n\n-----Original Message-----\n"
+        "From: Customer\nSent: Monday\nTo: Operations\nSubject: Quote Request\n\n"
+        "Please confirm receipt.\nNo action is required.\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forwarded_only"
+    for header in ["From:", "Sent:", "To:", "Subject:"]:
+        assert header not in scope.classification_text, f"{header} leaked into classification_text"
+    assert "Please confirm receipt." in scope.classification_text
+    assert classify_customer_request("", body) != "Quote Request"
+
+
+def test_administrative_only_top_level_with_bare_sender_and_operational_subject_stripped():
+    body = (
+        "FYI\n\n-----Original Message-----\n"
+        "From: C\nSent: Mon\nTo: Ops\nSubject: Rate\n\n"
+        "Please quote Houston to Dallas. Equipment: 40HC.\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forwarded_only"
+    for header in ["From:", "Sent:", "To:", "Subject:"]:
+        assert header not in scope.classification_text
+    assert "Please quote Houston to Dallas." in scope.classification_text
+    assert classify_customer_request("Fwd: Rate", body) == "Quote Request"
+
+
+def test_forwarded_envelope_with_cc_no_email_and_operational_subject_stripped():
+    body = (
+        "FYI\n\n-----Original Message-----\n"
+        "From: Customer\nTo: Operations\nCc: Manager\nSubject: Container Booking\n\n"
+        "Please cancel this shipment.\n"
+    )
+    scope = build_message_scope(body)
+    for header in ["From:", "To:", "Cc:", "Subject:"]:
+        assert header not in scope.classification_text
+    assert "Please cancel this shipment." in scope.classification_text
+
+
+# =====================================================================
+# Verification-pass: narrow, zero-independent-intent administrative
+# phrases found missing during adversarial review. Each carries no
+# independent operational instruction (unlike "Please advise" / "Can you
+# handle this" / "Process this", which were deliberately left unrecognized
+# since they can plausibly carry their own intent).
+# =====================================================================
+
+
+def test_bare_fwd_is_administrative_only():
+    body = (
+        "Fwd\n\n-----Original Message-----\n"
+        "From: C <c@example.com>\nSent: Mon\nTo: Ops\nSubject: Rate\n\n"
+        "Please quote Houston to Dallas.\nEquipment: 40HC\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forwarded_only"
+    assert "Please quote Houston to Dallas." in scope.classification_text
+
+
+def test_see_attached_is_administrative_only():
+    body = (
+        "See attached.\n\n-----Original Message-----\n"
+        "From: C <c@example.com>\nSent: Mon\nTo: Ops\nSubject: Rate\n\n"
+        "Please quote Houston to Dallas.\nEquipment: 40HC\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forwarded_only"
+    assert "Please quote Houston to Dallas." in scope.classification_text
+
+
+def test_fyi_thanks_is_administrative_only():
+    body = (
+        "FYI, thanks\n\n-----Original Message-----\n"
+        "From: C <c@example.com>\nSent: Mon\nTo: Ops\nSubject: Rate\n\n"
+        "Please quote Houston to Dallas.\nEquipment: 40HC\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forwarded_only"
+    assert "Please quote Houston to Dallas." in scope.classification_text
+
+
+def test_please_advise_remains_top_level_authoritative():
+    """Unlike Fwd/See attached/FYI, "Please advise" can carry independent
+    intent (a request for the recipient's own judgment) - it must NOT be
+    added to the administrative-only list, so the forwarded content stays
+    supporting-only rather than classification-authoritative."""
+    body = (
+        "Please advise.\n\n-----Original Message-----\n"
+        "From: C <c@example.com>\nSent: Mon\nTo: Ops\nSubject: Rate\n\n"
+        "Please quote Houston to Dallas.\nEquipment: 40HC\n"
+    )
+    scope = build_message_scope(body)
+    assert scope.scope_type == "forward"
