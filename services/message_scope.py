@@ -41,7 +41,7 @@ _SPANISH_TO_ENGLISH_LABEL = {
 
 _EMAIL_IN_VALUE_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
 _OPERATIONAL_PROXIMITY_RE = re.compile(
-    r"\b(?:equipment|quote|quoting|rate|container|port|pickup|delivery|size|"
+    r"\b(?:equipment|equipo|quote|quoting|rate|container|port|pickup|delivery|size|"
     r"reference|booking|terminal|lfd|cutoff|shipment|cotiz\w*|tarifa)\b",
     re.I,
 )
@@ -111,12 +111,31 @@ def is_reply_header_line(lines: list[str], index: int) -> tuple[bool, str]:
     if not has_from_label:
         return False, label
 
-    has_sent_subject_date = bool(_SENT_SUBJECT_DATE_RE.search(window))
+    has_to_label = bool(re.search(r"(?im)^\s*(?:to|para|a)\s*:", window))
     has_email_value = bool(_EMAIL_IN_VALUE_RE.search(value)) or bool(_EMAIL_IN_VALUE_RE.search(window))
+    has_operational_evidence = bool(_OPERATIONAL_PROXIMITY_RE.search(window))
+
+    # Strong operational-block veto - evaluated BEFORE the Sent/Subject/Date
+    # shortcut below, not after (Codex HIGH finding: the previous order let a
+    # bare Date:/Subject: label promote an operational From:/To: lane to
+    # reply history the moment either label appeared anywhere nearby, even
+    # though "From: Houston / To: Dallas / Date: Aug 10 / Equipment: 40HC" is
+    # exactly as plausible a real operational request as "From: Houston / To:
+    # Dallas" alone). A From:+To: lane carrying domain vocabulary
+    # (equipment/quote/rate/container/port/pickup/delivery/booking/terminal/
+    # ...) and no real email address anywhere nearby is never email-reply
+    # metadata - genuine Outlook/Gmail header blocks carry an actual sender/
+    # recipient email address essentially always, which is exactly what
+    # distinguishes them from a bare operational lane that merely happens to
+    # sit next to a Date: or Subject: line.
+    if has_to_label and has_operational_evidence and not has_email_value:
+        return False, label
+
+    has_sent_subject_date = bool(_SENT_SUBJECT_DATE_RE.search(window))
     if has_sent_subject_date or has_email_value:
         return True, label
 
-    if _OPERATIONAL_PROXIMITY_RE.search(window):
+    if has_operational_evidence:
         return False, label
 
     header_hits = len(_HEADER_LABEL_HITS_RE.findall(window))
