@@ -25,6 +25,7 @@ SM_TO_DB_COLUMNS = {
     "Port": "port",
     "Warehouse": "warehouse",
     "Address": "address",
+    "Full Return Terminal": "full_return_terminal",
     "Document Cutoff": "document_cutoff",
     "Delivery Need Date": "delivery_need_date",
     "LFD": "lfd",

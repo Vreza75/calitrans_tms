@@ -56,6 +56,7 @@ OPERATIONS_ORDER_FIELDS = [
     "Port PIN",
     "Warehouse",
     "Address",
+    "Full Return Terminal",
     "Delivery Need Date",
     "Document Cutoff",
     "LFD",
@@ -84,6 +85,7 @@ PARSED_TO_LOAD_COLUMN_MAP = {
     "Contact Email": "contact_email",
     "Contact Phone": "contact_phone",
     "Dispatcher Notes": "dispatcher_notes",
+    "Full Return Terminal": "full_return_terminal",
 }
 
 
