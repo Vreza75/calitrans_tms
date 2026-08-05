@@ -2,6 +2,23 @@
 
 Date: 2026-08-04
 
+> **Correction (2026-08-05, message-scope final-corrections pass):** a third
+> independent Codex review of this branch found two real HIGH-severity
+> defects in the `services/message_scope.py` module this document describes:
+> an operational `From:`/`To:` lane block containing a `Date:`/`Subject:`
+> label nearby could still be misdetected as reply-header metadata and
+> discarded (the "Reply segmentation" and "Operational From/To handling"
+> sections below overstate this as fully general), and forwarded-header
+> block stripping only removed the first header line, leaking
+> `Sent:`/`To:`/`Subject:` into `classification_text` for every
+> `forwarded_only` message (the "Forward segmentation" section's "skipping
+> its header lines" claim was true only for a single-line header). Both are
+> fixed; see
+> `docs/reviews/OPERATIONS_INBOX_MESSAGE_SCOPE_FINAL_CORRECTIONS.md` for the
+> full reproduction, root cause, and fix. The claims below are left as
+> originally written rather than silently rewritten - read them as
+> superseded by the final-corrections document wherever the two disagree.
+
 Second independent Codex review of `fix/operations-inbox-certification-edge-corrections`
 (HEAD `08bce1e`) concluded **D. REWORK THE EDGE-CORRECTION DESIGN** — 4 HIGH,
 1 MEDIUM, 1 LOW. This document records the rework: a shared message-scope
