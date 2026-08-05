@@ -65,7 +65,7 @@ _ADMINISTRATIVE_ONLY_RE = re.compile(
     r"^(?:fyi|please\s+handle|please\s+process|please\s+see\s+below|see\s+below|"
     r"forwarding(?:\s+for\s+(?:your\s+)?(?:review|action|handling))?|forwarded|"
     r"please\s+review|for\s+your\s+action|for\s+your\s+review|"
-    r"para\s+su\s+atenci[oó]n|favor\s+revisar)[.:!,]*$",
+    r"para\s+su\s+atenci[oó]n|favor\s+revisar|favor\s+atender)[.:!,]*$",
     re.I,
 )
 
@@ -169,6 +169,23 @@ def _is_administrative_or_empty(text: str) -> bool:
     return len(lines) <= 2 and all(_ADMINISTRATIVE_ONLY_RE.match(line) for line in lines)
 
 
+def _is_header_label_line(line: str) -> tuple[bool, str]:
+    """Cheap shape-only check: is this line shaped like `<Label>: <value>`
+    where <Label> is one of the recognized reply/forward header words -
+    deliberately not re-running the full look-ahead evidence gate
+    is_reply_header_line needs, since that gate can never succeed for a line
+    once earlier lines of the same block have already been consumed (its
+    window no longer contains the From:/De: line the gate requires)."""
+    stripped = line.strip()
+    match = _HEADER_LABEL_LINE_RE.match(stripped)
+    if not match:
+        return False, ""
+    raw_label = match.group(1).strip().lower()
+    if raw_label not in _REPLY_HEADER_LABELS and raw_label not in _SPANISH_REPLY_HEADER_LABELS:
+        return False, ""
+    return True, _label_key(raw_label)
+
+
 def _forwarded_active_content(forwarded_block: str) -> tuple[str, str]:
     """Given text starting at a forward separator line, return
     (forwarded_active_text, remaining_forwarded_block). Skips the separator
@@ -177,14 +194,40 @@ def _forwarded_active_content(forwarded_block: str) -> tuple[str, str]:
     further quoted history."""
     lines = forwarded_block.splitlines()
     cursor = 1  # skip the separator line itself
-    while cursor < len(lines):
-        if lines[cursor].strip() == "":
+
+    anchor = cursor
+    while anchor < len(lines) and lines[anchor].strip() == "":
+        anchor += 1
+
+    is_header = False
+    if anchor < len(lines):
+        is_header, _ = is_reply_header_line(lines, anchor)
+
+    if is_header:
+        # Consume the whole coherent header block as one unit rather than
+        # re-running the full evidence gate line-by-line (Codex HIGH
+        # finding: the previous line-by-line re-check lost the From:/De:
+        # line from its own look-ahead window the moment the first line was
+        # consumed, so it always stopped after just one line and leaked
+        # Sent:/To:/Subject: into classification_text). A blank line between
+        # fields is tolerated (some clients format headers that way); a
+        # second From:/De: line ends the block, since a genuine envelope
+        # never repeats it - that second From: is the start of the
+        # forwarded message's own operational content instead (e.g. its own
+        # "From: Houston" / "To: Dallas" lane), not more envelope metadata.
+        cursor = anchor
+        seen_labels: set[str] = set()
+        while cursor < len(lines):
+            if lines[cursor].strip() == "":
+                cursor += 1
+                continue
+            is_label_line, label = _is_header_label_line(lines[cursor])
+            if not is_label_line or (label == "from" and "from" in seen_labels):
+                break
+            seen_labels.add(label)
             cursor += 1
-            continue
-        is_header, _ = is_reply_header_line(lines, cursor)
-        if not is_header:
-            break
-        cursor += 1
+    else:
+        cursor = anchor
 
     body_lines = lines[cursor:]
     nested_reply_index = _find_reply_marker(body_lines)
