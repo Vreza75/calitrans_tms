@@ -9,16 +9,38 @@ can never disagree about which text is active.
 No streamlit import, no database access, no external AI calls. Pure text in,
 structured result out - safe to unit test in isolation.
 
-Replaces the previous single-line "does this line look like a reply header"
-heuristic (services/email_parser.py::_looks_like_reply_header), which
-misclassified an active operational lane block ("From: Houston" / "To:
-Dallas") as quoted-email history because two connected `Label:` lines were
-treated as sufficient evidence on their own. A genuine reply/forward header
-now requires either an email address in the From value, a Sent/Subject/Date
-label nearby, or three or more connected metadata labels - and an
-operational keyword (Equipment, Quote, Rate, Container, ...) nearby
-overrides a weak header signal, since real freight lanes and email headers
-never share that vocabulary.
+## Design
+
+Three prior patch cycles each fixed one observed email shape (a bare Date:
+label, a Sent:/Cc:/Bcc: label, an email address) by adding an isolated
+signal check, and each time a structurally adjacent shape (a coherent
+From:/To:/Subject: envelope with none of those signals) reproduced the same
+underlying defect in a different guise. This module replaces that pattern
+with a single structural distinction, applied uniformly everywhere a
+label-shaped block is evaluated:
+
+- A contiguous run of label-shaped lines (blank-line tolerant) is scanned
+  as one BLOCK, never line-by-line with a shrinking look-ahead window.
+- A block is EMAIL ENVELOPE metadata when it has a From:/De: line and
+  either an email address, or 2+ *other* envelope-shaped labels
+  (Sent/To/Subject/Date/Cc/Bcc, or their Spanish equivalents) - never
+  from a single label alone, and never from keyword content *inside* a
+  label's own value (a Subject: line's value is metadata, not active body
+  text - see _classify_label_line/_scan_label_block).
+- A block containing an OPERATIONAL-ONLY field (Equipment, Container
+  Number, Booking Number, Pickup/Delivery Date, Port, Terminal, Full
+  Return, Empty Pickup, Reference Number, LFD, Cutoff - fields no email
+  envelope ever carries) is always OPERATIONAL, regardless of how many
+  envelope-shaped labels are also present in the same block.
+- A bare From:+To: location pair with nothing else present is treated as
+  plausible operational content by default (never classified as an
+  envelope) - this was the original defect this module was created to
+  fix, and the new design preserves it as a direct structural consequence
+  (2 envelope-shaped labels alone is below the 3-label/email threshold)
+  rather than as a separate special case.
+
+See docs/reviews/OPERATIONS_INBOX_COHERENT_ENVELOPE_ROOT_CAUSE_FIX.md for
+the full decision table this module implements.
 """
 from __future__ import annotations
 
@@ -28,30 +50,42 @@ from typing import Literal
 
 ScopeType = Literal["new_message", "reply", "forward", "forwarded_only", "unknown"]
 
-_REPLY_HEADER_LABELS = {"from", "sent", "to", "cc", "bcc", "subject", "date"}
-_SPANISH_REPLY_HEADER_LABELS = {"de", "enviado", "para", "asunto", "cc", "fecha"}
+# --- Envelope vs. operational label vocabulary ------------------------------
+
+_ENVELOPE_LABELS = {"from", "sent", "to", "cc", "bcc", "subject", "date"}
+_SPANISH_ENVELOPE_LABELS = {"de", "enviado", "para", "asunto", "fecha"}
 _SPANISH_TO_ENGLISH_LABEL = {
     "de": "from",
     "enviado": "sent",
     "para": "to",
     "asunto": "subject",
     "fecha": "date",
-    "cc": "cc",
 }
 
+# Fields that identify a block as an active transportation/operational
+# request rather than email transport metadata - no email envelope ever
+# carries a field labeled "Equipment:" or "Booking Number:". This
+# vocabulary is only ever matched against a label-shaped LINE's own label
+# (never against another label's *value*, e.g. never against what a
+# Subject: line says) - see _classify_label_line.
+_OPERATIONAL_ONLY_LABELS = {
+    "equipment", "equipo",
+    "container number", "container numbers", "numero de contenedor",
+    "booking number", "numero de reserva", "numero de booking",
+    "pickup date", "fecha de recogida", "fecha de recoleccion",
+    "delivery date", "fecha de entrega",
+    "port", "puerto",
+    "terminal",
+    "full return", "full return terminal", "retorno completo",
+    "empty return", "empty return terminal",
+    "empty pickup", "recogida vacia", "recogida vacía",
+    "reference number", "numero de referencia",
+    "lfd",
+    "cutoff",
+}
+
+_LABEL_LINE_RE = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ /]{1,30})\s*:\s*(.*)$")
 _EMAIL_IN_VALUE_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
-_OPERATIONAL_PROXIMITY_RE = re.compile(
-    r"\b(?:equipment|equipo|quote|quoting|rate|container|port|pickup|delivery|size|"
-    r"reference|booking|terminal|lfd|cutoff|shipment|cotiz\w*|tarifa)\b",
-    re.I,
-)
-_HEADER_LABEL_LINE_RE = re.compile(r"^([A-Za-z][A-Za-zÀ-ÿ -]{1,18})\s*:\s*(.*)$")
-_HEADER_LABEL_HITS_RE = re.compile(
-    r"(?im)^\s*(?:from|sent|to|cc|bcc|subject|date|de|enviado|para|asunto|fecha)\s*:"
-)
-_SENT_SUBJECT_DATE_RE = re.compile(
-    r"(?im)^\s*(?:sent|subject|date|enviado|asunto|fecha)\s*:"
-)
 
 _GMAIL_WROTE_RE = re.compile(r"^\s*On .{5,180}\bwrote:\s*$", re.I)
 _SPANISH_WROTE_RE = re.compile(r"^\s*El .{5,180}\bescribi[oó]:\s*$", re.I)
@@ -61,14 +95,10 @@ _FORWARD_SEPARATOR_RE = re.compile(
 )
 _UNDERSCORE_SEPARATOR_RE = re.compile(r"^\s*_{6,}\s*$")
 
-_ADMINISTRATIVE_ONLY_RE = re.compile(
-    r"^(?:fyi(?:\s*,?\s*thanks)?|please\s+handle|please\s+process|please\s+see\s+below|see\s+below|"
-    r"(?:please\s+)?see\s+attached|fwd|"
-    r"forwarding(?:\s+for\s+(?:your\s+)?(?:review|action|handling))?|forwarded|"
-    r"please\s+review|for\s+your\s+action|for\s+your\s+review|"
-    r"para\s+su\s+atenci[oó]n|favor\s+revisar|favor\s+atender)[.:!,]*$",
-    re.I,
-)
+# Iteration bound for descending through nested forward wrappers (Phase 7) -
+# guards against pathological/adversarial input with an unbounded chain of
+# separators; no legitimate email chain nests this deep.
+_MAX_FORWARD_NESTING_DEPTH = 5
 
 
 @dataclass(frozen=True)
@@ -83,83 +113,241 @@ class MessageScope:
     evidence: tuple[str, ...] = ()
 
 
+# --- Administrative wrapper normalization (Phase 8) -------------------------
+
+_DASH_NORMALIZE_RE = re.compile(r"[‐-―−]")  # unicode dashes -> "-"
+_WHITESPACE_COLLAPSE_RE = re.compile(r"[ \t]+")
+_REPEATED_PUNCT_RE = re.compile(r"([.:!,-])\1+")
+
+_ADMINISTRATIVE_ONLY_RE = re.compile(
+    r"^(?:fyi(?:\s*[,-]?\s*thanks)?|please\s+handle|please\s+process|"
+    r"please\s+see\s+below|see\s+below|"
+    r"(?:please\s+)?see\s+attached(?:\s+below)?|fwd|"
+    r"forwarding(?:\s+for\s+(?:your\s+)?(?:review|action|handling))?|forwarded|"
+    r"please\s+review|for\s+your\s+action|for\s+your\s+review|"
+    r"para\s+su\s+atenci[oó]n|favor\s+revisar|favor\s+atender)[.:!,-]*$",
+    re.I,
+)
+
+# A wrapper phrase is administrative-only only when it also carries no
+# independent operational action term of its own (Phase 8/Invariant 8) -
+# "Fwd: please cancel booking ABC123" must never be swallowed as a zero-
+# intent wrapper merely because it starts with "Fwd". Checked in addition
+# to (not instead of) _ADMINISTRATIVE_ONLY_RE's own strict full-line match,
+# which already rejects most of these via its punctuation-only trailing
+# requirement - this is a second, explicit, independently-maintainable
+# safeguard against the same failure mode.
+_OPERATIONAL_ACTION_TERM_RE = re.compile(
+    r"\b(?:cancel|update|change|create|book|quote|rate|deliver|pickup|pick\s+up|"
+    r"return|move|revise|hold|release|"
+    r"cambiar|cancelar|actualizar|reservar|cotizar)\b",
+    re.I,
+)
+
+
+def _normalize_administrative_text(line: str) -> str:
+    normalized = _DASH_NORMALIZE_RE.sub("-", line)
+    normalized = _WHITESPACE_COLLAPSE_RE.sub(" ", normalized)
+    normalized = _REPEATED_PUNCT_RE.sub(r"\1", normalized)
+    return normalized.strip()
+
+
+def _is_administrative_line(line: str) -> bool:
+    normalized = _normalize_administrative_text(line)
+    if not normalized:
+        return True
+    if _OPERATIONAL_ACTION_TERM_RE.search(normalized):
+        return False
+    return bool(_ADMINISTRATIVE_ONLY_RE.match(normalized))
+
+
+def _is_administrative_or_empty(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return True
+    return len(lines) <= 2 and all(_is_administrative_line(line) for line in lines)
+
+
+# --- Block-level label parsing (Phase 4) ------------------------------------
+
+
 def _label_key(label: str) -> str:
     return _SPANISH_TO_ENGLISH_LABEL.get(label, label)
 
 
-def is_reply_header_line(lines: list[str], index: int) -> tuple[bool, str]:
-    """Whether lines[index] is genuine reply/forward header metadata (not
-    an active operational label line like "From: Houston"). Returns
-    (is_header, normalized_label)."""
-    line = lines[index].strip()
-    match = _HEADER_LABEL_LINE_RE.match(line)
+def _classify_label_line(line: str) -> tuple[str | None, str, str]:
+    """Classify a single line's label (not its value) as "envelope",
+    "operational", or None (not a recognized label at all - including any
+    line that isn't shaped like `Label: value` in the first place). Returns
+    (kind, normalized_label, value). This is the only place vocabulary is
+    ever matched against a *label* - operational-vocabulary words appearing
+    inside another label's *value* (e.g. "Subject: Quote Request") are
+    never inspected here or anywhere else in this module."""
+    match = _LABEL_LINE_RE.match(line.strip())
     if not match:
-        return False, ""
-    raw_label = match.group(1).strip().lower()
+        return None, "", ""
+    raw = re.sub(r"\s+", " ", match.group(1).strip().lower())
     value = match.group(2).strip()
-    label = _label_key(raw_label)
-    if raw_label not in _REPLY_HEADER_LABELS and raw_label not in _SPANISH_REPLY_HEADER_LABELS:
-        return False, ""
+    if raw in _ENVELOPE_LABELS or raw in _SPANISH_ENVELOPE_LABELS:
+        return "envelope", _label_key(raw), value
+    if raw in _OPERATIONAL_ONLY_LABELS:
+        return "operational", raw, value
+    return None, raw, value
 
-    window_lines = lines[index : min(len(lines), index + 8)]
-    window = "\n".join(window_lines)
 
-    # A real header block is fundamentally characterized by a From:/De: line
-    # (who sent it) - a bare "Date: 02-Jul-26" or "Subject: ..." operational
-    # field with no From: anywhere nearby (e.g. a booking confirmation's own
-    # "Date:" line) must never qualify on its own.
-    has_from_label = bool(re.search(r"(?im)^\s*(?:from|de)\s*:", window))
-    if not has_from_label:
-        return False, label
+@dataclass(frozen=True)
+class _BlockScan:
+    end_index: int
+    kind: Literal["envelope", "operational", "none"]
+    envelope_labels: tuple[str, ...]
+    has_email: bool
+    envelope_prefix_end: int
+    envelope_prefix_is_coherent: bool
 
-    has_to_label = bool(re.search(r"(?im)^\s*(?:to|para|a)\s*:", window))
-    has_email_value = bool(_EMAIL_IN_VALUE_RE.search(value)) or bool(_EMAIL_IN_VALUE_RE.search(window))
-    has_operational_evidence = bool(_OPERATIONAL_PROXIMITY_RE.search(window))
-    # Sent:/Enviado:/Cc:/Bcc: are pure email-transport vocabulary - no
-    # operational freight lane ever carries them - so their presence is
-    # coherent envelope evidence on its own, independent of whether an
-    # email address happens to be present. This matters because a real
-    # forwarded envelope's Subject: *value* can itself contain domain
-    # vocabulary ("Subject: Quote Request", "Subject: Rate") - that must not
-    # be read as proof of an operational lane when Sent:/Cc:/Bcc: already
-    # prove this is a genuine multi-field envelope, not a bare lane.
-    has_envelope_only_label = bool(re.search(r"(?im)^\s*(?:sent|enviado|cc|bcc)\s*:", window))
 
-    # Strong operational-block veto - evaluated BEFORE the Sent/Subject/Date
-    # shortcut below, not after (Codex HIGH finding: the previous order let a
-    # bare Date:/Subject: label promote an operational From:/To: lane to
-    # reply history the moment either label appeared anywhere nearby, even
-    # though "From: Houston / To: Dallas / Date: Aug 10 / Equipment: 40HC" is
-    # exactly as plausible a real operational request as "From: Houston / To:
-    # Dallas" alone). A From:+To: lane carrying domain vocabulary
-    # (equipment/quote/rate/container/port/pickup/delivery/booking/terminal/
-    # ...) and no real email address anywhere nearby is never email-reply
-    # metadata - genuine Outlook/Gmail header blocks carry an actual sender/
-    # recipient email address essentially always, which is exactly what
-    # distinguishes them from a bare operational lane that merely happens to
-    # sit next to a Date: or Subject: line. The veto is additionally
-    # suppressed by has_envelope_only_label (a display-name-only sender with
-    # no email address, but a Sent:/Cc:/Bcc: label proving a real envelope).
-    if has_to_label and has_operational_evidence and not has_email_value and not has_envelope_only_label:
-        return False, label
+def _scan_label_block(lines: list[str], start_index: int) -> _BlockScan:
+    """Scan the maximal contiguous run of label-shaped lines (blank-line
+    tolerant) beginning at start_index and classify the whole run as one
+    unit - never line-by-line with a shrinking look-ahead window, which is
+    what caused every prior patch cycle's leak (a header-shaped line loses
+    the evidence its own classification depends on the moment an earlier
+    line in the same block has already been consumed).
 
-    has_sent_subject_date = bool(_SENT_SUBJECT_DATE_RE.search(window))
-    if has_sent_subject_date or has_email_value:
-        return True, label
+    A second From:/De: line ends the run without being consumed - a
+    genuine envelope is never repeated, so a second From: line starts
+    unrelated content (the forwarded message's own operational lane, or a
+    new nested block) rather than continuing the same envelope.
 
-    if has_operational_evidence:
-        return False, label
+    Two different questions need two different answers from the same scan,
+    which is why this returns both `kind` and a separate envelope-prefix
+    result:
 
-    header_hits = len(_HEADER_LABEL_HITS_RE.findall(window))
-    return header_hits >= 3, label
+    - "Is this whole run safe to treat as active content, never quoted
+      history?" (used by _find_reply_marker) - here ANY operational-only
+      label anywhere in the run must veto envelope classification for the
+      *entire* run, since the goal is protecting real operational content
+      from being wrongly clipped as a reply header. `kind` answers this.
+    - "How much of this run, starting from the top, is a coherent email
+      envelope I should strip?" (used by _strip_envelope_block, only ever
+      called on confirmed forwarded content) - here an operational-only
+      label ends the *envelope* at that point without retroactively
+      un-classifying the coherent envelope-labeled prefix that came before
+      it (e.g. "From: Dispatch\nTo: Imports\nSubject: Port Update\nPort:
+      Bayport Container Terminal" - the first three lines are still a
+      genuine envelope even though "Port:" immediately follows with no
+      blank line; only "Port:" and beyond is body content).
+      `envelope_prefix_end`/`envelope_prefix_is_coherent` answer this.
+    """
+    cursor = start_index
+    envelope_labels: set[str] = set()
+    has_operational_label = False
+    has_email = False
+    has_from = False
+    seen_from_already = False
+
+    prefix_end = start_index
+    prefix_has_from = False
+    prefix_envelope_labels: set[str] = set()
+    prefix_has_email = False
+    prefix_closed = False
+
+    while cursor < len(lines):
+        if lines[cursor].strip() == "":
+            # A blank line is only tolerated as a separator WITHIN a run of
+            # envelope-shaped fields (some clients format headers with a
+            # blank line between each field) - never as a bridge into
+            # whatever follows the envelope, even when that next line also
+            # happens to be label-shaped (e.g. a genuine "Booking Number:"
+            # body line right after a stripped envelope must never be
+            # folded into the same block merely because a blank line
+            # separates them).
+            peek = cursor + 1
+            while peek < len(lines) and lines[peek].strip() == "":
+                peek += 1
+            peek_kind = _classify_label_line(lines[peek])[0] if peek < len(lines) else None
+            if peek_kind != "envelope":
+                break
+            cursor = peek
+            continue
+        kind, label, value = _classify_label_line(lines[cursor])
+        if kind is None:
+            break
+        if kind == "operational":
+            has_operational_label = True
+            if not prefix_closed:
+                prefix_closed = True
+                prefix_end = cursor
+            cursor += 1
+            continue
+        # kind == "envelope"
+        if label == "from":
+            if seen_from_already:
+                break
+            seen_from_already = True
+            has_from = True
+        envelope_labels.add(label)
+        if _EMAIL_IN_VALUE_RE.search(value):
+            has_email = True
+        if not prefix_closed:
+            if label == "from":
+                prefix_has_from = True
+            prefix_envelope_labels.add(label)
+            if _EMAIL_IN_VALUE_RE.search(value):
+                prefix_has_email = True
+        cursor += 1
+
+    if not prefix_closed:
+        prefix_end = cursor
+
+    if has_operational_label:
+        block_kind: Literal["envelope", "operational", "none"] = "operational"
+    elif has_from and (len(envelope_labels) >= 3 or has_email):
+        block_kind = "envelope"
+    else:
+        block_kind = "none"
+
+    prefix_is_coherent = prefix_has_from and (len(prefix_envelope_labels) >= 3 or prefix_has_email)
+
+    return _BlockScan(
+        end_index=cursor,
+        kind=block_kind,
+        envelope_labels=tuple(sorted(envelope_labels)),
+        has_email=has_email,
+        envelope_prefix_end=prefix_end,
+        envelope_prefix_is_coherent=prefix_is_coherent,
+    )
+
+
+def _strip_envelope_block(lines: list[str], start_index: int) -> int:
+    """If a coherent email envelope block begins at the first non-blank
+    line at or after start_index, return the index immediately after its
+    envelope-labeled prefix (stopping at the first operational-only label,
+    if any, rather than requiring the entire contiguous run to be free of
+    operational vocabulary - see _scan_label_block's envelope_prefix_*
+    fields); otherwise return start_index unchanged (nothing stripped)."""
+    anchor = start_index
+    while anchor < len(lines) and lines[anchor].strip() == "":
+        anchor += 1
+    if anchor >= len(lines):
+        return start_index
+    scan = _scan_label_block(lines, anchor)
+    if not scan.envelope_prefix_is_coherent:
+        return start_index
+    return scan.envelope_prefix_end
 
 
 def _find_reply_marker(lines: list[str]) -> int | None:
     for index, line in enumerate(lines):
         if _GMAIL_WROTE_RE.match(line) or _SPANISH_WROTE_RE.match(line):
             return index
-        is_header, _ = is_reply_header_line(lines, index)
-        if is_header:
+        kind, label, _ = _classify_label_line(line)
+        if kind != "envelope":
+            continue
+        scan = _scan_label_block(lines, index)
+        if scan.kind == "envelope":
             return index
     return None
 
@@ -171,82 +359,53 @@ def _find_forward_marker(lines: list[str]) -> int | None:
     return None
 
 
-def _is_administrative_or_empty(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return True
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    if not lines:
-        return True
-    return len(lines) <= 2 and all(_ADMINISTRATIVE_ONLY_RE.match(line) for line in lines)
+def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str]:
+    """Given raw text starting at (or containing) a forward separator,
+    repeatedly strip the separator and its immediately-following coherent
+    envelope block, descending into a directly-nested forward wrapper (a
+    forward separator with nothing actionable between it and the next one)
+    until reaching actionable content, a meaningful non-forward line, or no
+    further forward boundary - whichever comes first. Bounded by
+    _MAX_FORWARD_NESTING_DEPTH so malformed/adversarial input with an
+    unbounded chain of separators cannot loop indefinitely; real email
+    chains never nest this deep.
 
+    Returns (innermost_actionable_text, outer_forwarded_block_text) - the
+    second value preserves the full text from the first forward marker
+    onward, for callers that want the complete forwarded/quoted history
+    (e.g. low-confidence field extraction from older messages), independent
+    of which inner layer was selected as active.
+    """
+    lines = raw_text.splitlines()
+    forward_index = _find_forward_marker(lines)
+    if forward_index is None:
+        stripped = raw_text.strip()
+        return stripped, raw_text
 
-def _is_header_label_line(line: str) -> tuple[bool, str]:
-    """Cheap shape-only check: is this line shaped like `<Label>: <value>`
-    where <Label> is one of the recognized reply/forward header words -
-    deliberately not re-running the full look-ahead evidence gate
-    is_reply_header_line needs, since that gate can never succeed for a line
-    once earlier lines of the same block have already been consumed (its
-    window no longer contains the From:/De: line the gate requires)."""
-    stripped = line.strip()
-    match = _HEADER_LABEL_LINE_RE.match(stripped)
-    if not match:
-        return False, ""
-    raw_label = match.group(1).strip().lower()
-    if raw_label not in _REPLY_HEADER_LABELS and raw_label not in _SPANISH_REPLY_HEADER_LABELS:
-        return False, ""
-    return True, _label_key(raw_label)
+    outer_block_text = "\n".join(lines[forward_index:])
+    cursor = forward_index + 1
 
-
-def _forwarded_active_content(forwarded_block: str) -> tuple[str, str]:
-    """Given text starting at a forward separator line, return
-    (forwarded_active_text, remaining_forwarded_block). Skips the separator
-    line and any genuine header block immediately following it, then clips
-    at a nested reply marker if the forwarded message itself contains
-    further quoted history."""
-    lines = forwarded_block.splitlines()
-    cursor = 1  # skip the separator line itself
-
-    anchor = cursor
-    while anchor < len(lines) and lines[anchor].strip() == "":
-        anchor += 1
-
-    is_header = False
-    if anchor < len(lines):
-        is_header, _ = is_reply_header_line(lines, anchor)
-
-    if is_header:
-        # Consume the whole coherent header block as one unit rather than
-        # re-running the full evidence gate line-by-line (Codex HIGH
-        # finding: the previous line-by-line re-check lost the From:/De:
-        # line from its own look-ahead window the moment the first line was
-        # consumed, so it always stopped after just one line and leaked
-        # Sent:/To:/Subject: into classification_text). A blank line between
-        # fields is tolerated (some clients format headers that way); a
-        # second From:/De: line ends the block, since a genuine envelope
-        # never repeats it - that second From: is the start of the
-        # forwarded message's own operational content instead (e.g. its own
-        # "From: Houston" / "To: Dallas" lane), not more envelope metadata.
-        cursor = anchor
-        seen_labels: set[str] = set()
-        while cursor < len(lines):
-            if lines[cursor].strip() == "":
-                cursor += 1
-                continue
-            is_label_line, label = _is_header_label_line(lines[cursor])
-            if not is_label_line or (label == "from" and "from" in seen_labels):
-                break
-            seen_labels.add(label)
-            cursor += 1
-    else:
-        cursor = anchor
+    for _ in range(_MAX_FORWARD_NESTING_DEPTH):
+        cursor = _strip_envelope_block(lines, cursor)
+        peek = cursor
+        while peek < len(lines) and lines[peek].strip() == "":
+            peek += 1
+        if peek < len(lines) and (
+            _FORWARD_SEPARATOR_RE.match(lines[peek]) or _UNDERSCORE_SEPARATOR_RE.match(lines[peek])
+        ):
+            # Nothing actionable between this envelope and the next forward
+            # wrapper - descend into the nested forward instead of stopping
+            # on a bare separator/envelope with no real content.
+            cursor = peek + 1
+            continue
+        break
 
     body_lines = lines[cursor:]
     nested_reply_index = _find_reply_marker(body_lines)
     if nested_reply_index is not None:
         body_lines = body_lines[:nested_reply_index]
 
-    return "\n".join(body_lines).strip(), forwarded_block
+    return "\n".join(body_lines).strip(), outer_block_text
 
 
 def build_message_scope(raw_text: str) -> MessageScope:
@@ -277,7 +436,7 @@ def build_message_scope(raw_text: str) -> MessageScope:
     if forward_index is not None:
         top_level = "\n".join(lines[:forward_index]).strip()
         forwarded_block = "\n".join(lines[forward_index:]).strip()
-        forwarded_active, _ = _forwarded_active_content(forwarded_block)
+        forwarded_active, _ = select_innermost_actionable_forward(forwarded_block)
 
         if _is_administrative_or_empty(top_level):
             return MessageScope(
@@ -290,7 +449,7 @@ def build_message_scope(raw_text: str) -> MessageScope:
                 confidence=0.75,
                 evidence=(
                     f"forward marker at line {forward_index}",
-                    "top-level text is empty/administrative - using forwarded content",
+                    "top-level text is empty/administrative - using innermost forwarded content",
                 ),
             )
 
