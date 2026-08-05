@@ -241,3 +241,57 @@ def test_identity_invalid_existing_and_invalid_document_yields_no_valid_value():
     merged = merge_saved_attachment_fields(parsed, attachments, force=True)
     assert merged["Contact Name"] != "Steamship Line: CMA CGM"
     assert merged["Contact Name"] != "Carrier: ONE"
+
+
+# The four checks above (valid-existing-protected / invalid-existing-and-
+# invalid-document) were previously verified only for Contact Name. The
+# merge policy in merge_saved_attachment_fields is field-agnostic (it
+# dispatches through the same validate_field_value() regardless of field
+# name), so the same two cases are added here for the other three identity
+# fields to close that gap explicitly rather than relying on the shared
+# code path alone.
+
+
+def test_identity_valid_existing_email_protected_from_invalid_document():
+    parsed = {"Contact Email": "dana@example.com"}
+    attachments = [{"parsed_data": {"Contact Email": "not-an-email"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Email"] == "dana@example.com"
+
+
+def test_identity_invalid_existing_email_and_invalid_document_yields_no_valid_value():
+    parsed = {"Contact Email": "not-an-email"}
+    attachments = [{"parsed_data": {"Contact Email": "also-not-an-email"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Email"] != "not-an-email"
+    assert merged["Contact Email"] != "also-not-an-email"
+
+
+def test_identity_valid_existing_phone_protected_from_invalid_document():
+    parsed = {"Contact Phone": "713-555-0101"}
+    attachments = [{"parsed_data": {"Contact Phone": "not-a-phone"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Phone"] == "713-555-0101"
+
+
+def test_identity_invalid_existing_phone_and_invalid_document_yields_no_valid_value():
+    parsed = {"Contact Phone": "not-a-phone"}
+    attachments = [{"parsed_data": {"Contact Phone": "also-not-a-phone"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Phone"] != "not-a-phone"
+    assert merged["Contact Phone"] != "also-not-a-phone"
+
+
+def test_identity_valid_existing_company_protected_from_invalid_document():
+    parsed = {"Contact Company": "ABC Logistics Inc"}
+    attachments = [{"parsed_data": {"Contact Company": "dispatcher@example.com"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Company"] == "ABC Logistics Inc"
+
+
+def test_identity_invalid_existing_company_and_invalid_document_yields_no_valid_value():
+    parsed = {"Contact Company": "dispatcher@example.com"}
+    attachments = [{"parsed_data": {"Contact Company": "Coordinator"}}]
+    merged = merge_saved_attachment_fields(parsed, attachments, force=True)
+    assert merged["Contact Company"] != "dispatcher@example.com"
+    assert merged["Contact Company"] != "Coordinator"
