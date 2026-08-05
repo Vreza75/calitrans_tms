@@ -533,6 +533,7 @@ OPERATIONS_ORDER_FIELDS = [
     "Port",
     "Warehouse",
     "Address",
+    "Full Return Terminal",
     "Delivery Need Date",
     "Document Cutoff",
     "LFD",
@@ -2538,8 +2539,23 @@ def _sentence_has_plausible_lane(sentence: str) -> bool:
     return False
 
 
+_LABELED_FROM_TO_RE = re.compile(
+    r"(?im)^\s*(?:from|de)\s*:\s*(?P<origin>\S.*?)\s*$\r?\n\s*(?:to|para)\s*:\s*(?P<dest>\S.*?)\s*$"
+)
+
+
 def _has_plausible_quote_lane(text: str) -> bool:
     newest_only = extract_latest_email_body(text) or text
+
+    # A labeled operational lane ("From: Houston" / "To: Dallas") is a
+    # distinct shape from prose ("Houston to Dallas") - message_scope.py
+    # already keeps this out of quoted-history clipping when it's genuinely
+    # active content, so here it only needs the same origin/destination
+    # plausibility filter prose lanes use (rejects days/times/people).
+    for match in _LABELED_FROM_TO_RE.finditer(newest_only):
+        if _lane_words_are_plausible(match.group("origin"), match.group("dest")):
+            return True
+
     for sentence in re.split(r"[.!?;\n]+", newest_only):
         if _sentence_has_plausible_lane(sentence):
             return True
@@ -2606,7 +2622,15 @@ def has_new_order_details(text: str, parsed: dict, tokens: dict) -> bool:
 
 
 def operations_intent_scores(subject: str, body: str, parsed: dict | None = None) -> dict[str, int]:
-    text = f"{subject or ''} {body or ''}"
+    # Scope to the active message only - quote/rate/booking-intent keywords
+    # inside quoted reply history or an administrative-only forward wrapper
+    # must never combine with details from a *different* scope (see
+    # services/message_scope.py). A forwarded-only request still contributes
+    # its own (forwarded) active text here, not an empty string.
+    from services.message_scope import build_message_scope
+
+    scope = build_message_scope(body or "")
+    text = f"{subject or ''} {scope.classification_text}"
     parsed = coerce_parsed_for_classification(subject, body, parsed)
     tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
 
@@ -2666,7 +2690,10 @@ def operations_intent_scores(subject: str, body: str, parsed: dict | None = None
 
 
 def classify_customer_request(subject: str, body: str, parsed: dict | None = None) -> str:
-    text = f"{subject or ''} {body or ''}"
+    from services.message_scope import build_message_scope
+
+    scope = build_message_scope(body or "")
+    text = f"{subject or ''} {scope.classification_text}"
     parsed = coerce_parsed_for_classification(subject, body, parsed)
     tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
     has_reference = has_reference_details(tokens, parsed)
