@@ -65,8 +65,6 @@ OWN_COMPANY_TERMS = (
 
 EMAIL_HEADER_LABELS = {"from", "to", "cc", "bcc", "sent", "subject", "date", "reply-to"}
 
-REPLY_HEADER_LABELS = {"from", "sent", "to", "cc", "bcc", "subject", "date"}
-
 LATEST_SIGNATURE_MARKERS = [
     r"^\s*--\s*$",
     r"^\s*(?:thanks|thank you|best|best regards|warm regards|regards|sincerely|respectfully)[,!\s]*$",
@@ -142,29 +140,6 @@ def _normalize_text(text: str) -> str:
     return normalized
 
 
-def _looks_like_reply_header(lines: list[str], index: int) -> bool:
-    line = lines[index].strip()
-    match = re.match(r"^([A-Z][A-Z -]{1,18}|[a-z][a-z -]{1,18})\s*:", line, re.I)
-    if not match:
-        return False
-    label = match.group(1).strip().lower()
-    if label not in REPLY_HEADER_LABELS:
-        return False
-    window = "\n".join(lines[index : min(len(lines), index + 8)])
-    header_hits = len(re.findall(r"(?im)^\s*(?:from|sent|to|cc|bcc|subject|date)\s*:", window))
-    if label == "from":
-        return header_hits >= 2
-    return header_hits >= 3
-
-
-def _looks_like_outlook_separator(line: str) -> bool:
-    return bool(
-        re.match(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", line, re.I)
-        or re.match(r"^\s*_{6,}\s*$", line)
-        or re.match(r"^\s*On .{5,180}\bwrote:\s*$", line, re.I)
-    )
-
-
 def _drop_security_banners(text: str) -> str:
     lines = []
     for line in str(text or "").splitlines():
@@ -175,13 +150,18 @@ def _drop_security_banners(text: str) -> str:
 
 
 def _clip_quoted_thread(text: str) -> str:
-    lines = _normalize_text(text).splitlines()
-    clipped: list[str] = []
-    for index, line in enumerate(lines):
-        if _looks_like_outlook_separator(line) or _looks_like_reply_header(lines, index):
-            break
-        clipped.append(line)
-    return _drop_security_banners("\n".join(clipped)).strip()
+    """Return only the active portion of `text` - quoted reply history is
+    dropped, and a forwarded-only message (no real top-level content) yields
+    the forwarded message's own active content instead of an empty string.
+    Delegates to services/message_scope.py, the one canonical segmentation
+    implementation shared with classification (see
+    operations_inbox_service.py's use of the same module) - a bare
+    operational "From: <city>" / "To: <city>" lane is no longer mistaken for
+    quoted-email history the way a two-line heuristic previously did."""
+    from services.message_scope import build_message_scope
+
+    scope = build_message_scope(_normalize_text(text))
+    return _drop_security_banners(scope.active_text).strip()
 
 
 def _signature_marker_index(lines: list[str]) -> int | None:
@@ -247,11 +227,10 @@ def extract_latest_email_body(body: str | None, include_signature: bool = True) 
 
 def extract_quoted_email_history(body: str | None) -> str:
     """Return quoted/forwarded history separately from the newest message."""
-    lines = _normalize_text(body or "").splitlines()
-    for index, line in enumerate(lines):
-        if _looks_like_outlook_separator(line) or _looks_like_reply_header(lines, index):
-            return "\n".join(lines[index:]).strip()
-    return ""
+    from services.message_scope import build_message_scope
+
+    scope = build_message_scope(_normalize_text(body or ""))
+    return scope.quoted_text or scope.forwarded_text
 
 
 def _title_from_token(value: str) -> str:
