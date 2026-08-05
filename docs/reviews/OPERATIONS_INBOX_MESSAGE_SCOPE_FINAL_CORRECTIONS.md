@@ -2,6 +2,23 @@
 
 Date: 2026-08-05
 
+> **Correction (2026-08-05, verification/stabilization pass):** an
+> independent verification pass re-tested both fixes below with adversarial
+> inputs not covered by this document's own test list and found the
+> defect-1 fix (the operational-block veto) over-fired on a genuine
+> forwarded envelope whenever the sender had no inline email address (a
+> bare display name, e.g. `From: Customer`) **and** the envelope's own
+> `Subject:` value happened to contain domain vocabulary (`Subject: Quote
+> Request`, `Subject: Rate`) - extremely plausible in this business, since
+> customer subject lines are almost always about exactly that. This caused
+> the *entire* envelope (`Sent:`/`To:`/`Subject:`) to leak into
+> `classification_text` again, for a class of input this document did not
+> test. See
+> `docs/reviews/OPERATIONS_INBOX_MESSAGE_SCOPE_FINAL_VERIFICATION.md` for
+> the reproduction, root cause, and fix. This document's claims below are
+> left as originally written; read them as superseded wherever the two
+> disagree.
+
 A third independent Codex review of `fix/operations-inbox-certification-edge-rework`
 (HEAD `98e1d8e`) concluded the branch architecture was generally sound but
 found two HIGH-severity defects in `services/message_scope.py` that must be
