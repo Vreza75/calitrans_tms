@@ -45,7 +45,7 @@ Date: 2026-08-04
 
 ## 3. Exact baseline failing cases (before any code change)
 
-Ran `pytest -q tests/integration/operations_inbox` from a freshly reset database, twice independently (dropping/recreating the database between runs), plus once more in reverse file order, with `INBOX_CERTIFICATION_DATABASE_URL` set for every run. All three runs produced **identical results**: same 8 failing tests, same 46 passing, byte-identical diffs, zero skipped. No nondeterminism, no state leakage between cases.
+Ran `pytest -q tests/integration/operations_inbox` from a freshly reset database, twice independently (dropping/recreating the database between runs), plus once more in reverse file order, with `INBOX_CERTIFICATION_DATABASE_URL` set for every run. All three runs produced **identical results**: same 8 failing tests, same 40 passing, byte-identical diffs, zero skipped. No nondeterminism, no state leakage between cases.
 
 | Case | Result | Failing field(s) |
 |---|---|---|

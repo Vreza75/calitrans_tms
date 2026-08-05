@@ -2,6 +2,25 @@
 
 Date: 2026-08-04
 
+> **Correction (2026-08-04, edge-rework pass):** a second independent Codex
+> review of this document's own branch found that several claims here
+> ("never absorbs an unrelated field", "history-aware", the identity-field
+> "fully tested" claim) were true only for the specific fixture inputs
+> tested at the time, not for the underlying production paths generally.
+> Four real HIGH-severity gaps survived this pass's fixes: quote intent from
+> quoted history could still combine with active-message details; an active
+> operational `From:`/`To:` lane could still be clipped as if it were quoted
+> email history; multiline address extraction could still absorb fields this
+> document didn't test against (Empty Pickup, Pickup Date, a bare signature
+> name/email); and Full Return Terminal - despite passing CASE-006 - was
+> silently dropped by attachment reconciliation and never reached load
+> creation/update at all. See
+> `docs/reviews/OPERATIONS_INBOX_CERTIFICATION_EDGE_REWORK.md` for the full
+> second-pass investigation, root causes, and fixes. The claims below are
+> left as originally written (an accurate record of what that pass actually
+> verified) rather than silently rewritten - read them as superseded by the
+> rework document wherever the two disagree.
+
 Follow-up correction pass after an independent Codex review of
 `fix/operations-inbox-certification-regressions` (HEAD `9cd8c7b`) found
 remaining HIGH/MEDIUM issues. This document records each finding, the
