@@ -2,6 +2,32 @@
 
 Date: 2026-08-05
 
+> **Correction (2026-08-05, coherent-envelope root-cause pass):** a further
+> review found the nested-forward-collapsing-to-a-separator defect this
+> document's stabilization fix left unaddressed is **destructive, not
+> cosmetic** as originally characterized here (§"Two-nested-forward-blocks
+> cosmetic artifact") - it discards the innermost actionable operational
+> request, not just a bare separator string.
+>
+> This document's own test-count table also has an arithmetic error: the
+> row "Focused message-scope total (both files together) | 58 | +13 | 71"
+> mixed two different kinds of count. The correct reconciliation is **64 +
+> 7 = 71 collected cases** - at this document's own starting point (HEAD
+> `5d884cd`), `test_message_scope_final_corrections.py` had 31 functions/31
+> collected cases and `test_message_scope_and_field_boundaries.py` had 27
+> functions/33 collected cases (1 parametrized function × 7), for **64
+> collected cases total** (not 58 - that was the *function* count, 31+27,
+> not the collected-case count). This pass then added 7 new functions (no
+> parametrization) to `test_message_scope_final_corrections.py`, making it
+> 38/38, for **71 collected cases total** (64 + 7, not 58 + 13).
+>
+> The envelope-veto fix in this document is superseded by a structural
+> redesign in `docs/reviews/OPERATIONS_INBOX_COHERENT_ENVELOPE_ROOT_CAUSE_FIX.md`;
+> the underlying behavior it fixed remains fixed, now for a general
+> structural reason rather than a specific signal check. This document's
+> claims are left as originally written; read them as superseded wherever
+> the two disagree.
+
 An independent verification pass of `fix/operations-inbox-message-scope-final-corrections`
 (HEAD `5d884cd`) did not assume the prior implementation report was correct
 and independently reproduced both prior defects, ran fresh adversarial

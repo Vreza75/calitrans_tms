@@ -18,6 +18,15 @@ Date: 2026-08-05
 > the reproduction, root cause, and fix. This document's claims below are
 > left as originally written; read them as superseded wherever the two
 > disagree.
+>
+> **Second correction (2026-08-05, coherent-envelope root-cause pass):**
+> both the defect-1 fix described below and its own follow-up fix above
+> were themselves incremental patches, each addressing one observed input
+> shape rather than the underlying structural cause - a further no-Sent,
+> no-email, no-Cc/Bcc `From:`/`To:`/`Subject:` envelope (Defect A) still
+> leaked in full. This has been replaced entirely by a block-level
+> structural redesign; see
+> `docs/reviews/OPERATIONS_INBOX_COHERENT_ENVELOPE_ROOT_CAUSE_FIX.md`.
 
 A third independent Codex review of `fix/operations-inbox-certification-edge-rework`
 (HEAD `98e1d8e`) concluded the branch architecture was generally sound but
