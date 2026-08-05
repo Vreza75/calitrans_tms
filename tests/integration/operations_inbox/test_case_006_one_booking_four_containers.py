@@ -134,6 +134,72 @@ def test_case_006_child_load_creation_is_idempotent_and_creates_exactly_four():
         assert second["errors"] == []
         assert second["containers_created"] == 4
 
+
+def test_case_006_full_return_terminal_survives_the_real_production_path():
+    """Codex found that the sub-test above proves nothing about Full Return
+    Terminal propagation, because DRAFT hand-types the value instead of
+    deriving it from the real parser/persisted-data output. This test
+    replaces that mask: it reads the real, persisted order_intake row this
+    email produced, confirms the parser actually captured Full Return
+    Terminal from "FULL RETURN: Bayport Terminal" in the source email, then
+    projects a draft the same way pages_app/operations_inbox.py's real
+    projection does (parsed.get("Full Return Terminal") ->
+    draft["full_return_terminal"]) instead of hand-typing the string, and
+    proves that projected value survives all the way through
+    create_container_work_orders' persisted loads."""
+    report = run_case(CASE_ID)
+    intake_id = report.actual["_row_ids"][0]
+    url = require_scratch_database_url()
+
+    with scratch_database(url):
+        import db_client
+        from services.operations_multi_container_service import create_container_work_orders
+
+        row = db_client.read_df(
+            "select parsed_data from order_intake where id = :id",
+            {"id": intake_id},
+        ).iloc[0]
+        parsed_data = row["parsed_data"]
+        if isinstance(parsed_data, str):
+            import json
+
+            parsed_data = json.loads(parsed_data)
+
+        # 1. Parsed value exists - the real parser captured it from the
+        # source email, nothing hand-typed.
+        assert parsed_data.get("Full Return Terminal") == "Bayport Terminal"
+
+        # 2. Draft projection - same mapping pages_app/operations_inbox.py
+        # uses (parsed.get("Full Return Terminal") -> draft key), not a
+        # literal string.
+        production_equivalent_draft = dict(DRAFT)
+        production_equivalent_draft["full_return_terminal"] = parsed_data.get("Full Return Terminal")
+        assert production_equivalent_draft["full_return_terminal"] == "Bayport Terminal"
+
+        db_client.execute(
+            "delete from loads where parent_booking_key = :key",
+            {"key": "RICGX1235800"},
+        )
+
+        # 3/4. create/update payload + persisted load field.
+        result = create_container_work_orders(
+            intake_id=intake_id,
+            draft=production_equivalent_draft,
+            conversation_key="RICGX1235800",
+            subject="FCL Sea Freight Booking Confirmation - RICGX1235800",
+            sender="bookings@fleurdelis.example.com",
+            container_qty=4,
+            containers_created=0,
+        )
+        assert result["errors"] == []
+        assert len(result["created_load_ids"]) == 4
+
+        loads_df = db_client.read_df(
+            "select full_return_terminal from loads where parent_booking_key = :key",
+            {"key": "RICGX1235800"},
+        )
+        assert (loads_df["full_return_terminal"] == "Bayport Terminal").all()
+
         total_df = db_client.read_df(
             "select count(*)::int as total from loads where parent_booking_key = :key",
             {"key": "RICGX1235800"},
