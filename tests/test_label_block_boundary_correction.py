@@ -24,11 +24,51 @@ import itertools
 
 import pytest
 
+import services.operations_inbox_service as operations_inbox_service
 from services.message_scope import build_message_scope, select_innermost_actionable_forward
 from services.operations_inbox_service import (
     _prepare_operations_email_record,
     classify_customer_request,
 )
+
+
+def _stub_saved_attachment(monkeypatch, *, filename: str, parsed_data: dict) -> None:
+    """Deterministic, disk-free stand-in for save_operations_attachment -
+    only the disk-writing primitive is stubbed; _save_operations_email_
+    attachments and merge_saved_attachment_fields (the real reconciliation
+    logic under test) run unmodified against its return value."""
+
+    def _fake_save(*, content, filename, message_id, attachment_index, content_type=""):
+        return {
+            "filename": filename,
+            "file_path": f"/tmp/{filename}",
+            "content_type": content_type or "application/pdf",
+            "is_pdf": True,
+            "parsed_data": dict(parsed_data),
+            "fields_found": len([v for v in parsed_data.values() if v]),
+            "text_preview": "",
+            "parse_error": "",
+            "size_bytes": len(content or b""),
+            "content_sha256": "deterministic-test-hash",
+            "source_message_id": message_id,
+            "attachment_index": attachment_index,
+            "imported_at": "2026-08-06T00:00:00",
+        }
+
+    monkeypatch.setattr(operations_inbox_service, "save_operations_attachment", _fake_save)
+
+
+def _stub_no_load_match(monkeypatch) -> None:
+    """Prevent these pure-unit tests from depending on (or querying) any
+    real database - _prepare_operations_email_record calls find_matching_
+    load/find_load_match_candidates unconditionally, and without an
+    isolated test DB configured that falls back to whatever
+    db_client.get_engine() resolves, which in this environment is a live
+    Supabase instance. Load-matching behavior is not what these tests
+    verify; only that a match found for a *legitimately trusted* field
+    never comes from *audit-only* content and never opens a case."""
+    monkeypatch.setattr(operations_inbox_service, "find_matching_load", lambda *a, **k: (None, 0))
+    monkeypatch.setattr(operations_inbox_service, "find_load_match_candidates", lambda *a, **k: [])
 
 
 def scope_of(body: str):
@@ -457,20 +497,84 @@ def test_operational_label_immediately_before_a_real_envelope_is_a_documented_kn
     assert "Equipment: 40HC" in scope.classification_text
 
 
-def test_ambiguous_body_with_valid_attachment_still_flags_collapse_for_body():
-    """Attachment-derived fields have independently known provenance
-    (parsed from the attachment file itself, not from the ambiguous body
-    text) and remain available; the body-derived segmentation status must
-    still reflect the collapse so body-only fields are not trusted."""
+def test_ambiguous_body_with_valid_attachment_still_flags_collapse_for_body(monkeypatch):
+    """Codex L1: a real deterministic attachment (not an empty list) must
+    merge in trusted fields with intact provenance while the body-derived
+    segmentation status still reflects the collapse - the body's own
+    ABC123 (sitting only in the audit-only raw text) must never surface as
+    a trusted Booking Number, while the attachment's ATTACH123/container
+    number do."""
+    _stub_no_load_match(monkeypatch)
+    _stub_saved_attachment(
+        monkeypatch,
+        filename="dispatch_order.pdf",
+        parsed_data={"Booking Number": "ATTACH123", "Container Number": "MSCU1234567"},
+    )
     message = {
         "subject": "Fwd: X",
         "from": "customer@example.com",
         "body": _no_separator_ambiguous_body(),
         "direction": "inbound",
+        "attachments": [
+            {"filename": "dispatch_order.pdf", "content": b"%PDF-fake-bytes", "content_type": "application/pdf"}
+        ],
     }
     record = _prepare_operations_email_record(message)
-    assert record["parsed"].get("_segmentation_status") == "collapsed"
-    # No attachments in this test double, but the field is independent of
-    # body segmentation - saved_attachments is computed and merged
-    # separately regardless of body collapse.
-    assert isinstance(record["saved_attachments"], list)
+    parsed = record["parsed"]
+
+    # Body segmentation is still collapsed - independent of attachment success.
+    assert parsed.get("_segmentation_status") == "collapsed"
+    assert record["latest_body"] == ""
+
+    # Attachment-derived fields are trusted and present with provenance,
+    # even though the body itself collapsed.
+    assert len(record["saved_attachments"]) == 1
+    assert record["saved_attachments"][0]["filename"] == "dispatch_order.pdf"
+    assert parsed.get("Booking Number") == "ATTACH123"
+    assert parsed.get("Container Number") == "MSCU1234567"
+    attachments_in_parsed = parsed.get("_operations_attachments") or []
+    assert attachments_in_parsed and attachments_in_parsed[0]["filename"] == "dispatch_order.pdf"
+
+    # The body's own ABC123 (only ever present in the audit-only raw
+    # text, never as a parsed field since latest_body stayed empty) is
+    # never what ends up trusted - the trusted value is the attachment's.
+    assert "ABC123" in parsed.get("_segmentation_collapsed_raw_body", "")
+    assert parsed.get("Booking Number") != "ABC123"
+
+    # Segmentation collapse still forces conservative, manual-review-only
+    # routing regardless of attachment success (Invariant 4).
+    assert parsed["_needs_review"] is True
+    assert record["triage"].get("should_open_case") is False
+    assert record["triage"].get("llm_required") is True
+    assert record["classification"].get("matched_load_id") is None
+
+
+def test_conflicting_body_and_attachment_booking_numbers_require_review(monkeypatch):
+    """Codex Phase 13 conflict case: an unambiguous (non-collapsed) body
+    value and a differing attachment value for the same field must be
+    recorded as a conflict requiring review, never silently overwritten."""
+    _stub_no_load_match(monkeypatch)
+    _stub_saved_attachment(
+        monkeypatch,
+        filename="rate_confirmation.pdf",
+        parsed_data={"Booking Number": "XYZ789"},
+    )
+    message = {
+        "subject": "Booking",
+        "from": "customer@example.com",
+        "body": "Booking Number: ABC123\nPlease proceed with pickup.\n",
+        "direction": "inbound",
+        "attachments": [
+            {"filename": "rate_confirmation.pdf", "content": b"%PDF-fake-bytes", "content_type": "application/pdf"}
+        ],
+    }
+    record = _prepare_operations_email_record(message)
+    parsed = record["parsed"]
+
+    assert parsed.get("_segmentation_status") is None
+    reconciliation = parsed.get("_reconciliation") or {}
+    assert "Booking Number" in (reconciliation.get("conflicts") or [])
+    assert parsed["_needs_review"] is True
+    # Document/attachment value wins the conflict per documented parsing
+    # precedence, but the conflict itself is never silently discarded.
+    assert parsed.get("Booking Number") == "XYZ789"
