@@ -204,18 +204,32 @@ def test_decision_table_row(name, body, expect_scope, must_contain, must_not_con
 # --- Rows 23-25: classification-level checks (person name / weekday / hour) --
 
 
-def test_row23_person_name_from_to_does_not_force_quote_request():
+def test_row23_person_name_lane_message_scope_preserves_content_without_clipping():
+    """message_scope.py itself must never clip or corrupt this content
+    regardless of what the values look like - envelope-vs-operational
+    classification is a structural property of which labels are present,
+    not a judgment about whether the values are locations or people. This
+    test only asserts that scope invariant."""
     body = "Please quote:\nFrom: John Smith\nTo: Maria Garcia\n"
-    assert classify_customer_request("Quote", body) != "Quote Request" or True
-    # Documented pre-existing, out-of-scope limitation (see root-cause doc):
-    # the lane-plausibility check lives in operations_inbox_service.py, not
-    # this branch's file. This test intentionally does not assert a strict
-    # negative to avoid masking that known gap as newly "fixed" - it only
-    # locks in that build_message_scope itself does not clip or corrupt the
-    # content either way.
     scope = scope_of(body)
+    assert scope.scope_type != "reply"
     assert "From: John Smith" in scope.classification_text
     assert "To: Maria Garcia" in scope.classification_text
+
+
+def test_row23_person_name_lane_final_classification_is_a_known_documented_ambiguity():
+    """Known pre-existing limitation, pinned down honestly rather than
+    left as a non-enforcing `or True` assertion: the lane-plausibility
+    check that would reject a person-name pair lives in
+    operations_inbox_service.py's _lane_words_are_plausible, a different
+    file from this branch's message_scope.py, and is not fixed here (see
+    docs/reviews/OPERATIONS_INBOX_COHERENT_ENVELOPE_ROOT_CAUSE_FIX.md and
+    docs/reviews/OPERATIONS_INBOX_LABEL_BLOCK_BOUNDARY_CORRECTION.md's
+    remaining known risks). This test intentionally enforces the CURRENT
+    behavior so a future change to lane detection is a deliberate,
+    reviewed decision - not a silent regression this suite fails to catch."""
+    body = "Please quote:\nFrom: John Smith\nTo: Maria Garcia\n"
+    assert classify_customer_request("Quote", body) == "Quote Request"
 
 
 def test_row24_weekday_from_to_remains_rejected():
