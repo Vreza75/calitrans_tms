@@ -289,6 +289,18 @@ def _scan_label_block(lines: list[str], start_index: int) -> _BlockScan:
             peek_kind = _classify_label_line(lines[peek])[0] if peek < len(lines) else None
             if peek_kind != "envelope":
                 break
+            if has_operational_label and _scan_label_block(lines, peek).kind == "envelope":
+                # Codex H1 (blank-line variant): once this run has already
+                # established itself as operational content, a blank line
+                # must never auto-bridge into a run that is, on its own, a
+                # COHERENT email envelope (from + 2 more labels, or an
+                # email) - that is a later, genuinely separate reply
+                # envelope, not a continuation field of the current
+                # request (Invariant 1). A blank followed by a run that is
+                # only envelope-shaped-so-far but not yet coherent (e.g.
+                # kind == "none"/"operational") still bridges, preserving
+                # the existing ambiguity-preserves-content behavior.
+                break
             cursor = peek
             continue
         kind, label, value = _classify_label_line(lines[cursor])
@@ -384,6 +396,16 @@ def _find_block_start(lines: list[str], candidate_index: int) -> int:
             if _GMAIL_WROTE_RE.match(lines[back]) or _SPANISH_WROTE_RE.match(lines[back]):
                 break
             if _classify_label_line(lines[back])[0] is None:
+                break
+            # Only cross the blank backward when a forward scan starting at
+            # `back` would itself bridge across this same blank to reach
+            # (or pass) `index` - i.e. the two sides are connected by the
+            # exact same rule _scan_label_block uses going forward
+            # (including the H1 operational-then-coherent-envelope
+            # restriction above). Reusing _scan_label_block as the single
+            # source of truth keeps forward and backward connectivity
+            # decisions from ever disagreeing with each other.
+            if _scan_label_block(lines, back).end_index <= index:
                 break
             index = back
             continue
@@ -501,6 +523,44 @@ def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str, bool]:
         body_lines = body_lines[:nested_reply_index]
 
     return "\n".join(body_lines).strip(), outer_block_text, False
+
+
+def non_envelope_label_blocks(raw_text: str) -> tuple[str, ...]:
+    """Return the text of every maximal contiguous label-shaped block in
+    raw_text that is NOT a coherent email envelope (_scan_label_block's own
+    `kind != "envelope"`) - operational and ambiguous ("none") blocks only.
+    Callers that pair two labels found anywhere in scoped text (e.g. a
+    From:/To: quote lane) must search within these block boundaries, never
+    across the whole text independently, so:
+
+    - two unrelated blocks separated by prose or a blank-line boundary are
+      never merged into one pairing candidate (Codex M1 - "From: Houston"
+      in one paragraph and an unrelated "To: Dallas" in another must never
+      pair); and
+    - a genuine email envelope (From:/To:/Subject:, or any coherent
+      3+-label/email block) is never mistaken for operational lane data,
+      since real envelope metadata is excluded entirely rather than
+      merely subjected to the same plausibility filter operational values
+      get.
+
+    Reuses _find_block_start/_scan_label_block - the same connectivity
+    rules build_message_scope's own reply/forward detection already uses -
+    so this can never disagree with how the rest of the module divides
+    text into blocks."""
+    lines = raw_text.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        kind, _, _ = _classify_label_line(lines[index])
+        if kind is None:
+            index += 1
+            continue
+        start = _find_block_start(lines, index)
+        scan = _scan_label_block(lines, start)
+        if scan.kind != "envelope":
+            blocks.append("\n".join(lines[start:scan.end_index]))
+        index = max(scan.end_index, index + 1)
+    return tuple(blocks)
 
 
 def build_message_scope(raw_text: str) -> MessageScope:

@@ -9,6 +9,10 @@ import streamlit as st
 
 from db_client import column_exists, execute, read_df
 from services.email_parser import extract_latest_email_body, parse_email_text
+from services.operations_email_triage_service import (
+    flatten_parsed_values_for_scan,
+    sanitize_parsed_for_classification,
+)
 from services.operations_field_service import extract_operational_fields
 
 
@@ -301,8 +305,8 @@ def case_identity_values(
     parsed: dict | None = None,
     matched_load_id=None,
 ) -> dict:
-    parsed = parsed if isinstance(parsed, dict) else {}
-    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    parsed = sanitize_parsed_for_classification(parsed)
+    tokens = _extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     identifiers = {
         _safe_str(tokens.get("booking_number", "")),
         _safe_str(tokens.get("container_number", "")),

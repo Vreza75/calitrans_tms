@@ -1305,8 +1305,8 @@ def _ops_llm_review_required(record, detected_type: str = "") -> bool:
 def _ops_primary_action_label(record, detected_type: str = "") -> str:
     subject = ops._safe_str(record.get("source_subject", ""))
     body = ops._safe_str(record.get("raw_text_preview", "")) or ops._safe_str(record.get("raw_text", ""))
-    parsed = ops._coerce_json_dict(record.get("parsed_data"))
-    tokens = ops._extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    parsed = ops.operations_parsed_for_row(record)
+    tokens = ops._extract_reference_tokens(f"{subject}\n{body}\n{ops.flatten_parsed_values_for_scan(parsed)}")
 
     decision = _ops_final_dispatcher_decision(
         record=record,
@@ -1331,9 +1331,9 @@ def _ops_action_buttons_for_record(
     matched_load_id=None,
     confidence: int = 0,
 ) -> list[str]:
-    parsed = parsed if isinstance(parsed, dict) else ops._coerce_json_dict(record.get("parsed_data"))
+    parsed = parsed if isinstance(parsed, dict) else ops.operations_parsed_for_row(record)
     tokens = tokens if isinstance(tokens, dict) else ops._extract_reference_tokens(
-        f"{subject}\n{body}\n{parsed}"
+        f"{subject}\n{body}\n{ops.flatten_parsed_values_for_scan(parsed)}"
     )
 
     decision = _ops_final_dispatcher_decision(
@@ -1598,7 +1598,7 @@ def _ops_active_row_business_key(row) -> str:
     if row is None or not hasattr(row, "get"):
         return ""
 
-    parsed = ops._coerce_json_dict(row.get("parsed_data"))
+    parsed = ops.operations_parsed_for_row(row)
 
     subject = ops._safe_str(row.get("source_subject", ""))
     body_preview = (
@@ -1607,7 +1607,7 @@ def _ops_active_row_business_key(row) -> str:
     )
 
     tokens = ops._extract_reference_tokens(
-        f"{subject}\n{body_preview}\n{json.dumps(parsed, default=str)}"
+        f"{subject}\n{body_preview}\n{ops.flatten_parsed_values_for_scan(parsed)}"
     )
 
     candidates = [
@@ -4031,7 +4031,7 @@ def _render_selected_operations_work_item(
 
     record = record_df.iloc[0]
     with timing.stage("parsed_data_loading"):
-        parsed = _coerce_json_dict(record.get("parsed_data"))
+        parsed = ops.operations_parsed_for_row(record)
     record["request_type_clean"] = _effective_operations_request_type_for_row(record)
     record["review_status_clean"] = _safe_str(record.get("review_status", "Open")) or "Open"
     record["owner_label"] = _operations_owner_label_for_row(record)
@@ -4076,7 +4076,7 @@ def _render_selected_operations_work_item(
     )
 
     tokens = classification.get("tokens") or ops._extract_reference_tokens(
-        f"{subject}\n{body}\n{json.dumps(parsed, default=str)}"
+        f"{subject}\n{body}\n{ops.flatten_parsed_values_for_scan(parsed)}"
     )
     matched_load_id = classification.get("matched_load_id")
     confidence = int(classification.get("confidence_score") or record.get("confidence_score") or 0)

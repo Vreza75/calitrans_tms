@@ -233,6 +233,75 @@ def _safe_str(value: Any) -> str:
     return text
 
 
+def sanitize_parsed_for_classification(parsed: dict | None) -> dict:
+    """Return a copy of `parsed` with every internal/audit/diagnostic key
+    removed - the single canonical projection classification, token
+    extraction, and case/load matching must use instead of the raw
+    `parsed` dict (Codex H2/Invariants 3 and 5).
+
+    Every field a parser ever emits as trusted operational data (Booking
+    Number, Container Number, Equipment, Origin, ...) is a plain, non-
+    underscore-prefixed key. Every underscore-prefixed key in this
+    codebase is internal bookkeeping: sync metadata, review state,
+    parser-failure diagnostics, segmentation evidence, or - the specific
+    defect this closes - `_segmentation_collapsed_raw_body`, the raw body
+    text preserved only for audit/display when segmentation could not
+    identify authoritative active content. A namespaced key is not enough
+    on its own once a caller does `str(parsed)`, `f"...{parsed}"`, or
+    iterates `parsed.values()` to build a search blob - that string/value
+    scan does not know or care which key it came from. This function is
+    the structural quarantine: strip those keys before any such blob is
+    ever built, so audit-only text can never re-enter classification,
+    token extraction, or matching no matter how many call sites build
+    their own blob. Explicit structured lookups on well-known internal
+    signal keys (e.g. `parsed.get("_booking_confirmation")`,
+    `parsed.get("_parse_profile")`) are untouched by this function - they
+    read the original `parsed` dict directly and are not "general string
+    scans"."""
+    if not isinstance(parsed, dict):
+        return {}
+    return {key: value for key, value in parsed.items() if not str(key).startswith("_")}
+
+
+def flatten_parsed_values_for_scan(parsed: dict | None) -> str:
+    """Render a parsed dict as a values-only blob safe to feed into a free-
+    text reference-token/keyword scanner - never `str(dict)` or an f-string
+    interpolation of the dict itself. Two independent defects share this
+    one fix:
+
+    1. Invariant 3/5 (audit quarantine): `sanitize_parsed_for_classification`
+       drops every internal/audit key first, so a collapsed segmentation's
+       preserved raw body can never re-enter a scan through this path.
+    2. A field's own KEY NAME can satisfy the very regex meant to extract
+       a value FROM free text - `str({"Booking Number": ""})` contains the
+       literal substring "Booking Number" even when the field is empty,
+       and `\\b(?:booking)...(?:number)?...([A-Z0-9]{5,})` happily matches
+       the word "Number" itself as if it were a captured value, producing
+       a synthetic "NUMBER" token from a blank field (Codex H2). Rendering
+       VALUES ONLY (recursively, for nested dicts/lists) makes this
+       structurally impossible - a key name never appears in the output
+       unless it is *also* someone's value."""
+    sanitized = sanitize_parsed_for_classification(parsed)
+
+    parts: list[str] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                _collect(nested)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                _collect(item)
+        else:
+            text = _safe_str(value)
+            if text:
+                parts.append(text)
+
+    for value in sanitized.values():
+        _collect(value)
+    return "\n".join(parts)
+
+
 def _lower_blob(*parts: Any) -> str:
     """Join parts into one lowercase keyword-search blob. A dict part
     contributes its VALUES only, never its Python repr - str({"Port": ""})
@@ -277,7 +346,7 @@ def _contains_any(text: str, terms: list[str]) -> bool:
 
 def _extract_tokens(subject: str, body: str, parsed: dict | None = None) -> dict[str, str]:
     parsed = parsed if isinstance(parsed, dict) else {}
-    blob = f"{subject or ''}\n{body or ''}\n{parsed}"
+    blob = f"{subject or ''}\n{body or ''}\n{flatten_parsed_values_for_scan(parsed)}"
 
     booking = _safe_str(parsed.get("Booking Number"))
     container = _safe_str(parsed.get("Container Number"))
@@ -611,6 +680,63 @@ def _llm_need_for(
     return False, "Fast triage found enough signals to route without the LLM. Manual review is still available."
 
 
+def apply_segmentation_safety_policy(triage: dict, segmentation_status: str) -> dict:
+    """Invariant 4: when message_scope's segmentation_status is not "ok",
+    routing must stay neutral and conservative no matter what fast-triage's
+    keyword rules computed against the (already-sanitized, but possibly
+    subject-only) text - a recognized reply/forward structure that
+    produced no reliable authoritative active text ("collapsed") or hit
+    the nested-forward traversal budget ("depth_limit_reached") must never
+    let a dispatcher-facing queue treat the message as already fully
+    triaged. Centralized here (single call site in
+    _prepare_operations_email_record) so this rule cannot be silently
+    skipped by a future new intake path."""
+    if segmentation_status == "ok":
+        return triage
+
+    triage = dict(triage)
+    triage["should_open_case"] = False
+    triage["llm_required"] = True
+    triage["llm_review_required"] = True
+    reason = (
+        f"Segmentation {segmentation_status}: recognized reply/forward structure did not "
+        "produce reliable authoritative active text. Automatic case opening and "
+        "destructive actions are disabled; a dispatcher must review before acting."
+    )
+    triage["llm_reason"] = reason
+    triage["llm_review_reason"] = reason
+    tags = list(triage.get("tags") or [])
+    tag = f"segmentation-{segmentation_status}"
+    if tag not in tags:
+        tags.append(tag)
+    triage["tags"] = tags
+
+    try:
+        current_confidence = int(triage.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        current_confidence = 0
+
+    if segmentation_status == "collapsed":
+        # No authoritative active text at all - the only safe routing is a
+        # full manual-review queue, regardless of what keyword rules
+        # matched against the subject line alone.
+        triage["confidence_score"] = min(current_confidence, 40)
+        triage["work_level"] = REVIEW_LEVEL
+        triage["work_queue"] = "Review"
+        triage["department_lane"] = "Human Review"
+        triage["triage_reason"] = (
+            "Needs human review: segmentation collapsed, no authoritative active text found."
+        )
+    else:
+        # depth_limit_reached - real (if possibly incomplete) active
+        # content was preserved and may still usefully inform a dispatcher,
+        # so request_type/work_queue are left as computed; only confidence
+        # and automatic-action eligibility are capped.
+        triage["confidence_score"] = min(current_confidence, 55)
+
+    return triage
+
+
 def triage_operations_email(
     *,
     sender: str = "",
@@ -630,7 +756,7 @@ def triage_operations_email(
 
     parsed = parsed if isinstance(parsed, dict) else {}
     classification = classification if isinstance(classification, dict) else {}
-    text = _lower_blob(sender, subject, body, parsed)
+    text = _lower_blob(sender, subject, body, sanitize_parsed_for_classification(parsed))
     tokens = _extract_tokens(subject, body, parsed)
     has_reference = _has_reference(tokens)
     attachments_present = _attachment_count(attachments, parsed) > 0

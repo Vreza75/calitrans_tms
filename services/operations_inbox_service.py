@@ -27,8 +27,11 @@ from services.order_intake import create_load_from_intake
 from services.operations_field_service import derive_review_state, extract_operational_fields
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
+    apply_segmentation_safety_policy,
+    flatten_parsed_values_for_scan,
     has_actual_billing_request,
     is_booking_confirmation,
+    sanitize_parsed_for_classification,
     triage_operations_email,
 )
 
@@ -2198,13 +2201,13 @@ def row_conversation_join_key(row) -> str:
     if conversation_key and not is_generic_conversation_key(conversation_key):
         return conversation_key
 
-    parsed = coerce_json_dict(row.get("parsed_data", {}) if hasattr(row, "get") else {})
+    parsed = operations_parsed_for_row(row)
     text = " ".join(
         [
             safe_str(row.get("source_subject", "") if hasattr(row, "get") else ""),
             safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else ""),
             safe_str(row.get("raw_text", "") if hasattr(row, "get") else ""),
-            str(parsed),
+            flatten_parsed_values_for_scan(parsed),
         ]
     )
     tokens = extract_reference_tokens(text)
@@ -2290,7 +2293,7 @@ def load_operations_conversation_timeline(conversation_key: str) -> pd.DataFrame
 
 
 def timeline_filter_tokens(record, tokens: dict, subject: str, body: str) -> set[str]:
-    parsed = coerce_json_dict(record.get("parsed_data") if hasattr(record, "get") else {})
+    parsed = operations_parsed_for_row(record)
     candidates = [
         tokens.get("booking_number", ""),
         tokens.get("container_number", ""),
@@ -2300,7 +2303,7 @@ def timeline_filter_tokens(record, tokens: dict, subject: str, body: str) -> set
         parsed.get("Reference Number", ""),
         record.get("matched_load_id", "") if hasattr(record, "get") else "",
     ]
-    text_tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    text_tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     candidates.extend([
         text_tokens.get("booking_number", ""),
         text_tokens.get("container_number", ""),
@@ -2339,7 +2342,7 @@ def filter_operations_timeline_for_record(
                 safe_str(row.get("source_subject", "")),
                 safe_str(row.get("message_preview", "")),
                 safe_str(row.get("conversation_key", "")),
-                safe_str(row.get("parsed_data", "")),
+                flatten_parsed_values_for_scan(operations_parsed_for_row(row)),
                 safe_str(row.get("matched_load_id", "")),
             ]
         ).upper()
@@ -2455,11 +2458,23 @@ def resolve_reply_language(reply_language: str, subject: str, body: str) -> str:
 
 
 def coerce_parsed_for_classification(subject: str, body: str, parsed: dict | None = None) -> dict:
+    """The single choke point classification, token extraction, and case/
+    load matching flow through - always returns a dict with every
+    internal/audit key (segmentation-collapse raw body, review state,
+    sync metadata, ...) stripped (Invariant 3/5; see
+    sanitize_parsed_for_classification). Every caller that reassigns its
+    own `parsed` local to this function's return value (operations_intent_
+    scores, classify_customer_request, build_operations_email_
+    classification, operations_classification_for_review) automatically
+    passes only the sanitized dict to every function it calls afterward -
+    that is the "trusted classification projection" required by this
+    pass, achieved by fixing the one function already sitting at the top
+    of each entry point rather than adding a new parallel path."""
     if isinstance(parsed, dict):
-        return parsed
+        return sanitize_parsed_for_classification(parsed)
 
     try:
-        return parse_email_text(subject, body)
+        return sanitize_parsed_for_classification(parse_email_text(subject, body))
     except Exception:
         return {}
 
@@ -2544,25 +2559,26 @@ _TO_LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:to|para)\s*:\s*(\S.*?)\s*$")
 
 
 def _has_plausible_quote_lane(text: str) -> bool:
+    from services.message_scope import non_envelope_label_blocks
+
     newest_only = extract_latest_email_body(text) or text
 
     # A labeled operational lane ("From: Houston" / "To: Dallas") is a
     # distinct shape from prose ("Houston to Dallas") - message_scope.py
     # already keeps this out of quoted-history clipping when it's genuinely
-    # active content, so here it only needs the same origin/destination
-    # plausibility filter prose lanes use (rejects days/times/people).
-    #
-    # From:/To: are matched independently rather than requiring the To:
-    # line to immediately follow the From: line - a real operational block
-    # can have other recognized fields (Equipment/Subject/Booking Number/
-    # dates/...) between them in any order, and message_scope.py has
-    # already confirmed newest_only is one coherent active/operational
-    # block by the time this runs, so pairing the first From: value found
-    # with the first To: value found anywhere in it is safe.
-    from_match = _FROM_LABEL_LINE_RE.search(newest_only)
-    to_match = _TO_LABEL_LINE_RE.search(newest_only)
-    if from_match and to_match and _lane_words_are_plausible(from_match.group(1), to_match.group(1)):
-        return True
+    # active content. From:/To: are matched independently rather than
+    # requiring the To: line to immediately follow the From: line, since a
+    # real operational block can have other recognized fields (Equipment/
+    # Booking Number/dates/...) between them in any order - but the pair
+    # must come from the SAME contiguous label block (Codex M1), never
+    # from two unrelated label-shaped sections merely because both appear
+    # somewhere in newest_only, and never from a block that is itself a
+    # coherent email envelope (non_envelope_label_blocks excludes both).
+    for block_text in non_envelope_label_blocks(newest_only):
+        from_match = _FROM_LABEL_LINE_RE.search(block_text)
+        to_match = _TO_LABEL_LINE_RE.search(block_text)
+        if from_match and to_match and _lane_words_are_plausible(from_match.group(1), to_match.group(1)):
+            return True
 
     for sentence in re.split(r"[.!?;\n]+", newest_only):
         if _sentence_has_plausible_lane(sentence):
@@ -2640,7 +2656,7 @@ def operations_intent_scores(subject: str, body: str, parsed: dict | None = None
     scope = build_message_scope(body or "")
     text = f"{subject or ''} {scope.classification_text}"
     parsed = coerce_parsed_for_classification(subject, body, parsed)
-    tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
 
     has_reference = has_reference_details(tokens, parsed)
     info_update = is_information_update(text)
@@ -2703,7 +2719,7 @@ def classify_customer_request(subject: str, body: str, parsed: dict | None = Non
     scope = build_message_scope(body or "")
     text = f"{subject or ''} {scope.classification_text}"
     parsed = coerce_parsed_for_classification(subject, body, parsed)
-    tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     has_reference = has_reference_details(tokens, parsed)
 
     if is_booking_confirmation(subject, body, parsed) and not has_actual_billing_request(subject, body):
@@ -2746,7 +2762,7 @@ def action_required_for_request(
     matched_load_id=None,
 ) -> str:
     text = f"{subject or ''} {body or ''}"
-    tokens = tokens or extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = tokens or extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     has_reference = has_reference_details(tokens, parsed)
 
     if request_type == "Customer Request":
@@ -2875,7 +2891,7 @@ def build_operations_email_classification(
     parsed = coerce_parsed_for_classification(subject, body, parsed)
     intent_scores = operations_intent_scores(subject, body, parsed)
     detected_type = classify_customer_request(subject, body, parsed)
-    tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
 
     load_match_candidates = find_load_match_candidates(
         tokens,
@@ -2947,6 +2963,7 @@ def operations_classification_for_review(
     body: str,
     fallback_key: str,
 ) -> dict:
+    parsed = coerce_parsed_for_classification(subject, body, parsed)
     saved_type = safe_str(record.get("request_type", ""))
     saved_confidence = pd.to_numeric(record.get("confidence_score", 0), errors="coerce")
     if pd.isna(saved_confidence):
@@ -2976,7 +2993,7 @@ def operations_classification_for_review(
             sender=safe_str(record.get("source_sender", "")),
         )
 
-    tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     conversation_key = (
         safe_str(record.get("conversation_key", ""))
         or tokens.get("booking_number")
@@ -3030,7 +3047,13 @@ _operations_classification_for_review = operations_classification_for_review
 # ============================================================
 
 def operations_parsed_for_row(row) -> dict:
-    return coerce_json_dict(row.get("parsed_data") if hasattr(row, "get") else {})
+    """Canonical choke point for reading a persisted row's parsed_data as a
+    trusted dict - sanitized (Invariant 3/5) so a collapsed record's
+    audit-only raw body can never re-enter token extraction or matching
+    via this accessor, no matter which downstream row-based consumer
+    calls it."""
+    parsed = coerce_json_dict(row.get("parsed_data") if hasattr(row, "get") else {})
+    return sanitize_parsed_for_classification(parsed)
 
 
 def operations_reference_tokens_for_row(row) -> dict:
@@ -3040,7 +3063,7 @@ def operations_reference_tokens_for_row(row) -> dict:
             [
                 safe_str(row.get("source_subject", "") if hasattr(row, "get") else ""),
                 safe_str(row.get("raw_text_preview", "") if hasattr(row, "get") else ""),
-                safe_str(parsed),
+                flatten_parsed_values_for_scan(parsed),
             ]
         )
     )
@@ -3088,7 +3111,7 @@ def effective_operations_request_type_for_row(row) -> str:
 
     text = f"{subject}\n{body}"
     parsed = operations_parsed_for_row(row)
-    tokens = extract_reference_tokens(f"{text}\n{parsed}")
+    tokens = extract_reference_tokens(f"{text}\n{flatten_parsed_values_for_scan(parsed)}")
     has_reference = has_reference_details(tokens, parsed)
 
     if is_information_update(text) and not has_order_placement_signal(text):
@@ -4505,6 +4528,7 @@ def _prepare_operations_email_record(message: dict) -> dict:
                     *review_state["parser_failures"],
                 ]
             ) or "Validated parsing requires dispatcher review."
+        triage = apply_segmentation_safety_policy(triage, segmentation_scope.segmentation_status)
     except Exception as exc:
         triage = {}
         processing_errors.append(f"triage failed: {exc}")
@@ -5547,8 +5571,8 @@ def _case_customer_from_sender(sender: str) -> str:
 
 def _operations_ai_rule_context(classification: dict, parsed: dict, subject: str, body: str) -> dict:
     classification = classification or {}
-    parsed = parsed or {}
-    tokens = classification.get("tokens") or extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    parsed = sanitize_parsed_for_classification(parsed or {})
+    tokens = classification.get("tokens") or extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     return {
         "request_type": classification.get("request_type", "Customer Request"),
         "confidence_score": classification.get("confidence_score", 0),
@@ -5870,9 +5894,9 @@ def _default_operations_reply_body(
     reply_language: str = "Auto",
     reply_tone: str = "Professional",
 ) -> str:
-    parsed = parsed or {}
+    parsed = sanitize_parsed_for_classification(parsed or {})
     company_name = _get_app_setting("COMPANY_NAME", "CaliTrans")
-    tokens = extract_reference_tokens(f"{subject}\n{body}\n{parsed}")
+    tokens = extract_reference_tokens(f"{subject}\n{body}\n{flatten_parsed_values_for_scan(parsed)}")
     reference = (
         safe_str(parsed.get("Booking Number", ""))
         or safe_str(parsed.get("Container Number", ""))
