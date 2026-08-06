@@ -82,6 +82,8 @@ _OPERATIONAL_ONLY_LABELS = {
     "reference number", "numero de referencia",
     "lfd",
     "cutoff",
+    "origin", "origen",
+    "destination", "destino",
 }
 
 _LABEL_LINE_RE = re.compile(r"^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ /]{1,30})\s*:\s*(.*)$")
@@ -101,6 +103,9 @@ _UNDERSCORE_SEPARATOR_RE = re.compile(r"^\s*_{6,}\s*$")
 _MAX_FORWARD_NESTING_DEPTH = 5
 
 
+SegmentationStatus = Literal["ok", "collapsed", "depth_limit_reached"]
+
+
 @dataclass(frozen=True)
 class MessageScope:
     raw_text: str
@@ -111,6 +116,20 @@ class MessageScope:
     scope_type: ScopeType
     confidence: float
     evidence: tuple[str, ...] = ()
+    # "ok": either no reply/forward structure was found (new_message - an
+    #   empty classification_text here only ever means the raw input itself
+    #   was empty), or structure was found and produced real active text.
+    # "collapsed": a reply/forward/forwarded_only structure was recognized
+    #   but produced empty classification_text - callers must NEVER
+    #   silently substitute the raw body as if it were active content in
+    #   this case (Invariant 7); it means segmentation could not identify
+    #   any authoritative active text, not that there is none to find.
+    # "depth_limit_reached": nested-forward traversal hit
+    #   _MAX_FORWARD_NESTING_DEPTH - text is still the best available
+    #   non-empty candidate (never empty solely because of the limit, see
+    #   select_innermost_actionable_forward), but callers should treat this
+    #   as lower-confidence/needing review.
+    segmentation_status: SegmentationStatus = "ok"
 
 
 # --- Administrative wrapper normalization (Phase 8) -------------------------
@@ -339,16 +358,70 @@ def _strip_envelope_block(lines: list[str], start_index: int) -> int:
     return scan.envelope_prefix_end
 
 
+def _find_block_start(lines: list[str], candidate_index: int) -> int:
+    """Walk backward from candidate_index to the true start of the
+    contiguous label-shaped block it belongs to (Codex H1: scanning that
+    starts partway through a block - e.g. at a From: line preceded by an
+    unconsumed Equipment: line - sees only a truncated suffix and can
+    misclassify an operational-label-first block as a coherent envelope,
+    or vice versa). Stops at the first line that is not label-shaped
+    (envelope or operational), at a forward/reply separator, at a Gmail/
+    Spanish wrote marker, or at the start of the text - the same
+    connectivity rules the forward scan already uses, applied in reverse.
+    A blank line is only crossed backward when the line before it is
+    itself label-shaped, mirroring _scan_label_block's forward rule."""
+    index = candidate_index
+    while index > 0:
+        prev = index - 1
+        if lines[prev].strip() == "":
+            back = prev - 1
+            while back >= 0 and lines[back].strip() == "":
+                back -= 1
+            if back < 0:
+                break
+            if _FORWARD_SEPARATOR_RE.match(lines[back]) or _UNDERSCORE_SEPARATOR_RE.match(lines[back]):
+                break
+            if _GMAIL_WROTE_RE.match(lines[back]) or _SPANISH_WROTE_RE.match(lines[back]):
+                break
+            if _classify_label_line(lines[back])[0] is None:
+                break
+            index = back
+            continue
+        if _FORWARD_SEPARATOR_RE.match(lines[prev]) or _UNDERSCORE_SEPARATOR_RE.match(lines[prev]):
+            break
+        if _GMAIL_WROTE_RE.match(lines[prev]) or _SPANISH_WROTE_RE.match(lines[prev]):
+            break
+        if _classify_label_line(lines[prev])[0] is None:
+            break
+        index = prev
+    return index
+
+
 def _find_reply_marker(lines: list[str]) -> int | None:
-    for index, line in enumerate(lines):
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if _GMAIL_WROTE_RE.match(line) or _SPANISH_WROTE_RE.match(line):
             return index
-        kind, label, _ = _classify_label_line(line)
-        if kind != "envelope":
+        kind, _, _ = _classify_label_line(line)
+        if kind is None:
+            index += 1
             continue
-        scan = _scan_label_block(lines, index)
+        # A label-shaped line (envelope OR operational) is a candidate -
+        # anchor to the true start of its containing block before
+        # classifying, so an operational label immediately preceding an
+        # envelope-shaped line is never invisible to the classifier
+        # (Invariant 1/3), regardless of which line inside the block the
+        # outer scan happens to reach first.
+        block_start = _find_block_start(lines, index)
+        scan = _scan_label_block(lines, block_start)
         if scan.kind == "envelope":
-            return index
+            return block_start
+        # Whether "operational" or "none", this whole block is settled -
+        # skip past it so its later lines aren't independently
+        # re-evaluated as new candidates (never repeatedly classify
+        # overlapping suffixes of the same block).
+        index = max(scan.end_index, index + 1)
     return None
 
 
@@ -359,7 +432,7 @@ def _find_forward_marker(lines: list[str]) -> int | None:
     return None
 
 
-def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str]:
+def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str, bool]:
     """Given raw text starting at (or containing) a forward separator,
     repeatedly strip the separator and its immediately-following coherent
     envelope block, descending into a directly-nested forward wrapper (a
@@ -370,23 +443,32 @@ def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str]:
     unbounded chain of separators cannot loop indefinitely; real email
     chains never nest this deep.
 
-    Returns (innermost_actionable_text, outer_forwarded_block_text) - the
-    second value preserves the full text from the first forward marker
-    onward, for callers that want the complete forwarded/quoted history
-    (e.g. low-confidence field extraction from older messages), independent
-    of which inner layer was selected as active.
+    Returns (innermost_actionable_text, outer_forwarded_block_text,
+    depth_limit_reached). The second value preserves the full text from the
+    first forward marker onward, for callers that want the complete
+    forwarded/quoted history independent of which inner layer was selected
+    as active. When the depth limit is reached, the first value is the
+    unprocessed remainder at that point (never empty when any candidate
+    seen so far was non-empty - Invariant 6) rather than the result of
+    running the normal nested-reply-marker clip on a not-yet-stripped,
+    still-nested block, which risked discarding real content beyond the
+    traversal budget.
     """
     lines = raw_text.splitlines()
     forward_index = _find_forward_marker(lines)
     if forward_index is None:
         stripped = raw_text.strip()
-        return stripped, raw_text
+        return stripped, raw_text, False
 
     outer_block_text = "\n".join(lines[forward_index:])
     cursor = forward_index + 1
+    last_nonempty_candidate = "\n".join(lines[cursor:]).strip()
 
     for _ in range(_MAX_FORWARD_NESTING_DEPTH):
         cursor = _strip_envelope_block(lines, cursor)
+        candidate = "\n".join(lines[cursor:]).strip()
+        if candidate:
+            last_nonempty_candidate = candidate
         peek = cursor
         while peek < len(lines) and lines[peek].strip() == "":
             peek += 1
@@ -399,13 +481,26 @@ def select_innermost_actionable_forward(raw_text: str) -> tuple[str, str]:
             cursor = peek + 1
             continue
         break
+    else:
+        # Exhausted the traversal budget while still finding another nested
+        # forward each time - cursor points at an unstripped, potentially
+        # still-nested block. Never run the normal nested-reply-marker clip
+        # on that unstripped remainder here: a bare envelope sitting at the
+        # depth limit would be read as "quoted history begins here" and
+        # discard everything beyond the budget, which is exactly the
+        # destructive terminal state Invariant 6 forbids. Preserve the
+        # current remainder as-is; fall back to the last known non-empty
+        # candidate only in the degenerate case where the chain ends with
+        # nothing at all after the final separator.
+        remainder = "\n".join(lines[cursor:]).strip()
+        return (remainder or last_nonempty_candidate), outer_block_text, True
 
     body_lines = lines[cursor:]
     nested_reply_index = _find_reply_marker(body_lines)
     if nested_reply_index is not None:
         body_lines = body_lines[:nested_reply_index]
 
-    return "\n".join(body_lines).strip(), outer_block_text
+    return "\n".join(body_lines).strip(), outer_block_text, False
 
 
 def build_message_scope(raw_text: str) -> MessageScope:
@@ -429,16 +524,31 @@ def build_message_scope(raw_text: str) -> MessageScope:
             forwarded_text="",
             classification_text=active_text,
             scope_type="reply",
-            confidence=0.9,
+            confidence=0.9 if active_text else 0.3,
             evidence=(f"reply marker at line {reply_index}",),
+            segmentation_status="ok" if active_text else "collapsed",
         )
 
     if forward_index is not None:
         top_level = "\n".join(lines[:forward_index]).strip()
         forwarded_block = "\n".join(lines[forward_index:]).strip()
-        forwarded_active, _ = select_innermost_actionable_forward(forwarded_block)
+        forwarded_active, _, depth_limit_reached = select_innermost_actionable_forward(forwarded_block)
 
         if _is_administrative_or_empty(top_level):
+            segmentation_status: SegmentationStatus = "ok"
+            confidence = 0.75
+            evidence = [
+                f"forward marker at line {forward_index}",
+                "top-level text is empty/administrative - using innermost forwarded content",
+            ]
+            if depth_limit_reached:
+                segmentation_status = "depth_limit_reached"
+                confidence = 0.4
+                evidence.append("forward_depth_limit_reached")
+            elif not forwarded_active:
+                segmentation_status = "collapsed"
+                confidence = 0.3
+                evidence.append("segmentation_collapsed - no authoritative active text found")
             return MessageScope(
                 raw_text=raw_text,
                 active_text=forwarded_active,
@@ -446,11 +556,9 @@ def build_message_scope(raw_text: str) -> MessageScope:
                 forwarded_text=forwarded_block,
                 classification_text=forwarded_active,
                 scope_type="forwarded_only",
-                confidence=0.75,
-                evidence=(
-                    f"forward marker at line {forward_index}",
-                    "top-level text is empty/administrative - using innermost forwarded content",
-                ),
+                confidence=confidence,
+                evidence=tuple(evidence),
+                segmentation_status=segmentation_status,
             )
 
         return MessageScope(
@@ -460,11 +568,12 @@ def build_message_scope(raw_text: str) -> MessageScope:
             forwarded_text=forwarded_block,
             classification_text=top_level,
             scope_type="forward",
-            confidence=0.85,
+            confidence=0.85 if top_level else 0.3,
             evidence=(
                 f"forward marker at line {forward_index}",
                 "top-level text has real content - forwarded content kept as supporting only",
             ),
+            segmentation_status="ok" if top_level else "collapsed",
         )
 
     stripped = raw_text.strip()

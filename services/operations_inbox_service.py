@@ -2539,9 +2539,8 @@ def _sentence_has_plausible_lane(sentence: str) -> bool:
     return False
 
 
-_LABELED_FROM_TO_RE = re.compile(
-    r"(?im)^\s*(?:from|de)\s*:\s*(?P<origin>\S.*?)\s*$\r?\n\s*(?:to|para)\s*:\s*(?P<dest>\S.*?)\s*$"
-)
+_FROM_LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:from|de)\s*:\s*(\S.*?)\s*$")
+_TO_LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:to|para)\s*:\s*(\S.*?)\s*$")
 
 
 def _has_plausible_quote_lane(text: str) -> bool:
@@ -2552,9 +2551,18 @@ def _has_plausible_quote_lane(text: str) -> bool:
     # already keeps this out of quoted-history clipping when it's genuinely
     # active content, so here it only needs the same origin/destination
     # plausibility filter prose lanes use (rejects days/times/people).
-    for match in _LABELED_FROM_TO_RE.finditer(newest_only):
-        if _lane_words_are_plausible(match.group("origin"), match.group("dest")):
-            return True
+    #
+    # From:/To: are matched independently rather than requiring the To:
+    # line to immediately follow the From: line - a real operational block
+    # can have other recognized fields (Equipment/Subject/Booking Number/
+    # dates/...) between them in any order, and message_scope.py has
+    # already confirmed newest_only is one coherent active/operational
+    # block by the time this runs, so pairing the first From: value found
+    # with the first To: value found anywhere in it is safe.
+    from_match = _FROM_LABEL_LINE_RE.search(newest_only)
+    to_match = _TO_LABEL_LINE_RE.search(newest_only)
+    if from_match and to_match and _lane_words_are_plausible(from_match.group(1), to_match.group(1)):
+        return True
 
     for sentence in re.split(r"[.!?;\n]+", newest_only):
         if _sentence_has_plausible_lane(sentence):
@@ -4347,21 +4355,53 @@ def _prepare_operations_email_record(message: dict) -> dict:
     cannot prevent the raw email fields from being available to the caller
     for an insert - only that step's contribution is degraded, and the
     failure is recorded in processing_errors instead of being swallowed."""
+    from services.message_scope import build_message_scope
+
     subject = safe_str(message.get("subject")) or "(no subject)"
     sender = safe_str(message.get("from")) or safe_str(message.get("sender")) or "(unknown sender)"
     received_at = safe_str(message.get("received_at")) or None
     raw_body = safe_str(message.get("body"))
-    latest_body = extract_latest_email_body(raw_body) or raw_body
+    latest_body = extract_latest_email_body(raw_body)
+
+    # A recognized reply/forward structure that produces empty authoritative
+    # text (segmentation_status != "ok") must never be silently replaced by
+    # the raw body as if it were active content (Invariant 7) - that body
+    # can still contain old quoted booking confirmations, cancelled
+    # requests, or another customer's history the structure deliberately
+    # excluded. Falling back to raw_body is only safe when there was no
+    # recognized structure to begin with (segmentation_status == "ok"),
+    # in which case an empty latest_body only ever means the raw body
+    # itself was blank.
+    segmentation_scope = build_message_scope(raw_body)
+    segmentation_collapsed = bool(raw_body) and segmentation_scope.segmentation_status != "ok"
+    if not latest_body and not segmentation_collapsed:
+        latest_body = raw_body
     direction = safe_str(message.get("direction")) or "inbound"
     message_id = _email_sync_unique_message_id(message)
 
     processing_errors: list[str] = []
+    if segmentation_collapsed:
+        # latest_body is deliberately left empty here (not raw_body) so
+        # parse_email_text below cannot manufacture trusted-looking active-
+        # message fields (a Booking Number, a cancellation instruction, ...)
+        # from ambiguous or structurally-collapsed content (Invariant 8).
+        # The raw body is preserved separately, in parsed_data only, purely
+        # for audit/display - never as a field callers would treat as a
+        # confirmed current-message value.
+        processing_errors.append(
+            f"segmentation {segmentation_scope.segmentation_status}: recognized reply/forward "
+            "structure produced no authoritative active text - raw body withheld from parsing "
+            "and preserved for audit only, routed to manual review"
+        )
 
     try:
         parsed = parse_email_text(subject, latest_body, sender)
     except Exception as exc:
         parsed = {}
         processing_errors.append(f"parse_email_text failed: {exc}")
+    if segmentation_collapsed:
+        parsed["_segmentation_status"] = segmentation_scope.segmentation_status
+        parsed["_segmentation_collapsed_raw_body"] = raw_body[:5000]
     parsed["_email_parsed"] = {
         key: value
         for key, value in parsed.items()
