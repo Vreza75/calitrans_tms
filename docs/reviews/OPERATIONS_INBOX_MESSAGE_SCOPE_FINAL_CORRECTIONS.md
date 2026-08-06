@@ -2,6 +2,12 @@
 
 Date: 2026-08-05
 
+> **Third correction (2026-08-05, label-block boundary pass):** the block
+> scanner introduced by the coherent-envelope rework could still start
+> classification midway through a contiguous block when an operational
+> label preceded a From:/De: line (Codex H1) - see
+> `docs/reviews/OPERATIONS_INBOX_LABEL_BLOCK_BOUNDARY_CORRECTION.md`.
+
 > **Correction (2026-08-05, verification/stabilization pass):** an
 > independent verification pass re-tested both fixes below with adversarial
 > inputs not covered by this document's own test list and found the

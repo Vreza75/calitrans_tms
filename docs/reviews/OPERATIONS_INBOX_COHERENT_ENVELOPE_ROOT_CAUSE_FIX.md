@@ -2,6 +2,22 @@
 
 Date: 2026-08-05
 
+> **Correction (2026-08-05, label-block boundary pass):** a fourth review
+> (Codex H1) found the block scanner itself could still start midway
+> through a contiguous operational block: when an operational-only label
+> (Equipment/Booking Number/Port/Pickup Date/...) appeared *before* a
+> From:/De: line in the same block, `_find_reply_marker`'s forward-only
+> scan began at the From: line and saw only the trailing envelope-shaped
+> suffix, misreading it as a coherent reply header and clipping the
+> operational-label-first content. This affected both top-level messages
+> and forwarded bodies. See
+> `docs/reviews/OPERATIONS_INBOX_LABEL_BLOCK_BOUNDARY_CORRECTION.md` for
+> the backward-anchoring fix, plus two further findings (M1: a
+> segmentation collapse could silently fall back to parsing the raw body;
+> M3: the nested-forward depth limit could return empty text). This
+> document's claims are left as originally written; read them as
+> superseded wherever the two disagree.
+
 ## Why this pass exists
 
 Three prior correction cycles on `services/message_scope.py` each fixed one

@@ -2,6 +2,11 @@
 
 Date: 2026-08-05
 
+> **Second correction (2026-08-05, label-block boundary pass):** see
+> `docs/reviews/OPERATIONS_INBOX_LABEL_BLOCK_BOUNDARY_CORRECTION.md` for
+> Codex H1 (mid-block scanning) plus M1 (segmentation-collapse raw
+> fallback) and M3 (nested-forward depth-limit collapse) fixes.
+
 > **Correction (2026-08-05, coherent-envelope root-cause pass):** a further
 > review found the nested-forward-collapsing-to-a-separator defect this
 > document's stabilization fix left unaddressed is **destructive, not
