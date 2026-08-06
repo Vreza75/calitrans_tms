@@ -8,6 +8,12 @@ Date: 2026-08-05
 > label preceded a From:/De: line (Codex H1) - see
 > `docs/reviews/OPERATIONS_INBOX_LABEL_BLOCK_BOUNDARY_CORRECTION.md`.
 
+> **Fourth correction (2026-08-06, segmentation quarantine pass):** a
+> blank-line variant of the same H1 class, a real audit-content quarantine
+> gap, and a field-order-independent quote-lane defect were found and
+> fixed - see
+> `docs/reviews/OPERATIONS_INBOX_SEGMENTATION_QUARANTINE_FINAL.md`.
+
 > **Correction (2026-08-05, verification/stabilization pass):** an
 > independent verification pass re-tested both fixes below with adversarial
 > inputs not covered by this document's own test list and found the

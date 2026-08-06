@@ -2,6 +2,15 @@
 
 Date: 2026-08-05
 
+> **Correction (2026-08-06):** a second, blank-line variant of H1 (an
+> operational block absorbing a later reply envelope *across a blank
+> line*), a deeper root cause for the M1 raw-fallback/audit-quarantine
+> concern, and a genuine field-order-independent lane-detector defect
+> (M1 in the newer pass's numbering) were found and fixed in
+> `fix/operations-inbox-segmentation-quarantine-final`. See
+> `docs/reviews/OPERATIONS_INBOX_SEGMENTATION_QUARANTINE_FINAL.md`. The
+> claims below remain accurate for what they tested at the time.
+
 ## Codex H1 reproduction
 
 ```

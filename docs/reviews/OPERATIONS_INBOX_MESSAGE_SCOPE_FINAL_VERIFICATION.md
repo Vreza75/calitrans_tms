@@ -7,6 +7,12 @@ Date: 2026-08-05
 > Codex H1 (mid-block scanning) plus M1 (segmentation-collapse raw
 > fallback) and M3 (nested-forward depth-limit collapse) fixes.
 
+> **Third correction (2026-08-06, segmentation quarantine pass):** see
+> `docs/reviews/OPERATIONS_INBOX_SEGMENTATION_QUARANTINE_FINAL.md` for a
+> blank-line variant of H1, a real audit-content quarantine gap in
+> classification/token extraction, and a field-order-independent
+> quote-lane defect.
+
 > **Correction (2026-08-05, coherent-envelope root-cause pass):** a further
 > review found the nested-forward-collapsing-to-a-separator defect this
 > document's stabilization fix left unaddressed is **destructive, not

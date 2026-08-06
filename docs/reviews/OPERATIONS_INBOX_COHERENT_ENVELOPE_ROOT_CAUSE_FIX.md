@@ -18,6 +18,14 @@ Date: 2026-08-05
 > document's claims are left as originally written; read them as
 > superseded wherever the two disagree.
 
+> **Further correction (2026-08-06):** a blank-line variant of the same
+> class of defect, a real audit-content quarantine gap (collapsed raw
+> body re-entering classification/tokens via `str(parsed)`/`f"...{parsed}"`
+> blobs at ~10 call sites), and a field-order-independent quote-lane
+> defect were found and fixed in
+> `fix/operations-inbox-segmentation-quarantine-final`. See
+> `docs/reviews/OPERATIONS_INBOX_SEGMENTATION_QUARANTINE_FINAL.md`.
+
 ## Why this pass exists
 
 Three prior correction cycles on `services/message_scope.py` each fixed one
