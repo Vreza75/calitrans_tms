@@ -313,7 +313,7 @@ text` or `flatten_parsed_values_for_scan`'s output.
 
 Not performed. No browser available in this environment.
 
-## A note on test-DB isolation (discovered during this pass, not introduced by it)
+## Test-DB isolation gap — found and fixed in this same branch
 
 Running a new test that queries `find_matching_load` without
 `DATABASE_URL` pointed at the disposable test database resulted in a real
@@ -321,17 +321,47 @@ Running a new test that queries `find_matching_load` without
 `.streamlit/secrets.toml` (a genuine match was returned for an
 incidentally-real container number). No write occurred —
 `_prepare_operations_email_record` is DB-write-free by design, and the
-attachment-saving primitive was stubbed in the affected test — but this
-means `pytest -q` run with no environment variables set does **not**
-avoid production reads for any test that reaches load-matching. This
-pass's own new tests either avoid load-matching content that could
-coincidentally match, or explicitly stub `find_matching_load`/
-`find_load_match_candidates`. The full-suite run recorded in this
-document explicitly set `DATABASE_URL` to the disposable instance
-alongside `MIGRATION_TEST_DATABASE_URL`/`INBOX_CERTIFICATION_DATABASE_URL`
-to guarantee isolation. This is a pre-existing condition across the whole
-test suite, not something this pass introduced or fully remediated —
-flagged here rather than silently relied upon.
+attachment-saving primitive was stubbed in the affected test.
+
+Investigation found the gap was worse than one query: `config.get_secret
+("DATABASE_URL")` checks Streamlit's own `st.secrets` (reads
+`.streamlit/secrets.toml` directly, even outside a Streamlit runtime)
+*before* checking `os.environ`, and `config.py`'s own module-level
+`_load_local_env_file()` unconditionally copies `.env`'s `DATABASE_URL`
+(also production, in this repo) into `os.environ` at first import. Both
+files hold the same real production URL. This meant the `export
+DATABASE_URL=<disposable-url> && pytest -q` pattern used for the "full
+pytest with disposable DB" runs earlier in this document's own history
+(and in every prior session's final report claiming isolation) **did
+not** actually isolate ordinary, non-harness test code from production —
+only `tests/test_migration_runner.py` and
+`tests/integration/operations_inbox/harness.py` were genuinely isolated,
+since both read `MIGRATION_TEST_DATABASE_URL`/
+`INBOX_CERTIFICATION_DATABASE_URL` directly (`harness.py`'s
+`scratch_database()` context manager patches `db_client.get_secret`
+directly, scoped per case), bypassing `config.py` entirely.
+
+Fixed with a new root `conftest.py` (`pytest_configure` hook,
+session-wide): neutralizes `get_streamlit_secret`/
+`_read_local_streamlit_secret`/`_read_local_env_secret` (all three
+fallbacks, for every secret key, not just `DATABASE_URL`) and strips a
+`.env`-sourced `DATABASE_URL` back out of `os.environ` unless the caller
+had explicitly set it themselves before pytest started. Deliberately does
+**not** set or mirror `DATABASE_URL` from
+`MIGRATION_TEST_DATABASE_URL`/`INBOX_CERTIFICATION_DATABASE_URL` — the
+certification harness's own `require_scratch_database_url` already
+refuses to run if `INBOX_CERTIFICATION_DATABASE_URL` equals the app's
+configured `DATABASE_URL`, specifically to catch this class of
+misconfiguration, and mirroring the URL would have tripped that check.
+
+Verified: with no test-DB env vars set, `config.get_secret("DATABASE_URL")`
+now returns `None` and `db_client.get_engine()` raises `RuntimeError`
+instead of silently connecting — full suite still 848 passed/53 skipped
+(unchanged), proving no test secretly depended on real production data.
+With `MIGRATION_TEST_DATABASE_URL`/`INBOX_CERTIFICATION_DATABASE_URL` set,
+certification remains 49/49 and full suite is 901 passed, now **genuinely**
+isolated rather than only appearing to be. New regression coverage:
+`tests/test_conftest_database_isolation.py`.
 
 ## Remaining known risks
 
@@ -345,8 +375,5 @@ flagged here rather than silently relied upon.
   incomplete backend-boundary migration, no dispatcher-confirmation
   provenance, conservative administrative-phrase list, person-name lane
   false positive) are unchanged by this pass.
-- Test-DB isolation gap noted above — plain `pytest -q` without
-  `DATABASE_URL` set can perform real (read-only) queries against
-  production Supabase for any test exercising load matching. Worth a
-  dedicated follow-up (e.g. a conftest-level guard or a documented
-  required env var) but out of this pass's scope.
+- Test-DB isolation gap — fixed in this same branch, see above (root
+  `conftest.py`).
