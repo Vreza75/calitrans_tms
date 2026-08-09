@@ -6,8 +6,9 @@ import json
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import text as sa_text
 
-from db_client import execute, read_df
+from db_client import execute, read_df, require_schema_ready, transaction
 
 
 TASK_STATUSES = ["Open", "In Progress", "Waiting", "Completed", "Cancelled"]
@@ -44,81 +45,13 @@ def _json_dump(data: dict | None) -> str:
 
 
 def ensure_task_schema() -> None:
-    """Create Dispatcher Workspace task/action tables if they do not exist."""
-
-    execute(
-        """
-        create table if not exists operations_tasks (
-            id bigserial primary key,
-            task_title text not null,
-            task_description text,
-            task_status text not null default 'Open',
-            task_priority text not null default 'Medium',
-            owner text not null default 'Dispatch',
-            due_at timestamptz,
-            completed_at timestamptz,
-            completed_by text,
-            source_type text,
-            intake_id bigint references order_intake(id) on delete set null,
-            case_id bigint references operations_cases(id) on delete set null,
-            load_id bigint references loads(id) on delete set null,
-            customer text,
-            booking_number text,
-            container_number text,
-            created_by text not null default 'system',
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now()
-        )
-        """
+    """Verify the Dispatcher Workspace task/action tables are present -
+    see database/dispatcher_workspace_migration.sql, which is the sole
+    owner of this schema. Raises SchemaNotReadyError if that migration
+    has not been applied; never runs DDL itself."""
+    require_schema_ready(
+        "operations_tasks", "task_status", migration_hint="database/dispatcher_workspace_migration.sql"
     )
-
-    execute(
-        """
-        create table if not exists dispatcher_actions (
-            id bigserial primary key,
-            action_type text not null,
-            action_status text not null default 'Recorded',
-            action_summary text,
-            intake_id bigint references order_intake(id) on delete set null,
-            case_id bigint references operations_cases(id) on delete set null,
-            load_id bigint references loads(id) on delete set null,
-            task_id bigint references operations_tasks(id) on delete set null,
-            actor text not null default 'dispatcher',
-            metadata jsonb not null default '{}'::jsonb,
-            created_at timestamptz not null default now()
-        )
-        """
-    )
-
-    execute(
-        """
-        create table if not exists ai_recommendation_decisions (
-            id bigserial primary key,
-            intake_id bigint references order_intake(id) on delete set null,
-            case_id bigint references operations_cases(id) on delete set null,
-            load_id bigint references loads(id) on delete set null,
-            task_id bigint references operations_tasks(id) on delete set null,
-            recommendation_type text not null,
-            recommendation_summary text,
-            ai_confidence integer,
-            decision text not null,
-            decision_notes text,
-            decided_by text not null default 'dispatcher',
-            ai_payload jsonb not null default '{}'::jsonb,
-            final_payload jsonb not null default '{}'::jsonb,
-            created_at timestamptz not null default now()
-        )
-        """
-    )
-
-    execute("create index if not exists idx_operations_tasks_status on operations_tasks(task_status)")
-    execute("create index if not exists idx_operations_tasks_owner on operations_tasks(owner)")
-    execute("create index if not exists idx_operations_tasks_due_at on operations_tasks(due_at)")
-    execute("create index if not exists idx_operations_tasks_case_id on operations_tasks(case_id)")
-    execute("create index if not exists idx_operations_tasks_load_id on operations_tasks(load_id)")
-    execute("create index if not exists idx_operations_tasks_intake_id on operations_tasks(intake_id)")
-    execute("create index if not exists idx_dispatcher_actions_created_at on dispatcher_actions(created_at desc)")
-    execute("create index if not exists idx_ai_recommendation_decisions_created_at on ai_recommendation_decisions(created_at desc)")
 
 
 def create_task(
@@ -146,63 +79,72 @@ def create_task(
     owner = owner if owner in TASK_OWNERS else "Dispatch"
     priority = priority if priority in TASK_PRIORITIES else "Medium"
 
-    result = read_df(
-        """
-        insert into operations_tasks (
-            task_title,
-            task_description,
-            task_status,
-            task_priority,
-            owner,
-            due_at,
-            source_type,
-            intake_id,
-            case_id,
-            load_id,
-            customer,
-            booking_number,
-            container_number,
-            created_by
-        )
-        values (
-            :task_title,
-            :task_description,
-            'Open',
-            :task_priority,
-            :owner,
-            cast(:due_at as timestamptz),
-            :source_type,
-            :intake_id,
-            :case_id,
-            :load_id,
-            :customer,
-            :booking_number,
-            :container_number,
-            :created_by
-        )
-        returning id
-        """,
-        {
-            "task_title": title,
-            "task_description": description or None,
-            "task_priority": priority,
-            "owner": owner,
-            "due_at": due_at,
-            "source_type": source_type or "manual",
-            "intake_id": _int_or_none(intake_id),
-            "case_id": _int_or_none(case_id),
-            "load_id": _int_or_none(load_id),
-            "customer": customer or None,
-            "booking_number": booking_number or None,
-            "container_number": container_number or None,
-            "created_by": created_by or "dispatcher",
-        },
-    )
+    # Uses transaction() (engine.begin(), commits on clean exit) rather than
+    # read_df() (engine.connect(), no auto-commit) - RETURNING id needs the
+    # row back before the transaction closes, same pattern as
+    # user_repo.create_user(). read_df() here silently discarded every
+    # insert (implicit rollback on connection close after RETURNING was
+    # already read) - fixed, no live callers were affected.
+    with transaction() as conn:
+        row = conn.execute(
+            sa_text(
+                """
+                insert into operations_tasks (
+                    task_title,
+                    task_description,
+                    task_status,
+                    task_priority,
+                    owner,
+                    due_at,
+                    source_type,
+                    intake_id,
+                    case_id,
+                    load_id,
+                    customer,
+                    booking_number,
+                    container_number,
+                    created_by
+                )
+                values (
+                    :task_title,
+                    :task_description,
+                    'Open',
+                    :task_priority,
+                    :owner,
+                    cast(:due_at as timestamptz),
+                    :source_type,
+                    :intake_id,
+                    :case_id,
+                    :load_id,
+                    :customer,
+                    :booking_number,
+                    :container_number,
+                    :created_by
+                )
+                returning id
+                """
+            ),
+            {
+                "task_title": title,
+                "task_description": description or None,
+                "task_priority": priority,
+                "owner": owner,
+                "due_at": due_at,
+                "source_type": source_type or "manual",
+                "intake_id": _int_or_none(intake_id),
+                "case_id": _int_or_none(case_id),
+                "load_id": _int_or_none(load_id),
+                "customer": customer or None,
+                "booking_number": booking_number or None,
+                "container_number": container_number or None,
+                "created_by": created_by or "dispatcher",
+            },
+        ).first()
 
-    if result.empty:
+    if row is None:
         raise RuntimeError("Task was not created.")
 
-    return int(result.iloc[0]["id"])
+    return int(row[0])
 
 
 def update_task_status(task_id, status: str, completed_by: str = "dispatcher") -> None:
