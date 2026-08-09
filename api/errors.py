@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from application.exceptions import CommandFailedError, ConflictError, NotFoundError, ValidationError
+from utils.error_sanitizer import sanitize_message
 
 logger = logging.getLogger("api.errors")
 
@@ -15,10 +16,16 @@ def _envelope(status_code: int, code: str, message: str, details: dict | None = 
     """Consistent error shape for every error response this API returns -
     application errors, FastAPI's own validation/HTTPException errors, and
     the catch-all 500 all go through this so a client never has to branch
-    on which layer raised the error."""
+    on which layer raised the error.
+
+    `message` is sanitized here rather than at each raise site: this is
+    the one choke point every error response passes through, so it is the
+    single place credential material (a DSN password, a bearer token) is
+    guaranteed to be stripped before reaching a client - regardless of
+    which layer's exception text produced it."""
     return JSONResponse(
         status_code=status_code,
-        content={"error": {"code": code, "message": message, "details": details or {}}},
+        content={"error": {"code": code, "message": sanitize_message(message), "details": details or {}}},
     )
 
 

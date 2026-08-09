@@ -4,6 +4,7 @@ from typing import Any
 
 from application.exceptions import CommandFailedError, ConflictError, NotFoundError, ValidationError
 from application.loads.models import CreateLoadResult, TransitionResult, UpdateLoadResult
+from utils.error_sanitizer import sanitize_exception_message
 
 
 def transition_load(
@@ -84,7 +85,7 @@ def create_load_from_work_item(work_item_id: int, approved_fields: dict[str, Any
     try:
         result = create_load_from_inbox_item(int(work_item_id), approved_fields, **kwargs)
     except Exception as exc:  # noqa: BLE001 - surfaced as a structured application error
-        raise CommandFailedError(str(exc)) from exc
+        raise CommandFailedError(sanitize_exception_message(exc)) from exc
 
     return CreateLoadResult(
         ok=True,
@@ -110,7 +111,7 @@ def update_load_from_work_item(
     try:
         result = update_load_from_inbox_item(int(work_item_id), int(load_id), approved_fields, **kwargs)
     except Exception as exc:  # noqa: BLE001
-        raise CommandFailedError(str(exc)) from exc
+        raise CommandFailedError(sanitize_exception_message(exc)) from exc
 
     if result.get("error"):
         raise NotFoundError(str(result["error"]))
