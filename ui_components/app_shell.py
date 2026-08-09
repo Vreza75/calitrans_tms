@@ -7,6 +7,14 @@ from typing import Callable
 
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import (
+    ADMIN_DIAGNOSTIC_OPTIONS,
+    NAVIGATION_SECTIONS,
+    allowed_admin_diagnostic_labels,
+    allowed_top_level_sections,
+)
+
 
 def load_local_env_file(base_dir: str | Path | None = None) -> None:
     project_root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent.parent
@@ -42,25 +50,11 @@ def configure_streamlit_page() -> None:
     )
 
 
-NAVIGATION_SECTIONS = [
-    "Operations Inbox",
-    "Orders/Load Management",
-    "Dispatch Board",
-    "Active Status",
-    "Calendar View",
-    "Documents",
-    "Billing / ProfitTools",
-    "Dashboard",
-    "Admin / Diagnostics",
-]
-
-ADMIN_DIAGNOSTIC_OPTIONS = {
-    "Master Data": "Master Data",
-    "Email Imports / Diagnostics": "Email Imports",
-    "Port Houston Setup / Testing": "Port Houston Integration",
-    "Validation": "Validation",
-    "AI Dispatcher Workspace (Experimental)": "AI Dispatcher Workspace",
-}
+# NAVIGATION_SECTIONS / ADMIN_DIAGNOSTIC_OPTIONS live in
+# application/auth/permissions.py (framework-neutral), not here - that
+# module is also the source of truth for role permissions, so the nav
+# labels and the permission map can never drift apart. Re-exported here
+# only for callers that imported them from this module previously.
 
 LOAD_DATA_SECTIONS = {
     "Dashboard",
@@ -111,24 +105,36 @@ def show_header() -> None:
 
 def render_sidebar(
     *,
+    principal: AuthenticatedActor,
     refresh_callback: Callable[[], None],
     status_legend_renderer: Callable[[], None] | None = None,
 ) -> str:
+    """Only offers sections/admin-tools permitted for principal.role - an
+    unpermitted section is never rendered as a nav choice in the first
+    place. pages_app/router.py independently re-checks the resolved
+    section before rendering it (defense in depth, not the only gate)."""
+    permitted_sections = allowed_top_level_sections(principal.role)
+
     with st.sidebar:
         if Path("assets/calitrans_logo.png").exists():
             st.image("assets/calitrans_logo.png", width=160)
 
+        if not permitted_sections:
+            st.error("Your account has no permitted sections. Contact an administrator.")
+            st.stop()
+
         section = st.radio(
             "Navigation",
-            NAVIGATION_SECTIONS,
+            permitted_sections,
         )
         if section == "Admin / Diagnostics":
+            admin_options = allowed_admin_diagnostic_labels(principal.role)
             admin_label = st.selectbox(
                 "Admin Tool",
-                list(ADMIN_DIAGNOSTIC_OPTIONS.keys()),
+                list(admin_options.keys()),
                 key="admin_diagnostics_tool",
             )
-            section = ADMIN_DIAGNOSTIC_OPTIONS[admin_label]
+            section = admin_options[admin_label]
             st.caption("Daily intake belongs in Operations Inbox. These tools are for setup, diagnostics, and exception work.")
 
         st.divider()

@@ -29,24 +29,22 @@ Configuration:
 
 import json
 import os
-from dataclasses import dataclass
-from enum import Enum
 
 from fastapi import Depends, Header, HTTPException
 
+from application.auth.models import AuthenticatedActor, Role
 
-class Role(str, Enum):
-    DISPATCHER = "dispatcher"
-    MANAGER = "manager"
-    ACCOUNTING = "accounting"
-    ADMIN = "admin"
-
-
-@dataclass(frozen=True)
-class AuthenticatedActor:
-    actor: str
-    role: Role
-
+__all__ = [
+    "Role",
+    "AuthenticatedActor",
+    "DEV_MODE_ACTOR",
+    "require_auth",
+    "require_role",
+    "READ_OPERATIONS",
+    "READ_LOADS",
+    "MUTATE_OPERATIONS",
+    "ADMIN_ONLY",
+]
 
 DEV_MODE_ACTOR = AuthenticatedActor(actor="dev-mode", role=Role.ADMIN)
 

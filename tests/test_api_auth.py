@@ -162,6 +162,177 @@ def test_dev_mode_bypasses_token_check_only_when_explicitly_enabled(monkeypatch)
     assert r.status_code != 403
 
 
+def test_accounting_role_cannot_create_load(configured_client: TestClient) -> None:
+    r = configured_client.post(
+        "/api/v1/work-items/1/create-load",
+        json={"approved_fields": {}},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_accounting_role_cannot_update_load(configured_client: TestClient) -> None:
+    r = configured_client.post(
+        "/api/v1/work-items/1/update-load",
+        json={"load_id": 1, "approved_fields": {}},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_accounting_role_cannot_link_load(configured_client: TestClient) -> None:
+    r = configured_client.post(
+        "/api/v1/work-items/1/link-load",
+        json={"load_id": 1},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_accounting_role_cannot_update_draft(configured_client: TestClient) -> None:
+    r = configured_client.put(
+        "/api/v1/work-items/1/draft",
+        json={"fields": {}},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_unauthenticated_cannot_create_load(configured_client: TestClient) -> None:
+    r = configured_client.post("/api/v1/work-items/1/create-load", json={"approved_fields": {}})
+    assert r.status_code == 401
+
+
+def test_unauthenticated_cannot_update_draft(configured_client: TestClient) -> None:
+    r = configured_client.put("/api/v1/work-items/1/draft", json={"fields": {}})
+    assert r.status_code == 401
+
+
+def test_dispatcher_role_can_create_load(configured_client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+    from application.loads.commands import CreateLoadResult
+
+    monkeypatch.setattr(
+        router_module,
+        "create_load_from_work_item",
+        lambda work_item_id, approved_fields: CreateLoadResult(ok=True, load_id=42, review_status="Ready"),
+    )
+
+    r = configured_client.post(
+        "/api/v1/work-items/1/create-load",
+        json={"approved_fields": {}},
+        headers={"Authorization": f"Bearer {DISPATCHER_TOKEN}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["load_id"] == 42
+
+
+def test_dispatcher_role_can_update_load(configured_client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+    from application.loads.commands import UpdateLoadResult
+
+    monkeypatch.setattr(
+        router_module,
+        "update_load_from_work_item",
+        lambda work_item_id, load_id, approved_fields, fill_blank_only=True: UpdateLoadResult(
+            ok=True, load_id=load_id, updated_fields=["Customer"], skipped_fields=[]
+        ),
+    )
+
+    r = configured_client.post(
+        "/api/v1/work-items/1/update-load",
+        json={"load_id": 7, "approved_fields": {"Customer": "Acme"}},
+        headers={"Authorization": f"Bearer {DISPATCHER_TOKEN}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["load_id"] == 7
+
+
+def test_dispatcher_role_can_link_load(configured_client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+    from application.work_items.commands import CommandResult
+
+    monkeypatch.setattr(
+        router_module.work_item_commands,
+        "link_work_item_to_load",
+        lambda work_item_id, load_id, actor: CommandResult(ok=True, work_item_id=work_item_id, detail="Linked"),
+    )
+
+    r = configured_client.post(
+        "/api/v1/work-items/1/link-load",
+        json={"load_id": 7},
+        headers={"Authorization": f"Bearer {DISPATCHER_TOKEN}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_dispatcher_role_can_update_draft(configured_client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+    from application.order_drafts.commands import UpdateDraftResult
+
+    monkeypatch.setattr(router_module, "get_work_item_detail", lambda work_item_id: _sample_detail())
+    monkeypatch.setattr(
+        router_module,
+        "update_order_draft",
+        lambda conversation_key, fields: UpdateDraftResult(
+            ok=True, conversation_key=conversation_key, updated_fields=list(fields.keys())
+        ),
+    )
+
+    r = configured_client.put(
+        "/api/v1/work-items/1/draft",
+        json={"fields": {"Customer": "Acme"}},
+        headers={"Authorization": f"Bearer {DISPATCHER_TOKEN}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_accounting_role_cannot_transition_load(configured_client: TestClient) -> None:
+    r = configured_client.post(
+        "/api/v1/loads/1/transition",
+        json={"new_status": "Delivered"},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_accounting_role_cannot_assign_driver(configured_client: TestClient) -> None:
+    r = configured_client.post(
+        "/api/v1/loads/1/assign-driver",
+        json={"driver": "J. Doe"},
+        headers={"Authorization": f"Bearer {ACCOUNTING_TOKEN}"},
+    )
+    assert r.status_code == 403
+
+
+def test_unauthenticated_cannot_transition_load(configured_client: TestClient) -> None:
+    r = configured_client.post("/api/v1/loads/1/transition", json={"new_status": "Delivered"})
+    assert r.status_code == 401
+
+
+def test_dispatcher_role_can_transition_load(configured_client: TestClient, monkeypatch) -> None:
+    from api.routers import loads as loads_router
+    from application.loads.commands import TransitionResult
+
+    monkeypatch.setattr(
+        loads_router,
+        "transition_load",
+        lambda load_id, new_status, **kwargs: TransitionResult(
+            ok=True, reason="", status=new_status, closeout_stage=""
+        ),
+    )
+
+    r = configured_client.post(
+        "/api/v1/loads/1/transition",
+        json={"new_status": "Delivered"},
+        headers={"Authorization": f"Bearer {DISPATCHER_TOKEN}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "Delivered"
+
+
 def test_dev_mode_value_must_be_exactly_true(monkeypatch) -> None:
     for value in ("1", "yes", "TRUE ", "enabled"):
         monkeypatch.setenv("API_AUTH_DEV_MODE", value)

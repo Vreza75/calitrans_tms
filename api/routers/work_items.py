@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from api.auth import READ_OPERATIONS, require_role
+from api.auth import MUTATE_OPERATIONS, READ_OPERATIONS, require_role
 from api.dependencies import get_current_actor
 from api.schemas.conversations import ConversationPageOut
 from api.schemas.loads import CreateLoadIn, CreateLoadOut, UpdateLoadIn, UpdateLoadOut
@@ -26,6 +26,14 @@ from application.work_items.queries import get_work_item_detail, get_work_item_q
 router = APIRouter(
     prefix="/work-items",
     tags=["work-items"],
+    # Router-level floor: every route on this router at least requires
+    # READ_OPERATIONS (excludes accounting - see loads.py's separate
+    # READ_LOADS group for that role's access). READ_OPERATIONS and
+    # MUTATE_OPERATIONS happen to share the same membership today, but
+    # mutation routes below also declare require_role(*MUTATE_OPERATIONS)
+    # explicitly rather than relying on that coincidence - if the two
+    # groups ever diverge, mutations stay correctly gated without anyone
+    # having to remember this router's default.
     dependencies=[Depends(require_role(*READ_OPERATIONS))],
 )
 
@@ -90,20 +98,32 @@ def get_work_item_draft(work_item_id: int) -> OrderDraftOut:
     return OrderDraftOut.from_domain(draft)
 
 
-@router.put("/{work_item_id}/draft", response_model=UpdateOrderDraftOut)
+@router.put(
+    "/{work_item_id}/draft",
+    response_model=UpdateOrderDraftOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
 def update_work_item_draft(work_item_id: int, payload: UpdateOrderDraftIn) -> UpdateOrderDraftOut:
     detail = get_work_item_detail(work_item_id)
     result = update_order_draft(detail.conversation_key, payload.fields)
     return UpdateOrderDraftOut(**result.__dict__)
 
 
-@router.post("/{work_item_id}/create-load", response_model=CreateLoadOut)
+@router.post(
+    "/{work_item_id}/create-load",
+    response_model=CreateLoadOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
 def create_load(work_item_id: int, payload: CreateLoadIn) -> CreateLoadOut:
     result = create_load_from_work_item(work_item_id, payload.approved_fields)
     return CreateLoadOut(ok=result.ok, load_id=result.load_id, review_status=result.review_status)
 
 
-@router.post("/{work_item_id}/update-load", response_model=UpdateLoadOut)
+@router.post(
+    "/{work_item_id}/update-load",
+    response_model=UpdateLoadOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
 def update_load(work_item_id: int, payload: UpdateLoadIn) -> UpdateLoadOut:
     result = update_load_from_work_item(
         work_item_id,
@@ -119,7 +139,11 @@ def update_load(work_item_id: int, payload: UpdateLoadIn) -> UpdateLoadOut:
     )
 
 
-@router.post("/{work_item_id}/close", response_model=CommandResultOut)
+@router.post(
+    "/{work_item_id}/close",
+    response_model=CommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
 def close_work_item(
     work_item_id: int,
     payload: CloseWorkItemIn,
@@ -129,7 +153,11 @@ def close_work_item(
     return CommandResultOut(**result.__dict__)
 
 
-@router.post("/{work_item_id}/link-load", response_model=CommandResultOut)
+@router.post(
+    "/{work_item_id}/link-load",
+    response_model=CommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
 def link_work_item_to_load(
     work_item_id: int,
     payload: LinkLoadIn,

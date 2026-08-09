@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import is_section_permitted
 from ui_components.app_shell import LOAD_DATA_SECTIONS, render_sidebar
 from ui_components.status_legend import render_status_legend
 from services.tms_data_service import load_tms_data, refresh_data
@@ -75,11 +77,20 @@ def _render_selected_page(section: str, df: pd.DataFrame) -> None:
         st.warning(f"Unknown section: {section}")
 
 
-def route_selected_page() -> None:
+def route_selected_page(principal: AuthenticatedActor) -> None:
     section = render_sidebar(
+        principal=principal,
         refresh_callback=refresh_data,
         status_legend_renderer=render_status_legend,
     )
+
+    if not is_section_permitted(principal.role, section):
+        # Defense in depth: render_sidebar already only offers permitted
+        # choices, but this is the actual fail-closed gate - it does not
+        # trust the sidebar's own filtering.
+        st.error("You do not have permission to view this section.")
+        st.stop()
+        return
 
     df = _load_current_tms_data_or_stop() if section in LOAD_DATA_SECTIONS else pd.DataFrame()
     _render_selected_page(section, df)
