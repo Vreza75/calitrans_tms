@@ -5,9 +5,11 @@ from datetime import date
 from typing import Any
 
 import pandas as pd
-import streamlit as st
+from sqlalchemy import text as sa_text
+from sqlalchemy.engine import Connection
 
-from db_client import column_exists, execute, read_df
+from db_client import execute, read_df, require_schema_ready, transaction
+from utils.ttl_cache import ttl_cache
 from services.email_parser import extract_latest_email_body, parse_email_text
 from services.operations_email_triage_service import (
     flatten_parsed_values_for_scan,
@@ -53,6 +55,8 @@ OPERATIONS_CASE_PRIORITIES = ["Critical", "High", "Medium", "Low", "Normal", "Ur
 OPERATIONS_SLA_FIRST_RESPONSE_HOURS = 2
 OPERATIONS_SLA_RESOLUTION_HOURS = 48
 
+_SCHEMA_READY = False
+
 
 def safe_str(value: Any) -> str:
     value_str = str(value or "").strip()
@@ -82,109 +86,23 @@ def int_or_none(value: Any) -> int | None:
 
 
 def ensure_operations_case_schema() -> None:
-    if st.session_state.get("_operations_case_schema_ready"):
+    """Verify the operations_cases/operations_case_notes/
+    operations_case_owner_history/operations_case_events tables and their
+    case_id linkage columns are present - see
+    database/operations_email_workflow_migration.sql, which is the sole
+    owner of this schema. Raises SchemaNotReadyError if that migration
+    has not been applied; never runs DDL itself."""
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
         return
 
-    if column_exists("operations_email_replies", "case_id"):
-        st.session_state["_operations_case_schema_ready"] = True
-        return
-
-    execute(
-        """
-        create table if not exists operations_cases (
-            id bigserial primary key,
-            case_number text unique not null,
-            conversation_key text,
-            status text not null default 'New',
-            owner text not null default 'Unassigned',
-            priority text not null default 'Normal',
-            customer text,
-            source_subject text,
-            request_type text,
-            linked_load_id bigint references loads(id) on delete set null,
-            next_action text,
-            last_message_direction text,
-            last_message_at timestamptz,
-            message_count integer not null default 0,
-            first_response_due_at timestamptz,
-            first_response_at timestamptz,
-            resolution_due_at timestamptz,
-            resolved_at timestamptz,
-            customer_wait_started_at timestamptz,
-            department_wait_started_at timestamptz,
-            sla_status text not null default 'On Track',
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            closed_at timestamptz,
-            reopened_at timestamptz
-        )
-        """
+    require_schema_ready(
+        "operations_email_replies", "case_id", migration_hint="database/operations_email_workflow_migration.sql"
     )
 
-    execute(
-        """
-        create table if not exists operations_case_notes (
-            id bigserial primary key,
-            case_id bigint references operations_cases(id) on delete cascade,
-            note_body text not null,
-            note_type text not null default 'internal',
-            created_by text not null default 'dispatcher',
-            created_at timestamptz not null default now()
-        )
-        """
-    )
+    _SCHEMA_READY = True
 
-    execute(
-        """
-        create table if not exists operations_case_owner_history (
-            id bigserial primary key,
-            case_id bigint references operations_cases(id) on delete cascade,
-            old_owner text,
-            new_owner text not null,
-            changed_by text not null default 'dispatcher',
-            changed_at timestamptz not null default now()
-        )
-        """
-    )
 
-    execute(
-        """
-        create table if not exists operations_case_events (
-            id bigserial primary key,
-            case_id bigint references operations_cases(id) on delete cascade,
-            event_type text not null,
-            title text,
-            details text,
-            actor text not null default 'system',
-            department text,
-            created_at timestamptz not null default now()
-        )
-        """
-    )
-
-    execute("alter table operations_cases add column if not exists first_response_due_at timestamptz")
-    execute("alter table operations_cases add column if not exists first_response_at timestamptz")
-    execute("alter table operations_cases add column if not exists resolution_due_at timestamptz")
-    execute("alter table operations_cases add column if not exists resolved_at timestamptz")
-    execute("alter table operations_cases add column if not exists customer_wait_started_at timestamptz")
-    execute("alter table operations_cases add column if not exists department_wait_started_at timestamptz")
-    execute("alter table operations_cases add column if not exists sla_status text not null default 'On Track'")
-
-    execute("alter table order_intake add column if not exists case_id bigint references operations_cases(id) on delete set null")
-    execute("alter table load_communications add column if not exists case_id bigint references operations_cases(id) on delete set null")
-    execute("alter table operations_email_replies add column if not exists case_id bigint references operations_cases(id) on delete set null")
-
-    execute("create index if not exists idx_operations_cases_conversation_key on operations_cases(conversation_key)")
-    execute("create index if not exists idx_operations_cases_status on operations_cases(status)")
-    execute("create index if not exists idx_operations_cases_owner on operations_cases(owner)")
-    execute("create index if not exists idx_operations_cases_linked_load_id on operations_cases(linked_load_id)")
-    execute("create index if not exists idx_operations_cases_updated_at on operations_cases(updated_at desc)")
-    execute("create index if not exists idx_operations_cases_sla_status on operations_cases(sla_status)")
-    execute("create index if not exists idx_order_intake_case_id on order_intake(case_id)")
-    execute("create index if not exists idx_load_communications_case_id on load_communications(case_id)")
-
-    st.session_state["_operations_case_schema_ready"] = True
-    
 def case_customer_from_sender(sender: str) -> str:
     name, email = parseaddr(str(sender or ""))
     return _safe_str(name) or _safe_str(email) or _safe_str(sender)
@@ -269,20 +187,18 @@ def next_operations_case_number() -> str:
     return f"{prefix}{last_number + 1:04d}"
 
 
-def load_operations_case_by_id(case_id) -> dict:
+def load_operations_case_by_id(case_id, *, conn: Connection | None = None) -> dict:
     case_id = _int_or_none(case_id)
     if case_id is None:
         return {}
+
+    sql = sa_text("select * from operations_cases where id = :case_id limit 1")
+
     try:
-        case_df = read_df(
-            """
-            select *
-            from operations_cases
-            where id = :case_id
-            limit 1
-            """,
-            {"case_id": case_id},
-        )
+        if conn is not None:
+            row = conn.execute(sql, {"case_id": case_id}).mappings().first()
+            return dict(row) if row is not None else {}
+        case_df = read_df(str(sql), {"case_id": case_id})
     except Exception:
         return {}
     return case_df.iloc[0].to_dict() if not case_df.empty else {}
@@ -327,7 +243,7 @@ def case_identity_values(
     }
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_operations_case_match_context(limit: int = 1000) -> pd.DataFrame:
     try:
         return read_df(
@@ -468,72 +384,118 @@ def log_operations_case_event(
     details: str = "",
     actor: str = "system",
     department: str = "",
+    *,
+    conn: Connection | None = None,
 ) -> None:
+    """Best-effort audit event - failure here must never block or corrupt
+    the operation that triggered it. `conn` is optional; when given, the
+    insert runs inside its own SAVEPOINT (conn.begin_nested()) so a
+    failure rolls back only this insert, not the caller's whole
+    transaction - PostgreSQL aborts an entire transaction on any
+    statement error until rollback/savepoint-rollback, so swallowing the
+    Python exception alone would leave a shared connection unusable for
+    subsequent statements without this."""
     case_id = _int_or_none(case_id)
     if case_id is None or not _safe_str(event_type):
         return
-    try:
-        execute(
-            """
-            insert into operations_case_events (
-                case_id,
-                event_type,
-                title,
-                details,
-                actor,
-                department
-            )
-            values (
-                :case_id,
-                :event_type,
-                :title,
-                :details,
-                :actor,
-                :department
-            )
-            """,
-            {
-                "case_id": case_id,
-                "event_type": event_type,
-                "title": title or None,
-                "details": details or None,
-                "actor": actor or "system",
-                "department": department or None,
-            },
+
+    sql = sa_text(
+        """
+        insert into operations_case_events (
+            case_id,
+            event_type,
+            title,
+            details,
+            actor,
+            department
         )
+        values (
+            :case_id,
+            :event_type,
+            :title,
+            :details,
+            :actor,
+            :department
+        )
+        """
+    )
+    params = {
+        "case_id": case_id,
+        "event_type": event_type,
+        "title": title or None,
+        "details": details or None,
+        "actor": actor or "system",
+        "department": department or None,
+    }
+
+    if conn is not None:
+        try:
+            with conn.begin_nested():
+                conn.execute(sql, params)
+        except Exception:
+            pass
+        return
+
+    try:
+        execute(str(sql), params)
     except Exception:
         pass
 
 
-def record_operations_case_owner_change(case_id, old_owner: str, new_owner: str, changed_by: str = "dispatcher") -> None:
+def record_operations_case_owner_change(
+    case_id, old_owner: str, new_owner: str, changed_by: str = "dispatcher", *, conn: Connection | None = None
+) -> None:
+    """Best-effort audit trail - see log_operations_case_event's docstring
+    for why `conn` (when given) must isolate this write in its own
+    SAVEPOINT rather than just swallowing the Python exception."""
     case_id = _int_or_none(case_id)
     old_owner = _safe_str(old_owner)
     new_owner = _safe_str(new_owner) or "Unassigned"
     if case_id is None or old_owner == new_owner:
         return
-    try:
-        execute(
-            """
-            insert into operations_case_owner_history (
-                case_id,
-                old_owner,
-                new_owner,
-                changed_by
-            )
-            values (
-                :case_id,
-                :old_owner,
-                :new_owner,
-                :changed_by
-            )
-            """,
-            {
-                "case_id": case_id,
-                "old_owner": old_owner or None,
-                "new_owner": new_owner,
-                "changed_by": changed_by,
-            },
+
+    sql = sa_text(
+        """
+        insert into operations_case_owner_history (
+            case_id,
+            old_owner,
+            new_owner,
+            changed_by
         )
+        values (
+            :case_id,
+            :old_owner,
+            :new_owner,
+            :changed_by
+        )
+        """
+    )
+    params = {
+        "case_id": case_id,
+        "old_owner": old_owner or None,
+        "new_owner": new_owner,
+        "changed_by": changed_by,
+    }
+
+    if conn is not None:
+        try:
+            with conn.begin_nested():
+                conn.execute(sql, params)
+            _log_operations_case_event(
+                case_id,
+                "assigned",
+                "Owner changed",
+                f"Owner changed from {old_owner or 'Unassigned'} to {new_owner}.",
+                actor=changed_by,
+                department=new_owner,
+                conn=conn,
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        execute(str(sql), params)
         _log_operations_case_event(
             case_id,
             "assigned",
@@ -546,40 +508,54 @@ def record_operations_case_owner_change(case_id, old_owner: str, new_owner: str,
         pass
 
 
-def update_operations_case_sla(case_id) -> None:
+def update_operations_case_sla(case_id, *, conn: Connection | None = None) -> None:
+    """Best-effort SLA-status refresh - see log_operations_case_event's
+    docstring for why `conn` (when given) must isolate this write in its
+    own SAVEPOINT rather than just swallowing the Python exception."""
     case_id = _int_or_none(case_id)
     if case_id is None:
         return
+
+    sql = sa_text(
+        """
+        update operations_cases
+        set sla_status = case
+                when status = 'Closed'
+                     and first_response_at is not null
+                     and first_response_due_at is not null
+                     and first_response_at <= first_response_due_at
+                     and (resolution_due_at is null or coalesce(resolved_at, closed_at, now()) <= resolution_due_at)
+                    then 'Met'
+                when status = 'Closed' then 'Closed'
+                when first_response_at is null
+                     and first_response_due_at is not null
+                     and now() > first_response_due_at
+                    then 'First Response Overdue'
+                when resolution_due_at is not null
+                     and now() > resolution_due_at
+                    then 'Resolution Overdue'
+                when first_response_at is null
+                     and first_response_due_at is not null
+                     and now() > first_response_due_at - interval '30 minutes'
+                    then 'Warning'
+                else 'On Track'
+            end,
+            updated_at = now()
+        where id = :case_id
+        """
+    )
+    params = {"case_id": case_id}
+
+    if conn is not None:
+        try:
+            with conn.begin_nested():
+                conn.execute(sql, params)
+        except Exception:
+            pass
+        return
+
     try:
-        execute(
-            """
-            update operations_cases
-            set sla_status = case
-                    when status = 'Closed'
-                         and first_response_at is not null
-                         and first_response_due_at is not null
-                         and first_response_at <= first_response_due_at
-                         and (resolution_due_at is null or coalesce(resolved_at, closed_at, now()) <= resolution_due_at)
-                        then 'Met'
-                    when status = 'Closed' then 'Closed'
-                    when first_response_at is null
-                         and first_response_due_at is not null
-                         and now() > first_response_due_at
-                        then 'First Response Overdue'
-                    when resolution_due_at is not null
-                         and now() > resolution_due_at
-                        then 'Resolution Overdue'
-                    when first_response_at is null
-                         and first_response_due_at is not null
-                         and now() > first_response_due_at - interval '30 minutes'
-                        then 'Warning'
-                    else 'On Track'
-                end,
-                updated_at = now()
-            where id = :case_id
-            """,
-            {"case_id": case_id},
-        )
+        execute(str(sql), params)
     except Exception:
         pass
 
@@ -957,12 +933,25 @@ def update_operations_case(
     linked_load_id=None,
     next_action: str = "",
 ) -> None:
+    """Update a case's status/owner/priority, record the change, and sync
+    the linked load onto order_intake.
+
+    Mandatory vs. best-effort, and why: the case UPDATE, the
+    status-change note, and the order_intake sync are the actual state
+    change this function promises the caller - they run inside one
+    db_client.transaction() and either all commit or all roll back. The
+    owner-change history row, the status-change event row, and the SLA
+    recompute are audit/derived data whose failure must never block or
+    partially-corrupt that mandatory change (this was already true before
+    this function ran inside a shared transaction - see each function's
+    own docstring for why a SAVEPOINT, not just a caught Python exception,
+    is required to preserve that once they share a connection)."""
     case_id = _int_or_none(case_id)
     if case_id is None:
         return
-    old_case = _load_operations_case_by_id(case_id)
     linked_load_id = _int_or_none(linked_load_id)
-    execute(
+
+    update_sql = sa_text(
         """
         update operations_cases
         set status = :status,
@@ -985,103 +974,98 @@ def update_operations_case(
             reopened_at = case when :status = 'Reopened' then now() else reopened_at end,
             updated_at = now()
         where id = :case_id
-        """,
-        {
-            "case_id": case_id,
-            "status": status,
-            "owner": owner,
-            "priority": priority,
-            "linked_load_id": linked_load_id,
-            "next_action": next_action or None,
-        },
-    )
-    _record_operations_case_owner_change(
-        case_id,
-        _safe_str(old_case.get("owner", "")),
-        owner,
-        changed_by="dispatcher",
-    )
-    if _safe_str(old_case.get("status", "")) != status:
-        _log_operations_case_event(
-            case_id,
-            "status_change",
-            f"Status changed to {status}",
-            next_action,
-            actor="dispatcher",
-            department=owner,
-        )
-    execute(
         """
-        insert into operations_case_notes (
-            case_id,
-            note_body,
-            note_type,
-            created_by
-        )
-        values (
-            :case_id,
-            :note_body,
-            'status_change',
-            'dispatcher'
-        )
-        """,
-        {
-            "case_id": case_id,
-            "note_body": (
-                f"Case updated to {status}; owner {owner}; priority {priority}; "
-                f"linked load {_safe_str(linked_load_id) or '-'}."
-            ),
-        },
     )
-    _update_operations_case_sla(case_id)
-    execute(
+    note_sql = sa_text(
         """
-        update order_intake
-        set matched_load_id = coalesce(:linked_load_id, matched_load_id)
-        where case_id = :case_id
-        """,
-        {"case_id": case_id, "linked_load_id": linked_load_id},
+        insert into operations_case_notes (case_id, note_body, note_type, created_by)
+        values (:case_id, :note_body, 'status_change', 'dispatcher')
+        """
     )
+    order_intake_sync_sql = sa_text(
+        "update order_intake set matched_load_id = coalesce(:linked_load_id, matched_load_id) where case_id = :case_id"
+    )
+
+    with transaction() as conn:
+        old_case = _load_operations_case_by_id(case_id, conn=conn)
+
+        conn.execute(
+            update_sql,
+            {
+                "case_id": case_id,
+                "status": status,
+                "owner": owner,
+                "priority": priority,
+                "linked_load_id": linked_load_id,
+                "next_action": next_action or None,
+            },
+        )
+
+        _record_operations_case_owner_change(
+            case_id, _safe_str(old_case.get("owner", "")), owner, changed_by="dispatcher", conn=conn
+        )
+        if _safe_str(old_case.get("status", "")) != status:
+            _log_operations_case_event(
+                case_id,
+                "status_change",
+                f"Status changed to {status}",
+                next_action,
+                actor="dispatcher",
+                department=owner,
+                conn=conn,
+            )
+
+        conn.execute(
+            note_sql,
+            {
+                "case_id": case_id,
+                "note_body": (
+                    f"Case updated to {status}; owner {owner}; priority {priority}; "
+                    f"linked load {_safe_str(linked_load_id) or '-'}."
+                ),
+            },
+        )
+
+        _update_operations_case_sla(case_id, conn=conn)
+
+        conn.execute(order_intake_sync_sql, {"case_id": case_id, "linked_load_id": linked_load_id})
 
 
 def add_operations_case_note(case_id, note_body: str, note_type: str = "internal", created_by: str = "dispatcher") -> None:
+    """Add a case note and touch the case's updated_at. Both are mandatory
+    (one transaction); the resulting audit event is best-effort (its own
+    SAVEPOINT) - see update_operations_case's docstring for the same
+    mandatory-vs-best-effort split applied here."""
     case_id = _int_or_none(case_id)
     note_body = _safe_str(note_body)
     if case_id is None or not note_body:
         return
-    execute(
+
+    note_sql = sa_text(
         """
-        insert into operations_case_notes (
+        insert into operations_case_notes (case_id, note_body, note_type, created_by)
+        values (:case_id, :note_body, :note_type, :created_by)
+        """
+    )
+    touch_sql = sa_text("update operations_cases set updated_at = now() where id = :case_id")
+
+    with transaction() as conn:
+        conn.execute(
+            note_sql,
+            {"case_id": case_id, "note_body": note_body, "note_type": note_type, "created_by": created_by},
+        )
+        conn.execute(touch_sql, {"case_id": case_id})
+        _log_operations_case_event(
             case_id,
+            "note",
+            "Internal note added" if note_type == "internal" else "Case note added",
             note_body,
-            note_type,
-            created_by
+            actor=created_by,
+            conn=conn,
         )
-        values (
-            :case_id,
-            :note_body,
-            :note_type,
-            :created_by
-        )
-        """,
-        {
-            "case_id": case_id,
-            "note_body": note_body,
-            "note_type": note_type,
-            "created_by": created_by,
-        },
-    )
-    execute("update operations_cases set updated_at = now() where id = :case_id", {"case_id": case_id})
-    _log_operations_case_event(
-        case_id,
-        "note",
-        "Internal note added" if note_type == "internal" else "Case note added",
-        note_body,
-        actor=created_by,
-    )
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_operations_case_timeline(case_id) -> pd.DataFrame:
     case_id = _int_or_none(case_id)
     if case_id is None:
@@ -1151,7 +1135,7 @@ def load_operations_case_timeline(case_id) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_recent_operations_cases(current_case_id=None) -> pd.DataFrame:
     current_case_id = _int_or_none(current_case_id)
     try:
@@ -1178,7 +1162,7 @@ def load_recent_operations_cases(current_case_id=None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_operations_case_owner_history(case_id) -> pd.DataFrame:
     case_id = _int_or_none(case_id)
     if case_id is None:
@@ -1202,7 +1186,7 @@ def load_operations_case_owner_history(case_id) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def _operations_case_metrics() -> dict:
     metrics = {
         "open": 0,
@@ -1235,7 +1219,7 @@ def _operations_case_metrics() -> dict:
     return metrics
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_operations_case_dashboard_df() -> pd.DataFrame:
     try:
         return read_df(
@@ -1311,7 +1295,7 @@ def merge_operations_cases(source_case_id, target_case_id) -> bool:
     return True
 
 
-@st.cache_data(show_spinner=False, ttl=30)
+@ttl_cache(ttl_seconds=30)
 def load_operations_case_email_summary(case_id) -> dict:
     case_id = _int_or_none(case_id)
     if case_id is None:

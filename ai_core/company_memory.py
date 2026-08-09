@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
-from db_client import execute, read_df
+from db_client import execute, read_df, require_schema_ready
 
 
 @dataclass
@@ -45,35 +45,11 @@ def _json_dump(value: Any) -> str:
 
 
 def ensure_company_memory_schema() -> None:
-    """Create the company_memory table used by AI agents and dispatcher learning."""
-
-    execute(
-        """
-        create table if not exists company_memory (
-            id bigserial primary key,
-            memory_type text not null,
-            memory_key text not null,
-            memory_value jsonb not null default '{}'::jsonb,
-            customer text,
-            sender_domain text,
-            source text,
-            confidence numeric not null default 0.75,
-            is_active boolean not null default true,
-            usage_count integer not null default 0,
-            last_used_at timestamptz,
-            created_by text not null default 'system',
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            unique(memory_type, memory_key)
-        )
-        """
-    )
-
-    execute("create index if not exists idx_company_memory_type on company_memory(memory_type)")
-    execute("create index if not exists idx_company_memory_key on company_memory(memory_key)")
-    execute("create index if not exists idx_company_memory_customer on company_memory(customer)")
-    execute("create index if not exists idx_company_memory_sender_domain on company_memory(sender_domain)")
-    execute("create index if not exists idx_company_memory_active on company_memory(is_active)")
+    """Verify the company_memory table used by AI agents and dispatcher
+    learning is present - see database/company_memory.sql, which is the
+    sole owner of this schema. Raises SchemaNotReadyError if that
+    migration has not been applied; never runs DDL itself."""
+    require_schema_ready("company_memory", "memory_type", migration_hint="database/company_memory.sql")
 
 
 def normalize_memory_key(value: str) -> str:

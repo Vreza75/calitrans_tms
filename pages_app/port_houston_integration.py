@@ -7,7 +7,8 @@ import pandas as pd
 import streamlit as st
 
 import services.operations_inbox_service as ops
-from db_client import DispatchDatabaseClient, execute, read_df
+from db_client import DispatchDatabaseClient, execute, read_df, require_schema_ready
+from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.customer_status_email_service import _get_app_setting
 from services.dispatch_workflow_service import (
     _first_present,
@@ -59,7 +60,12 @@ def _existing_load_columns() -> set[str]:
 
 
 def refresh_data() -> None:
-    st.cache_data.clear()
+    """Every call site here follows a write to the loads table (PIN/
+    appointment/container sync) - only tms_data_service's load caches are
+    affected, so this delegates to its targeted refresh rather than
+    wiping every unrelated cache app-wide (Operations Inbox, cases,
+    attachments)."""
+    _refresh_tms_data()
 
 
 PORT_HOUSTON_ENDPOINTS = {
@@ -111,21 +117,12 @@ PORT_HOUSTON_APPOINTMENT_TRAN_TYPES = {
 
 
 def _ensure_port_houston_sync_log_table() -> None:
-    execute(
-        """
-        create table if not exists port_houston_sync_log (
-            id bigserial primary key,
-            load_id bigint references loads(id) on delete set null,
-            action_type text not null,
-            lookup_type text,
-            request_reference text,
-            response_summary jsonb,
-            status text not null default 'success',
-            error_message text,
-            created_by text not null default 'streamlit',
-            created_at timestamptz not null default now()
-        )
-        """
+    """Verify port_houston_sync_log is present - see
+    database/port_houston_integration_migration.sql, which is the sole
+    owner of this schema. Raises SchemaNotReadyError if that migration
+    has not been applied; never runs DDL itself."""
+    require_schema_ready(
+        "port_houston_sync_log", "action_type", migration_hint="database/port_houston_integration_migration.sql"
     )
 
 

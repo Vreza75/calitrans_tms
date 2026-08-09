@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from db_client import DispatchDatabaseClient, column_exists, execute, read_df
+from db_client import DispatchDatabaseClient, execute, read_df, require_schema_ready
 
 def _read_status_timeline(load_id: int) -> pd.DataFrame:
     try:
@@ -67,21 +67,21 @@ def _update_load_extra_fields(load_id: int, current_location: str, eta_value, li
     )
 
 def ensure_communications_schema() -> None:
-    """Idempotently extends dispatch_messages with the columns the
-    Communications Engine's provider-agnostic layer needs (provider,
-    delivery/read status, attachments, metadata, provider message id).
-    Safe to call on every insert/read: column_exists() is a single cheap
-    round trip and this app's traffic (~10-20 drivers, one dispatcher)
-    never makes that a bottleneck. No st.session_state caching here —
-    services/ modules must not import streamlit (CLAUDE.md)."""
-    if column_exists("dispatch_messages", "provider_message_id"):
-        return
-    execute("alter table dispatch_messages add column if not exists provider text not null default 'internal'")
-    execute("alter table dispatch_messages add column if not exists delivery_status text")
-    execute("alter table dispatch_messages add column if not exists read_status text")
-    execute("alter table dispatch_messages add column if not exists attachments jsonb")
-    execute("alter table dispatch_messages add column if not exists metadata jsonb")
-    execute("alter table dispatch_messages add column if not exists provider_message_id text")
+    """Verify dispatch_messages has the columns the Communications
+    Engine's provider-agnostic layer needs (provider, delivery/read
+    status, attachments, metadata, provider message id) - see
+    database/communications_foundation_migration.sql, which is the sole
+    owner of this schema. Raises SchemaNotReadyError if that migration
+    has not been applied; never runs DDL itself.
+
+    Safe to call on every insert/read: require_schema_ready() is a single
+    cheap round trip and this app's traffic (~10-20 drivers, one
+    dispatcher) never makes that a bottleneck. No st.session_state
+    caching here — services/ modules must not import streamlit
+    (CLAUDE.md)."""
+    require_schema_ready(
+        "dispatch_messages", "provider_message_id", migration_hint="database/communications_foundation_migration.sql"
+    )
 
 def _insert_dispatch_message(load_id: int, message_type: str, direction: str, recipient: str, message_body: str, provider: str = "internal") -> None:
     ensure_communications_schema()

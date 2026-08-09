@@ -38,6 +38,8 @@ def test_dependent_migrations_come_after_what_they_depend_on():
     assert order["order_intake_migration.sql"] < order["operations_email_workflow_migration.sql"]
     assert order["order_intake_migration.sql"] < order["multi_container_migration.sql"]
     assert order["order_intake_migration.sql"] < order["operations_fast_triage_migration.sql"]
+    assert order["order_intake_migration.sql"] < order["loads_source_intake_idempotency_migration.sql"]
+    assert order["schema.sql"] < order["loads_source_intake_idempotency_migration.sql"]
     # dispatch_messages is created by operations_email_workflow_migration.sql.
     assert order["operations_email_workflow_migration.sql"] < order["communications_foundation_migration.sql"]
     assert order["operations_email_workflow_migration.sql"] < order["dispatcher_workspace_migration.sql"]
@@ -109,6 +111,19 @@ def test_parse_expected_schema_finds_indexes_and_triggers():
     assert expected["indexes"].get("idx_order_intake_triage_status") == "order_intake"
     assert "trg_loads_updated_at" in expected["triggers"]
     assert "trg_drivers_updated_at" in expected["triggers"]
+
+
+def test_parse_expected_schema_finds_unique_indexes():
+    """loads_source_intake_idempotency_migration.sql's
+    ux_loads_source_intake_id is this repo's first `create unique index`
+    (every prior migration only used plain `create index` or column-level
+    `unique`) - _CREATE_INDEX_RE previously matched only `create index if
+    not exists`, so this index would have been silently invisible to
+    scripts/verify_schema.py's live-database check."""
+    expected = _parse_expected_schema()
+
+    assert expected["indexes"].get("ux_loads_source_intake_id") == "loads"
+    assert "source_intake_id" in expected["tables"]["loads"]
 
 
 @pytest.mark.skipif(

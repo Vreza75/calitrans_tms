@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import streamlit as st
+from sqlalchemy import text as sa_text
+from sqlalchemy.engine import Connection
 
 from ai_agents.hybrid_document_parser import parse_document_hybrid
 from config import DOCUMENT_STORAGE_DIR
 from db_client import execute, read_df
+from utils.ttl_cache import ttl_cache
 from services.load_matching_service import existing_load_columns
 from services.order_parser import extract_text_from_pdf
 from services.operations_attachment_core import (
@@ -370,7 +372,7 @@ def save_operations_pdf_attachment(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@ttl_cache(ttl_seconds=900)
 def read_operations_attachment_file_cached(file_path: str, modified_ns: int) -> bytes:
     return Path(file_path).read_bytes()
 
@@ -384,7 +386,7 @@ def read_operations_pdf_bytes(file_path: str) -> bytes:
     return read_operations_attachment_bytes(file_path)
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@ttl_cache(ttl_seconds=900)
 def parse_operations_attachment_file_cached(
     file_path: str,
     filename: str,
@@ -409,7 +411,7 @@ def parse_saved_operations_attachment(
     )
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@ttl_cache(ttl_seconds=900)
 def parse_operations_pdf_file_cached(
     file_path: str,
     filename: str,
@@ -938,7 +940,13 @@ def update_load_from_operations_parsed(
     load_id,
     parsed: dict,
     overwrite: bool = False,
+    *,
+    conn: Connection | None = None,
 ) -> dict:
+    """`conn` is optional and defaults to None, so every existing caller
+    keeps its current own-commit behavior unchanged. Pass an open
+    connection (see db_client.transaction()) to run the update as part of
+    a larger multi-statement business command instead."""
     load_id = int_or_none(load_id)
     parsed = coerce_json_dict(parsed)
 
@@ -971,25 +979,30 @@ def update_load_from_operations_parsed(
     if not mapped_updates:
         return result
 
+    select_sql = sa_text(
+        f"""
+        select {", ".join(["id"] + list(mapped_updates.keys()))}
+        from loads
+        where id = :load_id
+        limit 1
+        """
+    )
+
     try:
-        current_df = read_df(
-            f"""
-            select {", ".join(["id"] + list(mapped_updates.keys()))}
-            from loads
-            where id = :load_id
-            limit 1
-            """,
-            {"load_id": load_id},
-        )
+        if conn is not None:
+            current_row = conn.execute(select_sql, {"load_id": load_id}).mappings().first()
+            current = dict(current_row) if current_row is not None else None
+        else:
+            current_df = read_df(str(select_sql), {"load_id": load_id})
+            current = current_df.iloc[0].to_dict() if not current_df.empty else None
     except Exception as exc:
         result["error"] = str(exc)
         return result
 
-    if current_df.empty:
+    if current is None:
         result["error"] = "Load not found."
         return result
 
-    current = current_df.iloc[0].to_dict()
     final_updates = {}
 
     for column, value in mapped_updates.items():
@@ -1007,17 +1020,20 @@ def update_load_from_operations_parsed(
     set_clause = ", ".join([f"{column} = :{column}" for column in final_updates.keys()])
     params = dict(final_updates)
     params["load_id"] = load_id
+    update_sql = sa_text(
+        f"""
+        update loads
+        set {set_clause},
+            updated_at = now()
+        where id = :load_id
+        """
+    )
 
     try:
-        execute(
-            f"""
-            update loads
-            set {set_clause},
-                updated_at = now()
-            where id = :load_id
-            """,
-            params,
-        )
+        if conn is not None:
+            conn.execute(update_sql, params)
+        else:
+            execute(str(update_sql), params)
     except Exception as exc:
         result["error"] = str(exc)
         return result
@@ -1030,8 +1046,10 @@ def update_load_from_operations_pdf(
     load_id,
     parsed: dict,
     overwrite: bool = False,
+    *,
+    conn: Connection | None = None,
 ) -> dict:
-    return update_load_from_operations_parsed(load_id, parsed, overwrite=overwrite)
+    return update_load_from_operations_parsed(load_id, parsed, overwrite=overwrite, conn=conn)
 
 
 def attach_saved_operations_file_to_load(

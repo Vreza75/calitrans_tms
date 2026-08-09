@@ -42,7 +42,7 @@ _ALTER_ADD_COLUMN_RE = re.compile(
     r"alter table\s+(\w+)\s+add column if not exists\s+(\w+)", re.IGNORECASE
 )
 _CREATE_INDEX_RE = re.compile(
-    r"create index if not exists\s+(\w+)\s+on\s+(\w+)", re.IGNORECASE
+    r"create (?:unique )?index if not exists\s+(\w+)\s+on\s+(\w+)", re.IGNORECASE
 )
 _CREATE_TRIGGER_RE = re.compile(r"create trigger\s+(\w+)", re.IGNORECASE)
 

@@ -6,13 +6,28 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 from utils.config import DOCUMENT_STORAGE_DIR
 from database.db_client import DispatchDatabaseClient, execute, read_df
 from services.email_client import fetch_recent_load_emails
 from services.email_parser import extract_latest_email_body, parse_email_text
 from services.order_parser import extract_text_from_pdf, parse_order_text
+from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.workflow_constants import SERVICE_FLOWS, normalize_service_flow
+
+# NOTE: render_order_upload_panel(), render_email_intake_panel(),
+# render_action_queue_panel(), and render_order_intake_workspace() below
+# are not called from anywhere in the live app (pages_app/router.py never
+# routes to them; the only other importer, storage/app.py, is a
+# gitignored/untracked backup file, not a deployment entry point).
+# create_load_from_intake()/create_load_from_intake_with_status() ARE
+# live (imported by services/operations_inbox_service.py) and unaffected
+# by this note. Not removing the render functions here - CLAUDE.md
+# requires full dead-code classification (aliases, dynamic access,
+# config-driven references) before deletion; flagging for a dedicated
+# review instead.
 
 
 INTAKE_STATUSES = [
@@ -171,7 +186,43 @@ def update_intake_status(record_id: int, status: str, action_required: str | Non
     )
 
 
-def create_load_from_intake(record_id: int, edited_data: dict[str, Any]) -> int:
+def create_load_from_intake(record_id: int, edited_data: dict[str, Any], *, conn: Connection | None = None) -> int:
+    """Create a load from a reviewed intake record, plus its document row
+    and intake-status update. Idempotent - see
+    create_load_from_intake_with_status for the full contract. Callers
+    that only need the resulting load id (new or pre-existing) can use
+    this unchanged wrapper; callers that need to know whether a new load
+    was actually inserted should call create_load_from_intake_with_status
+    directly."""
+    load_id, _created = create_load_from_intake_with_status(record_id, edited_data, conn=conn)
+    return load_id
+
+
+def create_load_from_intake_with_status(
+    record_id: int, edited_data: dict[str, Any], *, conn: Connection | None = None
+) -> tuple[int, bool]:
+    """Create a load from a reviewed intake record, plus its document row
+    and intake-status update. Returns (load_id, created).
+
+    Idempotent: passes record_id as add_row's source_intake_id, so a
+    second call for the same record_id does not insert a second loads
+    row - it resolves to the load created by the first call (see
+    DispatchDatabaseClient.add_row and
+    database/loads_source_intake_idempotency_migration.sql). `created` is
+    False when an existing row was resolved this way rather than a new
+    one being inserted; callers that also write a document row and
+    advance intake status (this function) or downstream records (e.g.
+    services.operations_inbox_service.create_load_from_inbox_item) should
+    skip those additional writes when `created` is False, since they were
+    already applied by the original, already-committed call - repeating
+    them would duplicate document/communication rows instead of no-oping
+    like the plain UPDATE statements here do.
+
+    `conn` is optional and defaults to None, so every existing caller
+    keeps its current one-call-per-statement behavior unchanged. Pass an
+    open connection (see db_client.transaction()) to run all writes as
+    part of a larger multi-statement business command instead - they
+    then commit or roll back together with the rest of that command."""
     booking_value = edited_data.get("Booking Number", "") or edited_data.get("Reference Number", "")
     client = DispatchDatabaseClient()
     created = client.add_row(
@@ -191,29 +242,32 @@ def create_load_from_intake(record_id: int, edited_data: dict[str, Any]) -> int:
             "Size": edited_data.get("Size", ""),
             "Status": edited_data.get("Status", "New") or "New",
             "Dispatcher Notes": edited_data.get("Dispatcher Notes", ""),
-        }
+        },
+        source_intake_id=record_id,
+        conn=conn,
     )
+
+    if not created.created:
+        return int(created.id), False
 
     record = get_intake_record(record_id)
     file_path = record.get("file_path")
     filename = record.get("filename")
 
-    if file_path and filename and Path(file_path).exists():
-        execute(
-            """
-            insert into documents (load_id, document_type, filename, file_path, source)
-            values (:load_id, :document_type, :filename, :file_path, :source)
-            """,
-            {
-                "load_id": created.id,
-                "document_type": "load_order",
-                "filename": filename,
-                "file_path": file_path,
-                "source": "order_intake",
-            },
-        )
-
-    execute(
+    document_sql = text(
+        """
+        insert into documents (load_id, document_type, filename, file_path, source)
+        values (:load_id, :document_type, :filename, :file_path, :source)
+        """
+    )
+    document_params = {
+        "load_id": created.id,
+        "document_type": "load_order",
+        "filename": filename,
+        "file_path": file_path,
+        "source": "order_intake",
+    }
+    intake_status_sql = text(
         """
         update order_intake
         set intake_status = 'Created Load',
@@ -221,11 +275,22 @@ def create_load_from_intake(record_id: int, edited_data: dict[str, Any]) -> int:
             reviewed_at = now(),
             reviewed_by = 'streamlit'
         where id = :id
-        """,
-        {"load_id": created.id, "id": record_id},
+        """
     )
+    intake_status_params = {"load_id": created.id, "id": record_id}
 
-    return int(created.id)
+    if conn is not None:
+        if file_path and filename and Path(file_path).exists():
+            conn.execute(document_sql, document_params)
+        conn.execute(intake_status_sql, intake_status_params)
+        return int(created.id), True
+
+    if file_path and filename and Path(file_path).exists():
+        execute(str(document_sql), document_params)
+
+    execute(str(intake_status_sql), intake_status_params)
+
+    return int(created.id), True
 
 
 def render_order_upload_panel() -> None:
@@ -262,7 +327,9 @@ def render_order_upload_panel() -> None:
                 action_required=action_required,
             )
             st.success("Order added to Action Queue.")
-            st.cache_data.clear()
+            # create_intake_record() writes order_intake, which nothing
+            # else in the app caches - get_intake_queue()/get_intake_record()
+            # read it uncached, so st.rerun() alone is sufficient.
             st.rerun()
 
 
@@ -419,7 +486,6 @@ def render_email_intake_panel() -> None:
                     },
                 )
                 st.success("Email body added to Action Queue.")
-                st.cache_data.clear()
                 st.rerun()
 
             
@@ -461,7 +527,6 @@ def render_email_intake_panel() -> None:
                         },
                     )
                     st.success("Email PDF added to Action Queue.")
-                    st.cache_data.clear()
                     st.rerun()
 
             if col3.button(
@@ -510,7 +575,6 @@ def render_email_intake_panel() -> None:
                     },
                 )
                 st.success("Combined email review added to Action Queue.")
-                st.cache_data.clear()
                 st.rerun()
     st.write(item)
 def render_action_queue_panel() -> None:
@@ -520,7 +584,6 @@ def render_action_queue_panel() -> None:
     status_filter = c1.selectbox("Queue Filter", ["Open", "All"] + INTAKE_STATUSES)
     refresh = c2.button("Refresh Queue")
     if refresh:
-        st.cache_data.clear()
         st.rerun()
 
     queue = get_intake_queue(status_filter)
@@ -604,7 +667,9 @@ def render_action_queue_panel() -> None:
                     },
                 )
                 st.success(f"Load created from intake item. Load ID: {load_id}")
-                st.cache_data.clear()
+                # create_load_from_intake() writes the loads table -
+                # targets tms_data_service's load caches specifically.
+                _refresh_tms_data()
                 st.rerun()
 
         elif action == "Mark Needs Customer Info":

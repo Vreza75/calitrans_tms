@@ -43,6 +43,10 @@ DATABASE_DIR = REPO_ROOT / "database"
 #                                               operations_email_workflow_migration.sql)
 #   operations_fast_triage_migration.sql     - ALTERs order_intake (needs
 #                                               order_intake_migration.sql)
+#   loads_source_intake_idempotency_migration.sql - ALTERs loads, FK -> order_intake
+#                                               (needs schema.sql and order_intake_migration.sql)
+#   ai_usage_log_migration.sql               - independent, no FKs (needs schema.sql only)
+#   app_users_migration.sql                  - independent, no FKs (Streamlit login accounts)
 MIGRATION_ORDER = [
     "schema.sql",
     "portpro_style_migration.sql",
@@ -56,6 +60,9 @@ MIGRATION_ORDER = [
     "multi_container_migration.sql",
     "communications_foundation_migration.sql",
     "operations_fast_triage_migration.sql",
+    "loads_source_intake_idempotency_migration.sql",
+    "ai_usage_log_migration.sql",
+    "app_users_migration.sql",
 ]
 
 

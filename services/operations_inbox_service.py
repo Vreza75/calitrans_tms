@@ -13,9 +13,11 @@ from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
 import services.operations_attachment_service as attachment_service
 
-from db_client import column_exists, execute, read_df
+from db_client import execute, read_df, require_schema_ready, transaction
 from services.email_parser import (
     _append_note,
     detect_container_quantity_mismatch,
@@ -23,7 +25,7 @@ from services.email_parser import (
     extract_latest_email_body,
     parse_email_text,
 )
-from services.order_intake import create_load_from_intake
+from services.order_intake import create_load_from_intake, create_load_from_intake_with_status
 from services.operations_field_service import derive_review_state, extract_operational_fields
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
@@ -1529,7 +1531,10 @@ def conversation_join_expr(alias: str = "") -> str:
 
 
 def ensure_operations_fast_triage_schema() -> None:
-    """Add optional fast-triage columns used by the Operations Inbox.
+    """Verify the optional fast-triage columns used by the Operations
+    Inbox are present - see database/operations_fast_triage_migration.sql,
+    which is the sole owner of this schema. Raises SchemaNotReadyError if
+    that migration has not been applied; never runs DDL itself.
 
     The app still stores the full triage payload inside parsed_data under
     _fast_triage, but these columns make filtering and dashboards fast.
@@ -1541,74 +1546,33 @@ def ensure_operations_fast_triage_schema() -> None:
     already confirmed the schema minutes earlier for someone else. A
     Streamlit worker process serves many sessions, so a module-level flag
     is the right scope for "has this process already confirmed the schema
-    is ready" - it still self-heals (re-runs the idempotent ALTER/CREATE
-    INDEX chain) on a fresh worker that has never checked.
+    is ready".
     """
     if "fast_triage" in _SCHEMA_READY_FLAGS or st.session_state.get("_operations_fast_triage_schema_ready"):
         _SCHEMA_READY_FLAGS.add("fast_triage")
         return
 
-    if column_exists("order_intake", "llm_review_reason"):
-        _SCHEMA_READY_FLAGS.add("fast_triage")
-        st.session_state["_operations_fast_triage_schema_ready"] = True
-        return
-
-    execute("alter table order_intake add column if not exists triage_status text not null default 'Not Triaged'")
-    execute("alter table order_intake add column if not exists triage_engine text")
-    execute("alter table order_intake add column if not exists triage_reason text")
-    execute("alter table order_intake add column if not exists triage_tags jsonb not null default '[]'::jsonb")
-    execute("alter table order_intake add column if not exists triaged_at timestamptz")
-    execute("alter table order_intake add column if not exists work_level text")
-    execute("alter table order_intake add column if not exists department_lane text")
-    execute("alter table order_intake add column if not exists work_queue text")
-    execute("alter table order_intake add column if not exists llm_review_required boolean not null default false")
-    execute("alter table order_intake add column if not exists llm_review_reason text")
-
-    execute("create index if not exists idx_order_intake_triage_status on order_intake(triage_status)")
-    execute("create index if not exists idx_order_intake_work_level on order_intake(work_level)")
-    execute("create index if not exists idx_order_intake_work_queue on order_intake(work_queue)")
-    execute("create index if not exists idx_order_intake_llm_review_required on order_intake(llm_review_required)")
+    require_schema_ready(
+        "order_intake", "llm_review_reason", migration_hint="database/operations_fast_triage_migration.sql"
+    )
 
     _SCHEMA_READY_FLAGS.add("fast_triage")
     st.session_state["_operations_fast_triage_schema_ready"] = True
 
 def ensure_operations_email_sync_schema() -> None:
-    if "email_sync" in _SCHEMA_READY_FLAGS or st.session_state.get("_operations_email_sync_schema_ready"):
-        _SCHEMA_READY_FLAGS.add("email_sync")
-        ensure_operations_fast_triage_schema()
-        ensure_operations_case_schema()
-        return
-
-    if column_exists("order_intake", "case_id"):
+    """Verify the email-sync columns on order_intake are present - see
+    database/operations_email_workflow_migration.sql, which is the sole
+    owner of this schema. Raises SchemaNotReadyError if that migration
+    has not been applied; never runs DDL itself."""
+    if not ("email_sync" in _SCHEMA_READY_FLAGS or st.session_state.get("_operations_email_sync_schema_ready")):
+        require_schema_ready(
+            "order_intake", "case_id", migration_hint="database/operations_email_workflow_migration.sql"
+        )
         _SCHEMA_READY_FLAGS.add("email_sync")
         st.session_state["_operations_email_sync_schema_ready"] = True
-        ensure_operations_fast_triage_schema()
-        ensure_operations_case_schema()
-        return
-
-    execute("alter table order_intake add column if not exists email_direction text not null default 'inbound'")
-    execute("alter table order_intake add column if not exists email_mailbox text")
-    execute("alter table order_intake add column if not exists email_in_reply_to text")
-    execute("alter table order_intake add column if not exists email_references jsonb not null default '[]'::jsonb")
-    execute("alter table order_intake add column if not exists email_thread_id text")
-    execute("alter table order_intake add column if not exists email_normalized_subject text")
-    execute("alter table order_intake add column if not exists conversation_status text not null default 'New Conversation'")
-    execute("alter table order_intake add column if not exists email_synced_at timestamptz")
-    execute("alter table order_intake add column if not exists case_id bigint")
 
     ensure_operations_fast_triage_schema()
-
-    execute("create index if not exists idx_order_intake_email_thread_id on order_intake(email_thread_id)")
-    execute("create index if not exists idx_order_intake_email_normalized_subject on order_intake(email_normalized_subject)")
-    execute("create index if not exists idx_order_intake_conversation_status on order_intake(conversation_status)")
-    execute("create index if not exists idx_order_intake_email_direction on order_intake(email_direction)")
-    execute("create index if not exists idx_order_intake_email_mailbox on order_intake(email_mailbox)")
-    execute("create index if not exists idx_order_intake_case_id on order_intake(case_id)")
-
     ensure_operations_case_schema()
-
-    _SCHEMA_READY_FLAGS.add("email_sync")
-    st.session_state["_operations_email_sync_schema_ready"] = True
 
 
 def inbox_review_where_clause() -> str:
@@ -1970,9 +1934,29 @@ def create_load_from_inbox_item(
     case_id=None,
     case_priority: str = "Normal",
 ) -> dict:
-    """Create a load from an inbox work item and keep the handoff linked."""
-    load_id = create_load_from_intake(int(work_item_id), approved_fields)
-    execute(
+    """Create a load from an inbox work item and keep the handoff linked.
+
+    Idempotent: retrying with the same work_item_id does not create a
+    second load. create_load_from_intake_with_status passes work_item_id
+    through as add_row's source_intake_id, which is enforced unique
+    (where not null) at the database level - see
+    database/loads_source_intake_idempotency_migration.sql. When a retry
+    resolves to an already-existing load (`created` is False), every
+    write below is skipped and the canonical existing result is returned
+    immediately: those writes (order_intake status, communication, case
+    update/note) were already applied by the original, already-committed
+    call, so repeating them would duplicate the communication and
+    case-note rows instead of harmlessly no-oping like a plain UPDATE.
+
+    The load insert, its document row, both order_intake updates, and the
+    inbound-communication row all run inside one db_client.transaction() -
+    a failure partway through rolls back every write from this function,
+    instead of leaving (for example) a created load with no linked
+    order_intake row. The operations-case update below intentionally
+    stays outside this transaction, unchanged from its prior own-commit
+    behavior - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md, "Known
+    limitations" for the remaining scope."""
+    review_status_sql = text(
         """
         update order_intake
         set review_status = 'Order Created',
@@ -1980,26 +1964,38 @@ def create_load_from_inbox_item(
             request_type = :request_type,
             conversation_key = coalesce(nullif(:conversation_key, ''), conversation_key)
         where id = :intake_id
-        """,
-        {
-            "intake_id": int(work_item_id),
-            "load_id": load_id,
-            "request_type": request_type or "New Booking",
-            "conversation_key": conversation_key,
-        },
+        """
     )
-    if subject or body:
-        _save_load_communication(
-            load_id,
-            int(work_item_id),
-            conversation_key,
-            request_type or "New Booking",
-            subject,
-            sender,
-            body,
-            direction="inbound",
-            case_id=case_id,
+
+    with transaction() as conn:
+        load_id, was_created = create_load_from_intake_with_status(int(work_item_id), approved_fields, conn=conn)
+
+        if not was_created:
+            return {"load_id": load_id, "review_status": "Order Created"}
+
+        conn.execute(
+            review_status_sql,
+            {
+                "intake_id": int(work_item_id),
+                "load_id": load_id,
+                "request_type": request_type or "New Booking",
+                "conversation_key": conversation_key,
+            },
         )
+        if subject or body:
+            _save_load_communication(
+                load_id,
+                int(work_item_id),
+                conversation_key,
+                request_type or "New Booking",
+                subject,
+                sender,
+                body,
+                direction="inbound",
+                case_id=case_id,
+                conn=conn,
+            )
+
     resolved_case_id = int_or_none(case_id)
     if resolved_case_id is not None:
         update_operations_case(
@@ -2029,7 +2025,13 @@ def update_load_from_inbox_item(
     case_owner: str = "Dispatch",
     case_priority: str = "Normal",
 ) -> dict:
-    """Update a matched load from an inbox work item and save the communication."""
+    """Update a matched load from an inbox work item and save the communication.
+
+    The load field update, the inbound-communication row, and the
+    order_intake update all run inside one db_client.transaction() - see
+    create_load_from_inbox_item's docstring for why. The operations-case
+    update below intentionally stays outside this transaction, unchanged
+    from its prior own-commit behavior."""
     resolved_load_id = int_or_none(load_id)
     if resolved_load_id is None:
         return {
@@ -2039,26 +2041,7 @@ def update_load_from_inbox_item(
             "error": "Missing matched load id.",
         }
 
-    update_result = update_load_from_operations_pdf(
-        resolved_load_id,
-        approved_fields,
-        overwrite=not fill_blank_only,
-    )
-    if not isinstance(update_result, dict):
-        update_result = {"updated_fields": [], "skipped_fields": [], "error": ""}
-
-    _save_load_communication(
-        resolved_load_id,
-        int(work_item_id),
-        conversation_key,
-        request_type or "Booking Update",
-        subject,
-        sender,
-        body,
-        direction="inbound",
-        case_id=case_id,
-    )
-    execute(
+    intake_update_sql = text(
         """
         update order_intake
         set review_status = 'Attached',
@@ -2066,14 +2049,41 @@ def update_load_from_inbox_item(
             request_type = :request_type,
             conversation_key = coalesce(nullif(:conversation_key, ''), conversation_key)
         where id = :intake_id
-        """,
-        {
-            "intake_id": int(work_item_id),
-            "matched_load_id": resolved_load_id,
-            "request_type": request_type or "Booking Update",
-            "conversation_key": conversation_key,
-        },
+        """
     )
+
+    with transaction() as conn:
+        update_result = update_load_from_operations_pdf(
+            resolved_load_id,
+            approved_fields,
+            overwrite=not fill_blank_only,
+            conn=conn,
+        )
+        if not isinstance(update_result, dict):
+            update_result = {"updated_fields": [], "skipped_fields": [], "error": ""}
+
+        _save_load_communication(
+            resolved_load_id,
+            int(work_item_id),
+            conversation_key,
+            request_type or "Booking Update",
+            subject,
+            sender,
+            body,
+            direction="inbound",
+            case_id=case_id,
+            conn=conn,
+        )
+        conn.execute(
+            intake_update_sql,
+            {
+                "intake_id": int(work_item_id),
+                "matched_load_id": resolved_load_id,
+                "request_type": request_type or "Booking Update",
+                "conversation_key": conversation_key,
+            },
+        )
+
     resolved_case_id = int_or_none(case_id)
     if resolved_case_id is not None:
         next_action = f"Request attached to load {resolved_load_id}."
@@ -6120,8 +6130,14 @@ def _save_load_communication(
     body,
     direction: str = "inbound",
     case_id=None,
+    *,
+    conn: Connection | None = None,
 ) -> None:
-    execute(
+    """`conn` is optional and defaults to None, so every existing caller
+    keeps its current own-commit behavior unchanged. Pass an open
+    connection (see db_client.transaction()) to run this insert as part
+    of a larger multi-statement business command instead."""
+    sql = text(
         """
         insert into load_communications (
             load_id, intake_id, case_id, conversation_key, communication_type,
@@ -6131,19 +6147,25 @@ def _save_load_communication(
             :load_id, :intake_id, :case_id, :conversation_key, :communication_type,
             :direction, :subject, :sender, :message_body
         )
-        """,
-        {
-            "load_id": int_or_none(load_id),
-            "intake_id": int_or_none(intake_id),
-            "case_id": int_or_none(case_id),
-            "conversation_key": conversation_key,
-            "communication_type": request_type,
-            "direction": direction,
-            "subject": subject,
-            "sender": sender,
-            "message_body": body,
-        },
+        """
     )
+    params = {
+        "load_id": int_or_none(load_id),
+        "intake_id": int_or_none(intake_id),
+        "case_id": int_or_none(case_id),
+        "conversation_key": conversation_key,
+        "communication_type": request_type,
+        "direction": direction,
+        "subject": subject,
+        "sender": sender,
+        "message_body": body,
+    }
+
+    if conn is not None:
+        conn.execute(sql, params)
+        return
+
+    execute(str(sql), params)
 
 
 def _save_operations_ai_feedback(**kwargs) -> None:
