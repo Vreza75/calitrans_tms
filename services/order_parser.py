@@ -264,37 +264,37 @@ def parse_order_text(text):
             r"\b([0-9]{6,})\s*/\s*[A-Z]{4}\d{7}\b",
         ]),
         "Customer": find_pattern(text, [
-            r"Customer:\s*([^\n]+)"
-            r"Consignee[:\s]+(.+)",
+            r"Customer:\s*([^\n]+)",
+            r"Consignee[:\s]+([^\n]+)",
             r"(Flat\s*World\s*Global\s*Logistics)",
         ]),
         "Port": find_pattern(text, [
-            r"Port:\s*([^\n]+)"
-            r"Terminal[:\s]+(.+)",
+            r"Port:\s*([^\n]+)",
+            r"Terminal[:\s]+([^\n]+)",
             r"Port of Lading:\s*([^\n]+)",
         ]),
         "Warehouse": find_pattern(text, [
-            r"Warehouse:\s*([^\n]+)"
-            r"Delivery Location[:\s]+(.+)",
-            r"Destination[:\s]+(.+)",
-            r"Deliver To[:\s]+(.+)",
+            r"Warehouse:\s*([^\n]+)",
+            r"Delivery Location[:\s]+([^\n]+)",
+            r"Destination[:\s]+([^\n]+)",
+            r"Deliver To[:\s]+([^\n]+)",
         ]),
         "Address": find_pattern(text, [
-            r"Delivery Address[:\s]+(.+)",
-            r"Warehouse Address[:\s]+(.+)",
+            r"Delivery Address[:\s]+([^\n]+)",
+            r"Warehouse Address[:\s]+([^\n]+)",
             r"Destination:\s*([^\n]+)",
         ]),
         "Size": find_pattern(text, [
             r"\b(?:\d+\s*x\s*)?((?:20|40|45)\s*'?\s*(?:ft|hc|hq|std)?)\b",
         ]),
         "Document Cutoff": find_pattern(text, [
-            r"Document Cutoff[:\s]+(.+)",
-            r"Doc Cutoff[:\s]+(.+)",
+            r"Document Cutoff[:\s]+([^\n]+)",
+            r"Doc Cutoff[:\s]+([^\n]+)",
             r"Port Cut-Off Date:\s*([^\n]+)",
         ]),
         "LFD": find_pattern(text, [
             r"LFD:\s*([^\n]+)",
-            r"Last Free Day[:\s]+(.+)",
+            r"Last Free Day[:\s]+([^\n]+)",
         ]),
         "Dispatcher Notes": "Parsed from generic order PDF",
     })
