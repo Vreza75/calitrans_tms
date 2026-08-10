@@ -7,8 +7,8 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
+from db_client import SchemaNotReadyError
 from repositories.ai_usage_repo import (
-    ensure_ai_usage_schema,
     load_ai_usage_by_agent,
     load_ai_usage_recent,
     load_ai_usage_summary,
@@ -26,12 +26,6 @@ def render_ai_usage_dashboard() -> None:
     st.markdown("### AI Usage Dashboard")
     st.caption("Track OpenAI/API usage by agent, model, cost, latency, and failures.")
 
-    try:
-        ensure_ai_usage_schema()
-    except Exception as exc:
-        st.error(f"AI usage schema is not ready: {exc}")
-        return
-
     today = date.today()
     default_start = today - timedelta(days=7)
 
@@ -43,14 +37,17 @@ def render_ai_usage_dashboard() -> None:
     with c3:
         st.info("Use this dashboard to verify agents are running and control monthly AI spend.")
 
-    summary = load_ai_usage_summary(start_date, end_date)
+    try:
+        summary = load_ai_usage_summary(start_date, end_date)
+    except SchemaNotReadyError as exc:
+        st.error(f"AI usage schema is not ready: {exc}")
+        return
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("AI Calls", int(summary.get("calls", 0) or 0))
     k2.metric("Total Tokens", f"{int(summary.get('total_tokens', 0) or 0):,}")
     k3.metric("Estimated Cost", _currency(summary.get("estimated_cost", 0)))
     k4.metric("Avg Latency", f"{float(summary.get('avg_latency_seconds', 0) or 0):.2f}s")
-    k5.metric("Cache Hits", int(summary.get("cache_hits", 0) or 0))
 
     st.divider()
 
@@ -97,12 +94,6 @@ def render_ai_usage_dashboard() -> None:
                 "total_tokens": "Total",
                 "estimated_cost": "Cost",
                 "latency_seconds": "Latency",
-                "customer": "Customer",
-                "booking_number": "Booking",
-                "intake_id": "Intake",
-                "case_id": "Case",
-                "load_id": "Load",
-                "cache_hit": "Cache",
                 "error": "Error",
             }
         )

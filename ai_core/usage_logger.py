@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from db_client import execute
+from db_client import execute, require_schema_ready
 
 
 MODEL_PRICING_PER_1M_TOKENS = {
@@ -33,25 +33,15 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 
 
 def ensure_ai_usage_table() -> None:
-    execute(
-        """
-        create table if not exists ai_usage_log (
-            id bigserial primary key,
-            created_at timestamptz not null default now(),
-            task text,
-            agent_name text,
-            model text,
-            ok boolean,
-            input_tokens integer default 0,
-            output_tokens integer default 0,
-            total_tokens integer default 0,
-            estimated_cost_usd numeric(12, 6) default 0,
-            latency_seconds numeric(12, 3) default 0,
-            error text,
-            metadata jsonb not null default '{}'::jsonb
-        )
-        """
-    )
+    """Verify ai_usage_log is present - see
+    database/ai_usage_log_migration.sql, which is the sole owner of this
+    schema. Raises SchemaNotReadyError if that migration has not been
+    applied; never runs DDL itself.
+
+    Called unconditionally on every log_ai_usage() call (every real LLM
+    call in the app), so this must stay a cheap read-only check, not a
+    DDL statement."""
+    require_schema_ready("ai_usage_log", "task", migration_hint="database/ai_usage_log_migration.sql")
 
 
 def log_ai_usage(
