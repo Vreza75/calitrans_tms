@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
-import streamlit as st
 
 from db_client import DispatchDatabaseClient, read_df
 from services.workflow_constants import normalize_service_flow
 from services.workflow_status import enrich_load_workflow_columns
+from utils.ttl_cache import ttl_cache
+
+logger = logging.getLogger(__name__)
 
 
 SUMMARY_COLUMNS = [
@@ -91,17 +95,21 @@ BASE_OPTIONAL_COLUMNS = [
 
 
 def refresh_data() -> None:
-    """Clear cached Streamlit data after database writes."""
-    st.cache_data.clear()
+    """Clear this module's caches after database writes - targeted, not a
+    global st.cache_data.clear() (that would also wipe every unrelated
+    cache elsewhere in the app)."""
+    load_dispatch_data.clear()
+    load_tms_data.clear()
+    get_ext_df.clear()
 
 
-@st.cache_data(ttl=45)
+@ttl_cache(ttl_seconds=45)
 def load_dispatch_data() -> pd.DataFrame:
     """Read core dispatch/load rows from the configured database client."""
     return DispatchDatabaseClient().rows_to_dataframe()
 
 
-@st.cache_data(show_spinner=False, ttl=45)
+@ttl_cache(ttl_seconds=45)
 def load_tms_data() -> pd.DataFrame:
     """Load, normalize, and enrich TMS load data for Streamlit pages."""
     return enrich_load_workflow_columns(merge_ext(clean_df(load_dispatch_data())))
@@ -123,7 +131,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False, ttl=45)
+@ttl_cache(ttl_seconds=45)
 def get_ext_df() -> pd.DataFrame:
     """Read additional PortPro-style fields directly from the loads table."""
     try:
@@ -163,7 +171,7 @@ def get_ext_df() -> pd.DataFrame:
         # query silently, blanking out every extended field app-wide
         # (steamship line, rates, live tracking, container grouping, etc.)
         # with no visible error. Surface it instead of hiding it.
-        st.warning(f"Could not load extended load fields — some columns may be showing blank: {exc}")
+        logger.warning("Could not load extended load fields - some columns may be showing blank: %s", exc)
         return pd.DataFrame()
 
 

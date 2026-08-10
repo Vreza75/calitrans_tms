@@ -7,7 +7,10 @@ from database.db_client import execute, read_df
 
 
 def _refresh() -> None:
-    st.cache_data.clear()
+    # See admin_pages.py::_refresh() - same reasoning: nothing in the app
+    # caches customers/warehouses/carriers/drivers, so a global
+    # st.cache_data.clear() here only wiped unrelated caches for no
+    # functional benefit.
     st.rerun()
 
 

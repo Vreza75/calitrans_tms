@@ -8,8 +8,9 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
 
-import streamlit as st
 from openai import OpenAI
+
+from config import get_secret
 
 
 @dataclass
@@ -32,8 +33,8 @@ class LLMWrapper:
     """
 
     def __init__(self) -> None:
-        self.api_key = st.secrets.get("OPENAI_API_KEY", "")
-        self.default_model = st.secrets.get("OPENAI_RESPONSE_MODEL", "gpt-4.1-mini")
+        self.api_key = get_secret("OPENAI_API_KEY") or ""
+        self.default_model = get_secret("OPENAI_RESPONSE_MODEL") or "gpt-4.1-mini"
 
         if self.api_key:
             self.client = OpenAI(api_key=self.api_key)
@@ -61,7 +62,7 @@ class LLMWrapper:
                 model=selected_model,
                 output_text="",
                 output_json={},
-                error="OPENAI_API_KEY missing from Streamlit secrets.",
+                error="OPENAI_API_KEY is not configured.",
                 latency_seconds=0,
                 attempts=0,
             ))
@@ -161,7 +162,7 @@ class LLMWrapper:
                 model=selected_model,
                 output_text="",
                 output_json={},
-                error="OPENAI_API_KEY missing from Streamlit secrets.",
+                error="OPENAI_API_KEY is not configured.",
                 latency_seconds=0,
                 attempts=0,
             ))
@@ -226,35 +227,19 @@ class LLMWrapper:
             error=last_error,
             metadata={
                 "attempts": max_retries + 1,
-                "mode": "json",
-            },
-        )
-        usage = getattr(response, "usage", None)
-        input_tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
-        output_tokens = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
-
-        log_ai_usage(
-            task=task,
-            agent_name=task,
-            model=selected_model,
-            ok=True,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latency_seconds=round(time.time() - start, 3),
-            metadata={
-                "attempt": attempt,
                 "mode": "text",
             },
         )
+
         return asdict(LLMResult(
-            ok=True,
+            ok=False,
             task=task,
             model=selected_model,
-            output_text=output_text,
+            output_text="",
             output_json={},
-            error="",
+            error=last_error,
             latency_seconds=round(time.time() - start, 3),
-            attempts=attempt,
+            attempts=max_retries + 1,
         ))
 
     def _safe_json_loads(self, text: str) -> Dict[str, Any]:
@@ -268,6 +253,15 @@ class LLMWrapper:
             }
 
 
-@st.cache_resource(show_spinner=False)
+_llm_singleton: LLMWrapper | None = None
+
+
 def get_llm() -> LLMWrapper:
-    return LLMWrapper()
+    """Process-wide singleton, same lifetime st.cache_resource gave it -
+    one OpenAI client per process, not one per call. No framework
+    dependency: safe to import from services, application/, ai_agents/,
+    or a future API/background worker."""
+    global _llm_singleton
+    if _llm_singleton is None:
+        _llm_singleton = LLMWrapper()
+    return _llm_singleton

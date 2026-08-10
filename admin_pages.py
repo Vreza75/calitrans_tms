@@ -7,7 +7,12 @@ from db_client import execute, read_df
 
 
 def _refresh() -> None:
-    st.cache_data.clear()
+    # customers/warehouses/carriers/drivers are read here via read_df(),
+    # which is uncached - nothing elsewhere in the app caches these
+    # tables either (see services/driver_roster_service.py), so a
+    # st.cache_data.clear() here only ever wiped unrelated caches
+    # (Operations Inbox, cases, attachments, TMS load data) for zero
+    # functional benefit. st.rerun() alone re-queries fresh data.
     st.rerun()
 
 

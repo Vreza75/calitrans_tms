@@ -5,6 +5,7 @@ import streamlit as st
 
 from db_client import DispatchDatabaseClient, read_df
 from services.order_parser import extract_text_from_pdf, parse_order_text
+from services.tms_data_service import refresh_data as _refresh_tms_data
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
 
@@ -105,5 +106,8 @@ def render_pdf_intake(refresh_callback=None) -> None:
         if refresh_callback:
             refresh_callback()
         else:
-            st.cache_data.clear()
+            # This creates a load row - only tms_data_service's load
+            # caches are affected, so this targets those rather than
+            # clearing every cache app-wide.
+            _refresh_tms_data()
         st.success(f"Created load ID {created.id}")

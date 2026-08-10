@@ -17,6 +17,7 @@ from services.dispatch_data_service import (
     _save_status_quick_update,
     _update_load_extra_fields,
 )
+from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.dispatch_workflow_service import (
     LOAD_STATUS_FLOW,
     _clean_display_value,
@@ -70,8 +71,12 @@ def _run_refresh(refresh_callback: Callable[[], None] | None = None) -> None:
     if callable(refresh_callback):
         refresh_callback()
     else:
+        # Fallback only - the live app always passes tms_data_service's
+        # refresh_data as refresh_callback (see pages_app/router.py).
+        # Targets load caches specifically rather than clearing every
+        # unrelated cache app-wide.
         try:
-            st.cache_data.clear()
+            _refresh_tms_data()
         except Exception:
             pass
 

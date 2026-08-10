@@ -7,6 +7,7 @@ import streamlit as st
 
 from db_client import DispatchDatabaseClient
 from services.dispatch_data_service import _insert_dispatch_message
+from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.dispatch_workflow_service import (
     LOAD_TYPE_TABS,
     _generate_driver_dispatch_message,
@@ -54,7 +55,11 @@ def _parse_date_or_none(value):
 
 
 def refresh_data() -> None:
-    st.cache_data.clear()
+    """Every call site in this file follows a DispatchDatabaseClient()
+    write to the loads table - only tms_data_service's load caches are
+    affected, so this delegates to its targeted refresh rather than
+    wiping every unrelated cache app-wide."""
+    _refresh_tms_data()
 
 
 BOOKING_VERIFICATION_REQUIRED_FIELDS = [
