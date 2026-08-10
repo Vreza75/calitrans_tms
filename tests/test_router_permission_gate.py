@@ -22,7 +22,9 @@ def test_router_blocks_a_section_render_sidebar_should_never_return_for_this_rol
     monkeypatch.setattr(router_module, "render_sidebar", lambda **kwargs: "Billing / ProfitTools")
 
     rendered = {"called": False}
-    monkeypatch.setattr(router_module, "_render_selected_page", lambda section, df: rendered.__setitem__("called", True))
+    monkeypatch.setattr(
+        router_module, "_render_selected_page", lambda section, df, principal: rendered.__setitem__("called", True)
+    )
 
     at = AppTest.from_string(_APP_SCRIPT)
     at.run(timeout=15)
@@ -37,7 +39,7 @@ def test_router_renders_a_permitted_section(monkeypatch) -> None:
 
     rendered = {"section": None}
 
-    def _fake_render(section, df):
+    def _fake_render(section, df, principal):
         rendered["section"] = section
 
     monkeypatch.setattr(router_module, "_render_selected_page", _fake_render)

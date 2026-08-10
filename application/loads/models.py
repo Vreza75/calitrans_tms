@@ -30,6 +30,30 @@ class UpdateLoadResult:
 
 
 @dataclass(frozen=True)
+class LoadCommandResult:
+    """Shared result shape for the single/few-field load mutations added
+    in Phase 5 (mark_load_missing_info, save_load_note,
+    verify_load_booking, cancel_load, update_load_fields) - each is a
+    permission-gated wrapper around one DispatchDatabaseClient.
+    update_row_fields() call, so they share one result shape rather than
+    each inventing a near-identical dataclass."""
+
+    ok: bool
+    load_id: int
+    status: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReadyToDispatchResult:
+    ok: bool
+    load_id: int
+    status: str = ""
+    sms_sent: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class LoadSummary:
     id: int
     type: str

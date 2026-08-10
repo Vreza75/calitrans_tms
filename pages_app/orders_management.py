@@ -5,8 +5,17 @@ import re
 import pandas as pd
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, has_permission
+from application.exceptions import AuthorizationError
+from application.loads.commands import (
+    cancel_load,
+    mark_load_missing_info,
+    mark_load_ready_to_dispatch,
+    update_load_fields,
+    verify_load_booking,
+)
 from db_client import DispatchDatabaseClient
-from services.dispatch_data_service import _insert_dispatch_message
 from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.dispatch_workflow_service import (
     LOAD_TYPE_TABS,
@@ -18,7 +27,6 @@ from services.dispatch_workflow_service import (
     _status_row_style,
 )
 from services.driver_roster_service import find_driver_in_roster, list_active_drivers
-from services.driver_sms_service import format_phone_e164, send_sms
 from services.load_grouping_service import group_loads_by_booking
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
@@ -492,7 +500,9 @@ def render_booking_review(df: pd.DataFrame) -> None:
     if readiness_score < 100:
         st.info("Mark Booking Verified is disabled until all required fields are complete.")
 
-def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
+def _render_order_detail_editor(
+    work_df: pd.DataFrame, selected_row_id: int, context_key: str, principal: AuthenticatedActor
+) -> None:
     selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
 
     if selected_df.empty:
@@ -568,7 +578,10 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
                 key=f"{form_key}_notes",
             )
 
-        save_order = st.form_submit_button("Save Order Updates")
+        can_edit = has_permission(principal, Permission.LOAD_EDIT)
+        if not can_edit:
+            st.caption("Your role does not have permission to edit orders.")
+        save_order = st.form_submit_button("Save Order Updates", disabled=not can_edit)
 
     if save_order:
         updates = {
@@ -587,57 +600,90 @@ def _render_order_detail_editor(work_df: pd.DataFrame, selected_row_id: int, con
             "dispatcher_notes": notes.strip(),
         }
 
-        DispatchDatabaseClient().update_row_fields(selected_row_id, updates)
-        st.session_state.pop("orders_management_selected_row_id", None)
-        st.session_state.pop("orders_management_selected_context", None)
-        refresh_data()
-        st.success("Order updated successfully.")
-        st.rerun()
+        try:
+            update_load_fields(actor=principal, load_id=selected_row_id, updates=updates)
+        except AuthorizationError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state.pop("orders_management_selected_row_id", None)
+            st.session_state.pop("orders_management_selected_context", None)
+            refresh_data()
+            st.success("Order updated successfully.")
+            st.rerun()
 
     st.markdown("#### Quick Actions")
     q1, q2, q3 = st.columns(3)
     with q1:
-        if st.button("Mark Missing Info", key=f"quick_missing_info_{safe_context}_{selected_row_id}", use_container_width=True):
-            DispatchDatabaseClient().update_row_fields(
-                selected_row_id,
-                {
-                    "Status": "Hold/Need Info",
-                    "Dispatcher Notes": notes.strip() or "Missing information requested from customer.",
-                },
-            )
-            st.session_state.pop("orders_management_selected_row_id", None)
-            st.session_state.pop("orders_management_selected_context", None)
-            refresh_data()
-            st.warning("Order marked Hold/Need Info.")
-            st.rerun()
+        can_edit = has_permission(principal, Permission.LOAD_EDIT)
+        if st.button(
+            "Mark Missing Info",
+            key=f"quick_missing_info_{safe_context}_{selected_row_id}",
+            use_container_width=True,
+            disabled=not can_edit,
+        ):
+            try:
+                mark_load_missing_info(
+                    actor=principal,
+                    load_id=selected_row_id,
+                    note=notes.strip() or "Missing information requested from customer.",
+                )
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("orders_management_selected_row_id", None)
+                st.session_state.pop("orders_management_selected_context", None)
+                refresh_data()
+                st.warning("Order marked Hold/Need Info.")
+                st.rerun()
     with q2:
-        if st.button("Mark Booking Verified", key=f"quick_booking_verified_{safe_context}_{selected_row_id}", use_container_width=True):
-            DispatchDatabaseClient().update_row_fields(
-                selected_row_id,
-                {
-                    "Status": "Booking Verified",
-                    "Dispatcher Notes": notes.strip() or "Order reviewed and booking verified. Next action: verify booking with Port Houston.",
-                },
-            )
-            st.session_state.pop("orders_management_selected_row_id", None)
-            st.session_state.pop("orders_management_selected_context", None)
-            refresh_data()
-            st.success("Order marked Booking Verified.")
-            st.rerun()
+        can_verify = has_permission(principal, Permission.LOAD_VERIFY)
+        if st.button(
+            "Mark Booking Verified",
+            key=f"quick_booking_verified_{safe_context}_{selected_row_id}",
+            use_container_width=True,
+            disabled=not can_verify,
+        ):
+            try:
+                verify_load_booking(
+                    actor=principal,
+                    load_id=selected_row_id,
+                    note=notes.strip()
+                    or "Order reviewed and booking verified. Next action: verify booking with Port Houston.",
+                )
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("orders_management_selected_row_id", None)
+                st.session_state.pop("orders_management_selected_context", None)
+                refresh_data()
+                st.success("Order marked Booking Verified.")
+                st.rerun()
     with q3:
-        if st.button("Cancel Order", key=f"quick_cancel_order_{safe_context}_{selected_row_id}", use_container_width=True):
-            DispatchDatabaseClient().update_row_fields(
-                selected_row_id,
-                {"Status": "Cancelled"},
-            )
-            st.session_state.pop("orders_management_selected_row_id", None)
-            st.session_state.pop("orders_management_selected_context", None)
-            refresh_data()
-            st.error("Order cancelled.")
-            st.rerun()
+        can_cancel = has_permission(principal, Permission.LOAD_CANCEL)
+        if st.button(
+            "Cancel Order",
+            key=f"quick_cancel_order_{safe_context}_{selected_row_id}",
+            use_container_width=True,
+            disabled=not can_cancel,
+        ):
+            try:
+                cancel_load(actor=principal, load_id=selected_row_id)
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("orders_management_selected_row_id", None)
+                st.session_state.pop("orders_management_selected_context", None)
+                refresh_data()
+                st.error("Order cancelled.")
+                st.rerun()
+
+    if not (can_edit and can_verify and can_cancel):
+        st.caption("Some quick actions are disabled for your role.")
 
 
-def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int, context_key: str) -> None:
+def _render_ready_to_dispatch_panel(
+    work_df: pd.DataFrame, selected_row_id: int, context_key: str, principal: AuthenticatedActor
+) -> None:
     selected_df = work_df[work_df["_row_id"].astype(int).eq(int(selected_row_id))]
 
     if selected_df.empty:
@@ -748,51 +794,46 @@ def _render_ready_to_dispatch_panel(work_df: pd.DataFrame, selected_row_id: int,
     if phone.strip():
         st.caption(f"Driver phone on file: {phone.strip()}")
 
-    ready_disabled = not (driver_name.strip() and truck.strip() and chassis.strip() and phone.strip())
+    can_dispatch = has_permission(principal, Permission.LOAD_READY_TO_DISPATCH) and has_permission(
+        principal, Permission.DRIVER_MESSAGE_SEND
+    )
+    ready_disabled = not (driver_name.strip() and truck.strip() and chassis.strip() and phone.strip()) or not can_dispatch
     if st.button(
         "Mark Ready to Dispatch",
         key=f"{panel_key}_mark_ready",
         use_container_width=True,
         disabled=ready_disabled,
     ):
-        normalized_phone = format_phone_e164(phone)
-        if not normalized_phone:
-            st.error(f"'{phone.strip()}' isn't a valid phone number. Fix it and try again — no text was sent.")
+        try:
+            result = mark_load_ready_to_dispatch(
+                actor=principal,
+                load_id=selected_row_id,
+                driver_name=driver_name,
+                truck=truck,
+                chassis=chassis,
+                phone=phone,
+                message=edited_message,
+                note=_safe_str(selected_load.get("Dispatcher Notes", "")),
+            )
+        except AuthorizationError as exc:
+            st.error(str(exc))
         else:
-            sent, sid_or_error = send_sms(normalized_phone, edited_message)
-            if sent:
-                _insert_dispatch_message(
-                    selected_row_id,
-                    "driver_dispatch_sms",
-                    "outbound",
-                    normalized_phone,
-                    edited_message,
-                    provider="twilio",
-                )
-                DispatchDatabaseClient().update_row_fields(
-                    selected_row_id,
-                    {
-                        "Driver Name": driver_name.strip(),
-                        "Truck Assigned": truck.strip(),
-                        "Chassis": chassis.strip(),
-                        "Status": "Ready to Dispatch",
-                        "Dispatcher Notes": _safe_str(selected_load.get("Dispatcher Notes", ""))
-                        or "Driver, truck, and chassis assigned. Ready to dispatch.",
-                    },
-                )
+            if result.ok:
                 st.session_state.pop("orders_management_selected_row_id", None)
                 st.session_state.pop("orders_management_selected_context", None)
                 refresh_data()
                 st.success(f"Text sent to {driver_name} and load marked Ready to Dispatch.")
                 st.rerun()
             else:
-                st.error(f"Could not send the text — no changes were made. {sid_or_error}")
+                st.error(f"Could not send the text — no changes were made. {result.reason}")
 
-    if ready_disabled:
+    if not can_dispatch:
+        st.caption("Your role does not have permission to mark loads Ready to Dispatch.")
+    elif ready_disabled:
         st.info("Mark Ready to Dispatch is disabled until Driver, Truck, Chassis, and Phone are all filled in.")
 
 
-def render_orders_management(df: pd.DataFrame) -> None:
+def render_orders_management(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
     st.subheader("Orders / Load Management")
     st.caption("Review newly created orders, resolve missing information, mark bookings verified, or cancel bad orders before dispatch work begins.")
 
@@ -897,7 +938,7 @@ def render_orders_management(df: pd.DataFrame) -> None:
             visible_ids = set(work_df["_row_id"].dropna().astype(int).tolist())
             if int(selected_row_id) in visible_ids:
                 st.divider()
-                detail_renderer(work_df, int(selected_row_id), context_key)
+                detail_renderer(work_df, int(selected_row_id), context_key, principal)
 
     queue_options = [
         "New",

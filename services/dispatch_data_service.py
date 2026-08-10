@@ -83,12 +83,24 @@ def ensure_communications_schema() -> None:
         "dispatch_messages", "provider_message_id", migration_hint="database/communications_foundation_migration.sql"
     )
 
-def _insert_dispatch_message(load_id: int, message_type: str, direction: str, recipient: str, message_body: str, provider: str = "internal") -> None:
+def _insert_dispatch_message(
+    load_id: int,
+    message_type: str,
+    direction: str,
+    recipient: str,
+    message_body: str,
+    provider: str = "internal",
+    sent_by: str = "dispatcher",
+) -> None:
+    """`sent_by` defaults to the pre-existing literal "dispatcher" for
+    every caller that doesn't pass it (zero behavior change) -
+    application-command callers pass the real AuthenticatedActor.actor so
+    dispatch_messages reflects who actually sent it."""
     ensure_communications_schema()
     execute(
         """
         insert into dispatch_messages (load_id, message_type, direction, recipient, message_body, sent_by, provider)
-        values (:load_id, :message_type, :direction, :recipient, :message_body, 'dispatcher', :provider)
+        values (:load_id, :message_type, :direction, :recipient, :message_body, :sent_by, :provider)
         """,
         {
             "load_id": load_id,
@@ -96,6 +108,7 @@ def _insert_dispatch_message(load_id: int, message_type: str, direction: str, re
             "direction": direction,
             "recipient": recipient or None,
             "message_body": message_body,
+            "sent_by": sent_by,
             "provider": provider,
         },
     )
