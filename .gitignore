@@ -1,6 +1,44 @@
-.streamlit/secrets.toml
-.venv/
+# Secrets
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python / Streamlit
+.venv/
+venv/
 __pycache__/
-*.pyc
-exports/.streamlit/secrets.toml
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.streamlit.pid
+.streamlit_run.log
+*.log
+
+# Local storage / downloaded docs
+storage/
+exports/
+backups/
+
+# Codex / local build folders
+.codex_pydeps/
+.agents/
+
+# Claude Code / tooling worktrees
+.claude/worktrees/
+.superpowers/
+CLAUDE.local.md
+
+# Archives / local exports
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional local Python version file
+.python-version

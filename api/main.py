@@ -1,14 +1,48 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db_client import DispatchDatabaseClient, read_df
 
+from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
+from api.errors import register_error_handlers
+from api.routers import attachments, health, loads, work_items
 
 app = FastAPI(title="Calitrans TMS Integration API")
+
+register_error_handlers(app)
+
+# Phase 1 has no frontend consumer yet (Next.js is out of scope for this
+# phase - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md). Restrict
+# CORS to an explicit allowlist read from CORS_ALLOWED_ORIGINS (comma-
+# separated) instead of "*", so a future frontend origin is added
+# deliberately rather than the API defaulting open.
+_allowed_origins = [origin.strip() for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT"],
+        allow_headers=["*"],
+    )
+
+app.include_router(health.router, prefix="/api/v1")
+app.include_router(work_items.router, prefix="/api/v1")
+app.include_router(loads.router, prefix="/api/v1")
+app.include_router(attachments.router, prefix="/api/v1")
+
+
+# ---------------------------------------------------------------------------
+# Legacy endpoints (pre-Phase 1). Kept for backward compatibility with any
+# existing caller of the unversioned API - do not add new functionality
+# here. New work goes through /api/v1 (see api/routers/).
+# ---------------------------------------------------------------------------
 
 
 class LoadCreateRequest(BaseModel):
@@ -24,13 +58,15 @@ class LoadCreateRequest(BaseModel):
     dispatcher_notes: str | None = None
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
+@app.get("/health", tags=["legacy"])
+def health_legacy() -> dict[str, str]:
+    """Legacy unversioned health check. Prefer GET /api/v1/health."""
     return {"status": "ok"}
 
 
-@app.get("/loads")
-def list_loads(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+@app.get("/loads", tags=["legacy"], dependencies=[Depends(require_role(*READ_LOADS))])
+def list_loads_legacy(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """Legacy unversioned loads list. Prefer GET /api/v1/loads."""
     sql = "select * from loads"
     params: dict[str, Any] = {"limit": limit}
 
@@ -43,8 +79,9 @@ def list_loads(status: str | None = None, limit: int = 100) -> list[dict[str, An
     return read_df(sql, params).to_dict(orient="records")
 
 
-@app.post("/loads")
-def create_load(payload: LoadCreateRequest) -> dict[str, Any]:
+@app.post("/loads", tags=["legacy"], dependencies=[Depends(require_role(*MUTATE_OPERATIONS))])
+def create_load_legacy(payload: LoadCreateRequest) -> dict[str, Any]:
+    """Legacy unversioned load creation. Prefer POST /api/v1/work-items/{id}/create-load."""
     client = DispatchDatabaseClient()
 
     row_data = {

@@ -1,0 +1,31 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Export",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "RICGX1235800",
+  "order_numbers": [
+    "RICGX1235800"
+  ],
+  "container_count": 4,
+  "containers": [],
+  "customer": "CONTINENTAL INDUSTRIES GROUP",
+  "full_return_terminal": "Bayport Terminal",
+  "pickup": {},
+  "delivery": {},
+  "dates": {},
+  "references": {
+    "reference_number": "SO217089a/C25749C",
+    "container_size": "40HC",
+    "contact_name": "Dispatch Notices",
+    "contact_email": "bookings@fleurdelis.example.com",
+    "contact_phone": "008197 7702"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}

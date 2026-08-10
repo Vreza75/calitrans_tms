@@ -1,0 +1,20 @@
+case_id: CASE-002
+name: New Export, Single Container
+request_type: New Booking
+service_flow: Export
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Create New Order
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - containers
+  - pickup
+  - dates
+  - references
+noncritical_fields:
+  - queue
+  - delivery

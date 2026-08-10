@@ -1,0 +1,1135 @@
+import os
+import imaplib
+import email
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header
+from email.utils import parseaddr, parsedate_to_datetime
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+load_dotenv()
+
+
+MESSAGE_ID_RE = re.compile(r"<([^>]+)>")
+SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd)\s*:\s*", re.I)
+
+
+def get_setting(name, default=None):
+    value = os.getenv(name)
+    if value:
+        return value
+    if st is not None:
+        try:
+            value = st.secrets.get(name)
+            if value:
+                return value
+        except Exception:
+            pass
+    return default
+
+
+def decode_text(value):
+    if not value:
+        return ""
+    decoded_parts = decode_header(value)
+    result = ""
+    for part, encoding in decoded_parts:
+        if isinstance(part, bytes):
+            result += part.decode(encoding or "utf-8", errors="ignore")
+        else:
+            result += part
+    return result
+
+
+def normalize_message_id(value):
+    text = decode_text(value).strip()
+    if not text:
+        return ""
+    match = MESSAGE_ID_RE.search(text)
+    if match:
+        return match.group(1).strip().lower()
+    return text.strip("<> ").lower()
+
+
+def parse_reference_ids(value):
+    text = decode_text(value)
+    if not text:
+        return []
+    matches = MESSAGE_ID_RE.findall(text)
+    if matches:
+        return [item.strip().lower() for item in matches if item.strip()]
+    return [item.strip("<> ").lower() for item in text.split() if item.strip()]
+
+
+def normalize_subject(value):
+    text = decode_text(value)
+    while SUBJECT_PREFIX_RE.match(text):
+        text = SUBJECT_PREFIX_RE.sub("", text, count=1)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def derive_thread_id(message_id, in_reply_to, references):
+    reference_ids = parse_reference_ids(references)
+    if reference_ids:
+        return reference_ids[0]
+
+    reply_id = normalize_message_id(in_reply_to)
+    if reply_id:
+        return reply_id
+
+    return normalize_message_id(message_id)
+
+
+def derive_conversation_key(message_id, in_reply_to, references, subject):
+    reference_ids = parse_reference_ids(references)
+    if reference_ids:
+        return reference_ids[0]
+
+    reply_id = normalize_message_id(in_reply_to)
+    if reply_id:
+        return reply_id
+
+    normalized_message_id = normalize_message_id(message_id)
+    if normalized_message_id:
+        return normalized_message_id
+
+    normalized_subject = normalize_subject(subject)
+    return f"subject:{normalized_subject}" if normalized_subject else ""
+
+
+def _decode_payload(part):
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return ""
+
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="ignore")
+    except Exception:
+        return payload.decode("utf-8", errors="ignore")
+
+
+def get_email_body(msg):
+    plain_body = ""
+    html_body = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            disposition = str(part.get("Content-Disposition"))
+            if content_type == "text/plain" and "attachment" not in disposition:
+                plain_body += _decode_payload(part)
+            elif content_type == "text/html" and "attachment" not in disposition:
+                html_body += _decode_payload(part)
+    else:
+        if msg.get_content_type() == "text/html":
+            html_body = _decode_payload(msg)
+        else:
+            plain_body = _decode_payload(msg)
+
+    if plain_body.strip():
+        return plain_body.strip()
+
+    return re.sub(r"<[^<]+?>", " ", html_body).strip()
+
+
+def _attachment_filename(part, index):
+    filename = part.get_filename()
+    if filename:
+        return decode_text(filename)
+
+    content_type = part.get_content_type() or "application/octet-stream"
+    extension = {
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/csv": ".csv",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+    }.get(content_type, "")
+    return f"attachment_{index}{extension}"
+
+
+def get_email_attachments(msg):
+    attachments = []
+    seen = set()
+    save_inline_images = _get_bool_setting("OPERATIONS_SAVE_INLINE_IMAGES", False)
+    for index, part in enumerate(msg.walk(), start=1):
+        content_type = part.get_content_type() or "application/octet-stream"
+        if content_type == "message/rfc822":
+            payload = part.get_payload()
+            nested_messages = payload if isinstance(payload, list) else []
+            for nested in nested_messages:
+                for nested_attachment in get_email_attachments(nested):
+                    nested_content = nested_attachment.get("content") or b""
+                    nested_key = (
+                        str(nested_attachment.get("filename", "")).lower(),
+                        str(nested_attachment.get("content_type", "")),
+                        len(nested_content),
+                        nested_content[:32],
+                    )
+                    if nested_key in seen:
+                        continue
+                    seen.add(nested_key)
+                    attachments.append(nested_attachment)
+            continue
+
+        if part.is_multipart():
+            continue
+
+        disposition = str(part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        inline_without_filename = "inline" in disposition and not filename
+        inline_image = "inline" in disposition and content_type.startswith("image/") and "attachment" not in disposition
+        has_attachment_marker = "attachment" in disposition or bool(filename)
+        if inline_image and not save_inline_images:
+            continue
+        if inline_without_filename and content_type != "application/pdf":
+            continue
+        if not has_attachment_marker and content_type in {"text/plain", "text/html"}:
+            continue
+
+        content = part.get_payload(decode=True)
+        if not content:
+            continue
+
+        filename = _attachment_filename(part, index)
+        dedupe_key = (filename.lower(), content_type, len(content), content[:32])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        attachments.append(
+            {
+                "filename": filename,
+                "content": content,
+                "content_type": content_type,
+                "size_bytes": len(content),
+                "disposition": disposition,
+                "content_id": decode_text(part.get("Content-ID")),
+            }
+        )
+    return attachments
+
+
+def get_pdf_attachments(msg):
+    return [
+        attachment
+        for attachment in get_email_attachments(msg)
+        if str(attachment.get("filename", "")).lower().endswith(".pdf")
+        or str(attachment.get("content_type", "")).lower() == "application/pdf"
+    ]
+
+
+def _parse_email_date(value):
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed is None:
+            return None
+        return parsed.isoformat()
+    except Exception:
+        return None
+
+
+def _get_int_setting(name, default):
+    try:
+        return int(get_setting(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _get_bool_setting(name, default=False):
+    value = str(get_setting(name, str(default))).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _deadline_expired(deadline):
+    return bool(deadline and time.monotonic() >= deadline)
+
+
+def _remaining_seconds(deadline):
+    if not deadline:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _first_fetch_payload(msg_data):
+    if not msg_data:
+        return b""
+    for item in msg_data:
+        if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes):
+            return item[1]
+    return b""
+
+
+def _fetch_spec(max_fetch_bytes=None):
+    try:
+        size = int(max_fetch_bytes or 0)
+    except Exception:
+        size = 0
+    if size > 0:
+        return f"(BODY.PEEK[]<0.{size}>)"
+    return "(RFC822)"
+
+
+def _split_mailbox_candidates(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _split_email_accounts(value):
+    return [item.strip() for item in str(value or "").replace(";", ",").split(",") if item.strip()]
+
+
+def _account_setting_suffix(email_address):
+    local_part = str(email_address or "").split("@", 1)[0]
+    return re.sub(r"[^A-Za-z0-9]+", "_", local_part).strip("_").upper()
+
+
+NAMED_EMAIL_ACCOUNTS = {
+    "DISPATCH": "dispatch@calitranscorp.com",
+    "MARGIE": "margiea@calitranscorp.com",
+    "ACCOUNTING": "accounting@calitranscorp.com",
+}
+
+
+def _unique_values(values):
+    result = []
+    seen = set()
+    for value in values:
+        value = str(value or "").strip()
+        normalized = value.upper()
+        if not value or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+    return result
+
+
+def _email_account_aliases(email_address):
+    normalized_email = str(email_address or "").strip().lower()
+    suffix = _account_setting_suffix(email_address)
+    aliases = [suffix]
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = (
+            get_setting(f"{alias}_YAHOO_EMAIL")
+            or get_setting(f"{alias}_EMAIL")
+            or get_setting(f"YAHOO_EMAIL_{alias}")
+            or default_email
+        )
+        if normalized_email == str(configured_email or "").strip().lower():
+            aliases.append(alias)
+            if alias == "MARGIE":
+                aliases.append("MARGIEA")
+    return _unique_values(aliases)
+
+
+def _setting_candidates_for_aliases(aliases, templates):
+    return _unique_values(template.format(alias=alias) for alias in aliases for template in templates)
+
+
+def _password_for_email_account(email_address):
+    aliases = _email_account_aliases(email_address)
+    candidates = _setting_candidates_for_aliases(
+        aliases,
+        [
+            "{alias}_YAHOO_APP_PASSWORD",
+            "{alias}_EMAIL_APP_PASSWORD",
+            "{alias}_SMTP_PASSWORD",
+            "OPERATIONS_EMAIL_PASSWORD_{alias}",
+            "EMAIL_APP_PASSWORD_{alias}",
+            "YAHOO_APP_PASSWORD_{alias}",
+            "SMTP_PASSWORD_{alias}",
+        ],
+    )
+    for key in candidates:
+        value = get_setting(key)
+        if value:
+            return value
+
+    default_email = (get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS") or "").lower()
+    if str(email_address or "").lower() == default_email:
+        return get_setting("YAHOO_APP_PASSWORD") or get_setting("EMAIL_APP_PASSWORD")
+    return ""
+
+
+def _configured_operations_email_addresses():
+    raw_accounts = (
+        get_setting("OPERATIONS_CASE_MAILBOXES")
+        or get_setting("OPERATIONS_EMAIL_ACCOUNTS")
+        or get_setting(
+            "OPERATIONS_SHARED_MAILBOXES",
+            "margiea@calitranscorp.com,dispatch@calitranscorp.com,accounting@calitranscorp.com",
+        )
+    )
+    configured_accounts = _split_email_accounts(raw_accounts)
+    for alias, default_email in NAMED_EMAIL_ACCOUNTS.items():
+        configured_email = (
+            get_setting(f"{alias}_YAHOO_EMAIL")
+            or get_setting(f"{alias}_EMAIL")
+            or get_setting(f"YAHOO_EMAIL_{alias}")
+            or default_email
+        )
+        if configured_email and configured_email not in configured_accounts:
+            configured_accounts.append(configured_email)
+    default_email = get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS")
+    if default_email and default_email not in configured_accounts:
+        configured_accounts.insert(0, default_email)
+
+    addresses = []
+    seen = set()
+    for email_address in configured_accounts:
+        normalized = email_address.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        addresses.append(email_address)
+    return addresses
+
+
+def _operations_email_accounts():
+    accounts = []
+    for email_address in _configured_operations_email_addresses():
+        password = _password_for_email_account(email_address)
+        if not password:
+            continue
+        accounts.append({"email": email_address, "password": password})
+    return accounts
+
+
+def diagnose_operations_email_accounts():
+    """Test IMAP connection/login/folder-select for every configured mailbox
+    without importing or parsing any email content. Safe to call from a UI
+    diagnostic button - never logs passwords or message bodies."""
+    imap_server = get_setting("IMAP_SERVER", "imap.mail.yahoo.com")
+    imap_port = _get_int_setting("IMAP_PORT", 993)
+    selected_mailbox_setting = get_setting("EMAIL_INBOX_FOLDER", "INBOX")
+    mailbox_candidates = _split_mailbox_candidates(
+        get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+    )
+
+    results = []
+    for email_address in _configured_operations_email_addresses():
+        password = _password_for_email_account(email_address)
+        diag = {
+            "email": email_address,
+            "credentials_configured": bool(password),
+            "login_success": False,
+            "selected_folder": None,
+            "messages_found": 0,
+            "error_type": "",
+            "error_message": "",
+        }
+        results.append(diag)
+
+        if not password:
+            diag["error_type"] = "MissingCredentials"
+            diag["error_message"] = "No app password configured for this mailbox"
+            continue
+
+        mail = None
+        try:
+            try:
+                mail = imaplib.IMAP4_SSL(imap_server, imap_port, timeout=8)
+            except TypeError:
+                mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+            mail.login(email_address, password)
+            diag["login_success"] = True
+            diag["selected_folder"] = _select_mailbox(mail, selected_mailbox_setting, mailbox_candidates)
+            status, data = mail.search(None, "ALL")
+            if status == "OK" and data and data[0]:
+                diag["messages_found"] = len(data[0].split())
+        except Exception as exc:
+            diag["error_type"] = type(exc).__name__
+            diag["error_message"] = str(exc)
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+
+    return results
+
+
+def _select_mailbox(mail, selected_mailbox, fallback_mailboxes=None):
+    attempted = []
+    candidates = [selected_mailbox] + list(fallback_mailboxes or ["INBOX", "Inbox", "inbox"])
+
+    for mailbox in candidates:
+        if not mailbox or mailbox in attempted:
+            continue
+
+        attempted.append(mailbox)
+        status, data = mail.select(mailbox)
+        if status == "OK":
+            return mailbox
+
+    raise ValueError(f"Could not open email folder. Tried: {', '.join(attempted)}")
+
+
+def _search_message_ids(mail, search_query, *, fallback_to_all=True):
+    query = search_query or "ALL"
+    status, data = mail.search(None, query)
+
+    if status == "OK" and data and data[0]:
+        return data[0].split()
+
+    if fallback_to_all and query != "ALL":
+        status, data = mail.search(None, "ALL")
+        if status == "OK" and data and data[0]:
+            return data[0].split()
+
+    return []
+
+
+def _fetch_recent_emails(
+    *,
+    limit=10,
+    search_query="ALL",
+    terms=None,
+    scan_window=None,
+    mailbox=None,
+    mailbox_candidates=None,
+    direction="inbound",
+    require_terms=False,
+    email_address=None,
+    email_password=None,
+    include_attachments=True,
+    fallback_search_to_all=True,
+    max_fetch_bytes=None,
+    deadline=None,
+    diagnostics=None,
+):
+    email_address = email_address or get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS")
+    email_password = email_password or get_setting("YAHOO_APP_PASSWORD") or get_setting("EMAIL_APP_PASSWORD")
+    imap_server = get_setting("IMAP_SERVER", "imap.mail.yahoo.com")
+    imap_port = _get_int_setting("IMAP_PORT", 993)
+    selected_mailbox = mailbox or get_setting("EMAIL_INBOX_FOLDER", "INBOX")
+
+    if not email_address:
+        raise ValueError("YAHOO_EMAIL is missing from .streamlit/secrets.toml")
+    if not email_password:
+        raise ValueError("YAHOO_APP_PASSWORD is missing from .streamlit/secrets.toml")
+
+    imap_timeout = _get_int_setting(
+        "OPERATIONS_IMAP_TIMEOUT_SECONDS",
+        _get_int_setting("IMAP_TIMEOUT_SECONDS", 8),
+    )
+    if deadline:
+        remaining = int(_remaining_seconds(deadline) or 0)
+        if remaining <= 0:
+            return []
+        imap_timeout = max(3, min(imap_timeout, remaining))
+    try:
+        mail = imaplib.IMAP4_SSL(imap_server, imap_port, timeout=imap_timeout)
+    except TypeError:
+        mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+    try:
+        if _deadline_expired(deadline):
+            return []
+        mail.login(email_address, email_password)
+        if diagnostics is not None:
+            diagnostics["login_success"] = True
+        if _deadline_expired(deadline):
+            return []
+        selected_mailbox = _select_mailbox(mail, selected_mailbox, mailbox_candidates)
+        if diagnostics is not None:
+            diagnostics["selected_folder"] = selected_mailbox
+
+        if _deadline_expired(deadline):
+            return []
+        email_ids = _search_message_ids(
+            mail,
+            search_query,
+            fallback_to_all=fallback_search_to_all,
+        )
+        if diagnostics is not None:
+            diagnostics["messages_found"] = len(email_ids)
+        if not email_ids:
+            return []
+
+        candidate_count = scan_window or max(limit * 4, limit)
+        candidate_ids = email_ids[-candidate_count:]
+        normalized_terms = [term.lower() for term in (terms or []) if str(term or "").strip()]
+        results = []
+
+        fetch_spec = _fetch_spec(max_fetch_bytes)
+        for email_id in reversed(candidate_ids):
+            if _deadline_expired(deadline):
+                break
+            status, msg_data = mail.fetch(email_id, fetch_spec)
+            raw_email = _first_fetch_payload(msg_data)
+            if status != "OK" or not raw_email:
+                continue
+
+            msg = email.message_from_bytes(raw_email)
+            subject = decode_text(msg.get("Subject"))
+            sender = decode_text(msg.get("From"))
+            recipients = decode_text(msg.get("To"))
+            body = get_email_body(msg)
+            haystack = f"{subject}\n{sender}\n{body}".lower()
+            matched_terms = [term for term in normalized_terms if term in haystack]
+
+            if require_terms and normalized_terms and not matched_terms:
+                continue
+
+            message_id = normalize_message_id(msg.get("Message-ID")) or email_id.decode()
+            in_reply_to = normalize_message_id(msg.get("In-Reply-To"))
+            references = parse_reference_ids(msg.get("References"))
+            thread_id = derive_thread_id(message_id, in_reply_to, msg.get("References"))
+            normalized_subject = normalize_subject(subject)
+            conversation_key = derive_conversation_key(
+                message_id,
+                in_reply_to,
+                msg.get("References"),
+                subject,
+            )
+
+            results.append({
+                "id": email_id.decode(),
+                "message_id": message_id,
+                "mailbox": f"{email_address}:{selected_mailbox}" if email_address else selected_mailbox,
+                "mailbox_account": email_address,
+                "mailbox_folder": selected_mailbox,
+                "direction": direction,
+                "thread_id": thread_id,
+                "conversation_key": conversation_key,
+                "normalized_subject": normalized_subject,
+                "in_reply_to": in_reply_to,
+                "references": references,
+                "subject": subject,
+                "from": sender,
+                "to": recipients,
+                "cc": decode_text(msg.get("Cc")),
+                "date": decode_text(msg.get("Date")),
+                "received_at": _parse_email_date(msg.get("Date")),
+                "body": body,
+                "snippet": body[:300],
+                "matched_terms": matched_terms,
+                "attachments": get_email_attachments(msg) if include_attachments else [],
+            })
+
+            if len(results) >= limit:
+                break
+
+        return results
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
+def fetch_recent_load_emails(limit=10):
+    return _fetch_recent_emails(
+        limit=limit,
+        search_query=get_setting("EMAIL_LOAD_IMAP_SEARCH", "ALL"),
+        terms=["booking", "load", "delivery order", "container"],
+        scan_window=max(limit * 8, 150),
+        require_terms=False,
+    )
+
+def fetch_recent_operations_emails(limit=25):
+    terms = get_setting(
+        "EMAIL_OPERATIONS_TERMS",
+        "quote,rate,pricing,missing info,missing,load,booking,container,appointment,pod,cancel,delivery",
+    )
+    search_terms = [term.strip() for term in str(terms).split(",") if term.strip()]
+
+    return _fetch_recent_emails(
+        limit=limit,
+        search_query=get_setting("EMAIL_OPERATIONS_IMAP_SEARCH", "ALL"),
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=search_terms,
+        scan_window=max(limit * 10, 250),
+        require_terms=False,
+    )
+
+
+LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS = {}
+
+
+def get_last_operations_email_sync_diagnostics():
+    return dict(LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS or {})
+
+
+def _fetch_test_sync_messages(*, account_email, account_password, deadline):
+    """Dedicated lookback for OPERATIONS_TEST_SYNC_* messages. A busy
+    production mailbox can push a just-sent test message past the normal
+    per-mailbox top-N fetch within minutes, so this runs a separate,
+    sender-scoped search that isn't subject to that cutoff."""
+    if not _get_bool_setting("OPERATIONS_TEST_SYNC_ENABLED", False):
+        return []
+
+    allowed_sender = get_setting("OPERATIONS_TEST_SYNC_ALLOWED_SENDER", "")
+    subject_contains = get_setting("OPERATIONS_TEST_SYNC_SUBJECT_CONTAINS", "")
+    if not allowed_sender or not subject_contains:
+        return []
+
+    lookback_minutes = _get_int_setting("OPERATIONS_TEST_SYNC_LOOKBACK_MINUTES", 180)
+
+    messages = _fetch_recent_emails(
+        limit=10,
+        search_query=f'HEADER FROM "{allowed_sender}"',
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=[subject_contains.lower()],
+        require_terms=True,
+        scan_window=50,
+        email_address=account_email,
+        email_password=account_password,
+        include_attachments=True,
+        deadline=deadline,
+    )
+
+    if lookback_minutes <= 0:
+        return messages
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+    filtered = []
+    for item in messages:
+        received_at = item.get("received_at")
+        received_dt = None
+        if received_at:
+            try:
+                received_dt = datetime.fromisoformat(received_at)
+            except ValueError:
+                received_dt = None
+        if received_dt is None:
+            filtered.append(item)
+            continue
+        if received_dt.tzinfo is None:
+            received_dt = received_dt.replace(tzinfo=timezone.utc)
+        if received_dt >= cutoff:
+            filtered.append(item)
+    return filtered
+
+
+def fetch_operations_email_sync(limit=12, time_budget_seconds=None):
+    global LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS
+
+    terms = get_setting(
+        "EMAIL_OPERATIONS_TERMS",
+        "quote,rate,pricing,missing info,missing,load,booking,container,appointment,pod,cancel,delivery",
+    )
+    search_terms = [term.strip() for term in str(terms).split(",") if term.strip()]
+    accounts = _operations_email_accounts()
+    if not accounts:
+        accounts = [
+            {
+                "email": get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS"),
+                "password": get_setting("YAHOO_APP_PASSWORD") or get_setting("EMAIL_APP_PASSWORD"),
+            }
+        ]
+    account_count = max(1, len(accounts))
+    requested_limit = max(1, int(limit or 12))
+    default_per_account_limit = min(10, max(6, (requested_limit + account_count - 1) // account_count))
+    per_mailbox_limit = _get_int_setting("OPERATIONS_EMAIL_PER_ACCOUNT_LIMIT", default_per_account_limit)
+    sent_limit = min(per_mailbox_limit, _get_int_setting("OPERATIONS_SENT_SYNC_LIMIT", 2))
+    inbox_scan_window = _get_int_setting("OPERATIONS_EMAIL_SCAN_WINDOW", max(per_mailbox_limit * 3, 20))
+    sent_scan_window = _get_int_setting("OPERATIONS_SENT_SCAN_WINDOW", max(sent_limit * 2, 8))
+    sync_sent = _get_bool_setting("OPERATIONS_SYNC_SENT_ENABLED", False)
+    include_attachments = _get_bool_setting("OPERATIONS_SYNC_ATTACHMENTS_ENABLED", True)
+    max_fetch_bytes = 0 if include_attachments else _get_int_setting("OPERATIONS_EMAIL_FAST_FETCH_BYTES", 80000)
+    if time_budget_seconds is None:
+        time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
+    else:
+        try:
+            time_budget_seconds = max(0, int(time_budget_seconds))
+        except (TypeError, ValueError):
+            time_budget_seconds = _get_int_setting("OPERATIONS_EMAIL_SYNC_TIME_BUDGET_SECONDS", 18)
+    deadline = time.monotonic() + time_budget_seconds if time_budget_seconds > 0 else None
+    timed_out = False
+
+    diagnostics = {
+        "accounts_configured": len([a for a in accounts if a.get("email")]),
+        "accounts_attempted": 0,
+        "per_account": [],
+        "errors": [],
+        "inbox_scan_window": inbox_scan_window,
+        "sent_scan_window": sent_scan_window,
+        "per_mailbox_limit": per_mailbox_limit,
+        "sent_limit": sent_limit,
+        "sync_sent": sync_sent,
+        "sync_attachments": include_attachments,
+        "fast_fetch_bytes": max_fetch_bytes,
+        "time_budget_seconds": time_budget_seconds,
+        "timed_out": False,
+    }
+
+    inbox_messages = []
+    sent_messages = []
+    for account in accounts:
+        if _deadline_expired(deadline):
+            timed_out = True
+            diagnostics["errors"].append(
+                f"Sync stopped after {time_budget_seconds}s time budget before all accounts were checked."
+            )
+            break
+        account_email = account.get("email")
+        account_password = account.get("password")
+        account_diag = {
+            "email": account_email or "",
+            "credentials_configured": bool(account_email and account_password),
+            "login_success": False,
+            "selected_folder": None,
+            "messages_found": 0,
+            "messages_fetched": 0,
+            "inbox_fetched": 0,
+            "sent_fetched": 0,
+            "test_sync_matches": 0,
+            "error_type": "",
+            "error_message": "",
+            "errors": [],
+        }
+        diagnostics["per_account"].append(account_diag)
+
+        if not account_email or not account_password:
+            missing = []
+            if not account_email:
+                missing.append("email")
+            if not account_password:
+                missing.append("password/app password")
+            error_message = "Missing " + " and ".join(missing)
+            account_diag["errors"].append(error_message)
+            account_diag["error_type"] = "MissingCredentials"
+            account_diag["error_message"] = error_message
+            diagnostics["errors"].append(f"{account_email or 'account'}: {error_message}")
+            continue
+
+        diagnostics["accounts_attempted"] += 1
+
+        fetch_diag = {"login_success": False, "selected_folder": None, "messages_found": 0}
+        try:
+            inbox_batch = _fetch_recent_emails(
+                limit=per_mailbox_limit,
+                search_query=get_setting("EMAIL_OPERATIONS_IMAP_SEARCH", "ALL"),
+                mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+                mailbox_candidates=_split_mailbox_candidates(
+                    get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+                ),
+                direction="inbound",
+                terms=search_terms,
+                scan_window=inbox_scan_window,
+                require_terms=False,
+                email_address=account_email,
+                email_password=account_password,
+                include_attachments=include_attachments,
+                max_fetch_bytes=max_fetch_bytes,
+                deadline=deadline,
+                diagnostics=fetch_diag,
+            )
+            account_diag.update(fetch_diag)
+            account_diag["inbox_fetched"] = len(inbox_batch)
+            account_diag["messages_fetched"] = len(inbox_batch)
+            inbox_messages.extend(inbox_batch)
+        except Exception as exc:
+            account_diag.update(fetch_diag)
+            error_message = f"Inbox sync failed: {exc}"
+            account_diag["errors"].append(error_message)
+            account_diag["error_type"] = type(exc).__name__
+            account_diag["error_message"] = str(exc)
+            diagnostics["errors"].append(f"{account_email}: {error_message}")
+
+        if not _deadline_expired(deadline):
+            try:
+                test_batch = _fetch_test_sync_messages(
+                    account_email=account_email,
+                    account_password=account_password,
+                    deadline=deadline,
+                )
+                if test_batch:
+                    existing_ids = {m.get("message_id") for m in inbox_messages}
+                    new_test_messages = [m for m in test_batch if m.get("message_id") not in existing_ids]
+                    account_diag["test_sync_matches"] = len(new_test_messages)
+                    # Prepend rather than append: under time pressure the
+                    # insert loop processes messages in order and stops when
+                    # it runs out of budget, so a test message appended at
+                    # the end is exactly the one most likely to get cut off.
+                    inbox_messages[0:0] = new_test_messages
+            except Exception as exc:
+                account_diag["errors"].append(f"Test-sync lookback failed: {exc}")
+
+        if _deadline_expired(deadline):
+            timed_out = True
+            diagnostics["errors"].append(
+                f"Sync stopped after {time_budget_seconds}s time budget after inbox scan for {account_email}."
+            )
+            continue
+
+        if not sync_sent or sent_limit <= 0:
+            continue
+        try:
+            sent_batch = _fetch_recent_emails(
+                limit=sent_limit,
+                search_query=get_setting("EMAIL_OPERATIONS_SENT_IMAP_SEARCH", "ALL"),
+                mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+                mailbox_candidates=_split_mailbox_candidates(
+                    get_setting(
+                        "EMAIL_SENT_FOLDER_CANDIDATES",
+                        "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                    )
+                ),
+                direction="outbound",
+                terms=search_terms,
+                scan_window=sent_scan_window,
+                require_terms=False,
+                email_address=account_email,
+                email_password=account_password,
+                include_attachments=False,
+                max_fetch_bytes=max_fetch_bytes,
+                deadline=deadline,
+            )
+            account_diag["sent_fetched"] = len(sent_batch)
+            sent_messages.extend(sent_batch)
+        except Exception as exc:
+            error_message = f"Sent sync failed: {exc}"
+            account_diag["errors"].append(error_message)
+            diagnostics["errors"].append(f"{account_email}: {error_message}")
+
+    diagnostics["inbox_fetched"] = len(inbox_messages)
+    diagnostics["sent_fetched"] = len(sent_messages)
+    diagnostics["fetched"] = len(inbox_messages) + len(sent_messages)
+    diagnostics["timed_out"] = timed_out or _deadline_expired(deadline)
+    LAST_OPERATIONS_EMAIL_SYNC_DIAGNOSTICS = diagnostics
+
+    return inbox_messages + sent_messages
+
+
+def fetch_operations_email_near_date(*, sender="", received_at=None, limit=15, window_days=2):
+    """Targeted search bounded by sender + a date window around a known
+    received timestamp. Used to re-find an already-imported message's
+    attachments without scanning a huge chunk of a high-volume mailbox -
+    fetch_recent_operations_emails(limit=250) was observed to abort the IMAP
+    connection outright (socket EOF) rather than reliably find the target
+    message, and fetch_operations_email_by_message_id's HEADER Message-ID
+    search silently falls back to scanning ALL when it finds no exact
+    match, burning tens of seconds without ever finding the message."""
+    accounts = _operations_email_accounts()
+    if not accounts:
+        return []
+
+    since = ""
+    before = ""
+    parsed_date = received_at
+    if isinstance(parsed_date, str):
+        try:
+            parsed_date = datetime.fromisoformat(parsed_date)
+        except ValueError:
+            parsed_date = None
+    if parsed_date is not None:
+        try:
+            since = (parsed_date - timedelta(days=window_days)).strftime("%d-%b-%Y")
+            before = (parsed_date + timedelta(days=window_days + 1)).strftime("%d-%b-%Y")
+        except (TypeError, OverflowError):
+            since = ""
+            before = ""
+
+    sender_address = parseaddr(sender or "")[1] or sender or ""
+
+    query_parts = []
+    if since:
+        query_parts.append(f"SINCE {since}")
+    if before:
+        query_parts.append(f"BEFORE {before}")
+    if sender_address:
+        query_parts.append(f'FROM "{sender_address}"')
+    search_query = " ".join(query_parts) or "ALL"
+
+    results = []
+    for account in accounts:
+        try:
+            results.extend(
+                _fetch_recent_emails(
+                    limit=limit,
+                    search_query=search_query,
+                    mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+                    mailbox_candidates=_split_mailbox_candidates(
+                        get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+                    ),
+                    direction="inbound",
+                    terms=[],
+                    require_terms=False,
+                    scan_window=max(limit * 3, 30),
+                    email_address=account.get("email"),
+                    email_password=account.get("password"),
+                    include_attachments=True,
+                    fallback_search_to_all=False,
+                )
+            )
+        except Exception:
+            continue
+
+    return results
+
+
+def fetch_operations_email_by_message_id(message_id, limit=5):
+    normalized_message_id = normalize_message_id(message_id)
+    if not normalized_message_id:
+        return []
+
+    search_query = f'HEADER Message-ID "{normalized_message_id}"'
+    accounts = _operations_email_accounts()
+    if not accounts:
+        accounts = [{"email": get_setting("YAHOO_EMAIL") or get_setting("EMAIL_ADDRESS"), "password": get_setting("YAHOO_APP_PASSWORD") or get_setting("EMAIL_APP_PASSWORD")}]
+
+    found_messages = []
+    for account in accounts:
+        account_email = account.get("email")
+        account_password = account.get("password")
+        if not account_email or not account_password:
+            continue
+        try:
+            found_messages.extend(
+                _fetch_recent_emails(
+                    limit=limit,
+                    search_query=search_query,
+                    mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+                    mailbox_candidates=_split_mailbox_candidates(
+                        get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+                    ),
+                    direction="inbound",
+                    terms=[],
+                    scan_window=max(limit * 4, 20),
+                    require_terms=False,
+                    email_address=account_email,
+                    email_password=account_password,
+                    include_attachments=True,
+                    fallback_search_to_all=False,
+                )
+            )
+        except Exception:
+            pass
+        try:
+            found_messages.extend(
+                _fetch_recent_emails(
+                    limit=limit,
+                    search_query=search_query,
+                    mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+                    mailbox_candidates=_split_mailbox_candidates(
+                        get_setting(
+                            "EMAIL_SENT_FOLDER_CANDIDATES",
+                            "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                        )
+                    ),
+                    direction="outbound",
+                    terms=[],
+                    scan_window=max(limit * 4, 20),
+                    require_terms=False,
+                    email_address=account_email,
+                    email_password=account_password,
+                    include_attachments=False,
+                    fallback_search_to_all=False,
+                )
+            )
+        except Exception:
+            pass
+
+    return found_messages
+
+
+def _legacy_fetch_operations_email_sync(limit=50):
+    terms = get_setting(
+        "EMAIL_OPERATIONS_TERMS",
+        "quote,rate,pricing,missing info,missing,load,booking,container,appointment,pod,cancel,delivery",
+    )
+    search_terms = [term.strip() for term in str(terms).split(",") if term.strip()]
+    per_mailbox_limit = max(1, int(limit))
+
+    inbox_messages = _fetch_recent_emails(
+        limit=per_mailbox_limit,
+        search_query=get_setting("EMAIL_OPERATIONS_IMAP_SEARCH", "ALL"),
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=search_terms,
+        scan_window=max(per_mailbox_limit * 10, 250),
+        require_terms=False,
+    )
+
+    try:
+        sent_messages = _fetch_recent_emails(
+            limit=per_mailbox_limit,
+            search_query=get_setting("EMAIL_OPERATIONS_SENT_IMAP_SEARCH", "ALL"),
+            mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+            mailbox_candidates=_split_mailbox_candidates(
+                get_setting(
+                    "EMAIL_SENT_FOLDER_CANDIDATES",
+                    "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                )
+            ),
+            direction="outbound",
+            terms=search_terms,
+            scan_window=max(per_mailbox_limit * 10, 250),
+            require_terms=False,
+        )
+    except Exception:
+        sent_messages = []
+
+    return inbox_messages + sent_messages
+
+
+def _legacy_fetch_operations_email_by_message_id(message_id, limit=5):
+    normalized_message_id = normalize_message_id(message_id)
+    if not normalized_message_id:
+        return []
+
+    search_query = f'HEADER Message-ID "{normalized_message_id}"'
+    inbox_messages = _fetch_recent_emails(
+        limit=limit,
+        search_query=search_query,
+        mailbox=get_setting("EMAIL_INBOX_FOLDER", "INBOX"),
+        mailbox_candidates=_split_mailbox_candidates(
+            get_setting("EMAIL_INBOX_FOLDER_CANDIDATES", "INBOX,Inbox,inbox")
+        ),
+        direction="inbound",
+        terms=[],
+        scan_window=max(limit * 4, 20),
+        require_terms=False,
+    )
+
+    try:
+        sent_messages = _fetch_recent_emails(
+            limit=limit,
+            search_query=search_query,
+            mailbox=get_setting("EMAIL_SENT_FOLDER", "Sent"),
+            mailbox_candidates=_split_mailbox_candidates(
+                get_setting(
+                    "EMAIL_SENT_FOLDER_CANDIDATES",
+                    "Sent,Sent Messages,Sent Mail,Sent Items,sent,[Gmail]/Sent Mail",
+                )
+            ),
+            direction="outbound",
+            terms=[],
+            scan_window=max(limit * 4, 20),
+            require_terms=False,
+        )
+    except Exception:
+        sent_messages = []
+
+    return inbox_messages + sent_messages

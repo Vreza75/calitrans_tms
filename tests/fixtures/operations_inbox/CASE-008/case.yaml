@@ -1,0 +1,26 @@
+case_id: CASE-008
+name: Existing Order Delivery-Date Change
+request_type: Booking Update
+service_flow: Import
+language: English
+attachment_types: []
+existing_load_required: true
+expected_action: Update Existing Order
+critical_fields:
+  - intent
+  - decision
+  - existing_load_match
+  - booking_number
+  - containers
+noncritical_fields:
+  - queue
+  - dates
+  - references
+
+seed_load:
+  booking_number: GCR-IMP-260801
+  container_number: MSCU1234567
+  customer: Gulf Coast Retail Distribution
+  type: Import
+  status: Booking Verified
+  delivery_need_date: "2026-08-04"

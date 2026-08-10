@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import re
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from config import DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
+from utils.error_sanitizer import sanitize_message
 
 
 SM_TO_DB_COLUMNS = {
@@ -21,6 +26,7 @@ SM_TO_DB_COLUMNS = {
     "Port": "port",
     "Warehouse": "warehouse",
     "Address": "address",
+    "Full Return Terminal": "full_return_terminal",
     "Document Cutoff": "document_cutoff",
     "Delivery Need Date": "delivery_need_date",
     "LFD": "lfd",
@@ -165,6 +171,161 @@ def execute(sql: str, params: dict[str, Any] | None = None) -> None:
         conn.execute(text(sql), params or {})
 
 
+@contextmanager
+def transaction() -> Iterator[Connection]:
+    """One connection/transaction for a multi-statement business command.
+
+    Every statement run through the yielded connection commits together on
+    a clean exit and rolls back together on any exception - callers must
+    execute all writes for one command through this connection instead of
+    calling module-level execute()/read_df() (each of which opens and
+    commits its own separate transaction), or the command is not atomic.
+    """
+    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
+        yield conn
+
+
+def column_exists(table: str, column: str) -> bool:
+    """Real DB-state check for schema-readiness guards. A single round trip
+    that lets ensure_*_schema() functions skip their idempotent-but-slow
+    schema-migration statement chains once already applied, instead of
+    relying only on an in-memory session flag that doesn't survive process
+    restarts.
+
+    Used only by the explicit migration/admin DDL path (ensure_*_schema()
+    functions, scripts/run_migrations.py) - callers there already intend
+    to run DDL if the column turns out to be missing, so collapsing every
+    exception to "not found" is an acceptable, narrow simplification.
+    Normal page-render/request-path readiness checks must use
+    check_schema_readiness() instead, which does not make that
+    assumption - see its docstring."""
+    try:
+        with get_engine(get_secret("DATABASE_URL")).connect() as conn:
+            result = conn.execute(
+                text(
+                    "select 1 from information_schema.columns "
+                    "where table_name = :table and column_name = :column limit 1"
+                ),
+                {"table": table, "column": column},
+            )
+            return result.first() is not None
+    except Exception:
+        return False
+
+
+# Postgres SQLSTATE class prefixes: '08' = connection exception, '28' =
+# invalid authorization, '42501' = insufficient_privilege. See
+# https://www.postgresql.org/docs/current/errcodes-appendix.html
+_CONNECTION_SQLSTATE_PREFIXES = ("08",)
+_PERMISSION_SQLSTATES = {"42501"}
+_PERMISSION_SQLSTATE_PREFIXES = ("28",)
+
+
+@dataclass(frozen=True)
+class SchemaReadiness:
+    """Result of a non-mutating schema readiness check.
+
+    `reason` is one of "ready", "schema_missing", "connection_error",
+    "permission_error", or "unknown_error" - callers must not treat
+    connection_error/permission_error/unknown_error as proof the schema
+    is missing (that was the Phase 1 correction: column_exists() used to
+    collapse every exception, including a dropped connection, into
+    "column not found", which could make a render-path readiness check
+    look like a fresh-install case when the real problem was network or
+    credentials)."""
+
+    ready: bool
+    reason: str
+    detail: str = ""
+
+
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def check_schema_readiness(table: str, column: str) -> SchemaReadiness:
+    """Read-only readiness check for interactive render/request paths.
+
+    Never runs DDL, and never assumes a connection failure or permission
+    error means the schema is missing - each is reported as its own
+    reason so the caller can show an accurate message (and, for
+    connection/permission problems, must not suggest running migrations,
+    since that wouldn't fix either).
+
+    Uses PostgreSQL's information_schema on a real database, and SQLite's
+    PRAGMA table_info on a sqlite:// URL (test doubles without a `.dialect`
+    attribute - see tests/test_schema_readiness.py's _FakeEngine - fall
+    through to the information_schema path unchanged, since `getattr`
+    defaults dialect_name to ""). table/column are always internal,
+    hardcoded literals from this codebase's own ensure_*_schema() call
+    sites, never user input, but are still validated as safe identifiers
+    before being interpolated into the PRAGMA statement, which - unlike
+    information_schema's query - cannot bind them as parameters."""
+    dialect_name = getattr(getattr(get_engine(get_secret("DATABASE_URL")), "dialect", None), "name", "")
+
+    try:
+        with get_engine(get_secret("DATABASE_URL")).connect() as conn:
+            if dialect_name == "sqlite":
+                if not (_SAFE_IDENTIFIER_RE.match(table) and _SAFE_IDENTIFIER_RE.match(column)):
+                    raise ValueError(f"Unsafe identifier for PRAGMA table_info: table={table!r} column={column!r}")
+                result = conn.exec_driver_sql(f"PRAGMA table_info({table})")
+                found = any(row[1] == column for row in result)
+            else:
+                result = conn.execute(
+                    text(
+                        "select 1 from information_schema.columns "
+                        "where table_name = :table and column_name = :column limit 1"
+                    ),
+                    {"table": table, "column": column},
+                )
+                found = result.first() is not None
+            return SchemaReadiness(ready=found, reason="ready" if found else "schema_missing")
+    except (OperationalError, ProgrammingError) as exc:
+        pgcode = getattr(getattr(exc, "orig", None), "pgcode", None) or ""
+        if pgcode in _PERMISSION_SQLSTATES or pgcode.startswith(_PERMISSION_SQLSTATE_PREFIXES):
+            return SchemaReadiness(ready=False, reason="permission_error", detail=sanitize_message(str(exc)))
+        if pgcode.startswith(_CONNECTION_SQLSTATE_PREFIXES) or isinstance(exc, OperationalError):
+            return SchemaReadiness(ready=False, reason="connection_error", detail=sanitize_message(str(exc)))
+        return SchemaReadiness(ready=False, reason="unknown_error", detail=sanitize_message(str(exc)))
+    except Exception as exc:
+        return SchemaReadiness(ready=False, reason="unknown_error", detail=sanitize_message(str(exc)))
+
+
+class SchemaNotReadyError(RuntimeError):
+    """Raised when runtime code needs a table/column that migrations have
+    not created yet.
+
+    Runtime/request/page/service execution must never run DDL to "fix"
+    this itself - the required action is always `python
+    scripts/run_migrations.py`, run by an operator as part of deployment,
+    not a self-heal triggered by whichever request happens to hit the gap
+    first. See docs/DATABASE_MIGRATIONS.md."""
+
+
+def require_schema_ready(table: str, column: str, *, migration_hint: str) -> None:
+    """Read-only guard for runtime code that depends on schema a specific
+    migration is responsible for. Raises SchemaNotReadyError with an
+    actionable message if that migration has not been applied; returns
+    silently if it has. Never runs DDL itself."""
+    readiness = check_schema_readiness(table, column)
+    if readiness.ready:
+        return
+
+    if readiness.reason == "schema_missing":
+        raise SchemaNotReadyError(
+            f"Required schema is missing: {table}.{column}. Run "
+            f"`python scripts/run_migrations.py` (see {migration_hint}) "
+            "before using this feature."
+        )
+
+    # connection_error / permission_error / unknown_error: the real
+    # problem is connectivity or permissions, not a missing migration -
+    # do not tell the operator to run migrations, that would not fix it.
+    raise SchemaNotReadyError(
+        f"Could not verify required schema for {table}.{column} "
+        f"({readiness.reason}): {readiness.detail}"
+    )
+
+
 class DispatchDatabaseClient:
     """Postgres-backed replacement for the previous Smartsheet client."""
 
@@ -213,7 +374,33 @@ class DispatchDatabaseClient:
         df["Created Date"] = df.get("created_at")
         return df
 
-    def add_row(self, row_data: dict[str, Any]):
+    def add_row(
+        self,
+        row_data: dict[str, Any],
+        *,
+        source_intake_id: int | None = None,
+        conn: Connection | None = None,
+    ):
+        """Insert one loads row plus its creation status_events row.
+
+        `conn` is optional and defaults to None, so every existing caller
+        keeps its current one-call-one-transaction behavior unchanged. Pass
+        an open connection (see db_client.transaction()) to run this insert
+        as part of a larger multi-statement business command instead - the
+        write then commits or rolls back with the rest of that command.
+
+        `source_intake_id` is optional and defaults to None (existing
+        manual/legacy callers are unaffected). Pass the order_intake row
+        id that is creating this load to make creation idempotent: a
+        second call with the same source_intake_id does not insert a
+        second row - it resolves to the load created by the first call.
+        This is enforced by ux_loads_source_intake_id (a partial unique
+        index on loads.source_intake_id where not null - see
+        database/loads_source_intake_idempotency_migration.sql), not by
+        a Python-side existence check, so it holds under concurrent
+        callers. The returned object's `.created` flag is False when an
+        existing row was resolved this way instead of a new one being
+        inserted."""
         db_data: dict[str, Any] = {}
 
         for app_col, db_col in SM_TO_DB_COLUMNS.items():
@@ -224,26 +411,59 @@ class DispatchDatabaseClient:
 
         columns = [col for col, val in db_data.items() if val is not None]
         placeholders = [f":{col}" for col in columns]
+        insert_params = {col: db_data[col] for col in columns}
 
-        sql = f"""
-            insert into loads ({", ".join(columns)})
-            values ({", ".join(placeholders)})
-            returning id
-        """
+        if source_intake_id is not None:
+            columns = columns + ["source_intake_id"]
+            placeholders = placeholders + [":source_intake_id"]
+            insert_params["source_intake_id"] = source_intake_id
 
-        with get_engine(get_secret("DATABASE_URL")).begin() as conn:
-            new_id = conn.execute(
-                text(sql),
-                {col: db_data[col] for col in columns},
-            ).scalar_one()
+            insert_sql = text(
+                f"""
+                insert into loads ({", ".join(columns)})
+                values ({", ".join(placeholders)})
+                on conflict (source_intake_id) where source_intake_id is not null
+                do nothing
+                returning id
+                """
+            )
+        else:
+            insert_sql = text(
+                f"""
+                insert into loads ({", ".join(columns)})
+                values ({", ".join(placeholders)})
+                returning id
+                """
+            )
 
-            conn.execute(
-                text(
-                    """
-                    insert into status_events (load_id, new_status, notes, created_by)
-                    values (:load_id, :new_status, :notes, :created_by)
-                    """
-                ),
+        existing_by_source_sql = text("select id from loads where source_intake_id = :source_intake_id")
+        audit_sql = text(
+            """
+            insert into status_events (load_id, new_status, notes, created_by)
+            values (:load_id, :new_status, :notes, :created_by)
+            """
+        )
+
+        class CreatedRow:
+            def __init__(self, row_id: int, created: bool) -> None:
+                self.id = row_id
+                self.created = created
+
+        def _run(active_conn: Connection) -> "CreatedRow":
+            new_id = active_conn.execute(insert_sql, insert_params).scalar_one_or_none()
+
+            if new_id is None:
+                # ON CONFLICT ... DO NOTHING fired: a load for this
+                # source_intake_id already exists from an earlier,
+                # already-committed call - resolve and return it instead
+                # of treating this as a failure.
+                existing_id = active_conn.execute(
+                    existing_by_source_sql, {"source_intake_id": source_intake_id}
+                ).scalar_one()
+                return CreatedRow(int(existing_id), created=False)
+
+            active_conn.execute(
+                audit_sql,
                 {
                     "load_id": new_id,
                     "new_status": db_data.get("status") or "New",
@@ -251,14 +471,22 @@ class DispatchDatabaseClient:
                     "created_by": "streamlit",
                 },
             )
+            return CreatedRow(int(new_id), created=True)
 
-        class CreatedRow:
-            def __init__(self, row_id: int) -> None:
-                self.id = row_id
+        if conn is not None:
+            return _run(conn)
 
-        return CreatedRow(int(new_id))
+        with get_engine(get_secret("DATABASE_URL")).begin() as own_conn:
+            return _run(own_conn)
 
-    def update_row_fields(self, row_id: int, updates: dict[str, Any]) -> None:
+    def update_row_fields(self, row_id: int, updates: dict[str, Any], *, conn: Connection | None = None) -> None:
+        """Update editable columns on one loads row.
+
+        `conn` is optional and defaults to None, so every existing caller
+        keeps its current one-call-one-transaction behavior unchanged. Pass
+        an open connection (see db_client.transaction()) to run this update
+        as part of a larger multi-statement business command instead - the
+        write then commits or rolls back with the rest of that command."""
         allowed_db_columns = _editable_db_columns()
         db_updates: dict[str, Any] = {}
 
@@ -281,32 +509,57 @@ class DispatchDatabaseClient:
         if not db_updates:
             return
 
-        old_status = None
-        if "status" in db_updates:
-            old_df = read_df("select status from loads where id = :id", {"id": row_id})
-            if not old_df.empty:
-                old_status = old_df.iloc[0]["status"]
+        status_sql = text("select status from loads where id = :id")
+        update_sql = text(
+            f"""
+            update loads
+            set {", ".join(f"{column} = :{column}" for column in db_updates)},
+                updated_at = now()
+            where id = :id
+            """
+        )
+        audit_sql = text(
+            """
+            insert into status_events (load_id, old_status, new_status, notes, created_by)
+            values (:load_id, :old_status, :new_status, :notes, :created_by)
+            """
+        )
 
-        set_clause = ", ".join([f"{column} = :{column}" for column in db_updates])
         params = dict(db_updates)
         params["id"] = row_id
 
-        execute(
-            f"""
-            update loads
-            set {set_clause},
-                updated_at = now()
-            where id = :id
-            """,
-            params,
-        )
+        if conn is not None:
+            old_status = None
+            if "status" in db_updates:
+                old_row = conn.execute(status_sql, {"id": row_id}).first()
+                old_status = old_row[0] if old_row is not None else None
+
+            conn.execute(update_sql, params)
+
+            if "status" in db_updates and db_updates["status"] != old_status:
+                conn.execute(
+                    audit_sql,
+                    {
+                        "load_id": row_id,
+                        "old_status": old_status,
+                        "new_status": db_updates["status"],
+                        "notes": "Status updated from Streamlit",
+                        "created_by": "streamlit",
+                    },
+                )
+            return
+
+        old_status = None
+        if "status" in db_updates:
+            old_df = read_df(str(status_sql), {"id": row_id})
+            if not old_df.empty:
+                old_status = old_df.iloc[0]["status"]
+
+        execute(str(update_sql), params)
 
         if "status" in db_updates and db_updates["status"] != old_status:
             execute(
-                """
-                insert into status_events (load_id, old_status, new_status, notes, created_by)
-                values (:load_id, :old_status, :new_status, :notes, :created_by)
-                """,
+                str(audit_sql),
                 {
                     "load_id": row_id,
                     "old_status": old_status,

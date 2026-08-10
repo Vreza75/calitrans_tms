@@ -1,13 +1,14 @@
 # operations_email_intake_agent.py
 
 from __future__ import annotations
+from ai_core.llm import get_llm
 
-import json
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+from services.email_parser import extract_latest_email_body
+from services.operations_field_service import extract_operational_fields
 
 
 INTAKE_MODEL = "gpt-4.1-mini"
@@ -37,26 +38,14 @@ def detect_language(subject: str, body: str) -> str:
 
 
 def extract_quick_references(subject: str, body: str) -> dict:
-    text = f"{subject}\n{body}"
-
-    booking = re.search(
-        r"\b(?:booking|bkg|bk|reserva)\s*(?:number|no|#)?\s*[:#-]?\s*([A-Z0-9-]{5,})",
-        text,
-        re.I,
-    )
-
-    container = re.search(r"\b[A-Z]{4}\d{7}\b", text, re.I)
-
-    reference = re.search(
-        r"\b(?:ref|reference|po|referencia)\s*(?:number|no|#)?\s*[:#-]?\s*([A-Z0-9-]{4,})",
-        text,
-        re.I,
-    )
+    latest = extract_latest_email_body(body, include_signature=False) or body
+    shared = extract_operational_fields(subject=subject, newest_message=latest)
+    fields = shared["fields"]
 
     return {
-        "booking_number": booking.group(1).upper() if booking else "",
-        "container_number": container.group(0).upper() if container else "",
-        "reference_number": reference.group(1).upper() if reference else "",
+        "booking_number": str(fields.get("Booking Number") or "").upper(),
+        "container_number": str(fields.get("Container Number") or "").upper(),
+        "reference_number": str(fields.get("Reference Number") or "").upper(),
     }
 
 
@@ -147,7 +136,6 @@ def ai_intake_agent(
     """
 
     base = rule_based_intake(subject, body, sender)
-    client = OpenAI()
 
     system_prompt = """
 You are the CaliTrans AI Email Intake Agent for a drayage/container trucking company.
@@ -155,8 +143,8 @@ You are the CaliTrans AI Email Intake Agent for a drayage/container trucking com
 CaliTrans handles:
 - Import
 - Export
-- Import Local
-- Export Local
+- Local Import
+- Local Export
 - Port Houston drayage
 - warehouse transfers
 - billing/POD requests
@@ -230,17 +218,44 @@ Return JSON only.
     }
 
     try:
-        response = client.responses.create(
-            model=INTAKE_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt, default=str)},
-            ],
+        llm = get_llm()
+
+        llm_result = llm.generate_json(
+            task="operations_email_intake_agent",
+            system_prompt=system_prompt,
+            user_payload=user_prompt,
             temperature=0.1,
         )
 
-        content = response.output_text.strip()
-        result = json.loads(content)
+        if llm_result.get("ok"):
+            result = llm_result.get("output_json", {})
+
+            result["llm_used"] = True
+            result["llm_debug"] = {
+                "task": llm_result.get("task"),
+                "model": llm_result.get("model"),
+                "latency_seconds": llm_result.get("latency_seconds"),
+                "attempts": llm_result.get("attempts"),
+            }
+
+            # Keep fallback values if LLM omitted anything important
+            for key, value in base.items():
+                result.setdefault(key, value)
+
+        else:
+            result = {
+                **base,
+                "summary": "AI intake failed; using rule-based classification.",
+                "error": llm_result.get("error", ""),
+                "extracted_fields": {},
+                "match_recommendation": {},
+                "database_update_recommendation": {},
+                "draft_reply": "",
+                "llm_used": False,
+                "llm_debug": llm_result,
+                "human_review_required": True,
+                "automation_allowed": False,
+            }
 
     except Exception as exc:
         result = {
@@ -251,10 +266,11 @@ Return JSON only.
             "match_recommendation": {},
             "database_update_recommendation": {},
             "draft_reply": "",
+            "llm_used": False,
+            "llm_debug": {},
             "human_review_required": True,
             "automation_allowed": False,
-        }
-
+    }
     result["processed_at"] = datetime.utcnow().isoformat()
     result["agent_name"] = "ai_email_intake_agent_v1"
 

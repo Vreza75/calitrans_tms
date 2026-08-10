@@ -1,0 +1,40 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Local Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "LI-260803",
+  "order_numbers": [
+    "LI-260803"
+  ],
+  "container_count": 1,
+  "containers": [
+    "HJCU2468101"
+  ],
+  "customer": "Houston Home Supply",
+  "full_return_terminal": null,
+  "pickup": {
+    "terminal": "Houston Transload Warehouse",
+    "customer_pickup_address": "8700 Wallisville Road, Houston, TX 77029"
+  },
+  "delivery": {
+    "warehouse": "Houston Home Supply Distribution Center",
+    "address": "15500 North Freeway, Houston, TX 77090"
+  },
+  "dates": {
+    "delivery_need_date": "August 6, 2026"
+  },
+  "references": {
+    "reference_number": "LI-260803",
+    "container_size": "40FT",
+    "contact_name": "Melissa Grant",
+    "contact_email": "melissa.grant@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}

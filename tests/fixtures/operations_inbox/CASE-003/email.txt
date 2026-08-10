@@ -1,0 +1,26 @@
+Subject: Local Import Delivery - LI-260803
+From: Melissa Grant <melissa.grant@example.com>
+Message-ID: <case-003@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please create this local import delivery.
+
+Customer: Houston Home Supply
+Order Number: LI-260803
+Container Number: HJCU2468101
+Container Size: 40FT
+
+Pickup Location: Houston Transload Warehouse
+Pickup Address: 8700 Wallisville Road, Houston, TX 77029
+
+Delivery Location: Houston Home Supply Distribution Center
+Delivery Address: 15500 North Freeway, Houston, TX 77090
+
+Delivery Need Date: August 6, 2026
+
+This container is already at the warehouse. No port pickup or port PIN is required.
+
+Thank you,
+Melissa Grant

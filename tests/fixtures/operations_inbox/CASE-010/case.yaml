@@ -1,0 +1,17 @@
+case_id: CASE-010
+name: Two Separate Orders in One Email
+request_type: New Booking
+service_flow: Import
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Create two separate order drafts linked to one source email
+critical_fields:
+  - intent
+  - order_numbers
+  - container_count
+  - containers
+noncritical_fields:
+  - queue
+  - delivery
+  - dates

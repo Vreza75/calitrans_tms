@@ -1,0 +1,59 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 513 >>
+stream
+BT
+/F1 11 Tf
+14 TL
+50 760 Td
+(Coastal Appliance Group - New Import Order) Tj
+T*
+() Tj
+T*
+(Customer: Coastal Appliance Group) Tj
+T*
+(Booking Number: CAG-IMP-260805) Tj
+T*
+(Container Number: CMAU1122334) Tj
+T*
+(Container Size: 40HC) Tj
+T*
+(Steamship Line: CMA CGM) Tj
+T*
+(Terminal: Bayport Container Terminal) Tj
+T*
+(Warehouse: Coastal Appliance Receiving) Tj
+T*
+(Address: 6300 East Sam Houston Parkway North, Houston, TX 77049) Tj
+T*
+(Delivery Need Date: August 8, 2026) Tj
+T*
+(Last Free Day: August 7, 2026) Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+875
+%%EOF

@@ -1,0 +1,32 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "GCR-IMP-260801",
+  "order_numbers": ["GCR-IMP-260801"],
+  "container_count": 1,
+  "containers": ["MSCU1234567"],
+  "customer": "Gulf Coast Retail Distribution",
+  "pickup": {
+    "terminal": "Bayport Container Terminal"
+  },
+  "delivery": {
+    "warehouse": "Gulf Coast Retail DC",
+    "address": "4100 Market Center Drive, Houston, TX 77020"
+  },
+  "dates": {
+    "delivery_need_date": "August 4, 2026",
+    "last_free_day": "August 3, 2026"
+  },
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Elena Martinez",
+    "contact_email": "elena.martinez@example.com",
+    "contact_phone": "713-555-0101"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_critical_fields": ["intent", "service_flow", "customer", "booking_number", "containers", "dates", "references"]
+}

@@ -1,0 +1,39 @@
+{
+  "intent": "New Booking",
+  "service_flow": "Import",
+  "queue": "New Orders",
+  "decision": "Create New Order",
+  "existing_load_match": null,
+  "booking_number": "CAG-IMP-260805",
+  "order_numbers": [
+    "CAG-IMP-260805"
+  ],
+  "container_count": 1,
+  "containers": [
+    "CMAU1122334"
+  ],
+  "customer": "Coastal Appliance Group",
+  "full_return_terminal": null,
+  "pickup": {
+    "terminal": "Bayport Container Terminal"
+  },
+  "delivery": {
+    "warehouse": "Coastal Appliance Receiving",
+    "address": "6300 East Sam Houston Parkway North, Houston, TX 77049"
+  },
+  "dates": {
+    "delivery_need_date": "August 8, 2026",
+    "last_free_day": "August 7, 2026"
+  },
+  "references": {
+    "container_size": "40HC",
+    "contact_name": "Dana Phillips",
+    "contact_email": "dana.phillips@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_row_count": 1,
+  "_row_ids": [
+    1
+  ]
+}

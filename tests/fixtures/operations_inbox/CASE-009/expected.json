@@ -1,0 +1,25 @@
+{
+  "intent": "Booking Update",
+  "service_flow": null,
+  "queue": "Existing Loads",
+  "decision": "Update Existing Order",
+  "existing_load_match": 1,
+  "booking_number": "GCR-IMP-260801",
+  "order_numbers": ["GCR-IMP-260801"],
+  "container_count": 1,
+  "containers": ["MSCU1234567"],
+  "customer": "Example",
+  "pickup": {},
+  "delivery": {
+    "warehouse": "Gulf Coast Retail North DC",
+    "address": "16200 North Freeway, Houston, TX 77090"
+  },
+  "dates": {},
+  "references": {
+    "contact_name": "Elena Martinez",
+    "contact_email": "elena.martinez@example.com"
+  },
+  "missing_required_fields": [],
+  "requires_human_review": true,
+  "_critical_fields": ["intent", "decision", "existing_load_match", "booking_number", "containers"]
+}

@@ -1,0 +1,64 @@
+Subject: FCL Sea Freight Booking Confirmation - RICGX1235800
+From: Dispatch Notices <bookings@fleurdelis.example.com>
+Message-ID: <case-006-ricgx1235800@fixtures.calitrans.test>
+Date: Thu, 2 Jul 2026 10:22:00 +0000
+
+BOOKING CONFIRMATION
+Consol: C00008197
+7702 FM 1960 E, Suite 320, Humble TX 77346
+LOCAL CLIENT
+CONTINENTAL INDUSTRIES GROUP
+733 THIRD AVE. 21ST FLOOR
+NEW YORK NY 10017
+UNITED STATES
+Booking Number: RICGX1235800
+Reference Number: SO217089a/C25749C
+Date: 02-Jul-26 10:22
+
+VESSEL: CONTI CORTESIA 013W
+OPENS FOR RECEIVING: 20-Jul-26 08:00 *HAVE TRUCKER CONFIRM WITH PORT PRIOR TO INGATING*
+DOCUMENTATION CUT OFF: 22-Jul-26 12:00
+RAIL CUT OFF:
+VGM CUT OFF: 24-Jul-26 12:00
+CARGO CUT OFF: 24-Jul-26 16:00
+SAILING: 27-Jul-26
+ETA: 31-Aug-26
+
+EMPTY PICK UP: CONGLOBAL-LA PORTE
+FULL RETURN: Bayport Terminal
+EXPORTING CARRIER: ONE (OCEAN NETWORK EXPRESS)
+PLACE OF RECEIPT: Houston
+PORT OF LOADING: Houston
+PORT OF DISCHARGE: Kaohsiung
+PLACE OF DELIVERY: Kaohsiung
+
+NUMBER OF CNTRS: 4 X 40HC
+CARGO DESCRIPTION: RESIN NON HAZ
+
+SUPPLIER/WAREHOUSE ADDRESS: * NO ORGANIZATION IS SELECTED *
+PICK-UP TRANSPORTATION COMPANY: * NO ORGANIZATION IS SELECTED *
+
+**HAPAG Bookings: Effective immediately Carrier will implement and invoice a $25 per container
+cancellation fee if bookings are cancelled, reduced, or rolled 3 calendar days or less prior to the
+port cut off. To avoid this fee, please make any changes or cancellations at least 4 days prior to
+the port cut off.
+
+It is hereby agreed that this Contract shall be performed subject to the terms contained on Page 1
+hereof, which shall prevail over any previous arrangements and which shall in turn be superseded
+(except as to dead freight) by the terms of the Bill of Lading. "Rate as per NRA; Receipt of the
+booking confirmation indicates NRA acceptance previously quoted via email".
+
+Sea Freight FCL Rate Sheet Page 1 of 1
+DATE 02-Jul-26 10:22
+ORDER NUMBERS: SO217089a/C25749C
+OCEAN BILL OF LADING: RICGX1235800
+HOUSE BILL OF LADING: RICGX1235800
+LOCAL CLIENT: CONTINENTAL INDUSTRIES GROUP
+
+THE CHARGES BELOW WILL BE INVOICED TO: CONTINENTAL INDUSTRIES GROUP (CONINDNYC)
+CHARGE DESCRIPTION CHARGE (USD) TAX (USD) AMOUNT (USD)
+Sea Freight - 4 40HC @ USD 320.00/CN 1,280.00 0.00 1,280.00
+Documentation Fee 75.00 0.00 75.00
+AES Fee 50.00 0.00 50.00
+Job Total 1,405.00 0.00 1,405.00
+Please Note: This Document is not an Invoice. Charges may be subject to change.

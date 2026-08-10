@@ -1,0 +1,19 @@
+case_id: CASE-000
+name: Certification harness smoke test (infrastructure only, not a certified business case)
+request_type: New Booking
+service_flow: Import
+language: English
+attachment_types: []
+existing_load_required: false
+expected_action: Create New Order
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - containers
+noncritical_fields:
+  - pickup
+  - delivery
+  - dates
+  - references

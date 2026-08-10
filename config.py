@@ -8,11 +8,6 @@ except Exception:
     tomllib = None
 
 try:
-    import streamlit as st
-except Exception:
-    st = None
-
-try:
     from dotenv import load_dotenv
 except Exception:
     def load_dotenv(*args, **kwargs):
@@ -110,7 +105,12 @@ def _first_secret(names: list[str], default: str | None = None) -> str | None:
 
 
 def get_secret(name: str, default: str | None = None) -> str | None:
-    """Read config from Streamlit secrets, environment, and local fallback files."""
+    """Read config from Streamlit secrets, environment, and local fallback
+    files, in that order (Streamlit secrets win - see
+    tests/test_config_precedence.py). get_streamlit_secret() only ever
+    consults an already-imported streamlit module (see its docstring), so
+    this precedence-first check does not by itself cause `import config`
+    to pull in streamlit for processes that never imported it themselves."""
     value = get_streamlit_secret(name)
     if value not in [None, ""]:
         return str(value).strip()
@@ -131,8 +131,25 @@ def get_secret(name: str, default: str | None = None) -> str | None:
 
 
 def get_streamlit_secret(name: str) -> str | None:
+    # Only consult st.secrets if streamlit is already running in this
+    # process (i.e. sys.modules already has it, because `streamlit run
+    # app.py` - or a page/component under it - imported it first). Never
+    # trigger a fresh `import streamlit` here: config.py is imported by
+    # db_client.py, which every repository and application service
+    # imports for DB access, and every one of the many get_secret() calls
+    # below runs at config.py's own import time. A cold `import streamlit`
+    # from inside this function would make it impossible for FastAPI,
+    # scripts, tests, or the application/ layer to import anything
+    # DB-adjacent without pulling in Streamlit - even though none of them
+    # ever need st.secrets (they read DATABASE_URL etc. from the
+    # environment or a local secrets file instead; see get_secret()).
+    import sys
+
+    if "streamlit" not in sys.modules:
+        return None
+
     try:
-        value = st.secrets.get(name)
+        value = sys.modules["streamlit"].secrets.get(name)
     except Exception:
         return None
     return value

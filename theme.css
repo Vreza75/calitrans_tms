@@ -1,290 +1,333 @@
 <style>
 :root {
-    --ct-blue: #003B8E;
-    --ct-navy: #061B3A;
-    --ct-yellow: #FFD200;
-    --ct-red: #CE1126;
-    --ct-green: #16803C;
-    --ct-orange: #F97316;
-    --ct-gray: #f6f8fb;
-    --ct-border: #dbe3ef;
+    /* Primitive tokens — raw brand + neutral values */
+    --ct-navy-900: #061B3A;
+    --ct-blue-700: #003B8E;
+    --ct-blue-600: #0B4FA8;
+    --ct-yellow-500: #FFD200;
+    --ct-red-600: #CE1126;
+    --ct-green-700: #16803C;
+    --ct-orange-600: #F97316;
+
+    --ct-gray-50: #F6F8FB;
+    --ct-gray-100: #EEF2F8;
+    --ct-gray-200: #D8E0EC;
+    --ct-gray-300: #C3CEDE;
+    --ct-gray-500: #64748B;
+    --ct-gray-700: #334155;
+    --ct-gray-900: #0F172A;
+
+    /* Semantic tokens — what things mean */
+    --surface-page: var(--ct-gray-50);
+    --surface-card: #FFFFFF;
+    --text-primary: var(--ct-gray-900);
+    --text-muted: var(--ct-gray-500);
+    --border-default: var(--ct-gray-200);
+    --action-primary: var(--ct-blue-700);
+    --action-primary-hover: var(--ct-navy-900);
+    --action-accent: var(--ct-yellow-500);
+
+    /* Component tokens — spacing, radius, type scale */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 20px;
+    --space-6: 24px;
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --shadow-card: 0 4px 16px rgba(15, 23, 42, 0.06);
+
+    --font-size-label: 0.72rem;
+    --font-size-body: 0.86rem;
+    --font-size-title: 1.35rem;
+    --font-size-metric: 1.45rem;
+}
+
+html, body, [class*="css"] {
+    font-family: "Inter", "Segoe UI", Arial, sans-serif;
 }
 
 [data-testid="stAppViewContainer"] {
-    background: #f6f8fb;
+    background: var(--surface-page);
 }
 
 .block-container {
-    padding-top: 0.8rem;
+    padding-top: var(--space-3);
+    padding-bottom: var(--space-6);
     max-width: 1320px;
 }
 
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 
-.hero {
-    position: relative;
-    overflow: hidden;
-    border-radius: 8px;
-    margin-bottom: 16px;
-    min-height: 210px;
-    background:
-        linear-gradient(90deg, rgba(6,27,58,.98) 0%, rgba(0,59,142,.92) 45%, rgba(6,27,58,.78) 100%),
-        url("https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1800&q=80");
-    background-size: cover;
-    background-position: center;
-    box-shadow: 0 8px 18px rgba(6, 27, 58, .14);
-}
-
-.hero::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 18px;
-    background: linear-gradient(90deg, var(--ct-yellow) 0 33%, var(--ct-blue) 33% 66%, var(--ct-red) 66% 100%);
-}
-
-.hero::after {
-    content: "";
-    position: absolute;
-    top: 16px;
-    right: -80px;
-    width: 60%;
-    height: 72px;
-    background: linear-gradient(135deg, var(--ct-yellow) 0 32%, var(--ct-blue) 32% 62%, var(--ct-red) 62%);
-    clip-path: ellipse(70% 55% at 50% 0%);
-    opacity: .96;
-}
-
-.hero-inner {
-    position: relative;
-    z-index: 2;
-    padding: 42px 48px 36px 48px;
-}
-
-.brand-row {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    margin-bottom: 28px;
-}
-
-.brand-logo {
-    width: 170px;
-    height: auto;
-    background: white;
-    border-radius: 8px;
-    padding: 8px 12px;
-    box-shadow: 0 8px 25px rgba(0,0,0,.18);
-}
-
-.hero h1 {
-    color: white;
-    font-size: 36px;
-    line-height: 1.05;
-    margin: 0;
-    font-weight: 900;
+h1, h2, h3 {
     letter-spacing: 0;
+    color: var(--text-primary);
+}
+h2, h3 {
+    font-weight: 750;
 }
 
-.hero p {
-    color: #dceafe;
-    font-size: 17px;
-    margin: 12px 0 0 0;
-}
-
-.hero-slogan {
-    position: absolute;
-    right: 40px;
-    bottom: 30px;
-    color: var(--ct-yellow);
-    font-size: 28px;
-    font-weight: 800;
-    font-style: italic;
-    text-shadow: 0 3px 12px rgba(0,0,0,.4);
-}
-
-.kpi-card {
-    background: rgba(255,255,255,.96);
-    border: 1px solid var(--ct-border);
-    border-radius: 8px;
-    padding: 22px 20px;
-    box-shadow: none;
-    display: flex;
-    gap: 16px;
-    align-items: center;
-    min-height: 108px;
-}
-
-.kpi-icon {
-    width: 54px;
-    height: 54px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    font-size: 28px;
-    border: 2px solid currentColor;
-}
-
-.kpi-label {
-    text-transform: uppercase;
-    font-size: 13px;
-    letter-spacing: .06em;
-    font-weight: 900;
-    margin-bottom: 5px;
-}
-
-.kpi-value {
-    color: #05142f;
-    font-size: 34px;
-    font-weight: 950;
-    line-height: 1;
-}
-
-.kpi-sub {
-    color: #64748b;
-    font-size: 13px;
-    margin-top: 7px;
-}
-
-.kpi-blue { color: var(--ct-blue); }
-.kpi-green { color: var(--ct-green); }
-.kpi-orange { color: var(--ct-orange); }
-.kpi-yellow { color: #e2a900; }
-
-.section-title {
-    color: var(--ct-navy);
-    font-size: 24px;
-    font-weight: 900;
-    margin: 26px 0 14px 0;
-    border-left: 7px solid var(--ct-yellow);
-    padding-left: 14px;
-}
-
-.stTabs [data-baseweb="tab-list"] {
-    gap: 18px;
-    border-bottom: 1px solid #d9e1ec;
-}
-
-.stTabs [data-baseweb="tab"] {
-    height: 52px;
-    padding: 0 12px;
-    font-weight: 700;
-    color: var(--ct-navy);
-}
-
-.stTabs [aria-selected="true"] {
-    color: var(--ct-blue) !important;
-    border-bottom: 4px solid var(--ct-yellow);
-}
-
-[data-testid="stDataFrame"] {
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid var(--ct-border);
-    box-shadow: none;
-}
-
-.stButton > button {
-    background: linear-gradient(90deg, var(--ct-yellow), #ffbd00);
-    color: #061B3A;
-    border: 0;
-    border-radius: 8px;
-    padding: .65rem 1.1rem;
-    font-weight: 900;
-    box-shadow: none;
-}
-
-.stButton > button:hover {
-    background: linear-gradient(90deg, #ffd92e, var(--ct-yellow));
-    color: #061B3A;
-    border: 0;
-}
-
-.footer-band {
-    margin-top: 40px;
-    padding: 18px;
-    border-radius: 8px;
-    color: var(--ct-yellow);
-    background:
-        linear-gradient(90deg, #061B3A, #003B8E, #061B3A);
-    text-align: center;
-    font-weight: 800;
-}
-
-@media (max-width: 900px) {
-    .hero h1 {font-size: 32px;}
-    .hero-slogan {display:none;}
-    .brand-logo {width: 130px;}
-    .hero-inner {padding: 35px 28px;}
-}
-.stTabs [data-baseweb="tab-list"] {
-    gap: 12px;
-    border-bottom: 2px solid #d9e1ec;
-}
-
-.stTabs [data-baseweb="tab"] {
-    border: 1px solid #dbe3ef;
-    border-radius: 10px 10px 0 0;
-    padding: 10px 16px;
-    background: #ffffff;
-    font-weight: 800;
-    box-shadow: 0 3px 10px rgba(15, 23, 42, .05);
-}
-
-.stTabs [aria-selected="true"] {
-    background: #fff8dc !important;
-    color: #003B8E !important;
-    border: 2px solid #FFD200 !important;
-    border-bottom: 4px solid #FFD200 !important;
-}
-/* Banner spacing */
 .banner-wrapper {
     width: 100%;
-    margin-bottom: 16px;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     overflow: hidden;
-    box-shadow: 0 8px 18px rgba(6, 27, 58, .14);
-    background: white;
+    margin-bottom: var(--space-4);
+    box-shadow: var(--shadow-card);
+    background: var(--surface-card);
 }
-
 .header-banner {
     width: 100%;
     height: auto;
     display: block;
-    border-radius: 8px;
 }
 
-/* Reduce gap after banner */
-div[data-testid="stHorizontalBlock"] {
-    margin-top: 0rem;
+/* Metric / load cards */
+.metric-card, .ops-metric-card {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: var(--space-4);
+    background: var(--surface-card);
+    box-shadow: var(--shadow-card);
 }
-
-/* Tab button borders */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 12px;
-    border-bottom: 2px solid #d9e1ec;
+.ops-metric-card {
+    padding: var(--space-3) var(--space-4);
+    min-height: 74px;
+    border-radius: var(--radius-sm);
 }
-
-.stTabs [data-baseweb="tab"] {
-    border: 1px solid #dbe3ef;
-    border-radius: 10px 10px 0 0;
-    padding: 10px 16px;
-    background: #ffffff;
+.ops-metric-label {
+    color: var(--text-muted);
+    font-size: var(--font-size-label);
+    font-weight: 700;
+    margin-bottom: var(--space-1);
+}
+.ops-metric-value {
+    color: var(--text-primary);
+    font-size: var(--font-size-metric);
     font-weight: 800;
-    box-shadow: 0 3px 10px rgba(15, 23, 42, .05);
+    line-height: 1.05;
+}
+.ops-metric-sub {
+    color: var(--text-muted);
+    font-size: var(--font-size-label);
+    margin-top: var(--space-1);
 }
 
-.stTabs [aria-selected="true"] {
-    background: #fff8dc !important;
-    color: #003B8E !important;
-    border: 2px solid #FFD200 !important;
-    border-bottom: 4px solid #FFD200 !important;
+.load-card {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    padding: var(--space-3);
+    margin-bottom: var(--space-2);
+    background: var(--surface-card);
+    box-shadow: var(--shadow-card);
 }
-div[data-testid="stHorizontalBlock"] {
-    margin-top: 0px !important;
-    padding-top: 0px !important;
+.load-card-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+}
+.load-card-small {
+    color: var(--text-muted);
+    font-size: var(--font-size-label);
+}
+
+/* Status badge (see ui_components/status_badge.py) */
+.ct-status-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: var(--font-size-label);
+    font-weight: 700;
+    color: var(--ct-gray-900);
+    border: 1px solid rgba(15, 23, 42, 0.12);
+    white-space: nowrap;
+}
+
+/* Legacy fixed pills kept for existing call sites */
+.status-pill {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: var(--font-size-label);
+    background: #e0f2fe;
+    color: #075985;
+    font-weight: 700;
+}
+.danger-pill {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: var(--font-size-label);
+    background: #fee2e2;
+    color: #991b1b;
+    font-weight: 700;
+}
+.success-pill {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: var(--font-size-label);
+    background: #dcfce7;
+    color: #166534;
+    font-weight: 700;
+}
+
+/* Streamlit component overrides */
+div[data-testid="stExpander"] {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--surface-card);
+    box-shadow: none;
+}
+div[data-testid="stMetric"] {
+    background: var(--surface-card);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    box-shadow: none;
+}
+div[data-testid="stMetricLabel"] {
+    font-size: var(--font-size-label);
+    color: var(--text-muted);
+    font-weight: 650;
+}
+div[data-testid="stMetricValue"] {
+    font-size: 1.35rem;
+    color: var(--text-primary);
+    font-weight: 750;
+}
+.stButton > button {
+    border-radius: var(--radius-sm) !important;
+    min-height: 2.35rem;
+    padding: 0.45rem 0.9rem;
+    font-size: var(--font-size-body);
+    font-weight: 700;
+    box-shadow: none !important;
+    background: var(--action-primary) !important;
+    color: #FFFFFF !important;
+    border: 1px solid var(--action-primary) !important;
+}
+.stButton > button:hover {
+    background: var(--action-primary-hover) !important;
+    border-color: var(--action-primary-hover) !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: var(--space-2) !important;
+    border-bottom: 1px solid var(--border-default) !important;
+}
+.stTabs [data-baseweb="tab"] {
+    min-height: 38px !important;
+    height: 38px !important;
+    padding: 0 10px !important;
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0 !important;
+    font-size: 0.78rem !important;
+    font-weight: 650 !important;
+    box-shadow: none !important;
+    border: 1px solid var(--border-default) !important;
+    background: var(--surface-card) !important;
+}
+.stTabs [aria-selected="true"] {
+    background: #FFF8D7 !important;
+    color: var(--action-primary) !important;
+    border-color: var(--action-accent) !important;
+    border-bottom: 3px solid var(--action-accent) !important;
+}
+[data-testid="stDataFrame"] {
+    border-radius: var(--radius-sm) !important;
+    border: 1px solid var(--border-default) !important;
+    box-shadow: none !important;
+}
+
+/* Sidebar nav */
+section[data-testid="stSidebar"] .stRadio > div {
+    gap: var(--space-1);
+}
+section[data-testid="stSidebar"] .stRadio label {
+    border-radius: var(--radius-sm);
+    padding: 6px var(--space-2) !important;
+}
+section[data-testid="stSidebar"] .stRadio label:hover {
+    background: rgba(0, 59, 142, 0.06);
+}
+
+/* Operations Inbox page header (kept for pages_app/operations_inbox.py) */
+.ops-header {
+    margin: var(--space-1) 0 var(--space-4) 0;
+    padding: 0;
+}
+.ops-kicker {
+    color: var(--text-muted);
+    font-size: var(--font-size-label);
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0;
+    margin-bottom: var(--space-1);
+}
+.ops-title {
+    color: var(--text-primary);
+    font-size: var(--font-size-title);
+    line-height: 1.2;
+    font-weight: 800;
+    margin: 0;
+}
+.ops-subtitle {
+    color: var(--text-muted);
+    font-size: var(--font-size-body);
+    line-height: 1.45;
+    margin-top: var(--space-2);
+    max-width: 780px;
+}
+.ops-alert {
+    border: 1px solid #CFE0F8;
+    border-radius: var(--radius-sm);
+    background: #EAF3FF;
+    color: #064B91;
+    padding: var(--space-3) var(--space-3);
+    font-size: var(--font-size-body);
+    line-height: 1.45;
+}
+
+/* Booking Workspace popup (pages_app/dispatch_board.py render_dispatch_board_focused).
+   Sized via click-based presets (Compact/Medium/Large/Full Screen, chosen
+   with a radio control inside the popup) rather than native CSS
+   resize:both drag-resize — dragging the popup's own edge conflicted with
+   the dialog's click-outside/dismiss handling and made it disappear
+   mid-drag. Baseweb centers the dialog with its own position:fixed +
+   transform:translate(-50%,-50%), which is left untouched here and
+   handles re-centering fine for a discrete width/height change (unlike a
+   continuous drag). The width/height below are just the default/fallback
+   before the popup's own inline <style> (written per the selected preset)
+   takes over. div[data-testid="stDialog"] only sizes the outer popup box —
+   Streamlit's own internal wrappers (.block-container, then
+   stVerticalBlock) each have their own intrinsic/capped width, so they
+   have to be forced to fill the popup too, or content stays centered at
+   its original small size with empty space around it. */
+div[data-testid="stDialog"] {
+    overflow-x: auto;
+    overflow-y: auto;
+    width: 70vw;
+    height: 75vh;
+    min-width: 360px;
+    min-height: 240px;
+    max-width: 96vw;
+    max-height: 94vh;
+    box-sizing: border-box;
+}
+div[data-testid="stDialog"] > div {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stDialog"] .block-container {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: var(--space-3) !important;
+}
+div[data-testid="stDialog"] [data-testid="stVerticalBlock"],
+div[data-testid="stDialog"] [data-testid="stVerticalBlockBorderWrapper"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
 }
 </style>

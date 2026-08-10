@@ -1,0 +1,28 @@
+Subject: New Import Booking - GCR-IMP-260801
+From: Elena Martinez <elena.martinez@example.com>
+Message-ID: <case-001@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please create a new import order with the following information.
+
+Customer: Gulf Coast Retail Distribution
+Booking Number: GCR-IMP-260801
+Container Number: MSCU1234567
+Container Size: 40HC
+Steamship Line: MSC
+Pickup Terminal: Bayport Container Terminal
+Delivery Warehouse: Gulf Coast Retail DC
+Delivery Address: 4100 Market Center Drive, Houston, TX 77020
+Delivery Need Date: August 4, 2026
+Last Free Day: August 3, 2026
+
+Contact: Elena Martinez
+Email: elena.martinez@example.com
+Phone: 713-555-0101
+
+Please confirm once the order has been entered.
+
+Thank you,
+Elena Martinez

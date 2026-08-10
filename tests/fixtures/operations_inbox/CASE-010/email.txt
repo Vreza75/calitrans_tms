@@ -1,0 +1,29 @@
+Subject: Two New Import Bookings - Apex Retail
+From: Nathan Brooks <nathan.brooks@example.com>
+Message-ID: <case-010@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please enter these two separate import orders for Apex Retail.
+
+Order 1
+Booking Number: APEX-260810
+Container Number: HLXU3000001
+Container Size: 40HC
+Terminal: Bayport Container Terminal
+Delivery Address: 3400 Commerce Street, Houston, TX 77002
+Delivery Need Date: August 12, 2026
+
+Order 2
+Booking Number: APEX-260811
+Container Number: HLXU3000002
+Container Size: 20FT
+Terminal: Barbours Cut Terminal
+Delivery Address: 7800 Airport Boulevard, Houston, TX 77061
+Delivery Need Date: August 13, 2026
+
+These are separate bookings and should not be combined.
+
+Thank you,
+Nathan Brooks

@@ -1,8 +1,11 @@
 # ai_agents/operations_parser_agent.py
 
-import re
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
+
+from ai_core.llm import get_llm
 
 
 @dataclass
@@ -13,16 +16,21 @@ class ParserResult:
     confidence: float
     requires_human_review: bool
     summary: str
+    llm_used: bool
+    llm_debug: Dict
 
 
 class OperationsParserAgent:
     """
-    Agent 3: Operations Parser
+    Agent 3: LLM-first Operations Parser.
 
     Purpose:
-    Understand what operational data changed or is being requested.
-    Does NOT update database directly.
-    It only recommends proposed updates.
+    Understand operational meaning from emails:
+    appointments, delivery changes, reefer temperature, warehouse changes,
+    port changes, missing info, billing docs, POD requests, etc.
+
+    Does NOT update the database directly.
+    Only recommends proposed updates.
     """
 
     def analyze(
@@ -31,197 +39,119 @@ class OperationsParserAgent:
         body: str,
         intent_result: Optional[Dict] = None,
         existing_load: Optional[Dict] = None,
+        company_memory: Optional[Dict] = None,
+        conversation_context: Optional[Dict] = None,
     ) -> Dict:
-        text = f"{subject or ''}\n{body or ''}"
-        lowered = text.lower()
 
-        proposed_updates = {}
+        llm = get_llm()
 
-        container = self._extract_container(text)
-        booking = self._extract_booking(text)
-        date_change = self._extract_date_change(text)
-        appointment_time = self._extract_time(text)
-        warehouse = self._extract_warehouse(text)
-        port = self._extract_port(text)
+        system_prompt = """
+You are CaliTrans Operations Parser Agent.
 
-        if container:
-            proposed_updates["Container Number"] = container
+CaliTrans is a drayage trucking company handling Port Houston containers,
+warehouses, appointments, drivers, billing, and dispatch.
 
-        if booking:
-            proposed_updates["Booking Number"] = booking
+Your job:
+Extract operational meaning from the email.
 
-        if date_change:
-            proposed_updates["Delivery Need Date"] = date_change
+Do NOT invent missing information.
+Do NOT update the database.
+Only return proposed updates for dispatcher review.
 
-        if appointment_time:
-            proposed_updates["Appointment Time"] = appointment_time
+Return only valid JSON.
 
-        if warehouse:
-            proposed_updates["Warehouse"] = warehouse
+Allowed detected_change_type examples:
+new_booking_details
+appointment_request
+pickup_appointment_change
+delivery_appointment_change
+date_change
+time_change
+warehouse_change
+port_change
+container_update
+booking_update
+reefer_temperature
+status_request
+billing_request
+pod_request
+cancel_request
+missing_information
+general_update
+unknown
 
-        if port:
-            proposed_updates["Port"] = port
+Required JSON keys:
+detected_change_type
+proposed_updates
+missing_fields
+confidence
+requires_human_review
+summary
 
-        change_type = self._detect_change_type(lowered, intent_result)
+proposed_updates should use friendly field names such as:
+Booking Number
+Container Number
+Container Qty
+Reference Number
+Customer
+Port
+Terminal
+Warehouse
+Address
+Delivery Need Date
+Pickup Appointment
+Delivery Appointment
+Requested Receive Date
+Requested Receive Time
+Requested Pickup Date
+Requested Pickup Time
+Reefer Temperature
+Commodity
+Size
+Driver Instructions
+Billing Notes
+Dispatcher Notes
+"""
 
-        missing_fields = self._detect_missing_fields(proposed_updates, intent_result)
+        user_payload = {
+            "email": {
+                "subject": subject or "",
+                "body": (body or "")[:8000],
+            },
+            "intent_result": intent_result or {},
+            "existing_load": existing_load or {},
+            "company_memory": company_memory or {},
+            "conversation_context": conversation_context or {},
+        }
 
-        confidence = self._calculate_confidence(
-            proposed_updates=proposed_updates,
-            intent_result=intent_result,
-            text=lowered,
+        llm_result = llm.generate_json(
+            task="operations_parser_agent",
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            temperature=0.1,
         )
 
-        requires_review = confidence < 0.85 or change_type in {
-            "date_change",
-            "warehouse_change",
-            "cancel_request",
-        }
+        if llm_result.get("ok"):
+            data = llm_result.get("output_json", {})
+
+            return asdict(ParserResult(
+                detected_change_type=data.get("detected_change_type", "unknown"),
+                proposed_updates=data.get("proposed_updates", {}),
+                missing_fields=data.get("missing_fields", []),
+                confidence=float(data.get("confidence", 0.50)),
+                requires_human_review=bool(data.get("requires_human_review", True)),
+                summary=data.get("summary", "LLM parser completed."),
+                llm_used=True,
+                llm_debug=llm_result,
+            ))
 
         return asdict(ParserResult(
-            detected_change_type=change_type,
-            proposed_updates=proposed_updates,
-            missing_fields=missing_fields,
-            confidence=confidence,
-            requires_human_review=requires_review,
-            summary=self._build_summary(change_type, proposed_updates, confidence),
+            detected_change_type="unknown",
+            proposed_updates={},
+            missing_fields=[],
+            confidence=0.25,
+            requires_human_review=True,
+            summary="Manual review required. LLM parser failed.",
+            llm_used=False,
+            llm_debug=llm_result,
         ))
-
-    def _extract_container(self, text: str) -> str:
-        match = re.search(r"\b[A-Z]{4}\d{7}\b", text, re.I)
-        return match.group(0).upper() if match else ""
-
-    def _extract_booking(self, text: str) -> str:
-        match = re.search(
-            r"\b(?:booking|bkg|bk)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{4,})\b",
-            text,
-            re.I,
-        )
-        return match.group(1).upper() if match else ""
-
-    def _extract_date_change(self, text: str) -> str:
-        patterns = [
-            r"\b(?:deliver|delivery|entregar|entrega)\s+(?:on\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-            r"\b(?:instead of|en vez de)\s+\w+\s+(?:deliver|delivery|entregar)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-            r"\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\b",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                return match.group(1)
-
-        spanish_days = {
-            "lunes": "Monday",
-            "martes": "Tuesday",
-            "miercoles": "Wednesday",
-            "miércoles": "Wednesday",
-            "jueves": "Thursday",
-            "viernes": "Friday",
-            "sabado": "Saturday",
-            "sábado": "Saturday",
-            "domingo": "Sunday",
-        }
-
-        lowered = text.lower()
-        for spanish, english in spanish_days.items():
-            if spanish in lowered:
-                return english
-
-        return ""
-
-    def _extract_time(self, text: str) -> str:
-        match = re.search(
-            r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?)\b",
-            text,
-            re.I,
-        )
-        return match.group(1).strip() if match else ""
-
-    def _extract_warehouse(self, text: str) -> str:
-        patterns = [
-            r"(?:warehouse|bodega|almacen|almacén)\s*[:#-]?\s*([A-Za-z0-9 ,.-]{4,80})",
-            r"(?:deliver to|entregar en)\s+([A-Za-z0-9 ,.-]{4,80})",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                return match.group(1).strip()
-
-        return ""
-
-    def _extract_port(self, text: str) -> str:
-        ports = [
-            "Barbours Cut",
-            "Bayport",
-            "Port Houston",
-            "Houston Terminal",
-        ]
-
-        lowered = text.lower()
-        for port in ports:
-            if port.lower() in lowered:
-                return port
-
-        return ""
-
-    def _detect_change_type(self, text: str, intent_result: Optional[Dict]) -> str:
-        intent = ""
-        if isinstance(intent_result, dict):
-            intent = intent_result.get("primary_intent", "")
-
-        if intent:
-            return intent
-
-        if any(term in text for term in ["cancel", "cancelar"]):
-            return "cancel_request"
-
-        if any(term in text for term in ["reschedule", "change date", "cambiar fecha", "reprogramar"]):
-            return "date_change"
-
-        if any(term in text for term in ["warehouse", "bodega", "almacen", "almacén"]):
-            return "warehouse_change"
-
-        if any(term in text for term in ["appointment", "appt", "cita"]):
-            return "appointment_request"
-
-        return "general_update"
-
-    def _detect_missing_fields(self, proposed_updates: Dict, intent_result: Optional[Dict]) -> List[str]:
-        intent = ""
-        if isinstance(intent_result, dict):
-            intent = intent_result.get("primary_intent", "")
-
-        required_by_intent = {
-            "new_booking": ["Booking Number", "Container Number", "Warehouse", "Delivery Need Date"],
-            "appointment_request": ["Appointment Time", "Delivery Need Date"],
-            "warehouse_change": ["Warehouse"],
-            "date_change": ["Delivery Need Date"],
-            "status_request": [],
-            "billing_docs": [],
-        }
-
-        required = required_by_intent.get(intent, [])
-        return [field for field in required if not proposed_updates.get(field)]
-
-    def _calculate_confidence(self, proposed_updates: Dict, intent_result: Optional[Dict], text: str) -> float:
-        confidence = 0.50
-
-        if proposed_updates:
-            confidence += min(len(proposed_updates) * 0.10, 0.30)
-
-        if isinstance(intent_result, dict):
-            confidence += float(intent_result.get("confidence", 0)) * 0.20
-
-        if any(term in text for term in ["please", "favor", "attached", "adjunto"]):
-            confidence += 0.05
-
-        return round(min(confidence, 0.97), 2)
-
-    def _build_summary(self, change_type: str, proposed_updates: Dict, confidence: float) -> str:
-        if not proposed_updates:
-            return f"Detected {change_type}, but no direct load field updates were found."
-
-        fields = ", ".join(proposed_updates.keys())
-        return f"Detected {change_type}. Proposed update fields: {fields}. Confidence: {confidence}."

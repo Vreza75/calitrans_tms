@@ -1,0 +1,20 @@
+Subject: [TMS-TEST] New Booking - Harness Smoke Test
+From: QA Harness <qa-harness@fixtures.calitrans.test>
+Message-ID: <case-000-smoke@fixtures.calitrans.test>
+Date: Mon, 1 Jun 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please create a new import order with the following information.
+
+Customer: Harness Smoke Test Customer
+Booking Number: SMOKE-000
+Container Number: TEST0000001
+Container Size: 40HC
+Pickup Terminal: Test Terminal
+Delivery Warehouse: Test Warehouse
+Delivery Address: 1 Test Way, Houston, TX 77001
+Delivery Need Date: January 1, 2027
+
+Thank you,
+QA Harness

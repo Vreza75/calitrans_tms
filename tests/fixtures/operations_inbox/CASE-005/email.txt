@@ -1,0 +1,13 @@
+Subject: New Import Order - Attached Booking Document
+From: Dana Phillips <dana.phillips@example.com>
+Message-ID: <case-005@fixtures.calitrans.test>
+Date: Mon, 27 Jul 2026 09:00:00 +0000
+
+Hello Dispatch,
+
+Please create the new import order using the attached booking document.
+
+Please confirm if any required information is missing.
+
+Thank you,
+Dana Phillips

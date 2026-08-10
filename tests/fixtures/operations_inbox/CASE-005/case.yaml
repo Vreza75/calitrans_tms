@@ -1,0 +1,20 @@
+case_id: CASE-005
+name: New Import with PDF Attachment
+request_type: New Booking
+service_flow: Import
+language: English
+attachment_types: [pdf]
+existing_load_required: false
+expected_action: Create New Order
+critical_fields:
+  - intent
+  - service_flow
+  - customer
+  - booking_number
+  - containers
+  - delivery
+  - dates
+noncritical_fields:
+  - queue
+  - pickup
+  - references
