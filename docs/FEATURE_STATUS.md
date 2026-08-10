@@ -23,11 +23,11 @@ and compares the result field-by-field against a hand-approved
 | CASE-007 | Container quantity mismatch (declared vs. found) | ACCEPTED |
 | CASE-008 | Existing order delivery-date change | ACCEPTED |
 | CASE-009 | Delivery address change after driver assignment | ACCEPTED |
-| CASE-010 | Two separate orders in one email | **NOT ACCEPTED** — real capability gap (no multi-order detection/splitting exists); not started |
+| CASE-010 | Two separate orders in one email | ACCEPTED |
 
-**Next planned work**: CASE-010, via the same brainstorm → spec → plan →
-subagent-driven-implementation cycle CASE-007 went through. See
-`docs/handoffs/CURRENT_SESSION_HANDOFF.md` §10 for the exact next action.
+**Next planned work**: none currently queued for the certification harness.
+See `tests/fixtures/operations_inbox/CASE-010/verification.md` for CASE-010's
+acceptance audit and known limitations.
 
 ### Capabilities added while certifying CASE-007
 
@@ -38,6 +38,31 @@ subagent-driven-implementation cycle CASE-007 went through. See
   (`detect_container_quantity_mismatch`) routed to the existing `Review`
   work queue (`enforce_container_quantity_mismatch_review`) — no new
   schema/enum, no hard block on order creation.
+
+### Capabilities added while certifying CASE-010
+
+- Explicit multi-order block detection on `Order N` headers, 2-10 blocks
+  (`services/email_parser.py::detect_order_blocks`) — one `order_intake`
+  row inserted per detected block instead of one per email
+  (`services/operations_inbox_service.py::_prepare_operations_email_records`,
+  `_assign_split_row_identity`, `_insert_operations_email_record_row`).
+  Row identity: block 0 keeps the real `source_message_id`; block N≥1 gets
+  a synthetic `::order-N` suffix; all blocks share `email_thread_id`.
+- Narrow customer-name-in-prose fallback (`_customer_from_prose`) for
+  emails with no `Customer:` label, consulted only after label-based and
+  signature-derived lookups both come up empty.
+- Known limitation (not fixed): the per-block insert loop isn't
+  transactional — if block N's insert fails after block N-1 already
+  committed, block N-1's row is stranded permanently (rerun-dedupe keys on
+  the base `message_id`, which block 0 already claimed). Matches the
+  existing non-atomic/idempotent-by-check convention used elsewhere in this
+  pipeline (e.g. `create_container_work_orders`), not a regression.
+- Known limitation (not fixed): `_customer_from_prose` searches subject +
+  body combined — an early unrelated `"for <Capitalized Word>"` phrase
+  (e.g. subject `"New bookings for August"`) can be misread as a customer
+  name. Bounded to the narrow fallback path only; every new order still
+  requires dispatcher approval regardless. Full detail:
+  `tests/fixtures/operations_inbox/CASE-010/verification.md`.
 
 ### Known limitations (not fixed, documented)
 

@@ -280,16 +280,31 @@ volume (111 open items).
 
 ## Known limitations
 
-1. **Not fully atomic yet:** `application.loads.commands.create_load_from_work_item`
+1. **Partially atomic.** `application.loads.commands.create_load_from_work_item`
    and `update_load_from_work_item` delegate to the existing
    `services.operations_inbox_service.create_load_from_inbox_item` /
-   `update_load_from_inbox_item`, which still make several separate,
-   non-atomic writes (create the load, insert its document row, two
-   different `order_intake` updates, save communication, update the case).
-   Phase 1 deliberately reused this canonical, certification-tested
-   workflow rather than re-implementing multi-container/duplicate-protection
-   business rules inside `application/`. Making this one transaction is
-   Phase 2 scope.
+   `update_load_from_inbox_item`. As of the transaction-atomicity batch in
+   this file's git history, the core chain - create the load, insert its
+   document row, both `order_intake` updates, save communication - now
+   runs inside one `db_client.transaction()`; a failure partway through
+   rolls back every write in that chain (see
+   `tests/test_operations_inbox_load_creation_atomicity.py`). The
+   operations-case update (`update_operations_case`/
+   `add_operations_case_note`, and everything they call internally -
+   `operations_case_notes`, `operations_case_owner_history`,
+   `operations_case_events`, the case SLA update, and a further
+   `order_intake` write) intentionally still runs as its own separate,
+   non-atomic step after that transaction commits - it was left alone
+   because two of its internal writes are deliberately best-effort
+   (wrapped in `except Exception: pass`, e.g. owner-change/event audit
+   rows), and naively sharing one Postgres connection across all of it
+   would turn today's harmless best-effort failure into a hard abort of
+   the whole transaction (Postgres poisons a transaction on any statement
+   error until rollback/savepoint-rollback). Folding the case-service call
+   in safely needs `SAVEPOINT`s around those two best-effort writes, not
+   just threading `conn` through - deferred, still Phase 2 scope.
+   Idempotency (a retry after partial failure not creating a second load)
+   is a separate, also-deferred concern.
 2. **Operations Queue filter/classify/sort pipeline untouched:** the
    Streamlit queue still filters, classifies, and sorts in Python/Pandas
    after loading the (still `@st.cache_data`-cached, still SQL-filtered by
@@ -305,21 +320,36 @@ volume (111 open items).
    Splitting transform from render precisely would require finding a safe
    seam inside a ~600-line function; not attempted this phase to avoid
    destabilizing the classification pipeline.
-4. **Cache invalidation targeting is scoped to Operations Inbox.** The 9
-   `st.cache_data.clear()` call sites inside
+4. **Cache invalidation targeting was scoped to Operations Inbox in this
+   phase.** The 9 `st.cache_data.clear()` call sites inside
    `services/operations_inbox_service.py` were converted to
    `refresh_data()` (which clears only the 4 Operations-Inbox-specific
    `@st.cache_data` functions). `st.cache_data.clear()` call sites in
    `pages_app/admin.py`, `pages_app/dispatch_board.py`,
    `pages_app/orders_management.py`, `pages_app/port_houston_integration.py`,
-   `pages_app/documents.py`, and `services/order_intake.py` were left
-   untouched - out of scope for a backend-boundary phase focused on
-   Operations Inbox.
-5. **No authentication.** `api/dependencies.py::get_current_actor()` is a
-   placeholder. The API must not be exposed publicly without real auth.
-   CORS is restricted to an explicit allowlist (`CORS_ALLOWED_ORIGINS` env
-   var, comma-separated) and defaults to no cross-origin access at all when
-   unset.
+   `pages_app/documents.py`, and `services/order_intake.py` were out of
+   scope here — closed later in a separate backend-remediation pass: all 9
+   sites now delegate to `services/tms_data_service.py::refresh_data()`
+   (loads-table mutations) or were removed outright (mutations to tables
+   nothing caches). See `tests/test_global_cache_clear_removed.py`.
+5. **Authentication now exists on both surfaces** (closed in the same
+   later remediation pass as #4, not part of this phase's original scope).
+   API: `api/auth.py` implements a real, fail-closed bearer-token scheme
+   (`API_AUTH_TOKENS` env var, `require_auth`/`require_role`); routes in
+   `api/routers/work_items.py` that mutate declare
+   `Depends(require_role(*MUTATE_OPERATIONS))` explicitly rather than
+   relying on `READ_OPERATIONS`/`MUTATE_OPERATIONS` happening to share
+   membership. `api/dependencies.py::get_current_actor()` now resolves a
+   real authenticated actor via `require_auth`, no longer a placeholder.
+   Streamlit: `ui_components/auth_gate.py::require_login()` gates every
+   page behind a DB-backed login (`app_users` table, bcrypt-hashed
+   passwords — `application/auth/`), with role-based navigation filtering
+   (`application/auth/permissions.py`) re-checked at the router level, not
+   just hidden in the sidebar. Both surfaces share one `Role`/
+   `AuthenticatedActor` definition (`application/auth/models.py`). Full
+   detail: `docs/AUTHENTICATION.md`. CORS is restricted to an explicit
+   allowlist (`CORS_ALLOWED_ORIGINS` env var, comma-separated) and defaults
+   to no cross-origin access at all when unset.
 6. **`GET /api/v1/work-items`'s `WorkItemSummaryOut` includes `customer`,
    `booking_number`, etc. pulled from `parsed_data ->> 'Customer'` and
    similar JSON paths** - these mirror the app-column naming convention
