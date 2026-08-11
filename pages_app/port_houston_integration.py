@@ -7,6 +7,10 @@ import pandas as pd
 import streamlit as st
 
 import services.operations_inbox_service as ops
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, has_permission, require_permission
+from application.exceptions import AuthorizationError
+from application.port_houston.commands import apply_port_houston_data, apply_port_houston_extra_columns
 from db_client import DispatchDatabaseClient, execute, read_df, require_schema_ready
 from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.customer_status_email_service import _get_app_setting
@@ -312,14 +316,8 @@ def _updates_from_port_houston_booking(load_row: dict, booking_record: dict) -> 
     return updates
 
 
-def _apply_port_houston_updates(load_id: int, updates: dict, action_type: str) -> None:
-    if updates:
-        DispatchDatabaseClient().update_row_fields(load_id, updates)
-        _log_port_houston_event(
-            action_type=action_type,
-            load_id=load_id,
-            response_summary={"updated_fields": list(updates.keys())},
-        )
+def _apply_port_houston_updates(load_id: int, updates: dict, action_type: str, principal: AuthenticatedActor) -> None:
+    apply_port_houston_data(actor=principal, load_id=load_id, updates=updates, action_type=action_type)
 
 
 def _update_load_columns_if_present(load_id: int, updates: dict) -> list[str]:
@@ -424,7 +422,7 @@ def _port_houston_core_updates_from_records(load_row: dict, unit_record: dict | 
     return core_updates, extra_updates
 
 
-def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
+def _render_load_port_houston_panel(selected_load, readiness: dict, principal: AuthenticatedActor | None = None) -> None:
     load_id = int(selected_load["_row_id"])
     default_container = _safe_str(selected_load.get("Container Number", ""))
     default_booking = _safe_str(selected_load.get("Booking Number", ""))
@@ -441,7 +439,10 @@ def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
     container_value = c1.text_input("Container", value=default_container, key=f"load_port_sync_container_{load_id}")
     booking_value = c2.text_input("Booking", value=default_booking, key=f"load_port_sync_booking_{load_id}")
 
-    if st.button("Sync Port Data", key=f"load_port_sync_{load_id}", use_container_width=True):
+    _can_apply_port_data = has_permission(principal, Permission.PORT_DATA_APPLY) if principal else False
+    if not _can_apply_port_data:
+        st.caption("Your role does not have permission to apply Port Houston data to loads.")
+    if st.button("Sync Port Data", key=f"load_port_sync_{load_id}", use_container_width=True, disabled=not _can_apply_port_data):
         if not container_value.strip() and not booking_value.strip():
             st.error("Container or booking is required for Port Houston sync.")
         else:
@@ -471,10 +472,15 @@ def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
 
                 core_updates, extra_updates = _port_houston_core_updates_from_records(selected_load, unit_record, booking_record)
                 updated_fields = []
-                if core_updates:
-                    DispatchDatabaseClient().update_row_fields(load_id, core_updates)
-                    updated_fields.extend(core_updates.keys())
-                updated_fields.extend(_update_load_columns_if_present(load_id, extra_updates))
+                try:
+                    require_permission(principal, Permission.PORT_DATA_APPLY)
+                    if core_updates:
+                        DispatchDatabaseClient().update_row_fields(load_id, core_updates, created_by=principal.actor)
+                        updated_fields.extend(core_updates.keys())
+                    updated_fields.extend(apply_port_houston_extra_columns(actor=principal, load_id=load_id, updates=extra_updates))
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                    return
 
                 _log_port_houston_event(
                     action_type="load_port_sync",
@@ -565,7 +571,7 @@ def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
     if not _first_present(selected_load, ["Delivery Need Date", "delivery_need_date"], ""):
         pin_save_requirements.append("pickup/delivery date")
 
-    if st.button("Save PIN / Appointment To Load", key=f"load_save_pin_{load_id}", use_container_width=True):
+    if st.button("Save PIN / Appointment To Load", key=f"load_save_pin_{load_id}", use_container_width=True, disabled=not _can_apply_port_data):
         if pin_save_requirements:
             st.error("Cannot save PIN / appointment until these items are complete: " + ", ".join(pin_save_requirements))
         elif not booking_value and not container_value:
@@ -587,23 +593,30 @@ def _render_load_port_houston_panel(selected_load, readiness: dict) -> None:
                 f"\nDriver: {pin_driver}"
                 f"\nChassis: {pin_chassis}"
             )
-            DispatchDatabaseClient().update_row_fields(
-                load_id,
-                {
-                    "Status": target_status,
-                    "Driver Name": pin_driver.strip(),
-                    "Truck Assigned": pin_truck.strip(),
-                    "Chassis": pin_chassis.strip(),
-                    "Dispatcher Notes": (_safe_str(selected_load.get("Dispatcher Notes", "")) + note).strip(),
-                },
-            )
-            updated_extra = _update_load_columns_if_present(
-                load_id,
-                {
-                    "pickup_reference": pin_confirmation.strip() or None,
-                    "pickup_appointment": appointment_value,
-                },
-            )
+            try:
+                require_permission(principal, Permission.PORT_DATA_APPLY)
+                DispatchDatabaseClient().update_row_fields(
+                    load_id,
+                    {
+                        "Status": target_status,
+                        "Driver Name": pin_driver.strip(),
+                        "Truck Assigned": pin_truck.strip(),
+                        "Chassis": pin_chassis.strip(),
+                        "Dispatcher Notes": (_safe_str(selected_load.get("Dispatcher Notes", "")) + note).strip(),
+                    },
+                    created_by=principal.actor,
+                )
+                updated_extra = apply_port_houston_extra_columns(
+                    actor=principal,
+                    load_id=load_id,
+                    updates={
+                        "pickup_reference": pin_confirmation.strip() or None,
+                        "pickup_appointment": appointment_value,
+                    },
+                )
+            except AuthorizationError as exc:
+                st.error(str(exc))
+                return
             _log_port_houston_event(
                 action_type="pin_appointment_saved",
                 lookup_type="Express Pass / PIN",
@@ -722,7 +735,7 @@ def _render_port_houston_setup() -> None:
                 st.error(f"Connection test failed: {exc}")
 
 
-def _render_port_houston_selected_load(df: pd.DataFrame) -> None:
+def _render_port_houston_selected_load(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
     st.markdown("#### Load Lookup and Sync")
     st.caption("Pull Port Houston unit or booking data for a TMS load and update safe fields/notes.")
     load_options = _port_houston_load_options(df)
@@ -767,21 +780,33 @@ def _render_port_houston_selected_load(df: pd.DataFrame) -> None:
                     _log_port_houston_event(action_type="lookup", lookup_type="Booking", request_reference=booking_value, load_id=load_id, status="failed", error_message=str(exc))
                     st.error(f"Booking lookup failed: {exc}")
 
+    can_apply = has_permission(principal, Permission.PORT_DATA_APPLY)
+    if not can_apply:
+        st.caption("Your role does not have permission to apply Port Houston data to loads.")
+
     unit_records = _render_port_houston_result("port_houston_load_unit_result", mode="unit")
-    if unit_records and st.button("Update Load From Container Data", key="port_houston_update_from_unit", use_container_width=True):
+    if unit_records and st.button("Update Load From Container Data", key="port_houston_update_from_unit", use_container_width=True, disabled=not can_apply):
         updates = _updates_from_port_houston_unit(selected_load, unit_records[0])
-        _apply_port_houston_updates(load_id, updates, "update_load_from_unit")
-        refresh_data()
-        st.success("Load updated from Port Houston container data.")
-        st.rerun()
+        try:
+            _apply_port_houston_updates(load_id, updates, "update_load_from_unit", principal)
+        except AuthorizationError as exc:
+            st.error(str(exc))
+        else:
+            refresh_data()
+            st.success("Load updated from Port Houston container data.")
+            st.rerun()
 
     booking_records = _render_port_houston_result("port_houston_load_booking_result")
-    if booking_records and st.button("Update Load From Booking Data", key="port_houston_update_from_booking", use_container_width=True):
+    if booking_records and st.button("Update Load From Booking Data", key="port_houston_update_from_booking", use_container_width=True, disabled=not can_apply):
         updates = _updates_from_port_houston_booking(selected_load, booking_records[0])
-        _apply_port_houston_updates(load_id, updates, "update_load_from_booking")
-        refresh_data()
-        st.success("Load updated from Port Houston booking data.")
-        st.rerun()
+        try:
+            _apply_port_houston_updates(load_id, updates, "update_load_from_booking", principal)
+        except AuthorizationError as exc:
+            st.error(str(exc))
+        else:
+            refresh_data()
+            st.success("Load updated from Port Houston booking data.")
+            st.rerun()
         st.divider()
     st.markdown("#### Express Pass / PIN Request")
 
@@ -868,12 +893,17 @@ def _render_port_houston_selected_load(df: pd.DataFrame) -> None:
             key=f"pin_payload_{load_id}",
         )
 
-    if st.button("Save PIN Request To Load", key=f"save_pin_request_{load_id}", use_container_width=True):
+    if st.button("Save PIN Request To Load", key=f"save_pin_request_{load_id}", use_container_width=True, disabled=not has_permission(principal, Permission.PORT_DATA_APPLY)):
         if not booking_value and not container_value:
             st.error("Booking or container is required.")
         elif not pin_truck.strip():
             st.error("Truck license / truck number is required.")
         else:
+            try:
+                require_permission(principal, Permission.PORT_DATA_APPLY)
+            except AuthorizationError as exc:
+                st.error(str(exc))
+                return
             execute(
                 """
                 update loads
@@ -1120,14 +1150,14 @@ def _render_port_houston_mapping() -> None:
         )
 
 
-def render_port_houston_integration(df: pd.DataFrame) -> None:
+def render_port_houston_integration(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
     st.subheader("Port Houston Integration")
     st.caption("All-in-one Navis EVP workspace for Port Houston container, booking, vessel, gate, appointment, and subscription data.")
     _render_port_houston_setup()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Load Sync", "Live Lookup", "Appointments", "Subscriptions", "Data Map"])
     with tab1:
-        _render_port_houston_selected_load(df)
+        _render_port_houston_selected_load(df, principal)
     with tab2:
         _render_port_houston_direct_lookup()
     with tab3:

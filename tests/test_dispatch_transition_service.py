@@ -12,14 +12,16 @@ class _FakeDb:
         self.closeout_calls = []
         self.audit_notes = []
         self.conns_seen = []
+        self.created_by_seen = []
 
     def read_load_for_update(self, load_id: int, *, conn=None) -> dict | None:
         self.conns_seen.append(conn)
         return dict(self.load) if self.load is not None else None
 
-    def update_row_fields(self, load_id: int, updates: dict, *, conn=None) -> None:
+    def update_row_fields(self, load_id: int, updates: dict, *, conn=None, actor_display_name: str = "dispatcher") -> None:
         self.conns_seen.append(conn)
         self.update_calls.append(dict(updates))
+        self.created_by_seen.append(actor_display_name)
         self.load.update(updates)
 
     def set_closeout_stage(self, load_id: int, closeout_stage: str, *, conn=None) -> None:
@@ -27,9 +29,12 @@ class _FakeDb:
         self.closeout_calls.append(closeout_stage)
         self.load["closeout_stage"] = closeout_stage
 
-    def insert_assignment_audit(self, load_id: int, current_status: str, notes: str, *, conn=None) -> None:
+    def insert_assignment_audit(
+        self, load_id: int, current_status: str, notes: str, *, conn=None, actor_display_name: str = "dispatcher"
+    ) -> None:
         self.conns_seen.append(conn)
         self.audit_notes.append(notes)
+        self.created_by_seen.append(actor_display_name)
 
 
 @pytest.fixture

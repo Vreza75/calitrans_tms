@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
+from api.auth import MUTATE_OPERATIONS, READ_LOADS, AuthenticatedActor, require_auth, require_role
 from api.schemas.loads import AssignDriverIn, LoadSummaryOut, TransitionLoadIn, TransitionResultOut
 from application.loads.commands import transition_load
 from application.loads.queries import get_load, list_loads
@@ -26,10 +26,13 @@ def get_load_endpoint(load_id: int) -> LoadSummaryOut:
     response_model=TransitionResultOut,
     dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
 )
-def transition_load_endpoint(load_id: int, payload: TransitionLoadIn) -> TransitionResultOut:
+def transition_load_endpoint(
+    load_id: int, payload: TransitionLoadIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> TransitionResultOut:
     result = transition_load(
         load_id,
         payload.new_status,
+        actor=actor,
         note=payload.note,
         driver=payload.driver,
         truck=payload.truck,
@@ -44,12 +47,14 @@ def transition_load_endpoint(load_id: int, payload: TransitionLoadIn) -> Transit
     response_model=TransitionResultOut,
     dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
 )
-def assign_driver_endpoint(load_id: int, payload: AssignDriverIn) -> TransitionResultOut:
+def assign_driver_endpoint(
+    load_id: int, payload: AssignDriverIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> TransitionResultOut:
     """Assignment without a status change: re-applies the load's current
     status through the same transactional apply_transition() path, so the
     driver/truck write and its audit row are still atomic."""
     from application.loads.queries import get_load as _get_load
 
     current = _get_load(load_id)
-    result = transition_load(load_id, current.status, driver=payload.driver, truck=payload.truck)
+    result = transition_load(load_id, current.status, actor=actor, driver=payload.driver, truck=payload.truck)
     return TransitionResultOut(**result.__dict__)

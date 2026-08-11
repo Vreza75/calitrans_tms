@@ -19,28 +19,38 @@ def transition_load(
     load_id: int,
     new_status: str,
     *,
+    actor: AuthenticatedActor,
     note: str = "",
     driver: str | None = None,
     truck: str | None = None,
     override: bool = False,
     override_reason: str = "",
 ) -> TransitionResult:
-    """Status transition + optional driver/truck assignment.
+    """Status transition + optional driver/truck assignment. The one
+    canonical application command wrapping
+    services.dispatch_transition_service.apply_transition - called by
+    both api/routers/loads.py and pages_app/dispatch_board.py (Phase 5B
+    converged these onto a single implementation instead of the two
+    that briefly existed in parallel - see application/dispatch/
+    commands.py's history).
 
-    Delegates to services.dispatch_transition_service.apply_transition,
-    which is the one function allowed to change loads.status and, as of
-    Phase 1, runs its assignment/status/closeout writes and audit rows in
-    a single db_client.transaction() (see
+    Requires Permission.DISPATCH_TRANSITION before doing anything else -
+    an unauthorized actor triggers zero reads/writes.
+
+    apply_transition is the one function allowed to change loads.status
+    and runs its assignment/status/closeout writes and audit rows in a
+    single db_client.transaction() (see
     tests/test_dispatch_transition_service.py for the atomicity tests).
+    The real actor identity is threaded into that transaction's audit
+    rows via actor_display_name - see apply_transition's own docstring.
 
     Raises NotFoundError / ConflictError instead of returning ok=False
     with a 200-shaped result - a caller like the API needs a distinct
     status code for "load not found" (404) vs. "transition not valid from
     the current state" (409), not a 200 response it has to inspect an
-    `ok` flag on to find out something failed. Streamlit callers that want
-    the old inspect-a-dict shape should call
-    services.dispatch_transition_service.apply_transition directly (e.g.
-    pages_app/dispatch_board.py already does, unaffected by this)."""
+    `ok` flag on to find out something failed."""
+    require_permission(actor, Permission.DISPATCH_TRANSITION)
+
     from services.dispatch_transition_service import apply_transition
 
     result = apply_transition(
@@ -51,6 +61,7 @@ def transition_load(
         truck=truck,
         override=override,
         override_reason=override_reason,
+        actor_display_name=actor.actor,
     )
 
     if not result.get("ok"):

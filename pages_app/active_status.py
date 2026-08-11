@@ -6,6 +6,7 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
 from pages_app.dispatch_board import render_dispatch_workspace
 from services.dispatch_workflow_service import (
     ACTIVE_DRIVER_STATUSES,
@@ -20,7 +21,12 @@ from services.dispatch_workflow_service import (
 )
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
-def render_active_status_view(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+def render_active_status_view(
+    df: pd.DataFrame,
+    principal: AuthenticatedActor,
+    refresh_callback: Callable[[], None] | None = None,
+    port_houston_panel_renderer: Callable | None = None,
+) -> None:
     st.subheader("Active Status")
     st.caption("Quick dispatcher and manager list of current load statuses. Select a row to open dispatch details and update the load.")
 
@@ -191,4 +197,6 @@ def render_active_status_view(df: pd.DataFrame, refresh_callback: Callable[[], N
         return
 
     selected_load = sorted_df[sorted_df["_row_id"].astype(int).eq(int(selected_row_id))].iloc[0]
-    render_dispatch_workspace(selected_load, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+    render_dispatch_workspace(
+        selected_load, principal, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer
+    )

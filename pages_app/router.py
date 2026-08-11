@@ -44,7 +44,7 @@ def _render_selected_page(section: str, df: pd.DataFrame, principal: Authenticat
 
         render_dispatcher_workspace()
     elif section == "Port Houston Integration":
-        render_port_houston_integration(df)
+        render_port_houston_integration(df, principal)
     elif section == "Dashboard":
         render_dashboard(df)
     elif section == "Orders/Load Management":
@@ -52,19 +52,21 @@ def _render_selected_page(section: str, df: pd.DataFrame, principal: Authenticat
     elif section == "Active Status":
         render_active_status_view(
             df,
+            principal,
             refresh_callback=refresh_data,
             port_houston_panel_renderer=_render_load_port_houston_panel,
         )
     elif section == "Dispatch Board":
         render_dispatch_board_focused(
             df,
+            principal,
             refresh_callback=refresh_data,
             port_houston_panel_renderer=_render_load_port_houston_panel,
         )
     elif section == "Calendar View":
         render_calendar_view(df)
     elif section == "Documents":
-        render_documents(df)
+        render_documents(df, principal)
     elif section == "Email Imports":
         render_email_imports()
     elif section == "Billing / ProfitTools":
@@ -72,7 +74,7 @@ def _render_selected_page(section: str, df: pd.DataFrame, principal: Authenticat
     elif section == "Validation":
         render_validation(df)
     elif section == "Master Data":
-        render_master_data_admin()
+        render_master_data_admin(principal)
     else:
         st.warning(f"Unknown section: {section}")
 
