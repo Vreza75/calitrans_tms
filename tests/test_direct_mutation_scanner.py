@@ -88,6 +88,8 @@ def test_dead_code_files_are_still_actually_unreachable():
         )
         call_sites = [
             line for line in result.stdout.splitlines()
-            if "pages_app/orders_management.py" not in line and "storage/app.py" not in line
+            if "pages_app/orders_management.py" not in line
+            and "storage/app.py" not in line
+            and "tests/test_direct_mutation_scanner.py" not in line
         ]
         assert not call_sites, f"{func_name} now has a live caller outside orders_management.py/storage/app.py: {call_sites}"
