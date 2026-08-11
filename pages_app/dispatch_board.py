@@ -8,14 +8,23 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
-from db_client import DispatchDatabaseClient
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, has_permission
+from application.dispatch.commands import (
+    apply_legacy_status_update,
+    log_dispatch_communication,
+    mark_load_ready_for_billing,
+    save_dispatch_progress,
+    update_dispatch_assignment,
+)
+from application.documents.commands import attach_load_document
+from application.exceptions import AuthorizationError, ConflictError, NotFoundError
+from application.loads.commands import transition_load
 from services.dispatch_data_service import (
-    _insert_dispatch_message,
     _read_dispatch_messages,
     _read_documents_for_load,
     _read_status_timeline,
     _save_status_quick_update,
-    _update_load_extra_fields,
 )
 from services.tms_data_service import refresh_data as _refresh_tms_data
 from services.dispatch_workflow_service import (
@@ -42,7 +51,6 @@ from services.dispatch_card_priority import sort_booking_cards
 from services.dispatch_card_view_model import build_booking_card_view_models
 from services.dispatch_stages import CANCELLED_STATUS, get_operational_stages
 from services.workflow_constants import requires_port_pin
-from services.dispatch_transition_service import apply_transition
 from services.communications.communications_service import get_load_timeline
 from ui_components.dialog_presets import DIALOG_SIZE_PRESETS as _DIALOG_SIZE_PRESETS
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
@@ -94,16 +102,26 @@ def _close_workspace_and_refresh(refresh_callback: Callable[[], None] | None = N
     st.rerun()
 
 
-def _render_port_panel(selected_load, readiness: dict | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+def _render_port_panel(
+    selected_load,
+    readiness: dict | None = None,
+    port_houston_panel_renderer: Callable | None = None,
+    principal: AuthenticatedActor | None = None,
+) -> None:
     if callable(port_houston_panel_renderer):
         try:
-            port_houston_panel_renderer(selected_load, readiness or {})
+            port_houston_panel_renderer(selected_load, readiness or {}, principal)
         except TypeError:
-            port_houston_panel_renderer(selected_load)
+            try:
+                port_houston_panel_renderer(selected_load, readiness or {})
+            except TypeError:
+                port_houston_panel_renderer(selected_load)
     else:
         st.info("Port Houston panel is not available from this page context.")
 
-def _render_operational_status_tab(selected_load, load_id: int, current_status: str, operational_stages: list[str], refresh_callback) -> None:
+def _render_operational_status_tab(
+    selected_load, load_id: int, current_status: str, operational_stages: list[str], refresh_callback, principal: AuthenticatedActor
+) -> None:
     status_options = operational_stages + [CANCELLED_STATUS]
     current_index = status_options.index(current_status) if current_status in status_options else 0
 
@@ -124,7 +142,11 @@ def _render_operational_status_tab(selected_load, load_id: int, current_status: 
     if override:
         override_reason = st.text_input("Override reason", key=f"status_override_reason_{load_id}")
 
-    if st.button("Save Status Update", key=f"save_status_{load_id}"):
+    can_transition = has_permission(principal, Permission.DISPATCH_TRANSITION)
+    if not can_transition:
+        st.caption("Your role does not have permission to update dispatch status.")
+
+    if st.button("Save Status Update", key=f"save_status_{load_id}", disabled=not can_transition):
         detail_updates = {}
         if driver.strip() != str(selected_load.get("Driver Name", "") or "").strip():
             detail_updates["Driver Name"] = driver.strip()
@@ -133,21 +155,29 @@ def _render_operational_status_tab(selected_load, load_id: int, current_status: 
         if chassis.strip() != str(selected_load.get("Chassis", "") or "").strip():
             detail_updates["Chassis"] = chassis.strip()
 
-        if detail_updates:
-            DispatchDatabaseClient().update_row_fields(load_id, detail_updates)
+        try:
+            if detail_updates:
+                update_dispatch_assignment(actor=principal, load_id=load_id, updates=detail_updates)
 
-        if new_status != current_status:
-            result = apply_transition(
-                load_id,
-                new_status,
-                note=note.strip(),
-                override=override,
-                override_reason=override_reason.strip(),
-            )
-            if not result["ok"]:
-                st.error(result["reason"])
-                return
+            if new_status != current_status:
+                result = transition_load(
+                    load_id,
+                    new_status,
+                    actor=principal,
+                    note=note.strip(),
+                    override=override,
+                    override_reason=override_reason.strip(),
+                )
+            else:
+                result = None
+        except AuthorizationError as exc:
+            st.error(str(exc))
+            return
+        except (NotFoundError, ConflictError) as exc:
+            st.error(str(exc))
+            return
 
+        if result is not None:
             email_sent, email_msg = _send_customer_status_update_email(
                 load_id, selected_load, current_status, new_status, note.strip(), customer_email.strip(),
             )
@@ -164,7 +194,7 @@ def _render_operational_status_tab(selected_load, load_id: int, current_status: 
             st.info("No changes detected.")
 
 
-def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, refresh_callback) -> None:
+def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, refresh_callback, principal: AuthenticatedActor) -> None:
     """Unchanged pre-dispatch status path — loads not yet in the new
     operational model (Ready to Dispatch or later) keep the original free
     status selectbox until Phase 5 gives them their own Intake &
@@ -184,7 +214,11 @@ def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, 
 
     note = st.text_area("Status / Dispatch Note", value=str(selected_load.get("Dispatcher Notes", "") or ""), height=120, key=f"legacy_note_{load_id}")
 
-    if st.button("Save Status Update", key=f"legacy_save_status_{load_id}"):
+    can_transition = has_permission(principal, Permission.DISPATCH_TRANSITION)
+    if not can_transition:
+        st.caption("Your role does not have permission to update dispatch status.")
+
+    if st.button("Save Status Update", key=f"legacy_save_status_{load_id}", disabled=not can_transition):
         readiness = _load_readiness_details(selected_load, documents_df=_read_documents_for_load(load_id))
         if (
             new_status in ["Ready to Dispatch", "Dispatched"]
@@ -206,7 +240,11 @@ def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, 
             updates["Dispatcher Notes"] = note.strip()
 
         if updates:
-            DispatchDatabaseClient().update_row_fields(load_id, updates)
+            try:
+                apply_legacy_status_update(actor=principal, load_id=load_id, updates=updates)
+            except AuthorizationError as exc:
+                st.error(str(exc))
+                return
 
             if "Status" in updates:
                 email_sent, email_msg = _send_customer_status_update_email(
@@ -224,7 +262,12 @@ def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, 
             st.info("No changes detected.")
 
 
-def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+def render_dispatch_workspace(
+    selected_load,
+    principal: AuthenticatedActor,
+    refresh_callback: Callable[[], None] | None = None,
+    port_houston_panel_renderer: Callable | None = None,
+) -> None:
     load_id = int(selected_load["_row_id"])
     booking = str(selected_load.get("Booking Number", "") or "")
     container = str(selected_load.get("Container Number", "") or "-")
@@ -312,14 +355,26 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         if eta_date and eta_time:
             eta_value = pd.Timestamp.combine(eta_date, eta_time).to_pydatetime()
 
-        if st.button("Save Dispatch Progress", key=f"save_dispatch_progress_{load_id}"):
-            _update_load_extra_fields(load_id, current_location, eta_value, live_load_status, live_unload_status)
-            st.success("Dispatch progress saved.")
-            _close_workspace_and_refresh(refresh_callback)
+        can_track_progress = has_permission(principal, Permission.DISPATCH_TRANSITION)
+        if st.button("Save Dispatch Progress", key=f"save_dispatch_progress_{load_id}", disabled=not can_track_progress):
+            try:
+                save_dispatch_progress(
+                    actor=principal,
+                    load_id=load_id,
+                    current_location=current_location,
+                    eta_value=eta_value,
+                    live_load_status=live_load_status,
+                    live_unload_status=live_unload_status,
+                )
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.success("Dispatch progress saved.")
+                _close_workspace_and_refresh(refresh_callback)
 
     if port_tab is not None:
         with port_tab:
-            _render_port_panel(selected_load, readiness, port_houston_panel_renderer)
+            _render_port_panel(selected_load, readiness, port_houston_panel_renderer, principal)
 
     with status_tab:
         st.markdown("### Status Update")
@@ -329,10 +384,10 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
 
         if current_status in operational_stages or current_status == CANCELLED_STATUS:
             _render_operational_status_tab(
-                selected_load, load_id, current_status, operational_stages, refresh_callback
+                selected_load, load_id, current_status, operational_stages, refresh_callback, principal
             )
         else:
-            _render_legacy_status_tab(selected_load, load_id, current_status, refresh_callback)
+            _render_legacy_status_tab(selected_load, load_id, current_status, refresh_callback, principal)
 
     with timeline_tab:
         st.markdown("### Load Timeline")
@@ -388,6 +443,7 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             key=f"generated_dispatch_msg_{load_id}",
         )
 
+        can_log_comms = has_permission(principal, Permission.DISPATCH_COMMUNICATION_LOG)
         action_cols = st.columns(4)
 
         with action_cols[0]:
@@ -395,17 +451,22 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                 "Save Message",
                 key=f"save_generated_driver_msg_{load_id}",
                 use_container_width=True,
-                disabled=not packet_ready,
+                disabled=not packet_ready or not can_log_comms,
             ):
-                _insert_dispatch_message(
-                    load_id,
-                    "driver_dispatch_message",
-                    "outbound",
-                    driver_name,
-                    edited_message.strip(),
-                )
-                st.success("Driver dispatch message saved to history.")
-                _close_workspace_and_refresh(refresh_callback)
+                try:
+                    log_dispatch_communication(
+                        actor=principal,
+                        load_id=load_id,
+                        message_type="driver_dispatch_message",
+                        direction="outbound",
+                        recipient=driver_name,
+                        message_body=edited_message.strip(),
+                    )
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Driver dispatch message saved to history.")
+                    _close_workspace_and_refresh(refresh_callback)
 
         with action_cols[1]:
             st.download_button(
@@ -423,16 +484,21 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                 "Copy/Paste Ready",
                 key=f"copy_ready_{load_id}",
                 use_container_width=True,
-                disabled=not packet_ready,
+                disabled=not packet_ready or not can_log_comms,
             ):
-                _insert_dispatch_message(
-                    load_id,
-                    "driver_dispatch_message_copy_ready",
-                    "outbound",
-                    driver_name,
-                    edited_message.strip(),
-                )
-                st.info("Message saved. Copy the text above and paste into Motive.")
+                try:
+                    log_dispatch_communication(
+                        actor=principal,
+                        load_id=load_id,
+                        message_type="driver_dispatch_message_copy_ready",
+                        direction="outbound",
+                        recipient=driver_name,
+                        message_body=edited_message.strip(),
+                    )
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.info("Message saved. Copy the text above and paste into Motive.")
 
         with action_cols[3]:
             st.button(
@@ -517,24 +583,30 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
                 key=f"driver_msg_direction_{load_id}",
             )
 
+        can_log_comms = has_permission(principal, Permission.DISPATCH_COMMUNICATION_LOG)
         with msg_cols[2]:
             st.write("")
             st.write("")
-            save_manual = st.button("Save Driver Communication", key=f"save_manual_driver_msg_{load_id}")
+            save_manual = st.button("Save Driver Communication", key=f"save_manual_driver_msg_{load_id}", disabled=not can_log_comms)
 
         if save_manual:
             if not message_body.strip():
                 st.error("Message is required.")
             else:
-                _insert_dispatch_message(
-                    load_id,
-                    message_type,
-                    direction,
-                    recipient,
-                    message_body.strip(),
-                )
-                st.success("Driver communication saved.")
-                _close_workspace_and_refresh(refresh_callback)
+                try:
+                    log_dispatch_communication(
+                        actor=principal,
+                        load_id=load_id,
+                        message_type=message_type,
+                        direction=direction,
+                        recipient=recipient,
+                        message_body=message_body.strip(),
+                    )
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Driver communication saved.")
+                    _close_workspace_and_refresh(refresh_callback)
 
         st.markdown("#### Driver Communication Thread")
         messages = _read_dispatch_messages(load_id)
@@ -568,13 +640,25 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             height=100,
             key=f"customer_note_{load_id}",
         )
-        if st.button("Save Customer Note", key=f"save_customer_note_{load_id}"):
+        can_log_comms = has_permission(principal, Permission.DISPATCH_COMMUNICATION_LOG)
+        if st.button("Save Customer Note", key=f"save_customer_note_{load_id}", disabled=not can_log_comms):
             if not customer_note.strip():
                 st.error("Customer note is required.")
             else:
-                _insert_dispatch_message(load_id, "customer_note", "outbound", customer, customer_note.strip())
-                st.success("Customer note saved.")
-                _close_workspace_and_refresh(refresh_callback)
+                try:
+                    log_dispatch_communication(
+                        actor=principal,
+                        load_id=load_id,
+                        message_type="customer_note",
+                        direction="outbound",
+                        recipient=customer,
+                        message_body=customer_note.strip(),
+                    )
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Customer note saved.")
+                    _close_workspace_and_refresh(refresh_callback)
 
         messages = _read_dispatch_messages(load_id)
         customer_messages = messages[messages["message_type"].astype(str).str.contains("customer", case=False, na=False)] if not messages.empty else pd.DataFrame()
@@ -589,13 +673,25 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
             height=100,
             key=f"operational_note_{load_id}",
         )
-        if st.button("Save Operational Note", key=f"save_operational_note_{load_id}"):
+        can_log_comms = has_permission(principal, Permission.DISPATCH_COMMUNICATION_LOG)
+        if st.button("Save Operational Note", key=f"save_operational_note_{load_id}", disabled=not can_log_comms):
             if not operational_note.strip():
                 st.error("Note is required.")
             else:
-                _insert_dispatch_message(load_id, "operational_note", "internal", "dispatcher", operational_note.strip())
-                st.success("Operational note saved.")
-                _close_workspace_and_refresh(refresh_callback)
+                try:
+                    log_dispatch_communication(
+                        actor=principal,
+                        load_id=load_id,
+                        message_type="operational_note",
+                        direction="internal",
+                        recipient=principal.actor,
+                        message_body=operational_note.strip(),
+                    )
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Operational note saved.")
+                    _close_workspace_and_refresh(refresh_callback)
 
         messages = _read_dispatch_messages(load_id)
         operational_notes = messages[
@@ -616,10 +712,17 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         docs = _read_documents_for_load(load_id)
         st.dataframe(docs, use_container_width=True, hide_index=True)
         uploaded = st.file_uploader("Attach document to this load", type=["pdf", "png", "jpg", "jpeg"], key=f"doc_upload_{load_id}")
-        if st.button("Attach Document", key=f"attach_doc_{load_id}") and uploaded is not None:
-            DispatchDatabaseClient().attach_file_to_row(load_id, uploaded, source="dispatch_workspace")
-            st.success("Document attached.")
-            _close_workspace_and_refresh(refresh_callback)
+        can_attach = has_permission(principal, Permission.DOCUMENT_ATTACH)
+        if not can_attach:
+            st.caption("Your role does not have permission to attach documents.")
+        if st.button("Attach Document", key=f"attach_doc_{load_id}", disabled=not can_attach) and uploaded is not None:
+            try:
+                attach_load_document(actor=principal, load_id=load_id, uploaded_file=uploaded, source="dispatch_workspace")
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.success("Document attached.")
+                _close_workspace_and_refresh(refresh_callback)
 
     with billing_tab:
         st.markdown("### Billing Readiness")
@@ -631,10 +734,17 @@ def render_dispatch_workspace(selected_load, refresh_callback: Callable[[], None
         else:
             st.warning("This load is not ready for billing yet.")
 
-        if st.button("Mark Ready for ProfitTools", key=f"mark_billing_{load_id}"):
+        can_mark_billing = has_permission(principal, Permission.DISPATCH_TRANSITION)
+        if not can_mark_billing:
+            st.caption("Your role does not have permission to mark loads ready for billing.")
+        if st.button("Mark Ready for ProfitTools", key=f"mark_billing_{load_id}", disabled=not can_mark_billing):
             old_status = str(selected_load.get("Status", "") or "")
             new_status = "Ready for ProfitTools"
-            DispatchDatabaseClient().update_row_fields(load_id, {"Status": new_status})
+            try:
+                mark_load_ready_for_billing(actor=principal, load_id=load_id)
+            except AuthorizationError as exc:
+                st.error(str(exc))
+                return
             email_sent, email_msg = _send_customer_status_update_email(
                 load_id,
                 selected_load,
@@ -715,7 +825,12 @@ def _render_swimlane_board(scope_df: pd.DataFrame, totals_df: pd.DataFrame, comp
                         _render_booking_card(card)
 
 
-def render_booking_workspace(booking_df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+def render_booking_workspace(
+    booking_df: pd.DataFrame,
+    principal: AuthenticatedActor,
+    refresh_callback: Callable[[], None] | None = None,
+    port_houston_panel_renderer: Callable | None = None,
+) -> None:
     """Booking-level wrapper around render_dispatch_workspace.
 
     A single-container booking renders render_dispatch_workspace directly
@@ -749,12 +864,21 @@ def render_booking_workspace(booking_df: pd.DataFrame, refresh_callback: Callabl
             st.dataframe(booking_df[summary_cols], hide_index=True, use_container_width=True)
         for i, (_, row) in enumerate(booking_df.iterrows()):
             with tabs[i + 1]:
-                render_dispatch_workspace(row, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+                render_dispatch_workspace(
+                    row, principal, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer
+                )
     else:
-        render_dispatch_workspace(first, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+        render_dispatch_workspace(
+            first, principal, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer
+        )
 
 
-def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[], None] | None = None, port_houston_panel_renderer: Callable | None = None) -> None:
+def render_dispatch_board_focused(
+    df: pd.DataFrame,
+    principal: AuthenticatedActor,
+    refresh_callback: Callable[[], None] | None = None,
+    port_houston_panel_renderer: Callable | None = None,
+) -> None:
     st.subheader("Dispatch Board")
     st.caption("Action board by move type. Port/PIN work appears only for port imports and exports.")
 
@@ -968,6 +1092,8 @@ def render_dispatch_board_focused(df: pd.DataFrame, refresh_callback: Callable[[
         if selected_df.empty:
             st.warning("The selected booking is no longer available.")
         else:
-            render_booking_workspace(selected_df, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer)
+            render_booking_workspace(
+                selected_df, principal, refresh_callback=refresh_callback, port_houston_panel_renderer=port_houston_panel_renderer
+            )
 
     _booking_workspace_dialog()

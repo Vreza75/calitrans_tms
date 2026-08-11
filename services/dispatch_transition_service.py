@@ -37,8 +37,8 @@ def _load_row_for_update(load_id: int, *, conn) -> dict | None:
     return dict(row) if row is not None else None
 
 
-def _update_load(load_id: int, updates: dict, *, conn) -> None:
-    DispatchDatabaseClient().update_row_fields(load_id, updates, conn=conn)
+def _update_load(load_id: int, updates: dict, *, conn, actor_display_name: str = "dispatcher") -> None:
+    DispatchDatabaseClient().update_row_fields(load_id, updates, conn=conn, created_by=actor_display_name)
 
 
 def _set_closeout_stage(load_id: int, closeout_stage: str, *, conn) -> None:
@@ -48,19 +48,27 @@ def _set_closeout_stage(load_id: int, closeout_stage: str, *, conn) -> None:
     )
 
 
-def _insert_assignment_audit(load_id: int, current_status: str, notes: str, *, conn) -> None:
+def _insert_assignment_audit(
+    load_id: int, current_status: str, notes: str, *, conn, actor_display_name: str = "dispatcher"
+) -> None:
     """Driver/truck assignment gets its own status_events row, distinct
     from the status-change row — old_status == new_status == the load's
     status at the time of assignment, so this reads clearly as an
-    assignment event rather than a fake status transition."""
+    assignment event rather than a fake status transition.
+
+    `actor_display_name` defaults to the pre-existing literal "dispatcher"
+    for any caller that doesn't pass it (zero behavior change) -
+    application.loads.commands.transition_load passes the real
+    AuthenticatedActor.actor identity, so this no longer misrepresents a
+    manager/admin/API-originated transition as generically "dispatcher"."""
     conn.execute(
         text(
             """
             insert into status_events (load_id, old_status, new_status, notes, created_by)
-            values (:load_id, :status, :status, :notes, 'dispatcher')
+            values (:load_id, :status, :status, :notes, :created_by)
             """
         ),
-        {"load_id": load_id, "status": current_status, "notes": notes},
+        {"load_id": load_id, "status": current_status, "notes": notes, "created_by": actor_display_name},
     )
 
 
@@ -73,6 +81,7 @@ def apply_transition(
     truck: str | None = None,
     override: bool = False,
     override_reason: str = "",
+    actor_display_name: str = "dispatcher",
 ) -> dict:
     """Validate and apply an operational status transition for one load.
 
@@ -85,6 +94,17 @@ def apply_transition(
     one transaction with the row locked FOR UPDATE (see
     _load_row_for_update) - validation can no longer run against a status
     a concurrent transition is about to change out from under it.
+
+    `actor_display_name` (default "dispatcher", the pre-existing
+    hardcoded literal - zero behavior change for any caller that doesn't
+    pass it) is recorded as created_by on every status_events/loads audit
+    row this call writes - application.loads.commands.transition_load
+    (the sole application-command entry point into this function) passes
+    the real authenticated actor's identity, so a manager/admin/API-
+    originated transition no longer misrepresents itself as "dispatcher"
+    in the audit trail. This function itself stays framework-neutral -
+    it takes a plain string, not an AuthenticatedActor/Streamlit/HTTP
+    object.
     """
     if override and not override_reason.strip():
         return {"ok": False, "reason": "An override requires a reason.", "status": "", "closeout_stage": ""}
@@ -140,15 +160,17 @@ def apply_transition(
         should_set_closeout = new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
 
         if assignment_updates:
-            _update_load(load_id, assignment_updates, conn=conn)
+            _update_load(load_id, assignment_updates, conn=conn, actor_display_name=actor_display_name)
             parts = []
             if "Driver Name" in assignment_updates:
                 parts.append(f"Driver assigned: {assignment_updates['Driver Name']}")
             if "Truck Assigned" in assignment_updates:
                 parts.append(f"Truck assigned: {assignment_updates['Truck Assigned']}")
-            _insert_assignment_audit(load_id, current_status, "; ".join(parts), conn=conn)
+            _insert_assignment_audit(
+                load_id, current_status, "; ".join(parts), conn=conn, actor_display_name=actor_display_name
+            )
 
-        _update_load(load_id, status_updates, conn=conn)
+        _update_load(load_id, status_updates, conn=conn, actor_display_name=actor_display_name)
 
         if should_set_closeout:
             closeout_stage = "POD Needed"

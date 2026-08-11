@@ -212,6 +212,30 @@ are simply not yet migrated to the command-boundary pattern. Recommended
 as the next phase's scope, using the same `Permission`/`require_permission`
 model already in place rather than inventing a second one.
 
+## Phase 5B: expanded application-command coverage
+
+Extends the Phase 5 pattern to the remaining important reachable mutations found by a fresh inventory. Same model, same `has_permission()`/`require_permission()`/`AuthorizationError` - no second authorization system.
+
+New permissions: `dispatch:transition` (Dispatch Board status transitions, driver/truck/chassis assignment, dispatch-progress tracking, "Mark Ready for ProfitTools"), `document:attach` (file attachment - **the one permission accounting is granted**, since Documents is already accounting-visible and its document types include invoices), `port_data:apply` (applying a Port Houston lookup's data onto a load), `master_data:edit` (customer/warehouse/carrier/driver upserts, manager/admin only). Full rationale and the updated matrix are in `application/auth/permissions.py`'s `ROLE_PERMISSIONS` comment.
+
+New command modules: `application/admin/commands.py`, `application/documents/commands.py`, `application/dispatch/commands.py`, `application/port_houston/commands.py`. `application/dispatch/commands.py::apply_dispatch_transition` wraps `services/dispatch_transition_service.py::apply_transition` - the domain service itself gained no Streamlit/auth awareness; the permission check lives one layer up, per the preferred shape.
+
+Migrated: `admin_pages.py` (all 4 master-data upserts), `pages_app/documents.py` (Attach Document), `pages_app/dispatch_board.py` (both status-update tabs, dispatch progress, document attach, Mark Ready for ProfitTools), `pages_app/port_houston_integration.py` (Sync Port Data, Save PIN/Appointment To Load, Update Load From Container/Booking Data, Save PIN Request To Load).
+
+### Phase 5B closure pass
+
+Closed the gaps the initial Phase 5B pass left open:
+
+- **API convergence (`api/routers/loads.py`)**: `transition_load_endpoint`/`assign_driver_endpoint` now call the same `application/loads/commands.py::transition_load` command Dispatch Board uses (previously two parallel implementations briefly existed - `application/dispatch/commands.py::apply_dispatch_transition`, since removed - both wrapping `dispatch_transition_service.apply_transition`; converged onto one). `transition_load` now requires an `actor: AuthenticatedActor` and calls `require_permission(actor, Permission.DISPATCH_TRANSITION)` before anything else. The router's coarse `require_role(*MUTATE_OPERATIONS)` dependency stays as defense-in-depth; the command's fine-grained check is authoritative. `api/routers/work_items.py` was not touched - its mutations don't yet have an equivalent fine-grained command, out of this pass's scope.
+- **Dispatch Board's remaining 5 note/message buttons** (Save Message, Copy/Paste Ready, Save Driver Communication, Save Customer Note, Save Operational Note) now go through `application/dispatch/commands.py::log_dispatch_communication`, gated by a new `Permission.DISPATCH_COMMUNICATION_LOG` (dispatcher/manager/admin, not accounting - distinct from `DRIVER_MESSAGE_SEND`, which is specifically the Twilio-SMS-sending capability from Phase 5). Zero known live Dispatch Board mutation buttons bypass the application-command layer as of this pass.
+- **Real actor propagation**: `services/dispatch_transition_service.py::apply_transition` gained an `actor_display_name` parameter (default `"dispatcher"` - the pre-existing literal, zero behavior change for any caller that doesn't pass it), threaded into every `status_events`/`loads.update_row_fields` audit write it makes. `transition_load` passes the real `AuthenticatedActor.actor` identity. A manager or admin action no longer records itself as generically `"dispatcher"` in the audit trail.
+- **Scanner**: `tests/test_direct_mutation_scanner.py`'s `ALLOWED_DIRECT_CALLS` no longer contains any Dispatch Board entries (all 5 remaining direct calls migrated). Remaining entries are Port Houston's 2 inline-`require_permission`-gated writes (kept - reason documented in the scanner file itself) and Documents' 2 confirmed-dead-code call sites.
+
+**Known remaining gaps, not fixed this pass:**
+- `pages_app/documents.py::render_pdf_intake` (PDF-to-load intake creation) is confirmed dead code - not reachable from the live app, not migrated (nothing to protect).
+- `api/routers/work_items.py` remains coarse `MUTATE_OPERATIONS`-gated only - its mutations (create/update load from work item, close/link work item) have no fine-grained `Permission` check yet, unlike `api/routers/loads.py`'s transition endpoints.
+- Side-effect risk (unchanged, not addressed this pass - explicitly out of scope): `mark_load_ready_to_dispatch` (Phase 5) combines an SMS send with DB writes, non-atomic - a DB rollback cannot unsend an SMS. `attach_load_document` writes to disk before the DB insert - a crash between the two leaves an orphaned file. Both are candidates for a future transactional-outbox pattern; documented as requirements for that phase, not built here.
+
 ### Non-human actors (not built in this pass)
 
 `AuthenticatedActor` carries no Streamlit-specific assumption (see

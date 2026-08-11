@@ -3,6 +3,10 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, has_permission
+from application.documents.commands import attach_load_document
+from application.exceptions import AuthorizationError
 from db_client import DispatchDatabaseClient, read_df
 from services.order_parser import extract_text_from_pdf, parse_order_text
 from services.tms_data_service import refresh_data as _refresh_tms_data
@@ -16,7 +20,7 @@ def _normalize_date(value):
     return parsed.strftime("%Y-%m-%d")
 
 
-def render_documents(df: pd.DataFrame) -> None:
+def render_documents(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
     """Render the document repository and attach-file workflow."""
     st.subheader("Documents")
 
@@ -65,10 +69,18 @@ def render_documents(df: pd.DataFrame) -> None:
         doc_type = st.selectbox("Document Type", ["load_order", "rate_confirmation", "bol", "pod", "invoice", "other"])
         uploaded = st.file_uploader("Upload PDF or image", type=["pdf", "png", "jpg", "jpeg"])
 
-        if st.button("Attach Document") and uploaded is not None:
-            DispatchDatabaseClient().attach_file_to_row(row_id, uploaded, source=doc_type)
-            st.success("Document attached.")
-            st.rerun()
+        can_attach = has_permission(principal, Permission.DOCUMENT_ATTACH)
+        if not can_attach:
+            st.caption("Your role does not have permission to attach documents.")
+
+        if st.button("Attach Document", disabled=not can_attach) and uploaded is not None:
+            try:
+                attach_load_document(actor=principal, load_id=row_id, uploaded_file=uploaded, source=doc_type)
+            except AuthorizationError as exc:
+                st.error(str(exc))
+            else:
+                st.success("Document attached.")
+                st.rerun()
 
 
 def render_pdf_intake(refresh_callback=None) -> None:

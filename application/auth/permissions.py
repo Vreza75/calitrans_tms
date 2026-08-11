@@ -130,6 +130,13 @@ class Permission(str, Enum):
     LOAD_READY_TO_DISPATCH = "load:ready_to_dispatch"
     DRIVER_MESSAGE_SEND = "driver_message:send"
 
+    # Phase 5B additions.
+    DISPATCH_TRANSITION = "dispatch:transition"
+    DISPATCH_COMMUNICATION_LOG = "dispatch:communication_log"
+    DOCUMENT_ATTACH = "document:attach"
+    PORT_DATA_APPLY = "port_data:apply"
+    MASTER_DATA_EDIT = "master_data:edit"
+
     BILLING_VIEW = "billing:view"
     BILLING_EDIT = "billing:edit"
 
@@ -177,6 +184,39 @@ _ALL_PERMISSIONS = frozenset(Permission)
 #   through the normal has_permission()/require_permission() lookup below,
 #   not a role == ADMIN shortcut anywhere in this module or its callers -
 #   admin is not equated with an authentication/authorization bypass.
+#
+# Phase 5B additions - same restrictive-default-when-uncertain rule:
+# - DISPATCH_TRANSITION (Dispatch Board status transitions, driver/truck/
+#   chassis assignment, dispatch-progress tracking, and the "Mark Ready
+#   for ProfitTools" billing-handoff transition): dispatcher/manager/admin
+#   only. Dispatch Board is not in accounting's page-visibility set at
+#   all (ROLE_ALLOWED_SECTIONS), so this mirrors existing page scope, not
+#   a new restriction - included explicitly anyway so the invariant holds
+#   independent of page visibility (the same principle Phase 5 fixed for
+#   Orders/Load Management).
+# - DOCUMENT_ATTACH (attaching a file to a load's document record):
+#   granted to ALL FOUR roles, including accounting - unlike every other
+#   Phase 5B/5 operational permission. Documents is explicitly in
+#   accounting's page-visibility set already (ROLE_ALLOWED_SECTIONS),
+#   and the document-type list this action offers includes "invoice" -
+#   attaching billing documents fits this role's own stated scope
+#   ("billing plus enough load context to work invoices"), unlike
+#   operational dispatch mutations which explicitly do not. This is the
+#   one Phase 5B permission where the repository *does* establish
+#   accounting should have it, per the module docstring's own escape
+#   clause ("...unless repository business rules explicitly establish
+#   otherwise").
+# - PORT_DATA_APPLY (applying a Port Houston container/booking/PIN
+#   lookup's data onto a load): dispatcher/manager/admin only. Port
+#   Houston pages are not in accounting's page-visibility set either;
+#   same reasoning as DISPATCH_TRANSITION.
+# - MASTER_DATA_EDIT (customer/warehouse/carrier/driver upserts in
+#   admin_pages.py): manager/admin only, NOT dispatcher. Master Data is
+#   nested under the "Admin / Diagnostics" section, which dispatcher's
+#   page-visibility set does not include at all - restrictive default,
+#   nothing in this repository establishes dispatcher should edit master
+#   data. Distinct from USER_ADMIN (account provisioning) - editing a
+#   customer record is not the same capability as creating a login.
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.DISPATCHER: frozenset(
         {
@@ -186,6 +226,10 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.LOAD_VERIFY,
             Permission.LOAD_READY_TO_DISPATCH,
             Permission.DRIVER_MESSAGE_SEND,
+            Permission.DISPATCH_TRANSITION,
+            Permission.DISPATCH_COMMUNICATION_LOG,
+            Permission.DOCUMENT_ATTACH,
+            Permission.PORT_DATA_APPLY,
             Permission.TASK_CREATE,
             Permission.TASK_EDIT,
         }
@@ -193,6 +237,7 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.ACCOUNTING: frozenset(
         {
             Permission.LOAD_VIEW,
+            Permission.DOCUMENT_ATTACH,
             Permission.BILLING_VIEW,
             Permission.BILLING_EDIT,
         }
@@ -205,6 +250,11 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.LOAD_VERIFY,
             Permission.LOAD_READY_TO_DISPATCH,
             Permission.DRIVER_MESSAGE_SEND,
+            Permission.DISPATCH_TRANSITION,
+            Permission.DISPATCH_COMMUNICATION_LOG,
+            Permission.DOCUMENT_ATTACH,
+            Permission.PORT_DATA_APPLY,
+            Permission.MASTER_DATA_EDIT,
             Permission.BILLING_VIEW,
             Permission.BILLING_EDIT,
             Permission.TASK_CREATE,
