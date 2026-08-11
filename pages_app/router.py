@@ -34,7 +34,7 @@ def _load_current_tms_data_or_stop() -> pd.DataFrame:
         st.stop()
 
 
-def _render_selected_page(section: str, df: pd.DataFrame) -> None:
+def _render_selected_page(section: str, df: pd.DataFrame, principal: AuthenticatedActor) -> None:
     if section == "Operations Inbox":
         from pages_app.operations_inbox import render_operations_inbox
 
@@ -48,7 +48,7 @@ def _render_selected_page(section: str, df: pd.DataFrame) -> None:
     elif section == "Dashboard":
         render_dashboard(df)
     elif section == "Orders/Load Management":
-        render_orders_management(df)
+        render_orders_management(df, principal)
     elif section == "Active Status":
         render_active_status_view(
             df,
@@ -93,4 +93,4 @@ def route_selected_page(principal: AuthenticatedActor) -> None:
         return
 
     df = _load_current_tms_data_or_stop() if section in LOAD_DATA_SECTIONS else pd.DataFrame()
-    _render_selected_page(section, df)
+    _render_selected_page(section, df, principal)

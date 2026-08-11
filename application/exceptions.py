@@ -26,3 +26,15 @@ class ConflictError(ApplicationError):
     invalid status transition, a duplicate, a stale expected-state check).
     Maps to HTTP 409 - distinct from ValidationError (422, bad input) and
     CommandFailedError (400, an unexpected failure)."""
+
+
+class AuthorizationError(ApplicationError):
+    """The authenticated actor does not have the business permission
+    required for this command. Maps to HTTP 403 - distinct from a missing/
+    invalid authentication credential (401), which api/auth.py's
+    require_auth() already handles before a command ever runs. Raised by
+    application.auth.permissions.require_permission(); callers (Streamlit
+    pages, FastAPI routers) catch this the same way they catch
+    NotFoundError/ValidationError - this module has no framework
+    dependency and must never call st.error(), return an HTTP response, or
+    otherwise assume who is catching it."""

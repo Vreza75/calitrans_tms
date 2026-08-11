@@ -479,14 +479,28 @@ class DispatchDatabaseClient:
         with get_engine(get_secret("DATABASE_URL")).begin() as own_conn:
             return _run(own_conn)
 
-    def update_row_fields(self, row_id: int, updates: dict[str, Any], *, conn: Connection | None = None) -> None:
+    def update_row_fields(
+        self,
+        row_id: int,
+        updates: dict[str, Any],
+        *,
+        conn: Connection | None = None,
+        created_by: str = "streamlit",
+    ) -> None:
         """Update editable columns on one loads row.
 
         `conn` is optional and defaults to None, so every existing caller
         keeps its current one-call-one-transaction behavior unchanged. Pass
         an open connection (see db_client.transaction()) to run this update
         as part of a larger multi-statement business command instead - the
-        write then commits or rolls back with the rest of that command."""
+        write then commits or rolls back with the rest of that command.
+
+        `created_by` is recorded on the status_events audit row when this
+        update changes status - defaults to the pre-existing literal
+        "streamlit" for every caller that doesn't pass it (zero behavior
+        change), but application-command callers pass the real
+        AuthenticatedActor.actor so status_events reflects who actually
+        made the change instead of a generic per-framework label."""
         allowed_db_columns = _editable_db_columns()
         db_updates: dict[str, Any] = {}
 
@@ -544,7 +558,7 @@ class DispatchDatabaseClient:
                         "old_status": old_status,
                         "new_status": db_updates["status"],
                         "notes": "Status updated from Streamlit",
-                        "created_by": "streamlit",
+                        "created_by": created_by,
                     },
                 )
             return
@@ -565,7 +579,7 @@ class DispatchDatabaseClient:
                     "old_status": old_status,
                     "new_status": db_updates["status"],
                     "notes": "Status updated from Streamlit",
-                    "created_by": "streamlit",
+                    "created_by": created_by,
                 },
             )
 
