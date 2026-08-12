@@ -72,8 +72,8 @@ def _backoff_for(attempt_count: int) -> timedelta:
 
 
 def _handle_driver_dispatch_sms(payload: dict[str, Any]) -> tuple[bool, str | None, str]:
-    """Handler for event_type='driver_dispatch_sms' - the one event type
-    Phase 6 converts (application/loads/commands.py::
+    """Handler for event_type='driver_dispatch_sms' - the one Phase 6
+    event type (application/loads/commands.py::
     mark_load_ready_to_dispatch). Returns (success, provider_message_id,
     error) - error is "" on success, never None, so callers can always
     str() it safely."""
@@ -85,6 +85,23 @@ def _handle_driver_dispatch_sms(payload: dict[str, Any]) -> tuple[bool, str | No
     return False, None, str(sid_or_error)
 
 
+def _handle_document_finalize(payload: dict[str, Any]) -> tuple[bool, str | None, str]:
+    """Handler for event_type='document.file.finalize' - Phase 6B
+    (application/documents/commands.py::attach_load_document). Atomically
+    moves a staged upload to its final storage path - see
+    services/document_storage_service.py::finalize for the idempotency/
+    checksum-verification details. No "provider_message_id" concept here
+    (that's an SMS-specific idea); always returns None for it."""
+    from services.document_storage_service import finalize
+
+    success, error = finalize(
+        staging_relative_path=payload["staging_path"],
+        final_storage_key=payload["final_storage_key"],
+        expected_checksum=payload["checksum"],
+    )
+    return success, None, error
+
+
 # event_type -> handler(payload) -> (success, provider_message_id, error).
 # Registering a new event_type here is the whole integration point for a
 # future side effect (email, Motive, webhooks) - see docs/architecture/
@@ -92,6 +109,7 @@ def _handle_driver_dispatch_sms(payload: dict[str, Any]) -> tuple[bool, str | No
 # (e.g. "motive.load.sync") new event types should follow.
 _EVENT_HANDLERS: dict[str, Callable[[dict[str, Any]], tuple[bool, str | None, str]]] = {
     "driver_dispatch_sms": _handle_driver_dispatch_sms,
+    "document.file.finalize": _handle_document_finalize,
 }
 
 
@@ -99,10 +117,9 @@ def _parse_payload(raw: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else json.loads(raw)
 
 
-def _project_delivery_status(conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None) -> None:
-    """Project the outbox result onto the dispatch_messages row it
-    accompanies, if the payload references one - not every event_type
-    will (only driver_dispatch_sms does today)."""
+def _project_dispatch_message_status(
+    conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None
+) -> None:
     dispatch_message_id = payload.get("dispatch_message_id")
     if dispatch_message_id is None:
         return
@@ -113,6 +130,36 @@ def _project_delivery_status(conn, payload: dict[str, Any], outcome: str, provid
     update_dispatch_message_delivery(
         int(dispatch_message_id), conn=conn, delivery_status=delivery_status, provider_message_id=provider_message_id
     )
+
+
+def _project_document_status(conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None) -> None:
+    document_id = payload.get("document_id")
+    if document_id is None:
+        return
+
+    from repositories.document_repo import update_document_status
+
+    status = {"delivered": "available", "retrying": "pending", "failed": "failed"}[outcome]
+    update_document_status(conn, int(document_id), status=status)
+
+
+# event_type -> projector(conn, payload, outcome, provider_message_id).
+# Projects an outbox result onto the audit/domain row it accompanies, if
+# the payload references one. Not every event_type has a corresponding
+# row to update - a projector is only called when its event_type has one
+# registered here.
+_PROJECTORS: dict[str, Callable[[Any, dict[str, Any], str, str | None], None]] = {
+    "driver_dispatch_sms": _project_dispatch_message_status,
+    "document.file.finalize": _project_document_status,
+}
+
+
+def _project_delivery_status(
+    conn, event_type: str, payload: dict[str, Any], outcome: str, provider_message_id: str | None
+) -> None:
+    projector = _PROJECTORS.get(event_type)
+    if projector is not None:
+        projector(conn, payload, outcome, provider_message_id)
 
 
 def process_one() -> dict[str, Any] | None:
@@ -156,7 +203,7 @@ def process_one() -> dict[str, Any] | None:
             outbox_repo.mark_retry(conn, event["id"], error=error, delay=_backoff_for(event["attempt_count"]))
             outcome = "retrying"
 
-        _project_delivery_status(conn, payload, outcome, provider_message_id)
+        _project_delivery_status(conn, event["event_type"], payload, outcome, provider_message_id)
 
     return {"id": event["id"], "event_type": event["event_type"], "outcome": outcome, "error": error}
 

@@ -76,12 +76,24 @@ def test_create_driver_denied_for_dispatcher_zero_mutation():
 
 def test_accounting_can_attach_documents():
     """Deliberate exception to the accounting-denied-by-default rule -
-    see application/auth/permissions.py's ROLE_PERMISSIONS comment."""
+    see application/auth/permissions.py's ROLE_PERMISSIONS comment.
+    Phase 6B: attach_load_document now stages + enqueues rather than
+    calling DispatchDatabaseClient directly - see
+    tests/test_document_lifecycle.py for the full staged-write/outbox
+    command tests; this test only re-proves the accounting exception
+    still holds under the new flow."""
     from application.documents.commands import attach_load_document
 
-    with mock.patch("db_client.DispatchDatabaseClient") as client_cls:
+    conn = mock.MagicMock()
+    with mock.patch(
+        "services.document_storage_service.stage_upload", return_value=("staging/x", "final/x", "x.pdf", "abc123")
+    ), mock.patch("db_client.transaction") as transaction, mock.patch(
+        "repositories.document_repo.insert_pending_document", return_value=1
+    ) as insert_doc, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event:
+        transaction.return_value.__enter__.return_value = conn
         attach_load_document(actor=ACCOUNTING, load_id=1, uploaded_file=object(), source="invoice")
-    client_cls.return_value.attach_file_to_row.assert_called_once()
+    insert_doc.assert_called_once()
+    enqueue_event.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +143,16 @@ def test_accounting_cannot_attach_dispatch_document_via_dispatch_board_path():
     the identical command, not two divergent implementations."""
     from application.documents.commands import attach_load_document
 
-    with mock.patch("db_client.DispatchDatabaseClient") as client_cls:
+    conn = mock.MagicMock()
+    with mock.patch(
+        "services.document_storage_service.stage_upload", return_value=("staging/x", "final/x", "x.pdf", "abc123")
+    ), mock.patch("db_client.transaction") as transaction, mock.patch(
+        "repositories.document_repo.insert_pending_document", return_value=1
+    ) as insert_doc, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event:
+        transaction.return_value.__enter__.return_value = conn
         attach_load_document(actor=ACCOUNTING, load_id=1, uploaded_file=object(), source="dispatch_workspace")
-    client_cls.return_value.attach_file_to_row.assert_called_once()
+    insert_doc.assert_called_once()
+    enqueue_event.assert_called_once()
 
 
 def test_accounting_cannot_log_dispatch_communication_zero_mutation():

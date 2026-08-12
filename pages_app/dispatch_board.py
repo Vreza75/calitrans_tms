@@ -721,7 +721,7 @@ def render_dispatch_workspace(
             except AuthorizationError as exc:
                 st.error(str(exc))
             else:
-                st.success("Document attached.")
+                st.success("Document received - finalizing storage.")
                 _close_workspace_and_refresh(refresh_callback)
 
     with billing_tab:

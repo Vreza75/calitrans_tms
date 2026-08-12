@@ -33,10 +33,16 @@ def _read_dispatch_messages(load_id: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 def _read_documents_for_load(load_id: int) -> pd.DataFrame:
+    """`status` (Phase 6B - 'pending'/'available'/'failed') is included so
+    callers can distinguish a document whose file is actually stored from
+    one still staging or that failed to finalize -
+    services.dispatch_workflow_service::_load_document_count filters on
+    it; the raw Documents tab shows every status so the state is visible,
+    not hidden."""
     try:
         return read_df(
             """
-            select document_type, filename, file_path, source, created_at
+            select document_type, filename, source, status, created_at
             from documents
             where load_id = :load_id
             order by created_at desc
