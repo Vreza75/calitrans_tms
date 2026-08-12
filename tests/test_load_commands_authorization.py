@@ -113,9 +113,9 @@ def test_accounting_cannot_edit_load_fields_and_nothing_is_mutated(mock_dispatch
 
 
 def test_accounting_cannot_mark_ready_to_dispatch_and_nothing_is_mutated(mock_dispatch_client):
-    with mock.patch("services.driver_sms_service.send_sms") as send_sms, mock.patch(
+    with mock.patch("db_client.transaction") as transaction, mock.patch(
         "services.dispatch_data_service._insert_dispatch_message"
-    ) as insert_msg:
+    ) as insert_msg, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event:
         with pytest.raises(AuthorizationError):
             commands.mark_load_ready_to_dispatch(
                 actor=ACCOUNTING,
@@ -126,8 +126,9 @@ def test_accounting_cannot_mark_ready_to_dispatch_and_nothing_is_mutated(mock_di
                 phone="5551234567",
                 message="You're dispatched.",
             )
-    send_sms.assert_not_called()
+    transaction.assert_not_called()
     insert_msg.assert_not_called()
+    enqueue_event.assert_not_called()
     mock_dispatch_client.update_row_fields.assert_not_called()
 
 
@@ -188,15 +189,23 @@ def test_admin_is_denied_like_anyone_else_if_a_permission_were_revoked(mock_disp
 
 
 # ---------------------------------------------------------------------------
-# Ready-to-dispatch: requires BOTH permissions; SMS/DB side effects only
-# happen for a fully authorized, fully valid attempt.
+# Ready-to-dispatch: requires BOTH permissions. Phase 6: the SMS is
+# enqueued to the transactional outbox, not sent synchronously - these
+# tests prove the command never calls Twilio directly and that the
+# business-state write, the dispatch_messages audit row, and the outbox
+# enqueue all happen inside one db_client.transaction(). Actual delivery
+# is covered by tests/test_outbox_processor.py.
 # ---------------------------------------------------------------------------
 
 
-def test_mark_ready_to_dispatch_succeeds_and_records_real_actor(mock_dispatch_client):
-    with mock.patch("services.driver_sms_service.send_sms", return_value=(True, "SM123")) as send_sms, mock.patch(
-        "services.dispatch_data_service._insert_dispatch_message"
-    ) as insert_msg:
+def test_mark_ready_to_dispatch_succeeds_and_queues_sms_without_sending_it(mock_dispatch_client):
+    conn = mock.MagicMock()
+    with mock.patch("db_client.transaction") as transaction, mock.patch(
+        "services.dispatch_data_service._insert_dispatch_message", return_value=99
+    ) as insert_msg, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event, mock.patch(
+        "services.driver_sms_service.send_sms"
+    ) as send_sms:
+        transaction.return_value.__enter__.return_value = conn
         result = commands.mark_load_ready_to_dispatch(
             actor=DISPATCHER,
             load_id=7,
@@ -208,18 +217,26 @@ def test_mark_ready_to_dispatch_succeeds_and_records_real_actor(mock_dispatch_cl
         )
 
     assert result.ok is True
-    assert result.sms_sent is True
-    send_sms.assert_called_once()
+    assert result.sms_status == "queued"
+    send_sms.assert_not_called()  # Phase 6: never called directly by the command.
     insert_msg.assert_called_once()
     assert insert_msg.call_args.kwargs["sent_by"] == DISPATCHER.actor
+    assert insert_msg.call_args.kwargs["conn"] is conn
+    assert insert_msg.call_args.kwargs["delivery_status"] == "pending_delivery"
+    enqueue_event.assert_called_once()
+    assert enqueue_event.call_args.kwargs["conn"] is conn
+    assert enqueue_event.call_args.kwargs["event_type"] == "driver_dispatch_sms"
+    assert enqueue_event.call_args.kwargs["payload"]["dispatch_message_id"] == 99
+    assert enqueue_event.call_args.kwargs["actor"] == DISPATCHER.actor
     mock_dispatch_client.update_row_fields.assert_called_once()
     assert mock_dispatch_client.update_row_fields.call_args.kwargs["created_by"] == DISPATCHER.actor
+    assert mock_dispatch_client.update_row_fields.call_args.kwargs["conn"] is conn
 
 
-def test_mark_ready_to_dispatch_invalid_phone_sends_no_sms_and_mutates_nothing(mock_dispatch_client):
-    with mock.patch("services.driver_sms_service.send_sms") as send_sms, mock.patch(
+def test_mark_ready_to_dispatch_invalid_phone_enqueues_nothing_and_mutates_nothing(mock_dispatch_client):
+    with mock.patch("db_client.transaction") as transaction, mock.patch(
         "services.dispatch_data_service._insert_dispatch_message"
-    ) as insert_msg:
+    ) as insert_msg, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event:
         result = commands.mark_load_ready_to_dispatch(
             actor=DISPATCHER,
             load_id=7,
@@ -231,27 +248,51 @@ def test_mark_ready_to_dispatch_invalid_phone_sends_no_sms_and_mutates_nothing(m
         )
 
     assert result.ok is False
-    send_sms.assert_not_called()
+    transaction.assert_not_called()
     insert_msg.assert_not_called()
+    enqueue_event.assert_not_called()
     mock_dispatch_client.update_row_fields.assert_not_called()
 
 
-def test_mark_ready_to_dispatch_failed_sms_mutates_nothing(mock_dispatch_client):
-    with mock.patch(
-        "services.driver_sms_service.send_sms", return_value=(False, "Twilio error")
-    ) as send_sms, mock.patch("services.dispatch_data_service._insert_dispatch_message") as insert_msg:
-        result = commands.mark_load_ready_to_dispatch(
-            actor=DISPATCHER,
-            load_id=7,
-            driver_name="Joe Driver",
-            truck="T-100",
-            chassis="C-200",
-            phone="5551234567",
-            message="You're dispatched.",
-        )
+def test_mark_ready_to_dispatch_retry_within_window_is_idempotent():
+    """Same load/phone/message resubmitted within the retry-dedupe window
+    (e.g. a client-side retry after a timeout, a double-click) => same
+    idempotency key, mapping to the same outbox row instead of a second
+    SMS. Verified at the key-construction level, not against a real
+    unique-constraint conflict (that's covered by
+    tests/test_outbox_repo.py's idempotency tests)."""
+    key = commands._driver_dispatch_sms_idempotency_key
 
-    assert result.ok is False
-    assert result.reason == "Twilio error"
-    send_sms.assert_called_once()
-    insert_msg.assert_not_called()
-    mock_dispatch_client.update_row_fields.assert_not_called()
+    window = commands._RETRY_DEDUPE_WINDOW_SECONDS
+    base_time = (1_700_000_000 // window) * window  # aligned to a window boundary
+    same_bucket_later = base_time + window - 1
+
+    assert key(7, "+15551234567", "You're dispatched.", now=base_time) == key(
+        7, "+15551234567", "You're dispatched.", now=same_bucket_later
+    )
+
+
+def test_mark_ready_to_dispatch_different_message_is_not_deduped():
+    key = commands._driver_dispatch_sms_idempotency_key
+    t = 1_700_000_000.0
+
+    assert key(7, "+15551234567", "You're dispatched.", now=t) != key(
+        7, "+15551234567", "Different message.", now=t
+    )
+
+
+def test_mark_ready_to_dispatch_after_window_elapses_is_a_new_event_not_suppressed():
+    """Regression: the original content-only key design would silently
+    drop a legitimate future resend with identical text forever (ON
+    CONFLICT DO NOTHING with no new row, no error, no SMS). Once the
+    retry-dedupe window elapses, identical content must produce a
+    DIFFERENT key so a genuine later re-dispatch is not silently lost."""
+    key = commands._driver_dispatch_sms_idempotency_key
+
+    window = commands._RETRY_DEDUPE_WINDOW_SECONDS
+    base_time = (1_700_000_000 // window) * window
+    next_window = base_time + window + 1
+
+    assert key(7, "+15551234567", "You're dispatched.", now=base_time) != key(
+        7, "+15551234567", "You're dispatched.", now=next_window
+    )

@@ -47,6 +47,7 @@ DATABASE_DIR = REPO_ROOT / "database"
 #                                               (needs schema.sql and order_intake_migration.sql)
 #   ai_usage_log_migration.sql               - independent, no FKs (needs schema.sql only)
 #   app_users_migration.sql                  - independent, no FKs (Streamlit login accounts)
+#   outbox_migration.sql                     - independent, no FKs (Phase 6 transactional outbox)
 MIGRATION_ORDER = [
     "schema.sql",
     "portpro_style_migration.sql",
@@ -63,6 +64,7 @@ MIGRATION_ORDER = [
     "loads_source_intake_idempotency_migration.sql",
     "ai_usage_log_migration.sql",
     "app_users_migration.sql",
+    "outbox_migration.sql",
 ]
 
 
