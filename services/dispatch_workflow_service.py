@@ -427,11 +427,21 @@ def _load_port_verified(load) -> bool:
     )
 
 def _load_document_count(load_id: int | None, documents_df: pd.DataFrame | None = None) -> int:
-    if documents_df is not None:
-        return len(documents_df)
-    if load_id is None:
-        return 0
-    return len(_read_documents_for_load(int(load_id)))
+    """Phase 6B: a 'pending' or 'failed' document's file isn't actually
+    stored yet (or ever) - counting it toward dispatch readiness would
+    tell a dispatcher "documents attached" for a file that may not exist
+    on disk. Only 'available' counts. Falls back to counting every row
+    if the 'status' column isn't present (e.g. a caller passing a
+    hand-built dataframe in a test) rather than raising - readiness is a
+    soft UX signal, not a security boundary."""
+    if documents_df is None:
+        if load_id is None:
+            return 0
+        documents_df = _read_documents_for_load(int(load_id))
+
+    if "status" in documents_df.columns:
+        return int((documents_df["status"] == "available").sum())
+    return len(documents_df)
 
 def _load_readiness_details(load, documents_df: pd.DataFrame | None = None, include_documents: bool = True) -> dict:
     status = _first_present(load, ["Status", "status"], "New")

@@ -34,7 +34,7 @@ def render_documents(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
                 l.container_number,
                 d.document_type,
                 d.filename,
-                d.file_path,
+                d.status,
                 d.source,
                 d.created_at
             from documents d
@@ -79,7 +79,7 @@ def render_documents(df: pd.DataFrame, principal: AuthenticatedActor) -> None:
             except AuthorizationError as exc:
                 st.error(str(exc))
             else:
-                st.success("Document attached.")
+                st.success("Document received - finalizing storage.")
                 st.rerun()
 
 

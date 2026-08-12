@@ -217,6 +217,86 @@ def test_process_pending_stops_when_nothing_left_to_claim():
     assert len(results) == 3
 
 
+# ---------------------------------------------------------------------------
+# Phase 6B: event_type='document.file.finalize' - reuses the same claim/
+# result lifecycle as driver_dispatch_sms; only the handler and projector
+# differ (services.document_storage_service.finalize,
+# repositories.document_repo.update_document_status).
+# ---------------------------------------------------------------------------
+
+
+def test_process_one_document_finalize_success_marks_document_available():
+    conn = mock.MagicMock()
+    event = {
+        "id": 10,
+        "event_type": "document.file.finalize",
+        "aggregate_type": "document",
+        "aggregate_id": "42",
+        "payload": {"document_id": 42, "staging_path": "staging/tok.staging", "final_storage_key": "load_1_tok_a.pdf", "checksum": "abc"},
+        "attempt_count": 0,
+        "actor": "dispatcher@calitranscorp.com",
+    }
+    with mock.patch("services.outbox_processor.transaction", return_value=_fake_transaction(conn)), mock.patch(
+        "repositories.outbox_repo.claim_next_pending", return_value=event
+    ), mock.patch("repositories.outbox_repo.mark_delivered") as mark_delivered, mock.patch(
+        "services.document_storage_service.finalize", return_value=(True, "")
+    ) as finalize, mock.patch("repositories.document_repo.update_document_status") as update_status:
+        result = outbox_processor.process_one()
+
+    assert result["outcome"] == "delivered"
+    finalize.assert_called_once_with(
+        staging_relative_path="staging/tok.staging", final_storage_key="load_1_tok_a.pdf", expected_checksum="abc"
+    )
+    mark_delivered.assert_called_once_with(conn, 10, provider_message_id=None)
+    update_status.assert_called_once_with(conn, 42, status="available")
+
+
+def test_process_one_document_finalize_failure_retries_and_leaves_status_pending():
+    conn = mock.MagicMock()
+    event = {
+        "id": 11,
+        "event_type": "document.file.finalize",
+        "aggregate_type": "document",
+        "aggregate_id": "43",
+        "payload": {"document_id": 43, "staging_path": "staging/tok2.staging", "final_storage_key": "load_1_tok2_a.pdf", "checksum": "def"},
+        "attempt_count": 0,
+        "actor": None,
+    }
+    with mock.patch("services.outbox_processor.transaction", return_value=_fake_transaction(conn)), mock.patch(
+        "repositories.outbox_repo.claim_next_pending", return_value=event
+    ), mock.patch("repositories.outbox_repo.mark_retry") as mark_retry, mock.patch(
+        "services.document_storage_service.finalize", return_value=(False, "Staged file not found")
+    ), mock.patch("repositories.document_repo.update_document_status") as update_status:
+        result = outbox_processor.process_one()
+
+    assert result["outcome"] == "retrying"
+    mark_retry.assert_called_once()
+    update_status.assert_called_once_with(conn, 43, status="pending")
+
+
+def test_process_one_document_finalize_terminal_failure_marks_document_failed():
+    conn = mock.MagicMock()
+    event = {
+        "id": 12,
+        "event_type": "document.file.finalize",
+        "aggregate_type": "document",
+        "aggregate_id": "44",
+        "payload": {"document_id": 44, "staging_path": "s", "final_storage_key": "f", "checksum": "c"},
+        "attempt_count": outbox_processor.MAX_ATTEMPTS - 1,
+        "actor": None,
+    }
+    with mock.patch("services.outbox_processor.transaction", return_value=_fake_transaction(conn)), mock.patch(
+        "repositories.outbox_repo.claim_next_pending", return_value=event
+    ), mock.patch("repositories.outbox_repo.mark_failed") as mark_failed, mock.patch(
+        "services.document_storage_service.finalize", return_value=(False, "disk full")
+    ), mock.patch("repositories.document_repo.update_document_status") as update_status:
+        result = outbox_processor.process_one()
+
+    assert result["outcome"] == "failed"
+    mark_failed.assert_called_once_with(conn, 12, error="disk full")
+    update_status.assert_called_once_with(conn, 44, status="failed")
+
+
 def test_process_pending_respects_max_events_cap():
     with mock.patch(
         "services.outbox_processor.transaction", return_value=_fake_transaction(mock.MagicMock())

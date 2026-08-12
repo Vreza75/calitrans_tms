@@ -256,6 +256,10 @@ Closed the gaps a self-audit of Phase 6's first pass found before publication (s
 - **`last_error` sanitization**: now routed through `utils/error_sanitizer.py` at one choke point for *both* a handler's raised exception and a handler's own returned failure string (previously only the exception path was sanitized).
 - **Operator recovery tooling**: `scripts/process_outbox.py` gained `list-pending`/`list-failed`/`inspect`/`retry`/`retry-all-failed` subcommands, backed by new `repositories/outbox_repo.py` functions - an operator no longer needs direct SQL access to inspect or requeue a failed event.
 
+### Phase 6B: reliable document lifecycle
+
+See `docs/architecture/DOCUMENT_LIFECYCLE.md` for the full design. Summary: `attach_load_document` no longer writes the uploaded file to disk before the DB row exists - the upload is staged and checksummed, a `documents` row is inserted with `status='pending'`, and a `document.file.finalize` outbox event is enqueued, all in one transaction (same outbox infrastructure Phase 6 built for SMS). `services/outbox_processor.py` atomically renames the staged file to its final path and flips `status='available'` only once that succeeds. `require_permission(actor, Permission.DOCUMENT_ATTACH)` still runs first, before any staging/write - an unauthorized actor produces zero staged file, zero DB row, zero outbox event. Storage durability itself (local disk, uncertain whether it survives a Streamlit Cloud redeploy) is explicitly **not** claimed as solved by this pass - see the doc's "Storage architecture found" section.
+
 ### Non-human actors (not built in this pass)
 
 `AuthenticatedActor` carries no Streamlit-specific assumption (see
