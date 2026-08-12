@@ -14,6 +14,51 @@ from application.loads.models import (
 )
 from utils.error_sanitizer import sanitize_exception_message
 
+# mark_load_ready_to_dispatch's outbox idempotency-key time bucket - see
+# _driver_dispatch_sms_idempotency_key's docstring for the full rationale
+# (content-only keys silently suppress legitimate future resends;
+# timestamp-only keys defeat retry dedup; this buckets time coarsely to
+# get real dedup within a realistic retry window without permanently
+# blocking a later resend).
+_RETRY_DEDUPE_WINDOW_SECONDS = 300
+
+
+def _driver_dispatch_sms_idempotency_key(load_id: int, phone: str, message: str, *, now: float | None = None) -> str:
+    """Content-addressed AND time-windowed, deliberately neither alone:
+
+    - Pure content (load_id + phone + message, no time component) was
+      this key's first design and had a real bug: two genuinely separate
+      Ready-to-Dispatch actions for the same load with byte-identical
+      phone/message (e.g. the same driver re-dispatched days later with
+      the same standard message text) would collide on the same
+      idempotency_key. ON CONFLICT DO NOTHING would then silently drop
+      the second, legitimate SMS forever - no error, no event, nothing
+      sent, load still marked Ready to Dispatch. That's not
+      deduplication, that's silent message loss.
+    - Pure timestamp (no content) was rejected per design guidance - it
+      defeats retry deduplication entirely, since every resubmission
+      (even a genuine same-click retry a second later) gets a fresh key.
+
+    Bucketing time coarsely gets both: a same-content resubmission within
+    the window (a client-side retry after a timeout, a double-click) maps
+    to the same bucket and is deduped; the same content sent again after
+    the window elapses (a legitimate future re-dispatch) gets a new
+    bucket and is allowed through. Residual accepted risk: two genuinely
+    distinct dispatch actions with byte-identical phone+message occurring
+    within the same window would still collide - judged acceptable for a
+    ~10-20 driver fleet where that coincidence is vanishingly unlikely,
+    and far better than either pure-content (permanent loss) or
+    pure-timestamp (no dedup) alone.
+
+    `now` is injectable for tests - defaults to the real clock."""
+    import hashlib
+    import time
+
+    retry_window = int((now if now is not None else time.time()) // _RETRY_DEDUPE_WINDOW_SECONDS)
+    return "driver_dispatch_sms:" + hashlib.sha256(
+        f"{load_id}:{phone}:{message}:{retry_window}".encode("utf-8")
+    ).hexdigest()
+
 
 def transition_load(
     load_id: int,
@@ -255,22 +300,35 @@ def mark_load_ready_to_dispatch(
     message: str,
     note: str = "",
 ) -> ReadyToDispatchResult:
-    """Send the driver dispatch SMS, log it, and mark the load Ready to
-    Dispatch. Requires both LOAD_READY_TO_DISPATCH and DRIVER_MESSAGE_SEND
-    - this one command does both things, so an actor missing either
-    capability is refused before the SMS is sent (never a partial action:
-    SMS-sent-but-not-authorized-to-dispatch, or vice versa).
+    """Assign driver/truck/chassis, mark the load Ready to Dispatch, and
+    queue the driver dispatch SMS for asynchronous delivery. Requires both
+    LOAD_READY_TO_DISPATCH and DRIVER_MESSAGE_SEND - this one command does
+    both things, so an actor missing either capability is refused before
+    anything is written (never a partial action).
 
-    Preserves the original UI logic's ordering and failure handling
-    exactly: an invalid phone number or a failed send returns ok=False
-    with zero database mutation - the SMS provider call is not
-    transactional with the database writes (external side effect), so
-    this was never atomic and remains not atomic, matching the pre-Phase-5
-    behavior it replaces."""
+    Phase 6 change (see docs/architecture/OUTBOX.md): this used to call
+    Twilio synchronously and only wrote the database if the send
+    succeeded - the external call and the database writes were never
+    atomic with each other, but were at least ordered so a failed SMS
+    left zero mutation. That ordering is gone: the business-state write
+    (driver/truck/chassis/status), the dispatch_messages audit row, and
+    the outbox event are now one atomic database transaction, and the SMS
+    itself is sent afterward, asynchronously, by
+    services.outbox_processor. A load can now show "Ready to Dispatch"
+    before its SMS is confirmed delivered - `sms_status="queued"` on the
+    result reflects that honestly (see ReadyToDispatchResult's
+    docstring), and dispatch_messages.delivery_status/outbox_events let an
+    operator see actual delivery state. Deliberately not gated on SMS
+    success: this is the whole point of decoupling the business
+    transaction from the external side effect, not an oversight.
+
+    An invalid phone number still fails fast with zero mutation and zero
+    enqueue - that's local validation, not an external call, so there's
+    no reason to make it asynchronous."""
     require_permission(actor, Permission.LOAD_READY_TO_DISPATCH)
     require_permission(actor, Permission.DRIVER_MESSAGE_SEND)
 
-    from services.driver_sms_service import format_phone_e164, send_sms
+    from services.driver_sms_service import format_phone_e164
 
     normalized_phone = format_phone_e164(phone)
     if not normalized_phone:
@@ -278,32 +336,46 @@ def mark_load_ready_to_dispatch(
             ok=False, load_id=load_id, reason=f"'{phone.strip()}' isn't a valid phone number."
         )
 
-    sent, sid_or_error = send_sms(normalized_phone, message)
-    if not sent:
-        return ReadyToDispatchResult(ok=False, load_id=load_id, reason=str(sid_or_error))
-
-    from db_client import DispatchDatabaseClient
+    from db_client import DispatchDatabaseClient, transaction
+    from repositories.outbox_repo import enqueue_outbox_event
     from services.dispatch_data_service import _insert_dispatch_message
 
-    _insert_dispatch_message(
-        load_id,
-        "driver_dispatch_sms",
-        "outbound",
-        normalized_phone,
-        message,
-        provider="twilio",
-        sent_by=actor.actor,
-    )
-    DispatchDatabaseClient().update_row_fields(
-        load_id,
-        {
-            "Driver Name": driver_name.strip(),
-            "Truck Assigned": truck.strip(),
-            "Chassis": chassis.strip(),
-            "Status": "Ready to Dispatch",
-            "Dispatcher Notes": note or "Driver, truck, and chassis assigned. Ready to dispatch.",
-        },
-        created_by=actor.actor,
-    )
+    idempotency_key = _driver_dispatch_sms_idempotency_key(load_id, normalized_phone, message)
 
-    return ReadyToDispatchResult(ok=True, load_id=load_id, status="Ready to Dispatch", sms_sent=True)
+    with transaction() as conn:
+        DispatchDatabaseClient().update_row_fields(
+            load_id,
+            {
+                "Driver Name": driver_name.strip(),
+                "Truck Assigned": truck.strip(),
+                "Chassis": chassis.strip(),
+                "Status": "Ready to Dispatch",
+                "Dispatcher Notes": note or "Driver, truck, and chassis assigned. Ready to dispatch.",
+            },
+            conn=conn,
+            created_by=actor.actor,
+        )
+
+        dispatch_message_id = _insert_dispatch_message(
+            load_id,
+            "driver_dispatch_sms",
+            "outbound",
+            normalized_phone,
+            message,
+            provider="twilio",
+            sent_by=actor.actor,
+            conn=conn,
+            delivery_status="pending_delivery",
+        )
+
+        enqueue_outbox_event(
+            conn=conn,
+            event_type="driver_dispatch_sms",
+            aggregate_type="load",
+            aggregate_id=str(load_id),
+            payload={"to": normalized_phone, "message": message, "dispatch_message_id": dispatch_message_id},
+            idempotency_key=idempotency_key,
+            actor=actor.actor,
+        )
+
+    return ReadyToDispatchResult(ok=True, load_id=load_id, status="Ready to Dispatch", sms_status="queued")

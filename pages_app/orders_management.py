@@ -822,10 +822,10 @@ def _render_ready_to_dispatch_panel(
                 st.session_state.pop("orders_management_selected_row_id", None)
                 st.session_state.pop("orders_management_selected_context", None)
                 refresh_data()
-                st.success(f"Text sent to {driver_name} and load marked Ready to Dispatch.")
+                st.success(f"Load marked Ready to Dispatch. Text to {driver_name} is queued for delivery.")
                 st.rerun()
             else:
-                st.error(f"Could not send the text — no changes were made. {result.reason}")
+                st.error(f"Could not queue the text — no changes were made. {result.reason}")
 
     if not can_dispatch:
         st.caption("Your role does not have permission to mark loads Ready to Dispatch.")

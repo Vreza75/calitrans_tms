@@ -46,10 +46,17 @@ class LoadCommandResult:
 
 @dataclass(frozen=True)
 class ReadyToDispatchResult:
+    """Phase 6: `sms_status` replaced the old `sms_sent: bool` - the SMS
+    is now enqueued to the transactional outbox (services/
+    outbox_processor.py delivers it asynchronously), so this command can
+    no longer truthfully report "sent" by the time it returns. Values:
+    "queued" on success, "" when ok is False (invalid phone/unauthorized -
+    nothing was enqueued)."""
+
     ok: bool
     load_id: int
     status: str = ""
-    sms_sent: bool = False
+    sms_status: str = ""
     reason: str = ""
 
 

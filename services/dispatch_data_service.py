@@ -91,26 +91,72 @@ def _insert_dispatch_message(
     message_body: str,
     provider: str = "internal",
     sent_by: str = "dispatcher",
-) -> None:
+    *,
+    conn=None,
+    delivery_status: str | None = None,
+) -> int | None:
     """`sent_by` defaults to the pre-existing literal "dispatcher" for
     every caller that doesn't pass it (zero behavior change) -
     application-command callers pass the real AuthenticatedActor.actor so
-    dispatch_messages reflects who actually sent it."""
+    dispatch_messages reflects who actually sent it.
+
+    `conn`/`delivery_status` are Phase 6 additions, both optional and
+    both None by default (zero behavior change for every pre-Phase-6
+    caller, which keeps using the module-level execute() and gets back
+    None as before). Pass `conn` to run this insert as part of a larger
+    db_client.transaction() - see application/loads/commands.py::
+    mark_load_ready_to_dispatch, which inserts this row and its outbox
+    event in the same transaction. Only when `conn` is supplied does this
+    function return the inserted row's id (via RETURNING), so the caller
+    can reference it from an outbox event payload."""
     ensure_communications_schema()
-    execute(
+    sql = """
+        insert into dispatch_messages
+            (load_id, message_type, direction, recipient, message_body, sent_by, provider, delivery_status)
+        values
+            (:load_id, :message_type, :direction, :recipient, :message_body, :sent_by, :provider, :delivery_status)
         """
-        insert into dispatch_messages (load_id, message_type, direction, recipient, message_body, sent_by, provider)
-        values (:load_id, :message_type, :direction, :recipient, :message_body, :sent_by, :provider)
-        """,
-        {
-            "load_id": load_id,
-            "message_type": message_type,
-            "direction": direction,
-            "recipient": recipient or None,
-            "message_body": message_body,
-            "sent_by": sent_by,
-            "provider": provider,
-        },
+    params = {
+        "load_id": load_id,
+        "message_type": message_type,
+        "direction": direction,
+        "recipient": recipient or None,
+        "message_body": message_body,
+        "sent_by": sent_by,
+        "provider": provider,
+        "delivery_status": delivery_status,
+    }
+    if conn is not None:
+        from sqlalchemy import text
+
+        result = conn.execute(text(sql + " returning id"), params)
+        return int(result.scalar_one())
+
+    execute(sql, params)
+    return None
+
+
+def update_dispatch_message_delivery(
+    message_id: int, *, conn, delivery_status: str, provider_message_id: str | None = None
+) -> None:
+    """Project an outbox delivery outcome onto the dispatch_messages row
+    it accompanies. Called only by services.outbox_processor - must run
+    in the same short transaction as the corresponding outbox_events
+    status write (see repositories/outbox_repo.py's mark_delivered/
+    mark_retry/mark_failed), so the audit row and the queue state never
+    disagree about whether delivery happened."""
+    from sqlalchemy import text
+
+    conn.execute(
+        text(
+            """
+            update dispatch_messages
+            set delivery_status = :delivery_status,
+                provider_message_id = coalesce(:provider_message_id, provider_message_id)
+            where id = :id
+            """
+        ),
+        {"id": message_id, "delivery_status": delivery_status, "provider_message_id": provider_message_id},
     )
 
 def _save_status_quick_update(load_id: int, selected_load, new_status: str, note: str) -> tuple[bool, str]:

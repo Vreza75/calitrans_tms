@@ -28,6 +28,7 @@ catches that (`test_every_sql_file_on_disk_is_in_migration_order`).
 13. `loads_source_intake_idempotency_migration.sql` — ALTERs loads (adds `source_intake_id`, FK -> order_intake) and adds a partial unique index (`ux_loads_source_intake_id`, where not null) so a retried inbox-to-load creation resolves to the existing load instead of inserting a duplicate
 14. `ai_usage_log_migration.sql` — creates `ai_usage_log` (the table `ai_core/usage_logger.py::log_ai_usage()` actually writes to on every real LLM call). Previously had **no migration coverage at all** - the runtime `ensure_ai_usage_table()` call was the only definition of this table's schema anywhere, and it runs unconditionally on every call (no readiness-cache guard, unlike the other `ensure_*_schema()` functions below)
 15. `app_users_migration.sql` — creates `app_users` (Streamlit + API login: email, bcrypt password hash, role, is_active), with a unique index on `lower(email)` so case-variant emails can't create duplicate accounts. See `docs/AUTHENTICATION.md`.
+16. `outbox_migration.sql` — creates `outbox_events` (Phase 6 transactional outbox: durable queue for external side effects like the driver-dispatch SMS, enqueued in the same transaction as the business-state write it accompanies). See `docs/architecture/OUTBOX.md`.
 
 This numbered list mirrors `MIGRATION_ORDER` in `scripts/run_migrations.py` at the
 time of writing. When a new migration is appended there, add it here too -
@@ -37,6 +38,8 @@ but nothing enforces that this doc's list stays in sync with that registration,
 so treat this file as needing a one-line addition whenever `MIGRATION_ORDER` grows.
 
 **Required rollout order for this pass**: apply this migration (`python scripts/run_migrations.py`) *before* deploying application code that calls `DispatchDatabaseClient.add_row(..., source_intake_id=...)` (currently `services/order_intake.py::create_load_from_intake_with_status`, used by `services/operations_inbox_service.py::create_load_from_inbox_item`). The application does not create this column/index itself - if it runs against a database that hasn't had this migration applied yet, the `INSERT` referencing `source_intake_id` fails with a clear, sanitized `UndefinedColumn`-derived error (via `application/loads/commands.py`'s existing exception sanitization), not a silent schema mutation or a silently-skipped idempotency check. Verify with `python scripts/verify_schema.py` after applying (its index parser now also recognizes `create unique index`, not just `create index` - see `tests/test_migration_runner.py::test_parse_expected_schema_finds_unique_indexes`).
+
+**Rollout order for `outbox_migration.sql`**: apply it *before* deploying the Phase 6 application code (`application/loads/commands.py::mark_load_ready_to_dispatch` calling `repositories/outbox_repo.py::enqueue_outbox_event`) - the reverse order makes that command's outbox insert fail against a nonexistent `outbox_events` table. `outbox_migration.sql` has no FKs, so it can otherwise run any time after `schema.sql`.
 
 Every file is idempotent (`create table/index if not exists`,
 `add column if not exists`, `drop trigger if exists` + recreate) so
