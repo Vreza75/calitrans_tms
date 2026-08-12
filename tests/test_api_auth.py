@@ -121,8 +121,8 @@ def test_dispatcher_role_can_perform_permitted_mutation(configured_client: TestC
 
     captured_actor = {}
 
-    def _fake_close(work_item_id, actor, reason):
-        captured_actor["actor"] = actor
+    def _fake_close(work_item_id, *, actor, reason):
+        captured_actor["actor"] = actor.actor
         return CommandResult(ok=True, work_item_id=work_item_id, detail="Closed")
 
     monkeypatch.setattr(router_module.work_item_commands, "close_work_item", _fake_close)
@@ -215,7 +215,7 @@ def test_dispatcher_role_can_create_load(configured_client: TestClient, monkeypa
     monkeypatch.setattr(
         router_module,
         "create_load_from_work_item",
-        lambda work_item_id, approved_fields: CreateLoadResult(ok=True, load_id=42, review_status="Ready"),
+        lambda work_item_id, approved_fields, *, actor: CreateLoadResult(ok=True, load_id=42, review_status="Ready"),
     )
 
     r = configured_client.post(
@@ -234,7 +234,7 @@ def test_dispatcher_role_can_update_load(configured_client: TestClient, monkeypa
     monkeypatch.setattr(
         router_module,
         "update_load_from_work_item",
-        lambda work_item_id, load_id, approved_fields, fill_blank_only=True: UpdateLoadResult(
+        lambda work_item_id, load_id, approved_fields, *, actor, fill_blank_only=True: UpdateLoadResult(
             ok=True, load_id=load_id, updated_fields=["Customer"], skipped_fields=[]
         ),
     )
@@ -275,7 +275,7 @@ def test_dispatcher_role_can_update_draft(configured_client: TestClient, monkeyp
     monkeypatch.setattr(
         router_module,
         "update_order_draft",
-        lambda conversation_key, fields: UpdateDraftResult(
+        lambda conversation_key, fields, *, actor: UpdateDraftResult(
             ok=True, conversation_key=conversation_key, updated_fields=list(fields.keys())
         ),
     )

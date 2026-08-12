@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from db_client import transaction
 from repositories import inbox_repo, work_item_repo
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, require_permission
 from application.exceptions import NotFoundError
 
 
@@ -27,10 +29,17 @@ def _require_work_item(conn, work_item_id: int) -> dict:
     return dict(row)
 
 
-def close_work_item(work_item_id: int, *, actor: str = "dispatcher", reason: str = "") -> CommandResult:
+def close_work_item(work_item_id: int, *, actor: AuthenticatedActor, reason: str = "") -> CommandResult:
     """Mark a work item Closed. Single transaction: the status write and
     its case-history audit row (when the item belongs to a case) commit or
-    roll back together."""
+    roll back together.
+
+    Requires Permission.WORK_ITEM_MANAGE before doing anything else - an
+    unauthorized actor triggers zero reads/writes (Stage 2 closure pass).
+    The real actor identity (actor.actor) is recorded on the case-history
+    audit row, not a hardcoded placeholder."""
+    require_permission(actor, Permission.WORK_ITEM_MANAGE)
+
     with transaction() as conn:
         record = _require_work_item(conn, work_item_id)
         work_item_repo.update_review_status(work_item_id, "Closed", conn=conn)
@@ -41,18 +50,23 @@ def close_work_item(work_item_id: int, *, actor: str = "dispatcher", reason: str
                 event_type="work_item_closed",
                 title=f"Work item #{work_item_id} closed.",
                 details=reason,
-                actor=actor,
+                actor=actor.actor,
                 conn=conn,
             )
 
     return CommandResult(ok=True, work_item_id=int(work_item_id), detail="Closed")
 
 
-def link_work_item_to_load(work_item_id: int, load_id: int, *, actor: str = "dispatcher") -> CommandResult:
+def link_work_item_to_load(work_item_id: int, load_id: int, *, actor: AuthenticatedActor) -> CommandResult:
     """Attach a work item to an existing load. Single transaction: the
     order_intake link and its case-history audit row commit or roll back
     together (Phase 1 rule: never a load link without the matching audit
-    trail, and vice versa)."""
+    trail, and vice versa).
+
+    Requires Permission.WORK_ITEM_MANAGE before doing anything else - an
+    unauthorized actor triggers zero reads/writes (Stage 2 closure pass)."""
+    require_permission(actor, Permission.WORK_ITEM_MANAGE)
+
     with transaction() as conn:
         from sqlalchemy import text
 
@@ -71,7 +85,7 @@ def link_work_item_to_load(work_item_id: int, load_id: int, *, actor: str = "dis
                 case_id=int(record["case_id"]),
                 event_type="work_item_linked_to_load",
                 title=f"Work item #{work_item_id} linked to load {load_id}.",
-                actor=actor,
+                actor=actor.actor,
                 conn=conn,
             )
 

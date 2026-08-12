@@ -4,9 +4,13 @@ import pytest
 from sqlalchemy import text
 
 import db_client
-from application.exceptions import NotFoundError
+from application.auth.models import AuthenticatedActor, Role
+from application.exceptions import AuthorizationError, NotFoundError
 from application.work_items import commands as wic
 from repositories import work_item_repo
+
+DISPATCHER = AuthenticatedActor(actor="dispatcher@calitranscorp.com", role=Role.DISPATCHER)
+ACCOUNTING = AuthenticatedActor(actor="accountant@calitranscorp.com", role=Role.ACCOUNTING)
 
 
 @pytest.fixture
@@ -61,14 +65,14 @@ def _case_event_count(case_id: int) -> int:
 
 
 def test_close_work_item_without_a_case_just_updates_status(sqlite_order_intake) -> None:
-    result = wic.close_work_item(1, reason="duplicate")
+    result = wic.close_work_item(1, actor=DISPATCHER, reason="duplicate")
 
     assert result.ok is True
     assert _review_status(1) == "Closed"
 
 
 def test_close_work_item_with_a_case_writes_status_and_audit_together(sqlite_order_intake) -> None:
-    wic.close_work_item(2, reason="handled")
+    wic.close_work_item(2, actor=DISPATCHER, reason="handled")
 
     assert _review_status(2) == "Closed"
     assert _case_event_count(55) == 1
@@ -76,22 +80,36 @@ def test_close_work_item_with_a_case_writes_status_and_audit_together(sqlite_ord
 
 def test_close_work_item_raises_not_found_for_missing_id(sqlite_order_intake) -> None:
     with pytest.raises(NotFoundError):
-        wic.close_work_item(999)
+        wic.close_work_item(999, actor=DISPATCHER)
+
+
+def test_close_work_item_denies_accounting_zero_mutation(sqlite_order_intake) -> None:
+    with pytest.raises(AuthorizationError):
+        wic.close_work_item(1, actor=ACCOUNTING, reason="duplicate")
+
+    assert _review_status(1) == "Open"
 
 
 def test_link_work_item_to_load_raises_not_found_for_missing_load(sqlite_order_intake) -> None:
     with pytest.raises(NotFoundError):
-        wic.link_work_item_to_load(1, load_id=999999)
+        wic.link_work_item_to_load(1, load_id=999999, actor=DISPATCHER)
 
     # Nothing should have been written - the load lookup fails before any write.
     assert _review_status(1) == "Open"
 
 
 def test_link_work_item_to_load_updates_status_and_matched_load(sqlite_order_intake) -> None:
-    result = wic.link_work_item_to_load(1, load_id=100)
+    result = wic.link_work_item_to_load(1, load_id=100, actor=DISPATCHER)
 
     assert result.ok is True
     assert _review_status(1) == "Attached"
+
+
+def test_link_work_item_to_load_denies_accounting_zero_mutation(sqlite_order_intake) -> None:
+    with pytest.raises(AuthorizationError):
+        wic.link_work_item_to_load(1, load_id=100, actor=ACCOUNTING)
+
+    assert _review_status(1) == "Open"
 
 
 def test_close_work_item_audit_insert_failure_rolls_back_the_status_write(sqlite_order_intake, monkeypatch) -> None:
@@ -101,7 +119,7 @@ def test_close_work_item_audit_insert_failure_rolls_back_the_status_write(sqlite
     monkeypatch.setattr(work_item_repo, "insert_case_event", _boom)
 
     with pytest.raises(RuntimeError):
-        wic.close_work_item(2, reason="handled")
+        wic.close_work_item(2, actor=DISPATCHER, reason="handled")
 
     # Work item 2 has a case_id, so the audit insert runs after the status
     # write in the same transaction - a failure there must roll back the

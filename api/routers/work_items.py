@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from api.auth import MUTATE_OPERATIONS, READ_OPERATIONS, require_role
-from api.dependencies import get_current_actor
+from api.auth import MUTATE_OPERATIONS, READ_OPERATIONS, AuthenticatedActor, require_auth, require_role
 from api.schemas.conversations import ConversationPageOut
 from api.schemas.loads import CreateLoadIn, CreateLoadOut, UpdateLoadIn, UpdateLoadOut
 from api.schemas.order_drafts import OrderDraftOut, UpdateOrderDraftIn, UpdateOrderDraftOut
@@ -103,9 +102,13 @@ def get_work_item_draft(work_item_id: int) -> OrderDraftOut:
     response_model=UpdateOrderDraftOut,
     dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
 )
-def update_work_item_draft(work_item_id: int, payload: UpdateOrderDraftIn) -> UpdateOrderDraftOut:
+def update_work_item_draft(
+    work_item_id: int,
+    payload: UpdateOrderDraftIn,
+    actor: AuthenticatedActor = Depends(require_auth),
+) -> UpdateOrderDraftOut:
     detail = get_work_item_detail(work_item_id)
-    result = update_order_draft(detail.conversation_key, payload.fields)
+    result = update_order_draft(detail.conversation_key, payload.fields, actor=actor)
     return UpdateOrderDraftOut(**result.__dict__)
 
 
@@ -114,8 +117,12 @@ def update_work_item_draft(work_item_id: int, payload: UpdateOrderDraftIn) -> Up
     response_model=CreateLoadOut,
     dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
 )
-def create_load(work_item_id: int, payload: CreateLoadIn) -> CreateLoadOut:
-    result = create_load_from_work_item(work_item_id, payload.approved_fields)
+def create_load(
+    work_item_id: int,
+    payload: CreateLoadIn,
+    actor: AuthenticatedActor = Depends(require_auth),
+) -> CreateLoadOut:
+    result = create_load_from_work_item(work_item_id, payload.approved_fields, actor=actor)
     return CreateLoadOut(ok=result.ok, load_id=result.load_id, review_status=result.review_status)
 
 
@@ -124,11 +131,16 @@ def create_load(work_item_id: int, payload: CreateLoadIn) -> CreateLoadOut:
     response_model=UpdateLoadOut,
     dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
 )
-def update_load(work_item_id: int, payload: UpdateLoadIn) -> UpdateLoadOut:
+def update_load(
+    work_item_id: int,
+    payload: UpdateLoadIn,
+    actor: AuthenticatedActor = Depends(require_auth),
+) -> UpdateLoadOut:
     result = update_load_from_work_item(
         work_item_id,
         payload.load_id,
         payload.approved_fields,
+        actor=actor,
         fill_blank_only=payload.fill_blank_only,
     )
     return UpdateLoadOut(
@@ -147,7 +159,7 @@ def update_load(work_item_id: int, payload: UpdateLoadIn) -> UpdateLoadOut:
 def close_work_item(
     work_item_id: int,
     payload: CloseWorkItemIn,
-    actor: str = Depends(get_current_actor),
+    actor: AuthenticatedActor = Depends(require_auth),
 ) -> CommandResultOut:
     result = work_item_commands.close_work_item(work_item_id, actor=actor, reason=payload.reason)
     return CommandResultOut(**result.__dict__)
@@ -161,7 +173,7 @@ def close_work_item(
 def link_work_item_to_load(
     work_item_id: int,
     payload: LinkLoadIn,
-    actor: str = Depends(get_current_actor),
+    actor: AuthenticatedActor = Depends(require_auth),
 ) -> CommandResultOut:
     result = work_item_commands.link_work_item_to_load(work_item_id, payload.load_id, actor=actor)
     return CommandResultOut(**result.__dict__)

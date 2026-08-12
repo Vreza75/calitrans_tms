@@ -137,6 +137,9 @@ class Permission(str, Enum):
     PORT_DATA_APPLY = "port_data:apply"
     MASTER_DATA_EDIT = "master_data:edit"
 
+    # Stage 2 closure addition.
+    WORK_ITEM_MANAGE = "work_item:manage"
+
     BILLING_VIEW = "billing:view"
     BILLING_EDIT = "billing:edit"
 
@@ -217,6 +220,16 @@ _ALL_PERMISSIONS = frozenset(Permission)
 #   nothing in this repository establishes dispatcher should edit master
 #   data. Distinct from USER_ADMIN (account provisioning) - editing a
 #   customer record is not the same capability as creating a login.
+#
+# Stage 2 addition:
+# - WORK_ITEM_MANAGE (api/routers/work_items.py's draft-edit, create-load,
+#   update-load, close, and link-load mutations): dispatcher/manager/admin
+#   only, mirroring this router's existing coarse require_role(
+#   *MUTATE_OPERATIONS) gate - not a new grant, the fine-grained check
+#   simply now enforces what the coarse gate already implied. One
+#   permission covers all five work-item mutations rather than five,
+#   since they are all facets of the same business capability (turning an
+#   Operations Inbox work item into/onto a load) - not five distinct ones.
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.DISPATCHER: frozenset(
         {
@@ -230,6 +243,7 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.DISPATCH_COMMUNICATION_LOG,
             Permission.DOCUMENT_ATTACH,
             Permission.PORT_DATA_APPLY,
+            Permission.WORK_ITEM_MANAGE,
             Permission.TASK_CREATE,
             Permission.TASK_EDIT,
         }
@@ -255,6 +269,7 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.DOCUMENT_ATTACH,
             Permission.PORT_DATA_APPLY,
             Permission.MASTER_DATA_EDIT,
+            Permission.WORK_ITEM_MANAGE,
             Permission.BILLING_VIEW,
             Permission.BILLING_EDIT,
             Permission.TASK_CREATE,
