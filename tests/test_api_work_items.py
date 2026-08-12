@@ -171,7 +171,7 @@ def test_close_work_item_endpoint_validates_json_body(client: TestClient, monkey
     monkeypatch.setattr(
         router_module.work_item_commands,
         "close_work_item",
-        lambda work_item_id, actor, reason: CommandResult(ok=True, work_item_id=work_item_id, detail="Closed"),
+        lambda work_item_id, *, actor, reason: CommandResult(ok=True, work_item_id=work_item_id, detail="Closed"),
     )
 
     r = client.post("/api/v1/work-items/1/close", json={"reason": "handled"})
@@ -183,7 +183,7 @@ def test_close_work_item_endpoint_validates_json_body(client: TestClient, monkey
 def test_create_load_returns_422_on_validation_error(client: TestClient, monkeypatch) -> None:
     from api.routers import work_items as router_module
 
-    def _raise(work_item_id, approved_fields):
+    def _raise(work_item_id, approved_fields, *, actor):
         raise ValidationError("Booking Number or Reference Number is required to create a load.")
 
     monkeypatch.setattr(router_module, "create_load_from_work_item", _raise)
@@ -285,7 +285,7 @@ def test_update_load_route_exists_and_calls_shared_command(client: TestClient, m
     monkeypatch.setattr(
         router_module,
         "update_load_from_work_item",
-        lambda work_item_id, load_id, approved_fields, *, fill_blank_only: UpdateLoadResult(
+        lambda work_item_id, load_id, approved_fields, *, actor, fill_blank_only: UpdateLoadResult(
             ok=True, load_id=load_id, updated_fields=["Delivery Need Date"], skipped_fields=[]
         ),
     )

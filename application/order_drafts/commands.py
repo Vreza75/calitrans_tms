@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, require_permission
 from application.exceptions import NotFoundError, ValidationError
 from repositories import work_item_repo
 
@@ -14,11 +16,16 @@ class UpdateDraftResult:
     updated_fields: list[str]
 
 
-def update_order_draft(conversation_key: str, fields: dict[str, Any]) -> UpdateDraftResult:
+def update_order_draft(conversation_key: str, fields: dict[str, Any], *, actor: AuthenticatedActor) -> UpdateDraftResult:
     """Apply a dispatcher-submitted draft edit. Single transaction, one
     whitelisted UPDATE - see repositories.work_item_repo.
     DRAFT_EDITABLE_COLUMNS for why this doesn't need the automated-parser
-    merge/precedence logic the email-ingestion path uses."""
+    merge/precedence logic the email-ingestion path uses.
+
+    Requires Permission.WORK_ITEM_MANAGE before doing anything else - an
+    unauthorized actor triggers zero reads/writes (Stage 2 closure pass)."""
+    require_permission(actor, Permission.WORK_ITEM_MANAGE)
+
     if not str(conversation_key or "").strip():
         raise ValidationError("conversation_key is required to update a draft.")
 

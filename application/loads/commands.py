@@ -78,8 +78,13 @@ def transition_load(
     )
 
 
-def create_load_from_work_item(work_item_id: int, approved_fields: dict[str, Any], **kwargs: Any) -> CreateLoadResult:
+def create_load_from_work_item(
+    work_item_id: int, approved_fields: dict[str, Any], *, actor: AuthenticatedActor, **kwargs: Any
+) -> CreateLoadResult:
     """Create a load from a reviewed Operations Inbox draft.
+
+    Requires Permission.WORK_ITEM_MANAGE before doing anything else - an
+    unauthorized actor triggers zero reads/writes (Stage 2 closure pass).
 
     KNOWN LIMITATION (documented, not silently accepted): this delegates to
     services.operations_inbox_service.create_load_from_inbox_item, which
@@ -96,6 +101,8 @@ def create_load_from_work_item(work_item_id: int, approved_fields: dict[str, Any
     module top, so importing it happens inside this function body rather
     than at application/ module load time.
     """
+    require_permission(actor, Permission.WORK_ITEM_MANAGE)
+
     from services.operations_inbox_service import create_load_from_inbox_item
 
     if not approved_fields.get("Booking Number") and not approved_fields.get("Reference Number"):
@@ -117,14 +124,21 @@ def update_load_from_work_item(
     work_item_id: int,
     load_id: int,
     approved_fields: dict[str, Any],
+    *,
+    actor: AuthenticatedActor,
     **kwargs: Any,
 ) -> UpdateLoadResult:
     """Apply an existing-load update from an Operations Inbox work item.
+
+    Requires Permission.WORK_ITEM_MANAGE before doing anything else - an
+    unauthorized actor triggers zero reads/writes (Stage 2 closure pass).
 
     Same known limitation as create_load_from_work_item: delegates to
     services.operations_inbox_service.update_load_from_inbox_item, which
     is not yet single-transaction atomic. See docs/architecture/
     BACKEND_BOUNDARY_PHASE_1.md."""
+    require_permission(actor, Permission.WORK_ITEM_MANAGE)
+
     from services.operations_inbox_service import update_load_from_inbox_item
 
     try:
