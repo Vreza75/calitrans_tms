@@ -30,6 +30,7 @@ catches that (`test_every_sql_file_on_disk_is_in_migration_order`).
 15. `app_users_migration.sql` — creates `app_users` (Streamlit + API login: email, bcrypt password hash, role, is_active), with a unique index on `lower(email)` so case-variant emails can't create duplicate accounts. See `docs/AUTHENTICATION.md`.
 16. `outbox_migration.sql` — creates `outbox_events` (Phase 6 transactional outbox: durable queue for external side effects like the driver-dispatch SMS, enqueued in the same transaction as the business-state write it accompanies). See `docs/architecture/OUTBOX.md`.
 17. `document_lifecycle_migration.sql` — ALTERs `documents` (adds `status`, `checksum`, an index on `status`; Phase 6B's staged-write/atomic-finalize document lifecycle). See `docs/architecture/DOCUMENT_LIFECYCLE.md`.
+18. `worker_jobs_migration.sql` — creates `worker_jobs` (Phase 7 durable worker job queue: internal asynchronous work like inbox sync/message processing — distinct from `outbox_events`, which is for external side effects). See `docs/architecture/WORKER_RUNTIME.md`.
 
 This numbered list mirrors `MIGRATION_ORDER` in `scripts/run_migrations.py` at the
 time of writing. When a new migration is appended there, add it here too -
@@ -43,6 +44,8 @@ so treat this file as needing a one-line addition whenever `MIGRATION_ORDER` gro
 **Rollout order for `outbox_migration.sql`**: apply it *before* deploying the Phase 6 application code (`application/loads/commands.py::mark_load_ready_to_dispatch` calling `repositories/outbox_repo.py::enqueue_outbox_event`) - the reverse order makes that command's outbox insert fail against a nonexistent `outbox_events` table. `outbox_migration.sql` has no FKs, so it can otherwise run any time after `schema.sql`.
 
 **Rollout order for `document_lifecycle_migration.sql`**: apply it *before* deploying the Phase 6B application code (`application/documents/commands.py::attach_load_document` calling `repositories/document_repo.py::insert_pending_document`, which writes `status`/`checksum`) - the reverse order makes that insert fail against columns that don't exist yet. No FKs; can otherwise run any time after `schema.sql`.
+
+**Rollout order for `worker_jobs_migration.sql`**: apply it *before* deploying the Phase 7 application code (`application/inbox/commands.py::request_inbox_sync` calling `repositories/worker_job_repo.py::enqueue_job`) - the reverse order makes that command's job insert fail against a nonexistent `worker_jobs` table. No FKs; can otherwise run any time after `schema.sql`.
 
 Every file is idempotent (`create table/index if not exists`,
 `add column if not exists`, `drop trigger if exists` + recreate) so
