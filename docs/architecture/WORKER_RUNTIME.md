@@ -1,10 +1,10 @@
 # Worker Runtime (Phase 7)
 
-## Status: batch 1 of N - foundation only
+## Status: batch 2 of N - foundation + generic runtime, no handlers yet
 
 This document tracks Phase 7 (Worker Runtime + Operations Inbox
 Processing Extraction) as it's built in reviewed batches, not all at
-once. What exists after batch 1:
+once. What exists after batch 2:
 
 - `database/worker_jobs_migration.sql` - the durable job queue table.
 - `repositories/worker_job_repo.py` - framework-neutral persistence
@@ -13,16 +13,23 @@ once. What exists after batch 1:
 - `application/inbox/commands.py::request_inbox_sync` - the one
   user-triggered command that exists so far. Enqueues an `inbox.sync`
   job and returns immediately.
-- `tests/test_worker_job_repo.py`, `tests/test_inbox_commands.py`.
+- `workers/processor.py` - generic claim/dispatch/retry loop
+  (`process_one`, `process_pending`), same proven shape as
+  `services/outbox_processor.py`. `JOB_HANDLERS` is an **empty registry**
+  - no job type has a handler yet, so any claimed job (including the
+    `inbox.sync` jobs `request_inbox_sync` already enqueues) fails
+    immediately with "No handler registered", is retried, and eventually
+    terminal-fails after `MAX_ATTEMPTS`. This is expected, not a bug -
+    see "Next batches" below.
+- `scripts/process_worker_jobs.py` - operator CLI (`process`,
+  `list-pending`, `list-failed`, `inspect`, `retry`, `retry-all`), same
+  shape as `scripts/process_outbox.py`.
+- `tests/test_worker_job_repo.py`, `tests/test_inbox_commands.py`,
+  `tests/test_worker_processor.py`, `tests/test_process_worker_jobs_cli.py`.
 
 What does **not** exist yet, deliberately deferred to later batches:
 
-- **No worker runtime.** `workers/processor.py` is not built. An
-  enqueued `inbox.sync` job sits `'pending'` forever right now - nothing
-  claims or processes it. `request_inbox_sync` is safe to ship ahead of
-  the worker because enqueueing is a no-op until something consumes the
-  queue, same as any other durable-queue producer/consumer split.
-- **No worker CLI** (`scripts/process_worker_jobs.py`).
+- **No registered job handlers.** `JOB_HANDLERS` is empty - see above.
 - **No email/message processing extraction.** `services/
   operations_inbox_service.py::sync_operations_email_engine` is
   untouched - the Streamlit "Sync Email Engine" button still calls it
@@ -138,13 +145,14 @@ in this batch since no worker code writes anything yet.
 
 ## Next batches (not built here)
 
-1. `workers/processor.py` (generic claim/dispatch loop, handler
-   registry) + `scripts/process_worker_jobs.py` (CLI, same shape as
-   `scripts/process_outbox.py`).
-2. Extract `sync_operations_email_engine`'s body into an `inbox.sync`
-   job handler; convert the Streamlit "Sync Email Engine" button
+1. Extract `sync_operations_email_engine`'s body into an `inbox.sync`
+   job handler, register it in `workers/processor.py::JOB_HANDLERS`;
+   convert the Streamlit "Sync Email Engine" button
    (`pages_app/operations_inbox.py:3306`) and the admin debug sync
-   (`pages_app/email_imports.py:139`) to enqueue-and-return.
-3. `inbox.process_message` job type + message-processing extraction
+   (`pages_app/email_imports.py:139`) to enqueue-and-return via
+   `request_inbox_sync`.
+2. `inbox.process_message` job type + message-processing extraction
    (STEP 18) - parse, CASE-010 segment, classify, match, attach,
-   persist, reusing existing algorithms unchanged.
+   persist, reusing existing algorithms unchanged. This is also where a
+   handler first needs to follow the "processing failure vs. review
+   outcome" contract in workers/processor.py's docstring for real.
