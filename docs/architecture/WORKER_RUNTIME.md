@@ -1,6 +1,6 @@
 # Worker Runtime (Phase 7)
 
-## Status: batch 3 of N - inbox.sync has a handler; Streamlit UI untouched
+## Status: batch 4 of N - message-processing pipeline is addressable, no producer yet
 
 This document tracks Phase 7 (Worker Runtime + Operations Inbox
 Processing Extraction) as it's built in reviewed batches, not all at
@@ -26,6 +26,20 @@ once. What exists after batch 2:
 - `scripts/process_worker_jobs.py` - operator CLI (`process`,
   `list-pending`, `list-failed`, `inspect`, `retry`, `retry-all`), same
   shape as `scripts/process_outbox.py`.
+- `workers/inbox_handlers.py::handle_inbox_process_message` -
+  `job_type='inbox.process_message'`, registered but **not yet enqueued
+  by anything** (no producer exists). Wraps `services.
+  operations_inbox_service::_insert_operations_email_message` unchanged -
+  the exact function `sync_operations_email_engine`'s own per-message
+  loop already calls today. This function already covers STEP 18's full
+  pipeline in the right order (latest-body extraction + CASE-010
+  segmentation, parse, attachment processing, classification/triage,
+  load matching, persist) as a single already-framework-neutral,
+  already-DB-write-isolated call (`_prepare_operations_email_record` is
+  explicitly documented in its own docstring as "the pure (DB-write-free)
+  half" - `_insert_operations_email_record_row` is the persist half) -
+  STEP 18 did not require building new orchestration, only recognizing
+  and exposing what already existed as a worker-addressable job type.
 - `tests/test_worker_job_repo.py`, `tests/test_inbox_commands.py`,
   `tests/test_worker_processor.py`, `tests/test_process_worker_jobs_cli.py`,
   `tests/test_inbox_handlers.py`.
@@ -118,6 +132,15 @@ way a stale SMS key would be.
 configured mailbox today. If that becomes multi-mailbox, this becomes a
 parameter; not built now (YAGNI).
 
+`inbox.process_message`'s intended key (no producer builds this yet):
+`inbox.process_message:<provider-message-id>`, where the message id is
+`services.operations_inbox_service::_email_sync_unique_message_id(message)`
+- the same id `_insert_operations_email_message` already computes
+internally for its own dedup logic. One message, one job, forever - same
+reasoning as Phase 6B's `document_finalize:{document_id}` key, not the
+SMS-style time-bucketed key, since a provider message id is a stable,
+pre-existing unique identity, not content that could legitimately repeat.
+
 `enqueue_job` returns the job's `id` whether freshly inserted or already
 existing for that `idempotency_key` (`ON CONFLICT ... DO UPDATE ...
 RETURNING id`, where the "update" is a no-op self-assignment used only
@@ -164,6 +187,12 @@ in this batch since no worker code writes anything yet.
    (`pages_app/operations_inbox.py:3306`) and the admin debug sync
    (`pages_app/email_imports.py:139`) to enqueue-and-return via
    `request_inbox_sync`, once (1) is in place.
-3. `inbox.process_message` job type + message-processing extraction
-   (STEP 18) - parse, CASE-010 segment, classify, match, attach,
-   persist, reusing existing algorithms unchanged.
+3. Give `inbox.process_message` a real producer: split
+   `sync_operations_email_engine`'s inline per-message loop
+   (services/operations_inbox_service.py:4929-4991) into "fetch and
+   persist raw messages" + "enqueue one `inbox.process_message` per new
+   message" (STEP 16/17), so a crash mid-sync no longer requires
+   re-fetching from IMAP to retry the messages it already saw. Until
+   this lands, `inbox.process_message` exists and is tested but nothing
+   calls it in production - the sync loop still processes each message
+   inline exactly as before batch 4.

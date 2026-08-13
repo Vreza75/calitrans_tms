@@ -57,7 +57,7 @@ from typing import Any, Callable
 from db_client import transaction
 from repositories import worker_job_repo
 from utils.error_sanitizer import sanitize_exception_message, sanitize_message
-from workers.inbox_handlers import handle_inbox_sync
+from workers.inbox_handlers import handle_inbox_process_message, handle_inbox_sync
 
 # Bounded retry: after MAX_ATTEMPTS failed attempts, a job moves to the
 # terminal 'failed' state instead of retrying forever - an operator must
@@ -89,6 +89,7 @@ RECLAIM_STALE_AFTER = timedelta(minutes=15)
 # operator visibility.
 JOB_HANDLERS: dict[str, Callable[[dict[str, Any]], tuple[bool, str]]] = {
     "inbox.sync": handle_inbox_sync,
+    "inbox.process_message": handle_inbox_process_message,
 }
 
 
