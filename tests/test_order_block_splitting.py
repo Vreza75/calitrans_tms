@@ -127,7 +127,7 @@ def test_prepare_records_returns_single_record_when_no_split():
     ) as mocked:
         records = operations_inbox_service._prepare_operations_email_records(message)
     assert len(records) == 1
-    mocked.assert_called_once_with(message)
+    mocked.assert_called_once_with(message, pre_saved_attachments=None)
 
 
 def test_prepare_records_calls_once_per_detected_block_with_scoped_body():
@@ -141,7 +141,7 @@ def test_prepare_records_calls_once_per_detected_block_with_scoped_body():
     }
     calls = []
 
-    def fake_prepare(block_message):
+    def fake_prepare(block_message, pre_saved_attachments=None):
         calls.append(block_message)
         return {"parsed": {}, "triage": {}}
 

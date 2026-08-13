@@ -1,6 +1,6 @@
 # Worker Runtime (Phase 7)
 
-## Status: batch 4 of N - message-processing pipeline is addressable, no producer yet
+## Status: batch 5 of N - sync/process split done; nothing runs it automatically yet
 
 This document tracks Phase 7 (Worker Runtime + Operations Inbox
 Processing Extraction) as it's built in reviewed batches, not all at
@@ -26,40 +26,67 @@ once. What exists after batch 2:
 - `scripts/process_worker_jobs.py` - operator CLI (`process`,
   `list-pending`, `list-failed`, `inspect`, `retry`, `retry-all`), same
   shape as `scripts/process_outbox.py`.
-- `workers/inbox_handlers.py::handle_inbox_process_message` -
-  `job_type='inbox.process_message'`, registered but **not yet enqueued
-  by anything** (no producer exists). Wraps `services.
-  operations_inbox_service::_insert_operations_email_message` unchanged -
-  the exact function `sync_operations_email_engine`'s own per-message
-  loop already calls today. This function already covers STEP 18's full
-  pipeline in the right order (latest-body extraction + CASE-010
-  segmentation, parse, attachment processing, classification/triage,
-  load matching, persist) as a single already-framework-neutral,
-  already-DB-write-isolated call (`_prepare_operations_email_record` is
-  explicitly documented in its own docstring as "the pure (DB-write-free)
-  half" - `_insert_operations_email_record_row` is the persist half) -
-  STEP 18 did not require building new orchestration, only recognizing
-  and exposing what already existed as a worker-addressable job type.
+- **STEP 16/17 sync/process split, done.** `handle_inbox_sync` no longer
+  processes messages inline (that was its batch-3 behavior) - it now
+  calls `workers/inbox_handlers.py::_fetch_and_enqueue_inbox_messages`,
+  which fetches, dedupes, saves attachments to disk immediately (raw
+  bytes can't safely travel through a `worker_jobs.payload` jsonb column
+  - see that function's docstring for why, and Phase 6B's design doc for
+  the same reasoning applied to `outbox_events`), and enqueues one
+  `inbox.process_message` job per new message with idempotency key
+  `inbox.process_message:<provider-message-id>`. Each job's `actor` is
+  `SYSTEM_ACTOR_INBOX_WORKER` (`"system:inbox-worker"`) - the first real
+  use of the system-actor convention documented (but unused) since
+  batch 1.
+- `workers/inbox_handlers.py::handle_inbox_process_message` now has a
+  real producer. Wraps `services.operations_inbox_service::
+  _insert_operations_email_message` (unchanged, same function
+  `sync_operations_email_engine`'s inline loop calls) plus a
+  best-effort `sync_conversation_status` call after each successful
+  insert (same reconciliation `sync_operations_email_engine` does,
+  batched once per whole sync run there; here, once per processed
+  message, since a "whole sync run" boundary no longer exists once
+  fetching and processing are decoupled).
+- **`services/operations_inbox_service.py` gained one small, additive
+  seam**: `_prepare_operations_email_record`, `_prepare_operations_email_
+  records`, and `_insert_operations_email_message` each gained an
+  optional, keyword-only `pre_saved_attachments` parameter (default
+  `None` = 100% unchanged behavior for every pre-existing caller,
+  proven by `tests/test_operations_email_insert_resilience.py::
+  test_pre_saved_attachments_none_default_matches_unchanged_behavior`).
+  When provided, it skips the function's own
+  `_save_operations_email_attachments` call and uses the given metadata
+  instead - the mechanism `_fetch_and_enqueue_inbox_messages` uses to
+  hand off already-saved attachment metadata without ever putting raw
+  bytes in a job payload. `sync_operations_email_engine` itself was not
+  touched - it still calls `_insert_operations_email_message(message)`
+  with no keyword argument, exactly as before this batch.
 - `tests/test_worker_job_repo.py`, `tests/test_inbox_commands.py`,
   `tests/test_worker_processor.py`, `tests/test_process_worker_jobs_cli.py`,
-  `tests/test_inbox_handlers.py`.
+  `tests/test_inbox_handlers.py` (rewritten for the new contract),
+  two new cases in `tests/test_operations_email_insert_resilience.py`.
 
 What does **not** exist yet, deliberately deferred to later batches:
 
 - **Nothing runs the worker automatically.** No cron/Task Scheduler/
   always-on process invokes `scripts/process_worker_jobs.py process`
-  anywhere in this repo or its deployment config. `inbox.sync` jobs are
-  enqueued and (once something runs the CLI) correctly processed, but
-  nothing does that on its own yet - an operator runs it manually today.
-- **The Streamlit "Sync Email Engine" button is untouched.** It still
-  calls `sync_operations_email_engine` synchronously, exactly as before
-  Phase 7 (`pages_app/operations_inbox.py:3306`,
-  `pages_app/email_imports.py:139`). Converting it to enqueue-and-return
-  (STEP 16/28) was deliberately deferred - doing that before a periodic
-  worker runner exists would make the live "Sync Email Engine" button
-  silently stop doing anything. Batch 3 proves the worker *can* run the
-  real pipeline (via the CLI, manually), without changing what
-  dispatchers experience today.
+  anywhere in this repo or its deployment config. Jobs are enqueued and
+  (once something runs the CLI, which now needs to run at least twice
+  per sync - once to consume `inbox.sync` and enqueue `inbox.process_
+  message` jobs, once more to consume those) correctly processed, but
+  nothing does that on its own yet.
+- **The Streamlit "Sync Email Engine" button is untouched and uses a
+  completely separate code path now.** It still calls
+  `sync_operations_email_engine` synchronously
+  (`pages_app/operations_inbox.py:3306`, `pages_app/email_imports.py:139`)
+  - full inline fetch+process+persist, exactly as before Phase 7. The
+  worker's `inbox.sync` job type now does something different
+  (fetch+enqueue only) via a fully separate function
+  (`_fetch_and_enqueue_inbox_messages`) that shares no code with
+  `sync_operations_email_engine` beyond the same underlying fetch/dedup/
+  attachment-saving helper functions, called independently. Converting
+  the button to use the worker path (STEP 16/28's UI half) still
+  requires the periodic-runner decision above.
 - **No Inbox query/detail API work.** `GET /api/v1/work-items` and
   `GET /api/v1/work-items/{id}` (`api/routers/work_items.py`,
   `application/work_items/queries.py`) already cover this - Phase 7 does
@@ -132,8 +159,8 @@ way a stale SMS key would be.
 configured mailbox today. If that becomes multi-mailbox, this becomes a
 parameter; not built now (YAGNI).
 
-`inbox.process_message`'s intended key (no producer builds this yet):
-`inbox.process_message:<provider-message-id>`, where the message id is
+`inbox.process_message`'s key: `inbox.process_message:<provider-message-id>`,
+built by `_fetch_and_enqueue_inbox_messages` using
 `services.operations_inbox_service::_email_sync_unique_message_id(message)`
 - the same id `_insert_operations_email_message` already computes
 internally for its own dedup logic. One message, one job, forever - same
@@ -187,12 +214,11 @@ in this batch since no worker code writes anything yet.
    (`pages_app/operations_inbox.py:3306`) and the admin debug sync
    (`pages_app/email_imports.py:139`) to enqueue-and-return via
    `request_inbox_sync`, once (1) is in place.
-3. Give `inbox.process_message` a real producer: split
-   `sync_operations_email_engine`'s inline per-message loop
-   (services/operations_inbox_service.py:4929-4991) into "fetch and
-   persist raw messages" + "enqueue one `inbox.process_message` per new
-   message" (STEP 16/17), so a crash mid-sync no longer requires
-   re-fetching from IMAP to retry the messages it already saw. Until
-   this lands, `inbox.process_message` exists and is tested but nothing
-   calls it in production - the sync loop still processes each message
-   inline exactly as before batch 4.
+3. Consider whether `process_pending`/the CLI should process multiple
+   job types per invocation more eagerly (today `process` claims up to
+   `max_jobs` jobs of *any* pending type in one call, so a single
+   `process` run already drains both an `inbox.sync` job and any
+   `inbox.process_message` jobs it just enqueued, if both fit under
+   `max_jobs` - but there's no guarantee of ordering within one run).
+   Not a correctness problem (jobs are durable either way), just worth
+   documenting once a real periodic-runner cadence is chosen.
