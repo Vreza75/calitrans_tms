@@ -1,6 +1,6 @@
 # Worker Runtime (Phase 7)
 
-## Status: batch 2 of N - foundation + generic runtime, no handlers yet
+## Status: batch 3 of N - inbox.sync has a handler; Streamlit UI untouched
 
 This document tracks Phase 7 (Worker Runtime + Operations Inbox
 Processing Extraction) as it's built in reviewed batches, not all at
@@ -15,28 +15,37 @@ once. What exists after batch 2:
   job and returns immediately.
 - `workers/processor.py` - generic claim/dispatch/retry loop
   (`process_one`, `process_pending`), same proven shape as
-  `services/outbox_processor.py`. `JOB_HANDLERS` is an **empty registry**
-  - no job type has a handler yet, so any claimed job (including the
-    `inbox.sync` jobs `request_inbox_sync` already enqueues) fails
-    immediately with "No handler registered", is retried, and eventually
-    terminal-fails after `MAX_ATTEMPTS`. This is expected, not a bug -
-    see "Next batches" below.
+  `services/outbox_processor.py`.
+- `workers/inbox_handlers.py::handle_inbox_sync` - the first registered
+  handler, for `job_type='inbox.sync'`. Wraps `services.
+  operations_inbox_service::sync_operations_email_engine` **unchanged**
+  - no rewrite, same defaults (limit 12, 25s budget), same classification/
+  parsing/matching pipeline. A worker running `python scripts/
+  process_worker_jobs.py process` now actually processes the `inbox.sync`
+  jobs `request_inbox_sync` enqueues.
 - `scripts/process_worker_jobs.py` - operator CLI (`process`,
   `list-pending`, `list-failed`, `inspect`, `retry`, `retry-all`), same
   shape as `scripts/process_outbox.py`.
 - `tests/test_worker_job_repo.py`, `tests/test_inbox_commands.py`,
-  `tests/test_worker_processor.py`, `tests/test_process_worker_jobs_cli.py`.
+  `tests/test_worker_processor.py`, `tests/test_process_worker_jobs_cli.py`,
+  `tests/test_inbox_handlers.py`.
 
 What does **not** exist yet, deliberately deferred to later batches:
 
-- **No registered job handlers.** `JOB_HANDLERS` is empty - see above.
-- **No email/message processing extraction.** `services/
-  operations_inbox_service.py::sync_operations_email_engine` is
-  untouched - the Streamlit "Sync Email Engine" button still calls it
-  synchronously, exactly as before this batch. STEP 16/28 (make that
-  button enqueue-and-return instead) happens once a worker actually
-  exists to consume the queue - shipping the button change first would
-  make sync silently do nothing.
+- **Nothing runs the worker automatically.** No cron/Task Scheduler/
+  always-on process invokes `scripts/process_worker_jobs.py process`
+  anywhere in this repo or its deployment config. `inbox.sync` jobs are
+  enqueued and (once something runs the CLI) correctly processed, but
+  nothing does that on its own yet - an operator runs it manually today.
+- **The Streamlit "Sync Email Engine" button is untouched.** It still
+  calls `sync_operations_email_engine` synchronously, exactly as before
+  Phase 7 (`pages_app/operations_inbox.py:3306`,
+  `pages_app/email_imports.py:139`). Converting it to enqueue-and-return
+  (STEP 16/28) was deliberately deferred - doing that before a periodic
+  worker runner exists would make the live "Sync Email Engine" button
+  silently stop doing anything. Batch 3 proves the worker *can* run the
+  real pipeline (via the CLI, manually), without changing what
+  dispatchers experience today.
 - **No Inbox query/detail API work.** `GET /api/v1/work-items` and
   `GET /api/v1/work-items/{id}` (`api/routers/work_items.py`,
   `application/work_items/queries.py`) already cover this - Phase 7 does
@@ -145,14 +154,16 @@ in this batch since no worker code writes anything yet.
 
 ## Next batches (not built here)
 
-1. Extract `sync_operations_email_engine`'s body into an `inbox.sync`
-   job handler, register it in `workers/processor.py::JOB_HANDLERS`;
-   convert the Streamlit "Sync Email Engine" button
+1. Decide and configure an actual periodic worker runner (cron/Task
+   Scheduler/always-on process/Streamlit Cloud-compatible mechanism -
+   deployment infrastructure was never confirmed, same open question
+   Phase 6B's storage-durability section flagged) before converting the
+   Streamlit button - otherwise the conversion breaks a live daily-use
+   feature.
+2. Convert the Streamlit "Sync Email Engine" button
    (`pages_app/operations_inbox.py:3306`) and the admin debug sync
    (`pages_app/email_imports.py:139`) to enqueue-and-return via
-   `request_inbox_sync`.
-2. `inbox.process_message` job type + message-processing extraction
+   `request_inbox_sync`, once (1) is in place.
+3. `inbox.process_message` job type + message-processing extraction
    (STEP 18) - parse, CASE-010 segment, classify, match, attach,
-   persist, reusing existing algorithms unchanged. This is also where a
-   handler first needs to follow the "processing failure vs. review
-   outcome" contract in workers/processor.py's docstring for real.
+   persist, reusing existing algorithms unchanged.

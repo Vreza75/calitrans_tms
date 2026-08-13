@@ -23,6 +23,12 @@ def _fake_transaction(conn):
     return ctx
 
 
+def test_inbox_sync_handler_is_registered():
+    from workers.inbox_handlers import handle_inbox_sync
+
+    assert processor.JOB_HANDLERS.get("inbox.sync") is handle_inbox_sync
+
+
 def test_process_one_returns_none_when_nothing_claimable():
     conn = mock.MagicMock()
     with mock.patch("workers.processor.transaction", return_value=_fake_transaction(conn)), mock.patch(

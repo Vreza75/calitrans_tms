@@ -36,9 +36,10 @@ success=True and encodes that ambiguity in whatever domain state it
 writes (e.g. a work item's review_status = 'Needs Review'), the same
 way services.operations_inbox_service already distinguishes "processed
 successfully, flagged for human review" from an actual exception today.
-A future inbox.process_message handler must follow this contract, not
-report success=False for a parse it completed but couldn't fully
-resolve - see docs/architecture/WORKER_RUNTIME.md.
+workers/inbox_handlers.py::handle_inbox_sync follows this contract
+already; a future inbox.process_message handler must too - not report
+success=False for a parse it completed but couldn't fully resolve - see
+docs/architecture/WORKER_RUNTIME.md.
 
 Delivery guarantee, same as services/outbox_processor.py: **at-least-
 once**, not exactly-once. If a worker crashes after a handler's work
@@ -56,6 +57,7 @@ from typing import Any, Callable
 from db_client import transaction
 from repositories import worker_job_repo
 from utils.error_sanitizer import sanitize_exception_message, sanitize_message
+from workers.inbox_handlers import handle_inbox_sync
 
 # Bounded retry: after MAX_ATTEMPTS failed attempts, a job moves to the
 # terminal 'failed' state instead of retrying forever - an operator must
@@ -77,14 +79,17 @@ _MAX_BACKOFF_SECONDS = 3600
 RECLAIM_STALE_AFTER = timedelta(minutes=15)
 
 # job_type -> handler(payload) -> (success, error). error is "" on
-# success, never None, so callers can always str() it safely. Empty for
-# now - no job type has a handler yet (inbox.sync is enqueued by
-# application/inbox/commands.py::request_inbox_sync but nothing consumes
-# it until a later batch extracts services.operations_inbox_service::
-# sync_operations_email_engine into a registered handler here). A claimed
-# job with no registered handler fails cleanly - see process_one below -
-# rather than sitting unprocessed with no operator visibility.
-JOB_HANDLERS: dict[str, Callable[[dict[str, Any]], tuple[bool, str]]] = {}
+# success, never None, so callers can always str() it safely. Registering
+# a new job_type here (email, motive, communications-delivery, ...) is
+# the whole integration point for a future job type - see workers/
+# inbox_handlers.py for the one handler that exists so far, and this
+# module's own docstring for why the handler body lives there rather than
+# inline here. A claimed job with no registered handler fails cleanly -
+# see process_one below - rather than sitting unprocessed with no
+# operator visibility.
+JOB_HANDLERS: dict[str, Callable[[dict[str, Any]], tuple[bool, str]]] = {
+    "inbox.sync": handle_inbox_sync,
+}
 
 
 def _backoff_for(attempt_count: int) -> timedelta:
