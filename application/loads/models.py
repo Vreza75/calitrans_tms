@@ -72,3 +72,130 @@ class LoadSummary:
     driver_name: str
     truck_assigned: str
     updated_at: Any
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: read models for the paginated/filtered/searchable load
+# collection (application/loads/queries.py::search_loads,
+# get_load_detail, get_load_timeline, get_load_communications,
+# get_load_documents) - additive, does not replace LoadSummary/list_loads/
+# get_load above, which Phase 5/6 callers still use unchanged.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LoadFilters:
+    status: str | None = None
+    service_flow: str | None = None
+    customer: str | None = None
+    driver_name: str | None = None
+    port: str | None = None
+    warehouse: str | None = None
+    invoice_status: str | None = None
+    search: str | None = None
+    delivery_after: str | None = None
+    delivery_before: str | None = None
+
+
+@dataclass(frozen=True)
+class LoadListItem:
+    """List DTO - deliberately lighter than LoadDetail (STEP: "list DTO
+    != detail DTO"). `updated_at` doubles as this record's staleness/
+    change indicator (STEP 25) - no version column added solely for
+    that, per STEP 25's own guidance not to."""
+
+    id: int
+    type: str
+    booking_number: str
+    reference_number: str
+    container_number: str
+    customer: str
+    port: str
+    warehouse: str
+    status: str
+    driver_name: str
+    truck_assigned: str
+    delivery_need_date: Any
+    document_cutoff: Any
+    invoice_status: str
+    driver_pay_status: str
+    updated_at: Any
+
+
+@dataclass(frozen=True)
+class LoadDetail:
+    """Richer than LoadListItem, but deliberately still excludes large
+    related collections (timeline, communications, documents) - those
+    are separate, independently-paginated resources
+    (get_load_timeline/get_load_communications/get_load_documents), not
+    eagerly joined in here."""
+
+    id: int
+    type: str
+    load_id: str
+    booking_number: str
+    reference_number: str
+    container_number: str
+    customer: str
+    port: str
+    warehouse: str
+    address: str
+    document_cutoff: Any
+    delivery_need_date: Any
+    load_date: Any
+    lfd: Any
+    status: str
+    driver_name: str
+    truck_assigned: str
+    chassis: str
+    size: str
+    billing_notes: str
+    dispatcher_notes: str
+    invoice_status: str
+    driver_pay_status: str
+    closeout_stage: str
+    steamship_line: str
+    vessel_name: str
+    terminal: str
+    pickup_appointment: Any
+    delivery_appointment: Any
+    empty_return_location: str
+    empty_return_date: Any
+    parent_booking_key: str
+    container_sequence: int | None
+    container_total: int | None
+    created_at: Any
+    updated_at: Any
+
+
+@dataclass(frozen=True)
+class LoadTimelineEvent:
+    event_type: str
+    title: str
+    details: str
+    actor: str
+    created_at: Any
+
+
+@dataclass(frozen=True)
+class LoadCommunication:
+    id: int
+    message_type: str
+    direction: str
+    recipient: str
+    message_body: str
+    sent_by: str
+    provider: str
+    delivery_status: str
+    provider_message_id: str
+    created_at: Any
+
+
+@dataclass(frozen=True)
+class LoadDocumentMeta:
+    id: int
+    document_type: str
+    filename: str
+    source: str
+    status: str
+    created_at: Any
