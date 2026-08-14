@@ -10,7 +10,10 @@ import streamlit as st
 import services.operations_inbox_service as ops
 
 from uuid import uuid4
+from application.exceptions import AuthorizationError
+from application.inbox.commands import request_inbox_sync
 from db_client import check_schema_readiness
+from ui_components.auth_gate import get_current_principal
 from services.email_parser import extract_latest_email_body
 from services.operations_field_service import reconcile_parsed_sources, validate_field_value
 from services.operations_multi_container_service import create_container_work_orders
@@ -3301,41 +3304,45 @@ def render_operations_inbox() -> None:
     c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.2, 1.0, 1.4])
 
     with c1:
-        sync_running = bool(st.session_state.get("operations_email_sync_running", False))
-
         if st.button(
             "Sync Email Engine",
             key="operations_sync_email_engine",
             use_container_width=True,
-            disabled=sync_running,
         ):
-            sync_completed = False
-            st.session_state["operations_email_sync_running"] = True
+            # Phase 7 STEP 11: this used to call ops.sync_operations_email_engine
+            # directly, blocking the request for up to 25s while it fetched,
+            # parsed, classified, matched, and persisted every message inline.
+            # It now enqueues an inbox.sync job (application/inbox/commands.py::
+            # request_inbox_sync) and returns immediately - the actual work
+            # happens in workers/inbox_handlers.py, run by
+            # .github/workflows/process-jobs.yml (or an operator running
+            # scripts/process_worker_jobs.py process manually). This page no
+            # longer owns mailbox-wide processing; it only enqueues and,
+            # like "Refresh Inbox" below, re-queries current state.
+            # ops.sync_operations_email_engine itself is unchanged and still
+            # used by the admin debug "Sync Recent Mail" tool
+            # (pages_app/email_imports.py) for immediate-feedback debugging.
+            principal = get_current_principal()
+            sync_queued = False
 
             try:
-                with st.spinner("Checking the most recent operations emails..."):
-                    sync_result = ops.sync_operations_email_engine(
-                        limit=8,
-                        time_budget_seconds=25,
+                if principal is None:
+                    st.error("Your session has expired. Please log in again.")
+                else:
+                    sync_result = request_inbox_sync(actor=principal)
+                    st.session_state["operations_email_import_result"] = {
+                        "queued": True,
+                        "job_id": sync_result.job_id,
+                    }
+                    st.success(
+                        f"Inbox sync queued (job #{sync_result.job_id}). "
+                        "New messages will appear once the worker processes it."
                     )
+                    sync_queued = True
+            except AuthorizationError as exc:
+                st.error(str(exc))
 
-                st.session_state["operations_email_import_result"] = sync_result
-                sync_completed = True
-
-            except Exception as exc:
-                st.session_state["operations_email_import_result"] = {
-                    "error": str(exc),
-                    "fetched": 0,
-                    "imported": 0,
-                    "skipped": 0,
-                    "errors": 1,
-                }
-                st.error(f"Could not synchronize email: {exc}")
-
-            finally:
-                st.session_state["operations_email_sync_running"] = False
-
-            if sync_completed:
+            if sync_queued:
                 close_work_item(st.session_state)
                 ops.refresh_data()
                 st.rerun()

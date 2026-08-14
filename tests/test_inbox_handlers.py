@@ -10,7 +10,9 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from sqlalchemy import text
 
+import db_client
 from workers.inbox_handlers import (
     SYSTEM_ACTOR_INBOX_WORKER,
     handle_inbox_process_message,
@@ -277,3 +279,87 @@ def test_inbox_sync_handler_is_registered():
     from workers import processor
 
     assert processor.JOB_HANDLERS.get("inbox.sync") is handle_inbox_sync
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 closure (STEP 15): duplicate inbox.sync must not duplicate
+# inbox.process_message jobs. Against a real (SQLite) worker_jobs table,
+# not mocked - proves the actual idempotency_key uniqueness, not just
+# that enqueue_job was called with the right kwargs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sqlite_worker_jobs_for_dedup(monkeypatch, tmp_path):
+    db_path = tmp_path / "inbox_dedup_test.db"
+    url = f"sqlite:///{db_path}"
+
+    monkeypatch.setattr(db_client, "get_secret", lambda name, default=None: url if name == "DATABASE_URL" else default)
+    db_client._ENGINE_CACHE.pop(url, None)
+
+    with db_client.get_engine(url).begin() as conn:
+        conn.execute(
+            text(
+                """
+                create table worker_jobs (
+                    id integer primary key autoincrement,
+                    job_type text not null,
+                    aggregate_type text not null,
+                    aggregate_id text not null,
+                    payload text not null default '{}',
+                    idempotency_key text not null unique,
+                    status text not null default 'pending',
+                    attempt_count integer not null default 0,
+                    available_at timestamp not null default current_timestamp,
+                    created_at timestamp not null default current_timestamp,
+                    claimed_at timestamp,
+                    completed_at timestamp,
+                    last_error text,
+                    actor text
+                )
+                """
+            )
+        )
+
+    yield url
+
+    db_client._ENGINE_CACHE.pop(url, None)
+
+
+def test_duplicate_inbox_sync_does_not_duplicate_process_message_jobs(sqlite_worker_jobs_for_dedup):
+    """Two inbox.sync runs fetching the SAME not-yet-imported message
+    (e.g. an overlapping worker invocation before the first run's
+    inbox.process_message job has been processed - operations_email_
+    already_imported can't see it yet, since nothing has inserted into
+    order_intake) must still resolve to one worker_jobs row, not two -
+    enforced by inbox.process_message:<message_id>'s unique
+    idempotency_key, not by the (necessarily blind, at this stage)
+    already-imported check."""
+    from workers.inbox_handlers import _fetch_and_enqueue_inbox_messages
+
+    def _run_once():
+        with mock.patch("services.operations_inbox_service.ensure_operations_email_sync_schema"), mock.patch(
+            "services.email_client.fetch_operations_email_sync", return_value=[_MESSAGE_A]
+        ), mock.patch(
+            "services.email_client.get_last_operations_email_sync_diagnostics",
+            return_value={"errors": False, "accounts_attempted": 1},
+        ), mock.patch(
+            "services.operations_inbox_service.load_existing_operations_email_lookup",
+            return_value={"loaded": True, "by_message_id": {}, "by_received": {}},
+        ), mock.patch(
+            "services.operations_inbox_service.operations_email_already_imported", return_value=False
+        ), mock.patch(
+            "services.operations_inbox_service._save_operations_email_attachments", return_value=[]
+        ):
+            return _fetch_and_enqueue_inbox_messages()
+
+    first = _run_once()
+    second = _run_once()
+
+    assert first["enqueued"] == 1
+    assert second["enqueued"] == 1  # ON CONFLICT resolves to the existing row, still reported as "enqueued"
+
+    count = db_client.read_df(
+        "select count(*) as n from worker_jobs where job_type = 'inbox.process_message'"
+    ).iloc[0]["n"]
+    assert int(count) == 1

@@ -28,12 +28,25 @@ APPLICATION_MODULES = [
     "application.order_drafts.models",
     "application.order_drafts.queries",
     "application.order_drafts.commands",
+    "application.inbox.models",
+    "application.inbox.commands",
+    "application.jobs.models",
+    "application.jobs.queries",
 ]
 
 REPOSITORY_MODULES = [
     "repositories.work_item_repo",
     "repositories.inbox_repo",
     "repositories.load_repo",
+    "repositories.worker_job_repo",
+]
+
+# Phase 7: the worker runtime must be runnable as a standalone process
+# (scripts/process_worker_jobs.py) with no Streamlit dependency, same
+# framework-neutrality requirement as application/ and repositories/.
+WORKER_MODULES = [
+    "workers.processor",
+    "workers.inbox_handlers",
 ]
 
 
@@ -64,6 +77,12 @@ def test_repository_layer_does_not_import_streamlit() -> None:
     assert "streamlit-clean" in result.stdout, result.stdout
 
 
+def test_worker_runtime_does_not_import_streamlit() -> None:
+    result = _run_import_check(WORKER_MODULES)
+    assert result.returncode == 0, result.stderr
+    assert "streamlit-clean" in result.stdout, result.stdout
+
+
 def test_application_module_source_never_mentions_streamlit_at_top_level() -> None:
     """A stricter static check: no `application/*.py` file may have a
     top-level (unindented) `import streamlit` or `from streamlit`. A lazy
@@ -73,6 +92,19 @@ def test_application_module_source_never_mentions_streamlit_at_top_level() -> No
     app_dir = REPO_ROOT / "application"
     offenders = []
     for path in app_dir.rglob("*.py"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("import streamlit") or line.startswith("from streamlit"):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == []
+
+
+def test_worker_module_source_never_mentions_streamlit_at_top_level() -> None:
+    """Same static check as the application/ one above, applied to
+    workers/ - Phase 7's runtime must stay this way as it grows new job
+    handlers."""
+    workers_dir = REPO_ROOT / "workers"
+    offenders = []
+    for path in workers_dir.rglob("*.py"):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.startswith("import streamlit") or line.startswith("from streamlit"):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
@@ -102,3 +134,16 @@ def test_streamlit_page_and_fastapi_router_call_the_same_application_functions()
 
     assert work_items_router.get_work_item_detail is work_item_queries.get_work_item_detail
     assert work_items_router.work_item_commands.close_work_item is work_item_commands.close_work_item
+
+
+def test_streamlit_and_fastapi_share_the_same_inbox_sync_command() -> None:
+    """Phase 7: pages_app/operations_inbox.py's "Sync Email Engine"
+    button and POST /api/v1/inbox/sync must both resolve to the exact
+    same request_inbox_sync function object - not two implementations of
+    "enqueue an inbox sync job"."""
+    import pages_app.operations_inbox as operations_inbox_page
+    from api.routers import inbox as inbox_router
+    from application.inbox import commands as inbox_commands
+
+    assert operations_inbox_page.request_inbox_sync is inbox_commands.request_inbox_sync
+    assert inbox_router.request_inbox_sync is inbox_commands.request_inbox_sync
