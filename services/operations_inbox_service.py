@@ -4653,6 +4653,21 @@ def _prepare_operations_email_records(message: dict, *, pre_saved_attachments: l
     return records
 
 
+def _execute_returning_id(sql: str, params: dict) -> int | None:
+    """Same connection/commit semantics as this module's module-level
+    execute() (db_client.execute: one engine.begin() per call, commits on
+    clean exit) but returns a scalar instead of discarding the result -
+    needed for _insert_operations_email_record_row's ON CONFLICT ...
+    RETURNING id below. Not a general-purpose replacement for execute();
+    only used where a caller needs the inserted/conflicting row's id."""
+    from sqlalchemy import text
+
+    from db_client import get_engine, get_secret
+
+    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
+        return conn.execute(text(sql), params).scalar_one_or_none()
+
+
 def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     subject = record["subject"]
     sender = record["sender"]
@@ -4670,7 +4685,24 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     conversation_status = record["conversation_status"]
     source = _email_sync_source_for_direction(direction)
 
-    execute(
+    # ON CONFLICT (source_message_id) ... DO NOTHING RETURNING id, keyed
+    # on idx_order_intake_source_message_id_unique (the partial unique
+    # index database/operations_email_workflow_migration.sql already
+    # establishes) - same idempotent-insert pattern as
+    # db_client.py::DispatchDatabaseClient.add_row's ux_loads_source_
+    # intake_id handling. Phase 7 addition: workers/inbox_handlers.py::
+    # handle_inbox_process_message can retry this same insert after a
+    # crash between this row committing and the worker_jobs completion
+    # write committing (the job gets reclaimed and re-run) - without this,
+    # that retry would raise a raw unique-violation and the job would
+    # terminal-fail even though the message was already correctly
+    # persisted by the first attempt. new_id is intentionally unused when
+    # None (conflict fired) - the dict this function returns is built
+    # entirely from `record`/`message` locals below, not from the insert
+    # result, and those are deterministic given the same message content,
+    # so no re-query of the existing row is needed for a retry to resolve
+    # correctly.
+    _execute_returning_id(
         """
         insert into order_intake (
             source,
@@ -4744,6 +4776,9 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             :llm_review_required,
             :llm_review_reason
         )
+        on conflict (source_message_id) where source_message_id is not null
+        do nothing
+        returning id
         """,
         {
             "source": source,

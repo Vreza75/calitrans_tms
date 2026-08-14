@@ -152,6 +152,25 @@ def test_job_insert_failure_rolls_back_the_business_write_too(sqlite_worker_jobs
     assert status == "New"
 
 
+def test_count_by_status_aggregates_and_omits_zero_statuses(sqlite_worker_jobs) -> None:
+    with db_client.transaction() as conn:
+        worker_job_repo.enqueue_job(
+            conn=conn, job_type="inbox.sync", aggregate_type="mailbox", aggregate_id="m",
+            payload={}, idempotency_key="count-1",
+        )
+        worker_job_repo.enqueue_job(
+            conn=conn, job_type="inbox.sync", aggregate_type="mailbox", aggregate_id="m",
+            payload={}, idempotency_key="count-2",
+        )
+
+    with db_client.transaction() as conn:
+        counts = worker_job_repo.count_by_status(conn)
+
+    assert counts == {"pending": 2}
+    assert "failed" not in counts
+    assert "completed" not in counts
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL-only functions - claim/mark* use FOR UPDATE SKIP LOCKED, now(),
 # and make_interval, none of which SQLite supports. Gated behind an

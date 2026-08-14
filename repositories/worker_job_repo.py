@@ -250,6 +250,16 @@ def retry_job(conn: Connection, job_id: int, *, reset_attempts: bool = False) ->
     return (result.rowcount or 0) > 0
 
 
+def count_by_status(conn: Connection) -> dict[str, int]:
+    """Aggregate queue depth per status - for a minimal operator/health
+    view (Phase 7 STEP 5), not a monitoring platform. Statuses with zero
+    rows are simply absent from the returned dict rather than present
+    with a 0 - callers that want every known status represented should
+    default-fill (see application/jobs/queries.py::get_worker_runtime_status)."""
+    rows = conn.execute(text("select status, count(*) as n from worker_jobs group by status")).mappings().all()
+    return {row["status"]: int(row["n"]) for row in rows}
+
+
 def retry_all_failed(conn: Connection, *, reset_attempts: bool = False) -> int:
     """Bulk version of retry_job - requeues every currently-'failed' row.
     Returns the number of rows requeued."""

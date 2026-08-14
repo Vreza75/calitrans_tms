@@ -153,6 +153,20 @@ def test_outbox_insert_failure_rolls_back_the_business_write_too(sqlite_outbox) 
     assert status == "New"
 
 
+def test_count_by_status_aggregates_and_omits_zero_statuses(sqlite_outbox) -> None:
+    with db_client.transaction() as conn:
+        outbox_repo.enqueue_outbox_event(
+            conn=conn, event_type="driver_dispatch_sms", aggregate_type="load", aggregate_id="7",
+            payload={"to": "+15551234567", "message": "hi"}, idempotency_key="count-1",
+        )
+
+    with db_client.transaction() as conn:
+        counts = outbox_repo.count_by_status(conn)
+
+    assert counts == {"pending": 1}
+    assert "failed" not in counts
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL-only functions - claim/mark* use FOR UPDATE SKIP LOCKED, now(),
 # and make_interval, none of which SQLite supports. Gated behind an
