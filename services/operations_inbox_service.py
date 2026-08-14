@@ -4381,13 +4381,25 @@ def _save_operations_email_attachments(message: dict, message_id: str) -> list[d
     return saved_attachments
 
 
-def _prepare_operations_email_record(message: dict) -> dict:
+def _prepare_operations_email_record(message: dict, *, pre_saved_attachments: list | None = None) -> dict:
     """Pure (DB-write-free) half of email insert processing: parsing,
     attachment saving, classification, and triage. Each step is isolated so
     a failure in any one of them (a bad attachment, a classifier exception)
     cannot prevent the raw email fields from being available to the caller
     for an insert - only that step's contribution is degraded, and the
-    failure is recorded in processing_errors instead of being swallowed."""
+    failure is recorded in processing_errors instead of being swallowed.
+
+    `pre_saved_attachments` (Phase 7 addition, keyword-only, default None -
+    every pre-existing caller keeps calling this with the same one
+    positional argument and gets identical behavior): when provided, skips
+    calling _save_operations_email_attachments on `message` and uses this
+    list directly instead. workers/inbox_handlers.py's fetch-and-enqueue
+    path saves attachments to disk BEFORE enqueueing (raw attachment bytes
+    cannot safely travel through a worker_jobs.payload jsonb column - see
+    that module's docstring) and passes the resulting metadata-only list
+    back in here at process time, rather than this function re-deriving it
+    from `message['attachments']` (which the enqueue path deliberately
+    strips before the message ever reaches a job payload)."""
     from services.message_scope import build_message_scope
 
     subject = safe_str(message.get("subject")) or "(no subject)"
@@ -4441,11 +4453,14 @@ def _prepare_operations_email_record(message: dict) -> dict:
         if key != "_email_parsed"
     }
 
-    try:
-        saved_attachments = _save_operations_email_attachments(message, message_id)
-    except Exception as exc:
-        saved_attachments = []
-        processing_errors.append(f"attachment processing failed: {exc}")
+    if pre_saved_attachments is not None:
+        saved_attachments = pre_saved_attachments
+    else:
+        try:
+            saved_attachments = _save_operations_email_attachments(message, message_id)
+        except Exception as exc:
+            saved_attachments = []
+            processing_errors.append(f"attachment processing failed: {exc}")
 
     if saved_attachments:
         try:
@@ -4603,18 +4618,26 @@ def _prepare_operations_email_record(message: dict) -> dict:
     }
 
 
-def _prepare_operations_email_records(message: dict) -> list[dict]:
+def _prepare_operations_email_records(message: dict, *, pre_saved_attachments: list | None = None) -> list[dict]:
     """Returns one prepared record per detected order block (see
     services.email_parser.detect_order_blocks), or a single-element list -
     today's unchanged behavior - when the message has no multi-order
     split. Each record is produced by the existing, unmodified
     _prepare_operations_email_record(), called once per block; the only
     difference per call is the "body" (and, for block 1+, "attachments")
-    field of the message dict it's given."""
+    field of the message dict it's given.
+
+    `pre_saved_attachments` (Phase 7 addition, see
+    _prepare_operations_email_record's docstring) is only ever relevant to
+    the first block - only block 0 carries attachments today (block 1+
+    always gets `attachments=[]`, unchanged), so it's passed through only
+    for index 0; later blocks get `[]` regardless of what the caller
+    provided, matching the pre-existing empty-attachments behavior for
+    those blocks exactly."""
     raw_body = safe_str(message.get("body"))
     blocks = detect_order_blocks(raw_body)
     if not blocks:
-        return [_prepare_operations_email_record(message)]
+        return [_prepare_operations_email_record(message, pre_saved_attachments=pre_saved_attachments)]
 
     records = []
     for index, block_text in enumerate(blocks):
@@ -4622,11 +4645,27 @@ def _prepare_operations_email_records(message: dict) -> list[dict]:
         block_message["body"] = block_text
         if index > 0:
             block_message["attachments"] = []
-        record = _prepare_operations_email_record(block_message)
+        block_pre_saved = pre_saved_attachments if index == 0 else []
+        record = _prepare_operations_email_record(block_message, pre_saved_attachments=block_pre_saved)
         record["_order_block_index"] = index
         record["_order_block_count"] = len(blocks)
         records.append(record)
     return records
+
+
+def _execute_returning_id(sql: str, params: dict) -> int | None:
+    """Same connection/commit semantics as this module's module-level
+    execute() (db_client.execute: one engine.begin() per call, commits on
+    clean exit) but returns a scalar instead of discarding the result -
+    needed for _insert_operations_email_record_row's ON CONFLICT ...
+    RETURNING id below. Not a general-purpose replacement for execute();
+    only used where a caller needs the inserted/conflicting row's id."""
+    from sqlalchemy import text
+
+    from db_client import get_engine, get_secret
+
+    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
+        return conn.execute(text(sql), params).scalar_one_or_none()
 
 
 def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
@@ -4646,7 +4685,24 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     conversation_status = record["conversation_status"]
     source = _email_sync_source_for_direction(direction)
 
-    execute(
+    # ON CONFLICT (source_message_id) ... DO NOTHING RETURNING id, keyed
+    # on idx_order_intake_source_message_id_unique (the partial unique
+    # index database/operations_email_workflow_migration.sql already
+    # establishes) - same idempotent-insert pattern as
+    # db_client.py::DispatchDatabaseClient.add_row's ux_loads_source_
+    # intake_id handling. Phase 7 addition: workers/inbox_handlers.py::
+    # handle_inbox_process_message can retry this same insert after a
+    # crash between this row committing and the worker_jobs completion
+    # write committing (the job gets reclaimed and re-run) - without this,
+    # that retry would raise a raw unique-violation and the job would
+    # terminal-fail even though the message was already correctly
+    # persisted by the first attempt. new_id is intentionally unused when
+    # None (conflict fired) - the dict this function returns is built
+    # entirely from `record`/`message` locals below, not from the insert
+    # result, and those are deterministic given the same message content,
+    # so no re-query of the existing row is needed for a retry to resolve
+    # correctly.
+    _execute_returning_id(
         """
         insert into order_intake (
             source,
@@ -4720,6 +4776,9 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             :llm_review_required,
             :llm_review_reason
         )
+        on conflict (source_message_id) where source_message_id is not null
+        do nothing
+        returning id
         """,
         {
             "source": source,
@@ -4768,8 +4827,8 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     }
 
 
-def _insert_operations_email_message(message: dict) -> dict:
-    records = _prepare_operations_email_records(message)
+def _insert_operations_email_message(message: dict, *, pre_saved_attachments: list | None = None) -> dict:
+    records = _prepare_operations_email_records(message, pre_saved_attachments=pre_saved_attachments)
     base_message_id = _email_sync_unique_message_id(message)
     records = _assign_split_row_identity(records, base_message_id)
 

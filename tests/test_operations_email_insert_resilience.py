@@ -69,3 +69,35 @@ def test_no_failures_produces_no_processing_errors():
     record = ops._prepare_operations_email_record(MESSAGE)
     assert record["processing_errors"] == []
     assert record["subject"] == "[TMS-TEST] New Booking"
+
+
+def test_pre_saved_attachments_skips_self_save(monkeypatch):
+    """Phase 7: workers/inbox_handlers.py's fetch-and-enqueue path saves
+    attachments to disk before enqueueing an inbox.process_message job
+    (raw bytes can't safely travel through a job payload), then passes
+    the resulting metadata back in here via pre_saved_attachments - this
+    must skip _save_operations_email_attachments entirely, not call it a
+    second time on a message whose 'attachments' key was already
+    stripped before this function ever saw it."""
+    calls = []
+    monkeypatch.setattr(
+        ops,
+        "_save_operations_email_attachments",
+        lambda message, message_id: calls.append(1) or [],
+    )
+
+    pre_saved = [{"filename": "rate.pdf", "file_path": "/storage/rate.pdf", "content_sha256": "abc"}]
+    record = ops._prepare_operations_email_record(MESSAGE, pre_saved_attachments=pre_saved)
+
+    assert calls == []
+    assert record["saved_attachments"] == pre_saved
+
+
+def test_pre_saved_attachments_none_default_matches_unchanged_behavior():
+    """The default (None) must behave identically to calling this
+    function with one positional argument, as every pre-existing caller
+    still does."""
+    record_default = ops._prepare_operations_email_record(MESSAGE)
+    record_explicit_none = ops._prepare_operations_email_record(MESSAGE, pre_saved_attachments=None)
+
+    assert record_default["saved_attachments"] == record_explicit_none["saved_attachments"] == []

@@ -11,7 +11,7 @@ from db_client import DispatchDatabaseClient, read_df
 
 from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
 from api.errors import register_error_handlers
-from api.routers import attachments, health, loads, work_items
+from api.routers import attachments, health, inbox, jobs, loads, work_items
 
 app = FastAPI(title="Calitrans TMS Integration API")
 
@@ -36,6 +36,8 @@ app.include_router(health.router, prefix="/api/v1")
 app.include_router(work_items.router, prefix="/api/v1")
 app.include_router(loads.router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")
+app.include_router(inbox.router, prefix="/api/v1")
+app.include_router(jobs.router, prefix="/api/v1")
 
 
 # ---------------------------------------------------------------------------

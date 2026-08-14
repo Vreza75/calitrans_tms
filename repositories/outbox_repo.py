@@ -242,6 +242,15 @@ def retry_event(conn: Connection, event_id: int, *, reset_attempts: bool = False
     return (result.rowcount or 0) > 0
 
 
+def count_by_status(conn: Connection) -> dict[str, int]:
+    """Aggregate queue depth per status - Phase 7 closure addition for a
+    minimal operator/health view (application/jobs/queries.py::
+    get_worker_runtime_status), mirroring repositories/worker_job_repo.py::
+    count_by_status. Statuses with zero rows are absent from the dict."""
+    rows = conn.execute(text("select status, count(*) as n from outbox_events group by status")).mappings().all()
+    return {row["status"]: int(row["n"]) for row in rows}
+
+
 def retry_all_failed(conn: Connection, *, reset_attempts: bool = False) -> int:
     """Bulk version of retry_event - requeues every currently-'failed'
     row. Returns the number of rows requeued."""

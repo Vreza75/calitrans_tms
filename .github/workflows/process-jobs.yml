@@ -1,0 +1,89 @@
+name: Process worker jobs and outbox events
+
+# Phase 7 closure (STEP 3/4): the smallest production-appropriate
+# mechanism given this repo's actual deployment evidence - no
+# Dockerfile, no Procfile, no container/orchestration config, only a
+# Heroku-style runtime.txt (python-3.11) with no matching Procfile to
+# confirm an active worker dyno. Nothing in this repo demonstrates a
+# long-running second process is currently hostable, so this uses
+# scheduled invocation (Option B from docs/architecture/WORKER_RUNTIME.md)
+# rather than a dedicated always-on worker loop.
+#
+# Runs both CLIs in one scheduled workflow, not two separate schedules -
+# worker_jobs and outbox_events are different concepts (see
+# WORKER_RUNTIME.md) but share the same operational cadence and the same
+# "don't let one subsystem's failure block the other" requirement.
+# continue-on-error on both steps guarantees the second always runs even
+# if the first's exit code is 1 (its documented "something terminally
+# failed this run" signal, not a script crash) - the final step then
+# fails the job for visibility if either did, without having skipped the
+# other.
+#
+# Documented limitation: GitHub Actions scheduled workflows are
+# best-effort, not guaranteed-on-time - GitHub's own documentation states
+# schedule delays are possible during periods of high load, and a
+# schedule is disabled automatically after 60 days with no repository
+# activity (a real limitation of this mechanism, not a bug here). The
+# 5-minute interval is not a correctness requirement - claim_next_job/
+# claim_next_pending's FOR UPDATE SKIP LOCKED already makes overlapping
+# runs safe (two concurrent invocations claim different rows, never the
+# same one) - the concurrency group below exists only to avoid wasting
+# Actions minutes on a genuinely overlapping run, not to prevent a
+# correctness problem.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: process-jobs
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Process worker jobs (inbox.sync, inbox.process_message, ...)
+        id: worker_jobs
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          DISPATCH_YAHOO_EMAIL: ${{ secrets.DISPATCH_YAHOO_EMAIL }}
+          DISPATCH_YAHOO_APP_PASSWORD: ${{ secrets.DISPATCH_YAHOO_APP_PASSWORD }}
+          MARGIE_YAHOO_EMAIL: ${{ secrets.MARGIE_YAHOO_EMAIL }}
+          MARGIE_YAHOO_APP_PASSWORD: ${{ secrets.MARGIE_YAHOO_APP_PASSWORD }}
+          ACCOUNTING_YAHOO_EMAIL: ${{ secrets.ACCOUNTING_YAHOO_EMAIL }}
+          ACCOUNTING_YAHOO_APP_PASSWORD: ${{ secrets.ACCOUNTING_YAHOO_APP_PASSWORD }}
+        run: python scripts/process_worker_jobs.py process
+
+      - name: Process outbox events (driver_dispatch_sms, document.file.finalize)
+        id: outbox
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+        run: python scripts/process_outbox.py process
+
+      - name: Fail the run if either subsystem terminally failed a job/event this run
+        if: steps.worker_jobs.outcome == 'failure' || steps.outbox.outcome == 'failure'
+        run: |
+          echo "worker_jobs step outcome: ${{ steps.worker_jobs.outcome }}"
+          echo "outbox step outcome: ${{ steps.outbox.outcome }}"
+          echo "See the step logs above for which job/event failed and why (last_error is sanitized before it ever reaches this log)."
+          exit 1
