@@ -39,6 +39,20 @@ REPOSITORY_MODULES = [
     "repositories.inbox_repo",
     "repositories.load_repo",
     "repositories.worker_job_repo",
+    "repositories.domain_event_repo",
+]
+
+# Phase 9: the realtime event-delivery layer must be as framework-neutral
+# as application/ and repositories/ - a client-notification concern has
+# no business importing Streamlit, and services/realtime_publisher.py
+# must be runnable standalone (scripts/process_realtime_events.py), same
+# requirement as services/outbox_processor.py and workers/processor.py.
+REALTIME_MODULES = [
+    "realtime.event_types",
+    "realtime.events",
+    "realtime.channels",
+    "realtime.publisher",
+    "services.realtime_publisher",
 ]
 
 # Phase 7: the worker runtime must be runnable as a standalone process
@@ -83,6 +97,12 @@ def test_worker_runtime_does_not_import_streamlit() -> None:
     assert "streamlit-clean" in result.stdout, result.stdout
 
 
+def test_realtime_layer_does_not_import_streamlit() -> None:
+    result = _run_import_check(REALTIME_MODULES)
+    assert result.returncode == 0, result.stderr
+    assert "streamlit-clean" in result.stdout, result.stdout
+
+
 def test_application_module_source_never_mentions_streamlit_at_top_level() -> None:
     """A stricter static check: no `application/*.py` file may have a
     top-level (unindented) `import streamlit` or `from streamlit`. A lazy
@@ -105,6 +125,19 @@ def test_worker_module_source_never_mentions_streamlit_at_top_level() -> None:
     workers_dir = REPO_ROOT / "workers"
     offenders = []
     for path in workers_dir.rglob("*.py"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("import streamlit") or line.startswith("from streamlit"):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == []
+
+
+def test_realtime_module_source_never_mentions_streamlit_at_top_level() -> None:
+    """Same static check as the application/ and workers/ ones above,
+    applied to realtime/ - must stay this way as the event catalog
+    grows."""
+    realtime_dir = REPO_ROOT / "realtime"
+    offenders = []
+    for path in realtime_dir.rglob("*.py"):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.startswith("import streamlit") or line.startswith("from streamlit"):
                 offenders.append(str(path.relative_to(REPO_ROOT)))

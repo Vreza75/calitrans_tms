@@ -37,6 +37,24 @@ def mock_dispatch_client():
         yield client_cls.return_value
 
 
+@pytest.fixture(autouse=True)
+def mock_transaction():
+    """Phase 9: every command in application/loads/commands.py now opens
+    db_client.transaction() (to record a realtime domain event in the
+    same transaction as its write - see application/loads/commands.py::
+    _update_load_fields_with_event) - autouse so every test in this file
+    gets a fake connection instead of attempting a real DB connection.
+    Individual tests (e.g. the mark_load_ready_to_dispatch ones below)
+    may still locally re-patch db_client.transaction inside their own
+    `with` block when they want to assert on the specific conn object
+    used - that temporarily shadows this fixture's patch and is restored
+    correctly on exit, same as any nested mock.patch of the same target."""
+    conn = mock.MagicMock()
+    with mock.patch("db_client.transaction") as transaction:
+        transaction.return_value.__enter__.return_value = conn
+        yield conn
+
+
 # ---------------------------------------------------------------------------
 # 1. authorized actor succeeds
 # ---------------------------------------------------------------------------
@@ -69,11 +87,11 @@ def test_verify_load_booking_succeeds_for_authorized_roles(actor, mock_dispatch_
 
 
 @pytest.mark.parametrize("actor", AUTHORIZED_ACTORS, ids=lambda a: a.role.value)
-def test_save_load_note_succeeds_for_authorized_roles(actor, mock_dispatch_client):
+def test_save_load_note_succeeds_for_authorized_roles(actor, mock_dispatch_client, mock_transaction):
     result = commands.save_load_note(actor=actor, load_id=1, note="called customer")
     assert result.ok is True
     mock_dispatch_client.update_row_fields.assert_called_once_with(
-        1, {"Dispatcher Notes": "called customer"}, created_by=actor.actor
+        1, {"Dispatcher Notes": "called customer"}, conn=mock_transaction, created_by=actor.actor
     )
 
 
