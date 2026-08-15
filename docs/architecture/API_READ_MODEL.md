@@ -154,5 +154,8 @@ problem at higher data volume than this business's current scale.
 
 ## Future realtime
 
-Realtime events in Phase 9 will invalidate/refetch these stable query
-resources rather than replacing the read model.
+Realtime events in Phase 9 invalidate/refetch these stable query
+resources rather than replacing the read model - see `docs/
+architecture/REALTIME_EVENTS.md` for the event catalog and client
+invalidation contract now that Phase 9 is built (partial, stacked on
+this branch).

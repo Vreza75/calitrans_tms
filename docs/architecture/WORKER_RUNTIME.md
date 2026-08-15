@@ -18,6 +18,7 @@ on `feat/worker-runtime-inbox` / PR #8 for how it got here incrementally).
 ```text
 calitrans-api                  FastAPI (api/main.py, uvicorn)
 calitrans-worker               scripts/process_worker_jobs.py + scripts/process_outbox.py
+                                + scripts/process_realtime_events.py (Phase 9)
 legacy-calitrans-streamlit     Streamlit (app.py) - transitional client
 ```
 
@@ -360,7 +361,11 @@ dedicated regression tests.
 
 ## Future phases (not started here)
 
-- **Phase 8** - API Read Model + Pagination/Search/Filtering.
-- **Phase 9** - realtime event delivery.
+- **Phase 8** - API Read Model + Pagination/Search/Filtering (partial -
+  see `docs/architecture/API_READ_MODEL.md`).
+- **Phase 9** - realtime event delivery - see `docs/architecture/
+  REALTIME_EVENTS.md`. Its publisher (`scripts/process_realtime_events.py`)
+  runs in the same `.github/workflows/process-jobs.yml` scheduled
+  workflow as this phase's two processors, as a third independent step.
 - **Phase 10** - dedicated web client (Next.js).
 - Later: Motive integration.
