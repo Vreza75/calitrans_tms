@@ -33,6 +33,7 @@ import os
 from fastapi import Depends, Header, HTTPException
 
 from application.auth.models import AuthenticatedActor, Role
+from application.auth.session_tokens import verify_session_token
 
 __all__ = [
     "Role",
@@ -80,7 +81,16 @@ def _load_configured_tokens() -> dict[str, AuthenticatedActor]:
 
 
 def _resolve_actor_from_token(token: str) -> AuthenticatedActor | None:
-    return _load_configured_tokens().get(token)
+    """Static, out-of-band-configured tokens (API_AUTH_TOKENS) first -
+    these are for service/integration callers. Falls back to a signed
+    session token (application/auth/session_tokens.py) issued by
+    POST /api/v1/auth/login - the Phase 10 browser login path. Either
+    resolves to the same AuthenticatedActor shape; routes never need to
+    know which kind of token a given caller presented."""
+    configured = _load_configured_tokens().get(token)
+    if configured is not None:
+        return configured
+    return verify_session_token(token)
 
 
 def require_auth(authorization: str | None = Header(default=None)) -> AuthenticatedActor:
