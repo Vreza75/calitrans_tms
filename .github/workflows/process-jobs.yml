@@ -1,4 +1,4 @@
-name: Process worker jobs and outbox events
+name: Process worker jobs, outbox events, and realtime domain events
 
 # Phase 7 closure (STEP 3/4): the smallest production-appropriate
 # mechanism given this repo's actual deployment evidence - no
@@ -80,10 +80,29 @@ jobs:
           TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
         run: python scripts/process_outbox.py process
 
-      - name: Fail the run if either subsystem terminally failed a job/event this run
-        if: steps.worker_jobs.outcome == 'failure' || steps.outbox.outcome == 'failure'
+      # Phase 9: a third, independent queue - see docs/architecture/
+      # REALTIME_EVENTS.md for why domain_events is a separate table/
+      # processor from both worker_jobs and outbox_events. REALTIME_ENABLED
+      # is intentionally omitted here (defaults unset -> NoOpBroadcastPublisher,
+      # see realtime/publisher.py::get_publisher) until Supabase Realtime
+      # credentials are actually provisioned for this repository - the
+      # domain_events rows still get recorded and marked 'published'
+      # either way, they just don't reach a live channel yet.
+      - name: Process realtime domain events (load/inbox/communication/document change notifications)
+        id: realtime_events
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REALTIME_ENABLED: ${{ secrets.REALTIME_ENABLED }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python scripts/process_realtime_events.py process
+
+      - name: Fail the run if any subsystem terminally failed a job/event this run
+        if: steps.worker_jobs.outcome == 'failure' || steps.outbox.outcome == 'failure' || steps.realtime_events.outcome == 'failure'
         run: |
           echo "worker_jobs step outcome: ${{ steps.worker_jobs.outcome }}"
           echo "outbox step outcome: ${{ steps.outbox.outcome }}"
+          echo "realtime_events step outcome: ${{ steps.realtime_events.outcome }}"
           echo "See the step logs above for which job/event failed and why (last_error is sanitized before it ever reaches this log)."
           exit 1
