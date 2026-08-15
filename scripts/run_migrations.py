@@ -50,6 +50,8 @@ DATABASE_DIR = REPO_ROOT / "database"
 #   outbox_migration.sql                     - independent, no FKs (Phase 6 transactional outbox)
 #   document_lifecycle_migration.sql         - ALTERs documents (needs schema.sql only; Phase 6B)
 #   worker_jobs_migration.sql                - independent, no FKs (Phase 7 durable worker job queue)
+#   load_query_indexes_migration.sql         - independent, no FKs (Phase 8 read-model indexes)
+#   domain_events_migration.sql              - independent, no FKs (Phase 9 durable realtime domain events)
 MIGRATION_ORDER = [
     "schema.sql",
     "portpro_style_migration.sql",
@@ -70,6 +72,7 @@ MIGRATION_ORDER = [
     "document_lifecycle_migration.sql",
     "worker_jobs_migration.sql",
     "load_query_indexes_migration.sql",
+    "domain_events_migration.sql",
 ]
 
 
