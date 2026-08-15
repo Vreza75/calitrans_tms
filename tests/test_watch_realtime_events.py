@@ -10,7 +10,6 @@ from unittest import mock
 import pytest
 
 from scripts.watch_realtime_events import (
-    aggregate_from_topic,
     format_event_line,
     handle_frame,
     heartbeat_message,
@@ -61,27 +60,32 @@ def test_heartbeat_message_shape():
     assert msg == {"topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": "7"}
 
 
-def test_aggregate_from_topic_parses_resource_channel():
-    assert aggregate_from_topic("load:381") == ("load", "381")
-
-
-def test_aggregate_from_topic_returns_none_for_collection_channel():
-    assert aggregate_from_topic("loads") == (None, None)
-
-
-def test_format_event_line_reports_na_for_fields_never_sent_on_the_wire():
-    line = format_event_line(topic="load:381", event_type="load.status_changed")
+def test_format_event_line_reads_envelope_fields_off_the_wire():
+    envelope = {
+        "event_id": 42,
+        "aggregate_type": "load",
+        "aggregate_id": "381",
+        "version": "3",
+        "occurred_at": "2026-08-15T12:00:00+00:00",
+        "metadata": {"new_status": "Dispatched"},
+    }
+    line = format_event_line(topic="load:381", event_type="load.status_changed", envelope=envelope)
     assert "aggregate_type=load" in line
     assert "aggregate_id=381" in line
+    assert "event_id=42" in line
+    assert "version=3" in line
+    assert "occurred_at=2026-08-15T12:00:00+00:00" in line
+    # never prints the business metadata values
+    assert "Dispatched" not in line
+
+
+def test_format_event_line_reports_na_for_missing_envelope_fields():
+    line = format_event_line(topic="loads", event_type="load.updated", envelope={})
+    assert "aggregate_type=n/a" in line
+    assert "aggregate_id=n/a" in line
     assert "event_id=n/a" in line
     assert "version=n/a" in line
     assert "occurred_at=n/a" in line
-
-
-def test_format_event_line_collection_channel_has_no_aggregate_id():
-    line = format_event_line(topic="loads", event_type="load.updated")
-    assert "aggregate_type=n/a" in line
-    assert "aggregate_id=n/a" in line
 
 
 def test_handle_frame_ignores_non_broadcast_protocol_frames():
@@ -98,7 +102,18 @@ def test_handle_frame_formats_a_broadcast_frame():
         {
             "topic": "realtime:load:381",
             "event": "broadcast",
-            "payload": {"type": "broadcast", "event": "load.status_changed", "payload": {"new_status": "Dispatched"}},
+            "payload": {
+                "type": "broadcast",
+                "event": "load.status_changed",
+                "payload": {
+                    "event_id": 42,
+                    "aggregate_type": "load",
+                    "aggregate_id": "381",
+                    "version": None,
+                    "occurred_at": "2026-08-15T12:00:00+00:00",
+                    "metadata": {"new_status": "Dispatched"},
+                },
+            },
             "ref": None,
         }
     )
@@ -106,7 +121,9 @@ def test_handle_frame_formats_a_broadcast_frame():
     assert line is not None
     assert "channel=load:381" in line
     assert "event_type=load.status_changed" in line
-    # never prints the actual payload values
+    assert "event_id=42" in line
+    assert "aggregate_id=381" in line
+    # never prints the actual business metadata values
     assert "Dispatched" not in line
 
 
@@ -115,7 +132,18 @@ def test_handle_frame_never_leaks_payload_values_for_sensitive_looking_content()
         {
             "topic": "realtime:loads",
             "event": "broadcast",
-            "payload": {"type": "broadcast", "event": "load.updated", "payload": {"driver_name": "Jane Doe"}},
+            "payload": {
+                "type": "broadcast",
+                "event": "load.updated",
+                "payload": {
+                    "event_id": 43,
+                    "aggregate_type": "load",
+                    "aggregate_id": "381",
+                    "version": None,
+                    "occurred_at": None,
+                    "metadata": {"driver_name": "Jane Doe"},
+                },
+            },
             "ref": None,
         }
     )

@@ -34,21 +34,11 @@ SUPABASE_SERVICE_ROLE_KEY entries.
 
 Prints only safe invalidation metadata per received broadcast:
 event_id, event_type, aggregate_type, aggregate_id, version,
-occurred_at - never the raw payload dict or its values.
-
-IMPORTANT - what "n/a" means below: per docs/architecture/
-REALTIME_EVENTS.md's "Security" section, services/realtime_publisher.py
-broadcasts only a domain event's `payload` (metadata) column - never its
-`id`, `version`, or `created_at` columns (see services/
-realtime_publisher.py::process_one and tests/
-test_realtime_publisher_service.py). event_id, version, and occurred_at
-are therefore NOT present on the wire in this pass's implementation and
-will always print as "n/a" here - a real, documented gap between the
-wire format and a full audit trail, not a bug in this script.
-aggregate_type/aggregate_id print as "n/a" too when listening on a
-collection channel (e.g. "loads"), which carries no aggregate id at all
-- only a resource channel ("load:381") lets them be parsed from the
-topic name itself.
+occurred_at - never the raw business `metadata` dict or its values
+(Phase 10 addition: services/realtime_publisher.py now wraps that
+metadata in an envelope alongside these bookkeeping fields - see
+services/realtime_publisher.py::_envelope_payload - so they are read
+directly off the wire here rather than guessed from the topic name).
 
 Requires the `websockets` package (already present transitively via the
 uvicorn[standard] entry in requirements.txt - not added as a new
@@ -107,22 +97,16 @@ def heartbeat_message(ref: str) -> dict[str, Any]:
     return {"topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": ref}
 
 
-def aggregate_from_topic(topic: str) -> tuple[str | None, str | None]:
-    """Best-effort parse from a resource channel name (e.g. "load:381" ->
-    ("load", "381")). Collection channels (e.g. "loads") carry no
-    aggregate_id at all - both come back None, never guessed."""
-    if ":" not in topic:
-        return None, None
-    aggregate_type, aggregate_id = topic.split(":", 1)
-    return aggregate_type, aggregate_id
-
-
-def format_event_line(*, topic: str, event_type: str) -> str:
-    aggregate_type, aggregate_id = aggregate_from_topic(topic)
+def format_event_line(*, topic: str, event_type: str, envelope: dict[str, Any]) -> str:
+    """`envelope` is the broadcast payload built by services/
+    realtime_publisher.py::_envelope_payload - never pass its "metadata"
+    key through to the printed line (that's the business payload this
+    tool deliberately never displays)."""
     return (
         f"channel={topic} event_type={event_type} "
-        f"aggregate_type={aggregate_type or 'n/a'} aggregate_id={aggregate_id or 'n/a'} "
-        f"event_id=n/a version=n/a occurred_at=n/a"
+        f"aggregate_type={envelope.get('aggregate_type') or 'n/a'} aggregate_id={envelope.get('aggregate_id') or 'n/a'} "
+        f"event_id={envelope.get('event_id', 'n/a')} version={envelope.get('version') or 'n/a'} "
+        f"occurred_at={envelope.get('occurred_at') or 'n/a'}"
     )
 
 
@@ -141,8 +125,9 @@ def handle_frame(raw: str) -> str | None:
 
     inner = message.get("payload") or {}
     event_type = inner.get("event", "unknown")
+    envelope = inner.get("payload") or {}
     topic = str(message.get("topic", "")).removeprefix("realtime:")
-    return format_event_line(topic=topic, event_type=event_type)
+    return format_event_line(topic=topic, event_type=event_type, envelope=envelope)
 
 
 async def watch(*, url: str, topics: list[str]) -> None:

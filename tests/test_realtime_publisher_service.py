@@ -68,6 +68,48 @@ def test_process_one_success_marks_published_and_broadcasts_to_both_channels():
     assert channels_used == ["loads", "load:381"]
 
 
+def test_process_one_broadcast_payload_is_an_envelope_around_the_metadata():
+    """Phase 10 addition: the wire payload must carry event_id/
+    aggregate_type/aggregate_id/version/occurred_at alongside the
+    caller's metadata - not just the raw metadata dict - so a listening
+    client has an ordering token and an aggregate id even on a
+    collection channel (see docs/architecture/REALTIME_EVENTS.md's
+    "Wire payload" subsection)."""
+    import datetime
+
+    conn = mock.MagicMock()
+    occurred_at = datetime.datetime(2026, 8, 15, 18, 4, 2, tzinfo=datetime.timezone.utc)
+    event = {
+        "id": 1042,
+        "event_type": "load.status_changed",
+        "aggregate_type": "load",
+        "aggregate_id": "381",
+        "version": None,
+        "payload": {"new_status": "Dispatched", "old_status": "Verified"},
+        "attempt_count": 0,
+        "actor": "dispatcher@calitranscorp.com",
+        "created_at": occurred_at,
+    }
+    publisher = _FakePublisher(success=True)
+    with mock.patch("services.realtime_publisher.transaction", return_value=_fake_transaction(conn)), mock.patch(
+        "repositories.domain_event_repo.claim_next_pending", return_value=event
+    ), mock.patch("repositories.domain_event_repo.mark_published"), mock.patch(
+        "services.realtime_publisher.get_publisher", return_value=publisher
+    ):
+        realtime_publisher.process_one()
+
+    assert len(publisher.calls) == 2
+    for _channel, _event_type, sent_payload in publisher.calls:
+        assert sent_payload == {
+            "event_id": 1042,
+            "aggregate_type": "load",
+            "aggregate_id": "381",
+            "version": None,
+            "occurred_at": "2026-08-15T18:04:02+00:00",
+            "metadata": {"new_status": "Dispatched", "old_status": "Verified"},
+        }
+
+
 def test_process_one_document_event_only_broadcasts_to_its_collection_channel():
     """"document" has no resource-level channel this pass (realtime/
     channels.py's _RESOURCE_CHANNEL_AGGREGATE_TYPES) - only "documents"

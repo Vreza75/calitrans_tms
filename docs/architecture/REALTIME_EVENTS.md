@@ -142,6 +142,34 @@ precedence every other module in this codebase uses - never
 `SUPABASE_SERVICE_ROLE_KEY`. None of these are committed anywhere in
 this repo.
 
+**Wire payload (Phase 10 addition)**: `services/realtime_publisher.py::
+_envelope_payload` wraps the domain event's `payload` (business
+metadata - see "Security" below) inside a small envelope alongside its
+bookkeeping fields, so a listening client has an ordering token and an
+aggregate id even on a collection channel (which carries no id in its
+topic name):
+
+```json
+{
+  "event_id": 1042,
+  "aggregate_type": "load",
+  "aggregate_id": "381",
+  "version": null,
+  "occurred_at": "2026-08-15T18:04:02.113000+00:00",
+  "metadata": {"new_status": "Dispatched", "old_status": "Verified"}
+}
+```
+
+`event_id`/`aggregate_type`/`aggregate_id`/`version`/`occurred_at` come
+from the `domain_events` row itself (never guessed or reconstructed by
+the publisher); `metadata` is exactly what the emitting command passed
+to `realtime/events.py::publish_event(metadata=...)`, still governed by
+`realtime/channels.py::ALLOWED_METADATA_KEYS`. A client uses `event_id`
+as the same-aggregate ordering token (STEP 23 of the Phase 10 spec):
+track the highest `event_id` seen per `(aggregate_type, aggregate_id)`
+and ignore a broadcast whose `event_id` is not greater than the last one
+applied for that aggregate.
+
 ## Event durability
 
 Every instrumented command records its domain event via `realtime/
@@ -406,12 +434,12 @@ actually arrive.
 
 Prints only `channel`, `event_type`, `aggregate_type`, `aggregate_id`,
 `event_id`, `version`, `occurred_at` per received broadcast - never the
-payload's values. `event_id`/`version`/`occurred_at` always print as
-`n/a`: the publisher's wire payload is only the domain event's
-`payload` (metadata) column, never its `id`/`version`/`created_at`
-columns (see `services/realtime_publisher.py::process_one`) - this is a
-real gap between the wire format and a full audit trail, not a bug in
-the watcher.
+business `metadata` values. All of `event_id`/`aggregate_type`/
+`aggregate_id`/`version`/`occurred_at` are read directly off the wire
+envelope (see "Transport" above's "Wire payload" subsection) - none are
+guessed from the topic name or print as `n/a` unless the field is
+genuinely absent (a `NoOpBroadcastPublisher`-only environment producing
+a hand-built test frame, for instance).
 
 ## Future clients
 
