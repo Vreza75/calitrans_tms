@@ -37,7 +37,29 @@ OPERATIONS_EMAIL_SYNC_SOURCES = [
 
 
 def _sql_literal_list(values: list[str]) -> str:
-    return ", ".join("'" + str(value).replace("'", "''") + "'" for value in values)
+    """Render `values` as a comma-separated list of single-quoted SQL
+    string literals, for embedding directly into an f-string query
+    fragment (e.g. `source in ({_sql_literal_list(...)})`).
+
+    Single quotes are escaped per the SQL standard (`'` -> `''`), which is
+    safe for the fixed, module-level constant lists this is currently
+    fed (OPERATIONS_EMAIL_SYNC_SOURCES, INBOX_TERMINAL_REVIEW_STATUSES -
+    see call sites below). This is NOT a substitute for bind parameters:
+    it must never be called with caller-supplied or otherwise untrusted
+    input. The assertion below is defense in depth against exactly that -
+    it rejects anything that isn't a plain, printable string, so a future
+    caller that accidentally routes user input through here fails loudly
+    instead of silently embedding it.
+    """
+    literals = []
+    for value in values:
+        text = str(value)
+        assert text.isprintable() and "\x00" not in text, (
+            f"_sql_literal_list() only accepts plain trusted strings, got {value!r}. "
+            "Use a bind parameter for anything caller-supplied or untrusted."
+        )
+        literals.append("'" + text.replace("'", "''") + "'")
+    return ", ".join(literals)
 
 
 def operations_email_source_filter(alias: str = "") -> str:
