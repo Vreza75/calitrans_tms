@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import streamlit as st
 
+from application.auth.models import AuthenticatedActor
+from application.auth.permissions import Permission, require_permission
+from application.exceptions import AuthorizationError
+from application.inbox.commands import request_inbox_sync
 from db_client import read_df
 from services import operations_inbox_service as ops
+from ui_components.operations_inbox_state import close_work_item
 
 
 def _render_imap_result() -> None:
@@ -29,9 +34,71 @@ def _render_imap_result() -> None:
             )
 
 
-def _render_email_synchronization() -> None:
+def _render_manual_inbox_processing(principal: AuthenticatedActor) -> None:
+    """Sync Email Engine / Refresh Inbox / Recheck Next Batch - relocated
+    here from the normal Operations Inbox dispatcher view. Routine
+    processing already runs automatically (see
+    .github/workflows/process-jobs.yml -> scripts/process_worker_jobs.py
+    -> workers/inbox_handlers.py, every 5 minutes); these are
+    troubleshooting-only controls, not part of daily dispatcher workflow.
+    Admin/Diagnostics is already gated to Role.MANAGER/Role.ADMIN at the
+    section/router level (application/auth/permissions.py's
+    ROLE_ALLOWED_SECTIONS) - Recheck Next Batch additionally enforces
+    Permission.WORK_ITEM_MANAGE explicitly here because it calls a raw
+    service function with no application-command layer of its own, so
+    page visibility alone would otherwise be its only gate."""
+    with st.expander("Manual Inbox Processing (Advanced / Debug)", expanded=False):
+        st.caption(
+            "Routine processing already runs automatically via the scheduled worker. "
+            "These controls are for troubleshooting only - normal dispatcher work does "
+            "not need them."
+        )
+        sync_col, refresh_col, recheck_col = st.columns(3)
+
+        with sync_col:
+            if st.button("Sync Email Engine", key="admin_operations_sync_email_engine", width="stretch"):
+                try:
+                    sync_result = request_inbox_sync(actor=principal)
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["operations_email_import_result"] = {
+                        "queued": True,
+                        "job_id": sync_result.job_id,
+                    }
+                    st.success(
+                        f"Inbox sync queued (job #{sync_result.job_id}). "
+                        "New messages will appear once the worker processes it."
+                    )
+                    close_work_item(st.session_state)
+                    ops.refresh_data()
+                    st.rerun()
+
+        with refresh_col:
+            if st.button("Refresh Inbox", key="admin_operations_refresh_inbox", width="stretch"):
+                close_work_item(st.session_state)
+                ops.refresh_data()
+                st.rerun()
+
+        with recheck_col:
+            if st.button("Recheck Next Batch", key="admin_operations_recheck_smart_groups", width="stretch"):
+                try:
+                    require_permission(principal, Permission.WORK_ITEM_MANAGE)
+                except AuthorizationError as exc:
+                    st.error(str(exc))
+                else:
+                    with st.spinner("Running fast triage on the next small batch..."):
+                        triage_result = ops.auto_classify_open_inbox_items(limit=25, time_budget_seconds=8)
+                    st.session_state["operations_smart_group_update_result"] = triage_result
+                    close_work_item(st.session_state)
+                    st.rerun()
+
+
+def _render_email_synchronization(principal: AuthenticatedActor) -> None:
     st.markdown("### Email Synchronization")
     st.caption("Mailbox connectivity, synchronization settings, results, and technical status.")
+
+    _render_manual_inbox_processing(principal)
 
     if st.button(
         "Test IMAP Connections",
@@ -222,11 +289,11 @@ def _render_maintenance_cleanup() -> None:
             st.rerun()
 
 
-def render_email_imports() -> None:
+def render_email_imports(principal: AuthenticatedActor) -> None:
     """Render email import history from the email_imports table."""
     st.subheader("Email Imports / Diagnostics")
     st.caption("Admin view for mailbox troubleshooting, skipped messages, raw import metadata, and parser issues. Dispatchers should work daily email from Operations Inbox.")
-    _render_email_synchronization()
+    _render_email_synchronization(principal)
     _render_operations_diagnostics()
     _render_maintenance_cleanup()
 

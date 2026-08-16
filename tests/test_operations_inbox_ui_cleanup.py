@@ -66,9 +66,12 @@ def test_queue_is_button_driven_not_dataframe_selection_driven() -> None:
 
 
 def test_refresh_inbox_explicitly_clears_dialog_state() -> None:
-    refresh_block = INBOX_SOURCE[
-        INBOX_SOURCE.index('if st.button("Refresh Inbox"') :
-        INBOX_SOURCE.index('if st.button("Recheck Next Batch"')
+    """Sync Email Engine / Refresh Inbox / Recheck Next Batch were
+    relocated to Admin/Diagnostics (transitional UX pass) - the
+    close_work_item-on-refresh behavior must still hold there."""
+    refresh_block = ADMIN_SOURCE[
+        ADMIN_SOURCE.index('if st.button("Refresh Inbox"') :
+        ADMIN_SOURCE.index('if st.button("Recheck Next Batch"')
     ]
 
     assert "close_work_item(st.session_state)" in refresh_block
@@ -87,6 +90,9 @@ def test_dispatcher_workspace_hides_admin_and_routing_panels() -> None:
         "Extracted Fields",
         "Advanced Triage / AI Details",
         "### Routing Actions",
+        "Sync Email Engine",
+        "Refresh Inbox",
+        "Recheck Next Batch",
     ):
         assert label not in INBOX_SOURCE
 
@@ -98,6 +104,10 @@ def test_admin_diagnostics_owns_email_sync_panels() -> None:
         "Latest Email Sync Result",
         "Email Sync Settings",
         "Email Sync KPIs",
+        "Manual Inbox Processing (Advanced / Debug)",
+        "Sync Email Engine",
+        "Refresh Inbox",
+        "Recheck Next Batch",
     ):
         assert label in ADMIN_SOURCE
 

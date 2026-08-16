@@ -55,7 +55,15 @@ html, body, [class*="css"] {
 .block-container {
     padding-top: var(--space-3);
     padding-bottom: var(--space-6);
-    max-width: 1320px;
+    /* configure_streamlit_page() already sets layout="wide"
+       (ui_components/app_shell.py) - this 1320px cap was overriding that,
+       leaving large empty gutters on wider screens. max-width: 100% lets
+       the wide layout use the viewport it was already given; the
+       fixed-rem side padding (not a percentage) keeps a stable, small
+       gutter at any width instead of a hardcoded pixel canvas. */
+    max-width: 100%;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
 }
 
 #MainMenu {visibility: hidden;}

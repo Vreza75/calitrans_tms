@@ -68,7 +68,7 @@ def _render_selected_page(section: str, df: pd.DataFrame, principal: Authenticat
     elif section == "Documents":
         render_documents(df, principal)
     elif section == "Email Imports":
-        render_email_imports()
+        render_email_imports(principal)
     elif section == "Billing / ProfitTools":
         render_billing(df)
     elif section == "Validation":

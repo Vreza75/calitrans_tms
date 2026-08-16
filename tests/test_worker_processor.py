@@ -29,6 +29,19 @@ def test_inbox_sync_handler_is_registered():
     assert processor.JOB_HANDLERS.get("inbox.sync") is handle_inbox_sync
 
 
+def test_inbox_process_message_handler_is_registered():
+    """Regression guard for the transitional Streamlit UX pass (Issue 2):
+    Sync Email Engine / Refresh Inbox / Recheck Next Batch moved out of
+    the normal dispatcher view on the assumption that routine processing
+    is fully automated - this is the automated classify/parse/match/
+    persist path (workers/inbox_handlers.py::handle_inbox_process_message)
+    that makes that assumption true. If this handler is ever
+    unregistered, the manual buttons would need to come back."""
+    from workers.inbox_handlers import handle_inbox_process_message
+
+    assert processor.JOB_HANDLERS.get("inbox.process_message") is handle_inbox_process_message
+
+
 def test_process_one_returns_none_when_nothing_claimable():
     conn = mock.MagicMock()
     with mock.patch("workers.processor.transaction", return_value=_fake_transaction(conn)), mock.patch(
