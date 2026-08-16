@@ -270,7 +270,7 @@ Return JSON only.
             "llm_debug": {},
             "human_review_required": True,
             "automation_allowed": False,
-    }
+        }
     result["processed_at"] = datetime.utcnow().isoformat()
     result["agent_name"] = "ai_email_intake_agent_v1"
 

@@ -25,6 +25,12 @@ def export_ready_loads(
     if "Status" in df.columns:
         ready = df[df["Status"].astype(str).eq("Ready for ProfitTools")].copy()
     elif "Ready for ProfitTools" in df.columns:
+        # Legacy/alternate-shape fallback for callers with no "Status"
+        # column - the live caller (pages_app/billing_profittools.py)
+        # always has "Status" and never reaches this branch. `== True`
+        # is safe here because this column is only ever a clean bool
+        # (see tests/test_profittools_export.py); a NaN would need a
+        # caller that doesn't exist today, so not hardening for it.
         ready = df[df["Ready for ProfitTools"] == True].copy()
     else:
         ready = df.iloc[0:0].copy()
