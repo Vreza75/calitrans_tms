@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from db_client import read_df
+from utils.text_helpers import safe_str as _safe_str
 
 try:
     from repositories import inbox_repo, case_repo, load_repo, task_repo
@@ -16,13 +17,6 @@ except Exception:  # keeps module importable during staged integration
     case_repo = None
     load_repo = None
     task_repo = None
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def _int_or_zero(value: Any) -> int:

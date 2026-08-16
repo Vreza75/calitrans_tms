@@ -30,15 +30,10 @@ from typing import Any
 
 import pandas as pd
 
+from utils.text_helpers import safe_str
+
 OPERATIONS_ATTACHMENTS_KEY = "_operations_attachments"
 OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
-
-
-def safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def coerce_json_dict(value: Any) -> dict:

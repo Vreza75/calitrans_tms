@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from db_client import read_df
+from utils.text_helpers import safe_str
 
 
 AI_LOAD_CONTEXT_COLUMNS = [
@@ -72,12 +73,6 @@ AI_LOAD_CONTEXT_LABELS = {
     "last_driver_update": "Last Driver Update",
 }
 
-
-def safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def int_or_none(value: Any) -> int | None:

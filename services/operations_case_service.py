@@ -9,6 +9,7 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Connection
 
 from db_client import execute, read_df, require_schema_ready, transaction
+from utils.text_helpers import safe_str
 from utils.ttl_cache import ttl_cache
 from services.email_parser import extract_latest_email_body, parse_email_text
 from services.operations_email_triage_service import (
@@ -56,13 +57,6 @@ OPERATIONS_SLA_FIRST_RESPONSE_HOURS = 2
 OPERATIONS_SLA_RESOLUTION_HOURS = 48
 
 _SCHEMA_READY = False
-
-
-def safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def int_or_none(value: Any) -> int | None:

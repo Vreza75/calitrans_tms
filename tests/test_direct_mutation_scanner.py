@@ -30,8 +30,8 @@ _SCAN_FILES = sorted((REPO_ROOT / "pages_app").glob("*.py")) + [REPO_ROOT / "adm
 ALLOWED_DIRECT_CALLS: dict[tuple[str, int], str] = {
     ("pages_app/documents.py", 102): "render_pdf_intake() is confirmed dead code - zero live callers anywhere in the repo (Phase 5B mutation inventory); not reachable from the live app.",
     ("pages_app/documents.py", 117): "render_pdf_intake() is confirmed dead code - see above.",
-    ("pages_app/port_houston_integration.py", 478): "Gated by an explicit require_permission(principal, Permission.PORT_DATA_APPLY) call on the immediately preceding line inside the same try block - see _render_load_port_houston_panel's Sync Port Data handler.",
-    ("pages_app/port_houston_integration.py", 598): "Gated by an explicit require_permission(principal, Permission.PORT_DATA_APPLY) call on the immediately preceding line inside the same try block - see the Save PIN / Appointment To Load handler.",
+    ("pages_app/port_houston_integration.py", 474): "Gated by an explicit require_permission(principal, Permission.PORT_DATA_APPLY) call on the immediately preceding line inside the same try block - see _render_load_port_houston_panel's Sync Port Data handler.",
+    ("pages_app/port_houston_integration.py", 594): "Gated by an explicit require_permission(principal, Permission.PORT_DATA_APPLY) call on the immediately preceding line inside the same try block - see the Save PIN / Appointment To Load handler.",
 }
 
 # orders_management.py's dead functions carry 9 call sites - listed as a

@@ -7,19 +7,14 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from utils.text_helpers import safe_str as _safe_str
+
 try:
     from repositories import inbox_repo, case_repo, load_repo
 except Exception:  # Keeps this module import-safe during partial integration.
     inbox_repo = None
     case_repo = None
     load_repo = None
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def _coerce_dict(value: Any) -> Dict[str, Any]:

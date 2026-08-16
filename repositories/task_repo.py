@@ -2,25 +2,19 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import pandas as pd
 from sqlalchemy import text as sa_text
 
 from db_client import execute, read_df, require_schema_ready, transaction
+from utils.text_helpers import json_dump as _json_dump
+from utils.text_helpers import safe_str as _safe_str
 
 
 TASK_STATUSES = ["Open", "In Progress", "Waiting", "Completed", "Cancelled"]
 TASK_PRIORITIES = ["Critical", "High", "Medium", "Low"]
 TASK_OWNERS = ["Dispatch", "Accounting", "Manager", "Customer Service", "Safety", "Operations"]
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def _int_or_none(value: Any):
@@ -38,10 +32,6 @@ def _int_or_none(value: Any):
         return int(float(text))
     except Exception:
         return None
-
-
-def _json_dump(data: dict | None) -> str:
-    return json.dumps(data or {}, default=str)
 
 
 def ensure_task_schema() -> None:

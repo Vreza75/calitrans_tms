@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from services.operations_field_service import reconcile_parsed_sources
+from utils.text_helpers import safe_str as _safe_str
 
 DOCUMENT_ORDER_FIELDS = [
     "TYPE",
@@ -37,13 +38,6 @@ DOCUMENT_ORDER_FIELDS = [
     "Contact Phone",
     "Dispatcher Notes",
 ]
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
