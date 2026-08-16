@@ -1,11 +1,10 @@
 # ui_components/auth_gate.py
-
-from __future__ import annotations
-
 """Streamlit session login gate. The only place in the app permitted to
 touch st.session_state for identity - everything else (permission
 decisions, credential verification) lives in application/auth/, which has
 no streamlit import and is reusable from a future API login endpoint."""
+
+from __future__ import annotations
 
 import os
 
