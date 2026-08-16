@@ -320,6 +320,7 @@ def mark_load_ready_to_dispatch(
     phone: str,
     message: str,
     note: str = "",
+    expected_updated_at: Any = None,
 ) -> ReadyToDispatchResult:
     """Assign driver/truck/chassis, mark the load Ready to Dispatch, and
     queue the driver dispatch SMS for asynchronous delivery. Requires both
@@ -345,7 +346,12 @@ def mark_load_ready_to_dispatch(
 
     An invalid phone number still fails fast with zero mutation and zero
     enqueue - that's local validation, not an external call, so there's
-    no reason to make it asynchronous."""
+    no reason to make it asynchronous.
+
+    `expected_updated_at` is optional - pass the load's `updated_at` as
+    displayed to the caller to reject this write with ConflictError if
+    someone else's write landed on this load first (see
+    db_client.DispatchDatabaseClient.update_row_fields)."""
     require_permission(actor, Permission.LOAD_READY_TO_DISPATCH)
     require_permission(actor, Permission.DRIVER_MESSAGE_SEND)
 
@@ -375,6 +381,7 @@ def mark_load_ready_to_dispatch(
             },
             conn=conn,
             created_by=actor.actor,
+            expected_updated_at=expected_updated_at,
         )
 
         dispatch_message_id = _insert_dispatch_message(

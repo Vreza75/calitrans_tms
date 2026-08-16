@@ -157,7 +157,12 @@ def _render_operational_status_tab(
 
         try:
             if detail_updates:
-                update_dispatch_assignment(actor=principal, load_id=load_id, updates=detail_updates)
+                update_dispatch_assignment(
+                    actor=principal,
+                    load_id=load_id,
+                    updates=detail_updates,
+                    expected_updated_at=selected_load.get("updated_at"),
+                )
 
             if new_status != current_status:
                 result = transition_load(
@@ -241,8 +246,16 @@ def _render_legacy_status_tab(selected_load, load_id: int, current_status: str, 
 
         if updates:
             try:
-                apply_legacy_status_update(actor=principal, load_id=load_id, updates=updates)
+                apply_legacy_status_update(
+                    actor=principal,
+                    load_id=load_id,
+                    updates=updates,
+                    expected_updated_at=selected_load.get("updated_at"),
+                )
             except AuthorizationError as exc:
+                st.error(str(exc))
+                return
+            except ConflictError as exc:
                 st.error(str(exc))
                 return
 
