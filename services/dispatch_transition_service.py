@@ -74,7 +74,7 @@ def _insert_assignment_audit(
 
 def apply_transition(
     load_id: int,
-    new_status: str,
+    new_status: str | None,
     *,
     note: str = "",
     driver: str | None = None,
@@ -94,6 +94,17 @@ def apply_transition(
     one transaction with the row locked FOR UPDATE (see
     _load_row_for_update) - validation can no longer run against a status
     a concurrent transition is about to change out from under it.
+
+    `new_status=None` means "assignment only, no status change requested"
+    (api/routers/loads.py's assign_driver_endpoint - a caller that only
+    wants to attach a driver/truck has no business supplying a status at
+    all). The status reapplied in that case is always the one just read
+    under this same row lock, never a value the caller read earlier and
+    handed back - a caller-supplied status here would be racy: read
+    outside this lock, then handed back after another transition could
+    have already moved the row on, and validate_transition would reject
+    it as a spurious "backward" move instead of the assignment-only
+    caller getting a clean result.
 
     `actor_display_name` (default "dispatcher", the pre-existing
     hardcoded literal - zero behavior change for any caller that doesn't
@@ -116,6 +127,7 @@ def apply_transition(
 
         move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
         current_status = str(row.get("Status", "") or "New")
+        effective_new_status = new_status if new_status is not None else current_status
         existing_driver = str(row.get("Driver Name", "") or "").strip()
         existing_truck = str(row.get("Truck Assigned", "") or "").strip()
 
@@ -127,7 +139,7 @@ def apply_transition(
         ok, reason = validate_transition(
             move_type,
             current_status,
-            new_status,
+            effective_new_status,
             has_driver=bool(effective_driver),
             has_truck=bool(effective_truck),
             has_origin=has_origin,
@@ -149,7 +161,7 @@ def apply_transition(
         if truck and truck.strip() and truck.strip() != existing_truck:
             assignment_updates["Truck Assigned"] = truck.strip()
 
-        status_updates: dict = {"Status": new_status}
+        status_updates: dict = {"Status": effective_new_status}
         final_note = note.strip()
         if override:
             final_note = f"{final_note} [override: {override_reason.strip()}]".strip()
@@ -157,7 +169,7 @@ def apply_transition(
             status_updates["Dispatcher Notes"] = final_note
 
         closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
-        should_set_closeout = new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
+        should_set_closeout = effective_new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
 
         if assignment_updates:
             _update_load(load_id, assignment_updates, conn=conn, actor_display_name=actor_display_name)
@@ -178,10 +190,10 @@ def apply_transition(
             _set_closeout_stage(load_id, closeout_stage, conn=conn)
 
         _emit_load_status_changed_event(
-            load_id, old_status=current_status, new_status=new_status, conn=conn, actor=actor_display_name
+            load_id, old_status=current_status, new_status=effective_new_status, conn=conn, actor=actor_display_name
         )
 
-    return {"ok": True, "reason": "", "status": new_status, "closeout_stage": closeout_stage}
+    return {"ok": True, "reason": "", "status": effective_new_status, "closeout_stage": closeout_stage}
 
 
 def _emit_load_status_changed_event(

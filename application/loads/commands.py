@@ -62,7 +62,7 @@ def _driver_dispatch_sms_idempotency_key(load_id: int, phone: str, message: str,
 
 def transition_load(
     load_id: int,
-    new_status: str,
+    new_status: str | None,
     *,
     actor: AuthenticatedActor,
     note: str = "",
@@ -78,6 +78,12 @@ def transition_load(
     converged these onto a single implementation instead of the two
     that briefly existed in parallel - see application/dispatch/
     commands.py's history).
+
+    new_status=None means "assignment only" - apply_transition reapplies
+    whatever status is live under its row lock instead of a value read
+    by this call's caller before that lock was taken (see
+    apply_transition's docstring for why a caller-supplied status here
+    would be racy for an assignment-only request).
 
     Requires Permission.DISPATCH_TRANSITION before doing anything else -
     an unauthorized actor triggers zero reads/writes.

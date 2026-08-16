@@ -226,3 +226,46 @@ def test_override_with_reason_allows_backward_transition(monkeypatch):
 
     assert result["ok"] is True
     assert any("override: correction" in u.get("Dispatcher Notes", "").lower() for u in fake.update_calls)
+
+
+def test_new_status_none_reapplies_the_freshly_locked_status(import_load, monkeypatch):
+    """assign_driver_endpoint's whole point: attach a driver/truck without
+    supplying a status at all. new_status=None must reapply whatever
+    status this call's own row lock just read, not something a caller
+    read earlier - api/routers/loads.py used to read the load's status in
+    an unlocked call, then hand it back as the transition target, which
+    was racy against a concurrent transition (see git history for the
+    fix this test pins)."""
+    fake = _FakeDb(import_load)  # Status: "Ready to Dispatch"
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(1, None, driver="Alex", truck="T1")
+
+    assert result["ok"] is True
+    assert result["status"] == "Ready to Dispatch"
+    assert {"Driver Name": "Alex", "Truck Assigned": "T1"} in fake.update_calls
+    assert {"Status": "Ready to Dispatch"} in fake.update_calls
+    # old_status == new_status on the emitted event - a real self-transition,
+    # not the caller pretending it knows a target status.
+    assert ("load.status_changed", 1, "Ready to Dispatch", "Ready to Dispatch") in fake.realtime_events
+
+
+def test_new_status_none_does_not_apply_a_stale_caller_status(monkeypatch):
+    """Even if something upstream still threaded a stale status through
+    (regression guard), None must win - apply_transition never trusts a
+    status value that didn't come from its own row lock for the
+    assignment-only path."""
+    load = {
+        "_row_id": 6, "TYPE": "Import", "Status": "En Route to Pickup",
+        "Driver Name": "Alex", "Truck Assigned": "T1", "Port": "Bayport",
+        "empty_return_location": "", "closeout_stage": "Not Started",
+    }
+    fake = _FakeDb(load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(6, None, truck="T2")
+
+    assert result["ok"] is True
+    assert result["status"] == "En Route to Pickup"
+    assert {"Truck Assigned": "T2"} in fake.update_calls
+    assert {"Status": "En Route to Pickup"} in fake.update_calls
