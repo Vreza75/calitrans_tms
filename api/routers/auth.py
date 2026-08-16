@@ -7,9 +7,10 @@ Streamlit login gate (ui_components/auth_gate.py) already uses via
 application.auth.queries.authenticate_user. No second identity system:
 both callers resolve to the same AuthenticatedActor shape."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.auth import AuthenticatedActor, require_auth
+from api.rate_limit import enforce_login_rate_limit
 from api.schemas.auth import LoginIn, LoginOut, MeOut
 from application.auth.permissions import ROLE_PERMISSIONS
 from application.auth.queries import authenticate_user
@@ -25,7 +26,8 @@ me_router = APIRouter(tags=["auth"])
 
 
 @router.post("/login", response_model=LoginOut)
-def login(payload: LoginIn) -> LoginOut:
+def login(payload: LoginIn, request: Request) -> LoginOut:
+    enforce_login_rate_limit(request, payload.email)
     actor = authenticate_user(payload.email, payload.password)
     if actor is None:
         # Deliberately generic - do not reveal whether the email exists.

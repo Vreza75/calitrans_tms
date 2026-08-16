@@ -3,9 +3,12 @@ GET /api/v1/me. Mirrors tests/test_api_auth.py's fixture style (real
 TestClient, monkeypatched application-layer functions - no live DB)."""
 from __future__ import annotations
 
+from collections import defaultdict
+
 import pytest
 from fastapi.testclient import TestClient
 
+import api.rate_limit as rate_limit
 import application.auth.queries as auth_queries
 from api.main import app
 from application.auth.models import AuthenticatedActor, Role
@@ -17,6 +20,11 @@ def client(monkeypatch) -> TestClient:
     monkeypatch.delenv("API_AUTH_DEV_MODE", raising=False)
     monkeypatch.delenv("API_AUTH_TOKENS", raising=False)
     monkeypatch.setenv("SESSION_SECRET_KEY", "test-secret-key-do-not-use-in-prod")
+    # api.rate_limit's attempt log is module-level, in-process state (by
+    # design - see its docstring) - reset it per test so this file's
+    # several same-email login calls against TestClient's fixed host
+    # don't trip the real limiter across unrelated test cases.
+    monkeypatch.setattr(rate_limit, "_attempts", defaultdict(list))
     return TestClient(app)
 
 
@@ -73,6 +81,39 @@ def test_login_fails_for_unknown_email(client: TestClient, monkeypatch) -> None:
     r = client.post("/api/v1/auth/login", json={"email": "nobody@calitranscorp.com", "password": "anything"})
 
     assert r.status_code == 401
+
+
+def test_login_rate_limits_after_repeated_attempts(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(auth_queries, "get_user_by_email", lambda email: _stub_user())
+
+    for _ in range(rate_limit._MAX_ATTEMPTS):
+        r = client.post(
+            "/api/v1/auth/login", json={"email": "dispatcher@calitranscorp.com", "password": "wrong"}
+        )
+        assert r.status_code == 401
+
+    r = client.post("/api/v1/auth/login", json={"email": "dispatcher@calitranscorp.com", "password": "wrong"})
+
+    assert r.status_code == 429
+    body = r.json()
+    assert "error" in body
+    assert "code" in body["error"]
+    assert "message" in body["error"]
+
+
+def test_login_rate_limit_is_scoped_per_email_not_shared_globally(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(auth_queries, "get_user_by_email", lambda email: _stub_user())
+
+    for _ in range(rate_limit._MAX_ATTEMPTS):
+        client.post("/api/v1/auth/login", json={"email": "dispatcher@calitranscorp.com", "password": "wrong"})
+
+    # A different email from the same client host is not blocked by the
+    # other email's exhausted attempt count.
+    r = client.post(
+        "/api/v1/auth/login", json={"email": "someone-else@calitranscorp.com", "password": "correct-password"}
+    )
+    assert r.status_code in (200, 401)
+    assert r.status_code != 429
 
 
 def test_login_fails_for_inactive_account(client: TestClient, monkeypatch) -> None:
