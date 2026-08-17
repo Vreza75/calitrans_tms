@@ -7,12 +7,7 @@ from typing import Any, Dict, Iterable, Optional
 import pandas as pd
 import streamlit as st
 
-
-def _safe_str(value: Any) -> str:
-    text = str(value or "").strip()
-    if text.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return text
+from utils.text_helpers import safe_str as _safe_str
 
 
 def _safe_int(value: Any, default: int = 0) -> int:

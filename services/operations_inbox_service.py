@@ -975,113 +975,8 @@ def _is_strong_operations_business_key(value: str) -> bool:
         return False
 
     return len(value) >= 5
-# Paste this into services/operations_inbox_service.py near the other conversation/timeline helpers.
-
-def _is_strong_operations_business_key(value: str) -> bool:
-    value = safe_str(value).strip()
-
-    if not value:
-        return False
-
-    lowered = value.lower()
-
-    if lowered in {
-        "-",
-        "none",
-        "null",
-        "nan",
-        "unknown",
-        "contact",
-        "customer-request",
-        "customer request",
-    }:
-        return False
-
-    if lowered.startswith(("email-", "intake-", "intake:", "msg-", "message-", "cah+")):
-        return False
-
-    if "@" in lowered and "." in lowered:
-        return False
-
-    if not any(char.isdigit() for char in value):
-        return False
-
-    return len(value) >= 5
 
 
-def load_operations_business_conversation_timeline(
-    *,
-    conversation_key: str = "",
-    booking_number: str = "",
-    container_number: str = "",
-    reference_number: str = "",
-    limit: int = 50,
-) -> pd.DataFrame:
-    """
-    Strict booking/container/reference conversation timeline.
-
-    This prevents broad unrelated histories such as 300+ unrelated messages.
-    """
-
-    keys: list[str] = []
-
-    for value in [conversation_key, booking_number, container_number, reference_number]:
-        clean = safe_str(value).strip()
-        if _is_strong_operations_business_key(clean) and clean not in keys:
-            keys.append(clean)
-
-    if not keys:
-        return pd.DataFrame()
-
-    clauses = []
-    params = {"limit": int(limit or 50)}
-
-    for index, key in enumerate(keys):
-        key_param = f"key_{index}"
-        like_param = f"like_{index}"
-
-        params[key_param] = key
-        params[like_param] = f"%{key}%"
-
-        clauses.append(
-            f"""
-            conversation_key = :{key_param}
-            or source_subject ilike :{like_param}
-            or raw_text ilike :{like_param}
-            or parsed_data::text ilike :{like_param}
-            """
-        )
-
-    where_sql = " or ".join(f"({clause})" for clause in clauses)
-
-    try:
-        return read_df(
-            f"""
-            select
-                id,
-                source_received_at,
-                created_at,
-                coalesce(email_direction, 'inbound') as email_direction,
-                coalesce(conversation_status, 'New Conversation') as conversation_status,
-                coalesce(review_status, 'Open') as review_status,
-                coalesce(source_sender, '') as source_sender,
-                coalesce(source_subject, '') as source_subject,
-                coalesce(raw_text, '') as raw_text,
-                left(coalesce(raw_text, ''), 180) as message_preview,
-                coalesce(conversation_key, '') as conversation_key
-            from order_intake
-            where {operations_email_source_filter()}
-              and ({where_sql})
-            order by coalesce(source_received_at, created_at) asc, id asc
-            limit :limit
-            """,
-            params,
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
-_load_operations_business_conversation_timeline = load_operations_business_conversation_timeline
 def load_operations_intake_message(intake_id: int) -> pd.DataFrame:
     """
     Load one full operations inbox message for historical review.
@@ -1344,76 +1239,7 @@ def update_pending_order_draft_fields(
 
 
 _update_pending_order_draft_fields = update_pending_order_draft_fields
-def load_operations_business_conversation_timeline(
-        *,
-        conversation_key: str = "",
-        booking_number: str = "",
-        container_number: str = "",
-        reference_number: str = "",
-        limit: int = 50,
-    ) -> pd.DataFrame:
-        """
-        Strict booking/container/reference conversation timeline.
 
-        This prevents broad unrelated histories such as 390-message timelines.
-        """
-
-        keys: list[str] = []
-
-        for value in [conversation_key, booking_number, container_number, reference_number]:
-            clean = safe_str(value).strip()
-            if _is_strong_operations_business_key(clean) and clean not in keys:
-                keys.append(clean)
-
-        if not keys:
-            return pd.DataFrame()
-
-        clauses = []
-        params = {"limit": int(limit or 50)}
-
-        for index, key in enumerate(keys):
-            key_param = f"key_{index}"
-            like_param = f"like_{index}"
-
-            params[key_param] = key
-            params[like_param] = f"%{key}%"
-
-            clauses.append(
-                f"""
-                conversation_key = :{key_param}
-                or source_subject ilike :{like_param}
-                or raw_text ilike :{like_param}
-                or parsed_data::text ilike :{like_param}
-                """
-            )
-
-        where_sql = " or ".join(f"({clause})" for clause in clauses)
-
-        try:
-            return read_df(
-                f"""
-                select
-                    id,
-                    source_received_at,
-                    created_at,
-                    coalesce(email_direction, 'inbound') as email_direction,
-                    coalesce(conversation_status, 'New Conversation') as conversation_status,
-                    coalesce(review_status, 'Open') as review_status,
-                    coalesce(source_sender, '') as source_sender,
-                    coalesce(source_subject, '') as source_subject,
-                    coalesce(raw_text, '') as raw_text,
-                    left(coalesce(raw_text, ''), 180) as message_preview,
-                    coalesce(conversation_key, '') as conversation_key
-                from order_intake
-                where {operations_email_source_filter()}
-                and ({where_sql})
-                order by coalesce(source_received_at, created_at) asc, id asc
-                limit :limit
-                """,
-                params,
-            )
-        except Exception:
-            return pd.DataFrame()
 
 def load_operations_business_conversation_timeline(
     *,
@@ -1422,46 +1248,30 @@ def load_operations_business_conversation_timeline(
     container_number: str = "",
     reference_number: str = "",
     limit: int = 50,
-):
+) -> pd.DataFrame:
     """
-    Strict business-conversation timeline.
+    Strict booking/container/reference conversation timeline.
 
-    Avoid broad topic/customer matching. This prevents unrelated 300+ message
-    timelines when the selected key is weak.
+    Avoid broad topic/customer matching - this prevents unrelated 300+
+    message timelines when the selected key is weak (see
+    .claude/rules/operations-inbox.md's conversation/work-item rules).
+    Preview-only by design: the dispatcher opens the full message via
+    load_operations_intake_message() above, which is the single place
+    that selects parsed_data/raw_text in full for one record.
     """
 
-    keys = []
+    keys: list[str] = []
 
     for value in [conversation_key, booking_number, container_number, reference_number]:
-        clean_value = safe_str(value).strip()
-        if _is_strong_operations_business_key(clean_value) and clean_value not in keys:
-            keys.append(clean_value)
+        clean = safe_str(value).strip()
+        if _is_strong_operations_business_key(clean) and clean not in keys:
+            keys.append(clean)
 
     if not keys:
-        return read_df(
-            """
-            select
-                id,
-                source_received_at,
-                created_at,
-                email_direction,
-                conversation_status,
-                review_status,
-                source_sender,
-                source_subject,
-                raw_text,
-                parsed_data,
-                ''::text as message_preview,
-                conversation_key
-            from order_intake
-            where 1 = 0
-            """
-        )
+        return pd.DataFrame()
 
     clauses = []
-    params = {
-        "limit": int(limit or 50),
-    }
+    params = {"limit": int(limit or 50)}
 
     for index, key in enumerate(keys):
         key_param = f"key_{index}"
@@ -1481,31 +1291,36 @@ def load_operations_business_conversation_timeline(
 
     where_sql = " or ".join(f"({clause})" for clause in clauses)
 
-    return read_df(
-        f"""
-        select
-            id,
-            source_received_at,
-            created_at,
-            coalesce(email_direction, 'inbound') as email_direction,
-            coalesce(conversation_status, 'New Conversation') as conversation_status,
-            coalesce(review_status, 'Open') as review_status,
-            coalesce(source_sender, '') as source_sender,
-            coalesce(source_subject, '') as source_subject,
-            coalesce(raw_text, '') as raw_text,
-            parsed_data,
-            left(coalesce(raw_text, ''), 180) as message_preview,
-            coalesce(conversation_key, '') as conversation_key
-        from order_intake
-        where {where_sql}
-        order by coalesce(source_received_at, created_at) asc, id asc
-        limit :limit
-        """,
-        params,
-    )
+    try:
+        return read_df(
+            f"""
+            select
+                id,
+                source_received_at,
+                created_at,
+                coalesce(email_direction, 'inbound') as email_direction,
+                coalesce(conversation_status, 'New Conversation') as conversation_status,
+                coalesce(review_status, 'Open') as review_status,
+                coalesce(source_sender, '') as source_sender,
+                coalesce(source_subject, '') as source_subject,
+                coalesce(raw_text, '') as raw_text,
+                left(coalesce(raw_text, ''), 180) as message_preview,
+                coalesce(conversation_key, '') as conversation_key
+            from order_intake
+            where {operations_email_source_filter()}
+              and ({where_sql})
+            order by coalesce(source_received_at, created_at) asc, id asc
+            limit :limit
+            """,
+            params,
+        )
+    except Exception:
+        return pd.DataFrame()
 
 
 _load_operations_business_conversation_timeline = load_operations_business_conversation_timeline
+
+
 def conversation_join_expr(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     generic_conversation_key = (

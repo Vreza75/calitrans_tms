@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
 from db_client import execute, read_df, require_schema_ready
+from utils.text_helpers import json_dump as _json_dump
+from utils.text_helpers import safe_str as _safe_str
 
 
 @dataclass
@@ -31,17 +32,6 @@ MEMORY_TYPES = [
     "contact_preference",
     "document_rule",
 ]
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
-
-
-def _json_dump(value: Any) -> str:
-    return json.dumps(value or {}, default=str)
 
 
 def ensure_company_memory_schema() -> None:

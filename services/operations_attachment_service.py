@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 import zipfile
@@ -21,6 +20,7 @@ from sqlalchemy.engine import Connection
 from ai_agents.hybrid_document_parser import parse_document_hybrid
 from config import DOCUMENT_STORAGE_DIR
 from db_client import execute, read_df
+from utils.text_helpers import json_dump
 from utils.ttl_cache import ttl_cache
 from services.load_matching_service import existing_load_columns
 from services.order_parser import extract_text_from_pdf
@@ -119,10 +119,6 @@ def int_or_none(value: Any) -> int | None:
         return int(float(value_text))
     except Exception:
         return None
-
-
-def json_dump(data: dict) -> str:
-    return json.dumps(data or {}, default=str)
 
 
 def field_count(parsed: dict) -> int:

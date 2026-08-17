@@ -1,0 +1,39 @@
+{
+  "name": "web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "api:dump": "cd .. && python -c \"import json, os; os.environ.setdefault('API_AUTH_DEV_MODE', 'true'); from api.main import app; json.dump(app.openapi(), open('web/openapi.json', 'w'))\"",
+    "api:types": "openapi-typescript openapi.json -o lib/api/generated.ts",
+    "api:generate": "npm run api:dump && npm run api:types"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.3",
+    "@tanstack/react-query": "^5.101.4",
+    "next": "16.3.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.0.5",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.1",
+    "jsdom": "^30.0.1",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
+  }
+}

@@ -170,13 +170,16 @@ def test_streamlit_page_and_fastapi_router_call_the_same_application_functions()
 
 
 def test_streamlit_and_fastapi_share_the_same_inbox_sync_command() -> None:
-    """Phase 7: pages_app/operations_inbox.py's "Sync Email Engine"
-    button and POST /api/v1/inbox/sync must both resolve to the exact
-    same request_inbox_sync function object - not two implementations of
+    """Phase 7: the "Sync Email Engine" button (relocated to
+    pages_app/email_imports.py's Admin/Diagnostics "Manual Inbox
+    Processing" expander by the transitional UX pass - see
+    tests/test_operations_inbox_sync_button_async.py) and POST
+    /api/v1/inbox/sync must both resolve to the exact same
+    request_inbox_sync function object - not two implementations of
     "enqueue an inbox sync job"."""
-    import pages_app.operations_inbox as operations_inbox_page
+    import pages_app.email_imports as email_imports_page
     from api.routers import inbox as inbox_router
     from application.inbox import commands as inbox_commands
 
-    assert operations_inbox_page.request_inbox_sync is inbox_commands.request_inbox_sync
+    assert email_imports_page.request_inbox_sync is inbox_commands.request_inbox_sync
     assert inbox_router.request_inbox_sync is inbox_commands.request_inbox_sync

@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
+from application.exceptions import ConflictError
 from config import DOCUMENT_STORAGE_DIR, EDITABLE_COLUMNS, get_config_source, get_secret
 from utils.error_sanitizer import sanitize_message
 
@@ -486,6 +487,7 @@ class DispatchDatabaseClient:
         *,
         conn: Connection | None = None,
         created_by: str = "streamlit",
+        expected_updated_at: Any = None,
     ) -> None:
         """Update editable columns on one loads row.
 
@@ -500,7 +502,20 @@ class DispatchDatabaseClient:
         "streamlit" for every caller that doesn't pass it (zero behavior
         change), but application-command callers pass the real
         AuthenticatedActor.actor so status_events reflects who actually
-        made the change instead of a generic per-framework label."""
+        made the change instead of a generic per-framework label.
+
+        `expected_updated_at` is optional and defaults to None (existing
+        callers keep today's blind last-write-wins behavior). Pass the
+        row's `updated_at` value as loaded by the caller to enable an
+        optimistic lock: the UPDATE only applies `WHERE ... AND updated_at
+        = :expected_updated_at` too, so if another write already landed on
+        this row since the caller loaded it, zero rows match and this
+        raises application.exceptions.ConflictError instead of silently
+        overwriting the newer write. Driver/truck assignment call sites
+        pass this (see application/dispatch/commands.py and
+        application/loads/commands.py) after a concurrent-assignment race
+        (two dispatchers saving different drivers) was observed in
+        production with the prior blind-write behavior."""
         allowed_db_columns = _editable_db_columns()
         db_updates: dict[str, Any] = {}
 
@@ -523,13 +538,23 @@ class DispatchDatabaseClient:
         if not db_updates:
             return
 
-        status_sql = text("select status from loads where id = :id")
+        # Driver/truck assignment changes get their own audit trail even
+        # when status doesn't change - previously these writes left no
+        # audit row at all (see status_events, which historically only
+        # recorded status transitions).
+        assignment_columns_touched = [c for c in ("driver_name", "truck_assigned") if c in db_updates]
+        needs_current_row = bool(assignment_columns_touched) or "status" in db_updates
+
+        current_row_sql = text("select status, driver_name, truck_assigned from loads where id = :id")
+        where_clause = "where id = :id"
+        if expected_updated_at is not None:
+            where_clause += " and updated_at = :expected_updated_at"
         update_sql = text(
             f"""
             update loads
             set {", ".join(f"{column} = :{column}" for column in db_updates)},
                 updated_at = now()
-            where id = :id
+            {where_clause}
             """
         )
         audit_sql = text(
@@ -541,47 +566,68 @@ class DispatchDatabaseClient:
 
         params = dict(db_updates)
         params["id"] = row_id
+        if expected_updated_at is not None:
+            params["expected_updated_at"] = expected_updated_at
 
-        if conn is not None:
+        def _assignment_note(old_driver: Any, old_truck: Any) -> str:
+            parts = []
+            if "driver_name" in assignment_columns_touched and db_updates["driver_name"] != old_driver:
+                parts.append(f"Driver Name '{old_driver or ''}' -> '{db_updates['driver_name'] or ''}'")
+            if "truck_assigned" in assignment_columns_touched and db_updates["truck_assigned"] != old_truck:
+                parts.append(f"Truck Assigned '{old_truck or ''}' -> '{db_updates['truck_assigned'] or ''}'")
+            return "; ".join(parts)
+
+        def _run(active_conn: Connection) -> None:
             old_status = None
-            if "status" in db_updates:
-                old_row = conn.execute(status_sql, {"id": row_id}).first()
-                old_status = old_row[0] if old_row is not None else None
+            old_driver = None
+            old_truck = None
+            if needs_current_row:
+                old_row = active_conn.execute(current_row_sql, {"id": row_id}).first()
+                if old_row is not None:
+                    old_status, old_driver, old_truck = old_row[0], old_row[1], old_row[2]
 
-            conn.execute(update_sql, params)
+            result = active_conn.execute(update_sql, params)
 
-            if "status" in db_updates and db_updates["status"] != old_status:
-                conn.execute(
+            if expected_updated_at is not None and result.rowcount == 0:
+                raise ConflictError(
+                    f"Load {row_id} was updated by someone else since you loaded it. Reload and try again."
+                )
+
+            status_changed = "status" in db_updates and db_updates["status"] != old_status
+            assignment_note = _assignment_note(old_driver, old_truck) if assignment_columns_touched else ""
+
+            if status_changed:
+                notes = "Status updated from Streamlit"
+                if assignment_note:
+                    notes += f"; {assignment_note}"
+                active_conn.execute(
                     audit_sql,
                     {
                         "load_id": row_id,
                         "old_status": old_status,
                         "new_status": db_updates["status"],
-                        "notes": "Status updated from Streamlit",
+                        "notes": notes,
                         "created_by": created_by,
                     },
                 )
+            elif assignment_note:
+                active_conn.execute(
+                    audit_sql,
+                    {
+                        "load_id": row_id,
+                        "old_status": old_status,
+                        "new_status": old_status,
+                        "notes": assignment_note,
+                        "created_by": created_by,
+                    },
+                )
+
+        if conn is not None:
+            _run(conn)
             return
 
-        old_status = None
-        if "status" in db_updates:
-            old_df = read_df(str(status_sql), {"id": row_id})
-            if not old_df.empty:
-                old_status = old_df.iloc[0]["status"]
-
-        execute(str(update_sql), params)
-
-        if "status" in db_updates and db_updates["status"] != old_status:
-            execute(
-                str(audit_sql),
-                {
-                    "load_id": row_id,
-                    "old_status": old_status,
-                    "new_status": db_updates["status"],
-                    "notes": "Status updated from Streamlit",
-                    "created_by": created_by,
-                },
-            )
+        with get_engine(get_secret("DATABASE_URL")).begin() as own_conn:
+            _run(own_conn)
 
     def attach_file_to_row(self, row_id: int, uploaded_file, source: str = "streamlit") -> None:
         storage_dir = Path(DOCUMENT_STORAGE_DIR)

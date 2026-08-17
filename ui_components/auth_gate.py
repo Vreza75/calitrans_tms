@@ -1,22 +1,58 @@
 # ui_components/auth_gate.py
-
-from __future__ import annotations
-
 """Streamlit session login gate. The only place in the app permitted to
 touch st.session_state for identity - everything else (permission
 decisions, credential verification) lives in application/auth/, which has
-no streamlit import and is reusable from a future API login endpoint."""
+no streamlit import and is reusable from a future API login endpoint.
 
+Session persistence across a browser refresh (STEP: refresh-logout fix):
+st.session_state alone does not reliably survive a real browser refresh
+(Streamlit is not guaranteed to rebind a new WebSocket connection to the
+prior session). This reuses application/auth/session_tokens.py - the same
+HMAC-signed, time-limited token already issued by the FastAPI web-client
+bridge (api/auth.py) - stored in a browser cookie set via a small inline
+script (Streamlit has no first-party cookie-write API; st.context.cookies
+is read-only). The cookie is tamper-evident and expires like any other use
+of that module - this does not weaken authentication, it only lets a
+refresh recover a session verify_session_token() would already accept.
+Documented pre-production follow-up, same as the Next.js web client: an
+HttpOnly cookie set by the server would remove the need for client-side
+JS entirely (see docs/architecture/WEB_CLIENT.md)."""
+
+from __future__ import annotations
+
+import json
 import os
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from application.auth.models import AuthenticatedActor, Role
 from application.auth.queries import authenticate_user
+from application.auth.session_tokens import issue_session_token, verify_session_token
 
 _SESSION_KEY = "calitrans_authenticated_actor"
+_COOKIE_NAME = "calitrans_session"
+_COOKIE_SET_FLAG = "calitrans_session_cookie_set"
+_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60  # matches session_tokens' default TTL
 
 DEV_MODE_ACTOR = AuthenticatedActor(actor="dev-mode", role=Role.ADMIN)
+
+
+def _set_session_cookie(token: str) -> None:
+    cookie_value = f"{_COOKIE_NAME}={token}; path=/; max-age={_COOKIE_MAX_AGE_SECONDS}; SameSite=Lax"
+    components.html(f"<script>document.cookie = {json.dumps(cookie_value)};</script>", height=0)
+
+
+def _clear_session_cookie() -> None:
+    cookie_value = f"{_COOKIE_NAME}=; path=/; max-age=0; SameSite=Lax"
+    components.html(f"<script>document.cookie = {json.dumps(cookie_value)};</script>", height=0)
+
+
+def _restore_from_cookie() -> AuthenticatedActor | None:
+    token = st.context.cookies.get(_COOKIE_NAME)
+    if not token:
+        return None
+    return verify_session_token(token)
 
 
 def _dev_mode_enabled() -> bool:
@@ -60,6 +96,8 @@ def render_logout_control() -> None:
         st.caption(f"Signed in as **{principal.actor}** ({principal.role.value})")
         if st.button("Sign Out", key="calitrans_sign_out"):
             st.session_state.pop(_SESSION_KEY, None)
+            st.session_state.pop(_COOKIE_SET_FLAG, None)
+            _clear_session_cookie()
             st.rerun()
 
 
@@ -74,8 +112,31 @@ def require_login() -> AuthenticatedActor:
         return DEV_MODE_ACTOR
 
     principal = get_current_principal()
-    if principal is not None:
-        return principal
+    if principal is None:
+        # A real browser refresh does not reliably preserve
+        # st.session_state - try to restore identity from the signed
+        # session cookie before falling back to the login form.
+        restored = _restore_from_cookie()
+        if restored is not None:
+            st.session_state[_SESSION_KEY] = restored
+            principal = restored
 
-    _render_login_form()
-    st.stop()
+    if principal is None:
+        _render_login_form()
+        st.stop()
+
+    if not st.session_state.get(_COOKIE_SET_FLAG):
+        # Set once per session_state lifetime (fresh login or a
+        # cookie-restored session both land here) - not on every rerun.
+        try:
+            token = issue_session_token(principal)
+        except RuntimeError:
+            # SESSION_SECRET_KEY not configured - login still works, it
+            # just won't survive a browser refresh (same as before this
+            # fix). Fail closed, never issue an unsigned cookie.
+            token = None
+        if token:
+            _set_session_cookie(token)
+        st.session_state[_COOKIE_SET_FLAG] = True
+
+    return principal

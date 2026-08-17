@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+from utils.text_helpers import safe_str as _safe_str
+
 
 AGENT_KEYS = [
     "_intent_agent",
@@ -19,13 +21,6 @@ AGENT_KEYS = [
     "_hybrid_document_parser",
     "_document_parser_agent",
 ]
-
-
-def _safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

@@ -12,6 +12,10 @@ from openai import OpenAI
 
 from config import get_secret
 
+# No caller currently overrides this - the OpenAI SDK's own default has no
+# upper bound, so a hung connection could block an agent indefinitely.
+DEFAULT_LLM_TIMEOUT_SECONDS = 30
+
 
 @dataclass
 class LLMResult:
@@ -78,6 +82,7 @@ class LLMWrapper:
                         {"role": "user", "content": json.dumps(user_payload, default=str)},
                     ],
                     temperature=temperature,
+                    timeout=DEFAULT_LLM_TIMEOUT_SECONDS,
                 )
 
                 output_text = response.output_text.strip()
@@ -142,7 +147,7 @@ class LLMWrapper:
             attempts=max_retries + 1,
         ))
     def generate_text(
-         self,
+        self,
         *,
         task: str,
         system_prompt: str,
@@ -178,6 +183,7 @@ class LLMWrapper:
                         {"role": "user", "content": json.dumps(user_payload, default=str)},
                     ],
                     temperature=temperature,
+                    timeout=DEFAULT_LLM_TIMEOUT_SECONDS,
                 )
 
                 output_text = response.output_text.strip()

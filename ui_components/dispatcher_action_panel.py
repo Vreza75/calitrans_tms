@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+from utils.text_helpers import safe_str as _safe_str
+
 
 ACTION_OPTIONS = [
     "Approve AI Recommendation",
@@ -20,13 +22,6 @@ ACTION_OPTIONS = [
     "Mark Waiting Customer",
     "Close / No Action",
 ]
-
-
-def _safe_str(value: Any) -> str:
-    text = str(value or "").strip()
-    if text.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return text
 
 
 def _coerce_dict(value: Any) -> Dict[str, Any]:

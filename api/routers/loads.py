@@ -177,9 +177,14 @@ def assign_driver_endpoint(
 ) -> TransitionResultOut:
     """Assignment without a status change: re-applies the load's current
     status through the same transactional apply_transition() path, so the
-    driver/truck write and its audit row are still atomic."""
-    from application.loads.queries import get_load as _get_load
+    driver/truck write and its audit row are still atomic.
 
-    current = _get_load(load_id)
-    result = transition_load(load_id, current.status, actor=actor, driver=payload.driver, truck=payload.truck)
+    new_status=None, not a status read here first - a status read by this
+    router before apply_transition's row lock is taken could already be
+    stale by the time the lock lands, and handing that stale value back
+    as the transition target would make apply_transition validate it as
+    a (spurious) backward move instead of the assignment-only request it
+    actually is. See application/loads/commands.py::transition_load and
+    services/dispatch_transition_service.py::apply_transition."""
+    result = transition_load(load_id, None, actor=actor, driver=payload.driver, truck=payload.truck)
     return TransitionResultOut(**result.__dict__)

@@ -22,9 +22,20 @@ from application.auth.permissions import Permission, require_permission
 from application.dispatch.models import DispatchTransitionResult
 
 
-def update_dispatch_assignment(*, actor: AuthenticatedActor, load_id: int, updates: dict[str, Any]) -> None:
+def update_dispatch_assignment(
+    *,
+    actor: AuthenticatedActor,
+    load_id: int,
+    updates: dict[str, Any],
+    expected_updated_at: Any = None,
+) -> None:
     """Driver/Truck/Chassis-only update with no status change (the
-    operational Status tab's pre-transition assignment write)."""
+    operational Status tab's pre-transition assignment write).
+
+    `expected_updated_at` is optional - pass the load's `updated_at` as
+    displayed to the caller to reject this write with ConflictError if
+    someone else's write landed first (see
+    db_client.DispatchDatabaseClient.update_row_fields)."""
     require_permission(actor, Permission.DISPATCH_TRANSITION)
 
     if not updates:
@@ -32,16 +43,26 @@ def update_dispatch_assignment(*, actor: AuthenticatedActor, load_id: int, updat
 
     from db_client import DispatchDatabaseClient
 
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    DispatchDatabaseClient().update_row_fields(
+        load_id, updates, created_by=actor.actor, expected_updated_at=expected_updated_at
+    )
 
 
-def apply_legacy_status_update(*, actor: AuthenticatedActor, load_id: int, updates: dict[str, Any]) -> None:
+def apply_legacy_status_update(
+    *,
+    actor: AuthenticatedActor,
+    load_id: int,
+    updates: dict[str, Any],
+    expected_updated_at: Any = None,
+) -> None:
     """The legacy (pre-dispatch) status tab's direct write - status,
     driver/truck/chassis, and notes all in one update_row_fields call,
     bypassing apply_transition's validate_transition() checks. This
     predates Phase 5B and is not fixed here (see docs/AUTHENTICATION.md's
     known-gaps note) - this command only adds the permission check in
-    front of the existing behavior, unchanged otherwise."""
+    front of the existing behavior, unchanged otherwise.
+
+    `expected_updated_at` is optional - see update_dispatch_assignment."""
     require_permission(actor, Permission.DISPATCH_TRANSITION)
 
     if not updates:
@@ -49,7 +70,9 @@ def apply_legacy_status_update(*, actor: AuthenticatedActor, load_id: int, updat
 
     from db_client import DispatchDatabaseClient
 
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    DispatchDatabaseClient().update_row_fields(
+        load_id, updates, created_by=actor.actor, expected_updated_at=expected_updated_at
+    )
 
 
 def save_dispatch_progress(

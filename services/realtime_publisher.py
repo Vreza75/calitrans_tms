@@ -53,6 +53,25 @@ def _parse_payload(raw: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else json.loads(raw)
 
 
+def _envelope_payload(event: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Phase 10 addition: the broadcast payload was previously just the
+    raw metadata dict, with no event_id/aggregate_id/occurred_at - a
+    listening client had no ordering token and, on a collection channel
+    (no aggregate_id in the topic name), no way to know which aggregate
+    changed. Wraps metadata under its own key so realtime/channels.py's
+    ALLOWED_METADATA_KEYS allowlist keeps governing only the business
+    fields, not this envelope's own field names."""
+    occurred_at = event.get("created_at")
+    return {
+        "event_id": event["id"],
+        "aggregate_type": event["aggregate_type"],
+        "aggregate_id": event["aggregate_id"],
+        "version": event.get("version"),
+        "occurred_at": occurred_at.isoformat() if hasattr(occurred_at, "isoformat") else occurred_at,
+        "metadata": metadata,
+    }
+
+
 def process_one() -> dict[str, Any] | None:
     """Claim and broadcast exactly one pending, due domain event. Returns
     a small result dict for logging/observability, or None if nothing was
@@ -62,14 +81,15 @@ def process_one() -> dict[str, Any] | None:
     if event is None:
         return None
 
-    payload = _parse_payload(event["payload"])
+    metadata = _parse_payload(event["payload"])
+    envelope = _envelope_payload(event, metadata)
     publisher = get_publisher()
 
     try:
         success = True
         error = ""
         for channel in channels_for(event["aggregate_type"], event["aggregate_id"]):
-            ok, channel_error = publisher.broadcast(channel=channel, event_type=event["event_type"], payload=payload)
+            ok, channel_error = publisher.broadcast(channel=channel, event_type=event["event_type"], payload=envelope)
             if not ok:
                 success = False
                 error = channel_error

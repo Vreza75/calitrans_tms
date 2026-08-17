@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import date, datetime
 
 import pandas as pd
@@ -13,6 +12,7 @@ from application.exceptions import AuthorizationError
 from application.port_houston.commands import apply_port_houston_data, apply_port_houston_extra_columns
 from db_client import DispatchDatabaseClient, execute, read_df, require_schema_ready
 from services.tms_data_service import refresh_data as _refresh_tms_data
+from utils.text_helpers import json_dump as _json_dump
 from services.customer_status_email_service import _get_app_setting
 from services.dispatch_workflow_service import (
     _first_present,
@@ -40,10 +40,6 @@ def _safe_str(value, default: str = "") -> str:
     if value_str.lower() in {"nan", "none", "nat", "null"}:
         return default
     return value_str
-
-
-def _json_dump(data: dict) -> str:
-    return json.dumps(data or {}, default=str)
 
 
 def _existing_load_columns() -> set[str]:

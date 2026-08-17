@@ -11,17 +11,19 @@ from db_client import DispatchDatabaseClient, read_df
 
 from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
 from api.errors import register_error_handlers
-from api.routers import attachments, health, inbox, jobs, loads, work_items
+from api.routers import attachments, auth, health, inbox, jobs, loads, work_items
 
 app = FastAPI(title="Calitrans TMS Integration API")
 
 register_error_handlers(app)
 
-# Phase 1 has no frontend consumer yet (Next.js is out of scope for this
-# phase - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md). Restrict
-# CORS to an explicit allowlist read from CORS_ALLOWED_ORIGINS (comma-
-# separated) instead of "*", so a future frontend origin is added
-# deliberately rather than the API defaulting open.
+# Phase 10 (Next.js web client) is the first real frontend consumer -
+# restrict CORS to an explicit allowlist read from CORS_ALLOWED_ORIGINS
+# (comma-separated) instead of "*", so an origin is added deliberately
+# rather than the API defaulting open. Local dev: set
+# CORS_ALLOWED_ORIGINS=http://localhost:3000 (see docs/architecture/
+# WEB_CLIENT.md). allow_credentials=True is required for the browser to
+# send the Authorization header cross-origin to the dev API port.
 _allowed_origins = [origin.strip() for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 if _allowed_origins:
     app.add_middleware(
@@ -33,6 +35,8 @@ if _allowed_origins:
     )
 
 app.include_router(health.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(auth.me_router, prefix="/api/v1")
 app.include_router(work_items.router, prefix="/api/v1")
 app.include_router(loads.router, prefix="/api/v1")
 app.include_router(attachments.router, prefix="/api/v1")

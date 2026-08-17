@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
+from utils.text_helpers import safe_str as _safe_str
+
 
 OPERATIONS_LEVEL = "Level 1 - Operational Cases"
 BUSINESS_LEVEL = "Level 2 - Business Communications"
@@ -224,13 +226,6 @@ REFERENCE_RE = re.compile(
     r"\b(?:ref(?:erence)?|po|load)\b\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})\b",
     re.I,
 )
-
-
-def _safe_str(value: Any) -> str:
-    text = str(value or "").strip()
-    if text.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return text
 
 
 def sanitize_parsed_for_classification(parsed: dict | None) -> dict:

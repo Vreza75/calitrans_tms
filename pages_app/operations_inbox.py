@@ -10,10 +10,7 @@ import streamlit as st
 import services.operations_inbox_service as ops
 
 from uuid import uuid4
-from application.exceptions import AuthorizationError
-from application.inbox.commands import request_inbox_sync
 from db_client import check_schema_readiness
-from ui_components.auth_gate import get_current_principal
 from services.email_parser import extract_latest_email_body
 from services.operations_field_service import reconcile_parsed_sources, validate_field_value
 from services.operations_multi_container_service import create_container_work_orders
@@ -3301,71 +3298,19 @@ def render_operations_inbox() -> None:
     except Exception:
         sync_metrics = {}
 
-    c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.2, 1.0, 1.4])
-
-    with c1:
-        if st.button(
-            "Sync Email Engine",
-            key="operations_sync_email_engine",
-            use_container_width=True,
-        ):
-            # Phase 7 STEP 11: this used to call ops.sync_operations_email_engine
-            # directly, blocking the request for up to 25s while it fetched,
-            # parsed, classified, matched, and persisted every message inline.
-            # It now enqueues an inbox.sync job (application/inbox/commands.py::
-            # request_inbox_sync) and returns immediately - the actual work
-            # happens in workers/inbox_handlers.py, run by
-            # .github/workflows/process-jobs.yml (or an operator running
-            # scripts/process_worker_jobs.py process manually). This page no
-            # longer owns mailbox-wide processing; it only enqueues and,
-            # like "Refresh Inbox" below, re-queries current state.
-            # ops.sync_operations_email_engine itself is unchanged and still
-            # used by the admin debug "Sync Recent Mail" tool
-            # (pages_app/email_imports.py) for immediate-feedback debugging.
-            principal = get_current_principal()
-            sync_queued = False
-
-            try:
-                if principal is None:
-                    st.error("Your session has expired. Please log in again.")
-                else:
-                    sync_result = request_inbox_sync(actor=principal)
-                    st.session_state["operations_email_import_result"] = {
-                        "queued": True,
-                        "job_id": sync_result.job_id,
-                    }
-                    st.success(
-                        f"Inbox sync queued (job #{sync_result.job_id}). "
-                        "New messages will appear once the worker processes it."
-                    )
-                    sync_queued = True
-            except AuthorizationError as exc:
-                st.error(str(exc))
-
-            if sync_queued:
-                close_work_item(st.session_state)
-                ops.refresh_data()
-                st.rerun()
-
-    with c2:
-        if st.button("Refresh Inbox", key="operations_refresh_inbox", width="stretch"):
-            close_work_item(st.session_state)
-            ops.refresh_data()
-            st.rerun()
-
-    with c3:
-        if st.button("Recheck Next Batch", key="operations_recheck_smart_groups", use_container_width=True):
-            with st.spinner("Running fast triage on the next small batch..."):
-                triage_result = ops.auto_classify_open_inbox_items(limit=25, time_budget_seconds=8)
-                st.session_state["operations_smart_group_update_result"] = triage_result
-                close_work_item(st.session_state)
-                st.rerun()
-
-    with c4:
-        st.caption("Last Sync")
-        st.write(sync_metrics.get("last_sync") or "-")
-
-    with c5:
+    # The manual engine/backfill controls formerly here now live in
+    # pages_app/email_imports.py's "Manual Inbox Processing" expander -
+    # routine processing already runs automatically via the scheduled
+    # worker (see .github/workflows/process-jobs.yml), so normal
+    # dispatcher use does not need them in the primary view. Normal UI
+    # data refresh continues to happen via each rerun re-querying current
+    # state (see ops._load_operations_inbox_df below) and the existing
+    # @st.cache_data TTLs in services/operations_inbox_service.py.
+    header_left, header_right = st.columns([2.5, 1])
+    with header_left:
+        if sync_metrics.get("last_sync"):
+            st.caption(f"Last sync: {sync_metrics.get('last_sync')}")
+    with header_right:
         selected_flow = render_service_flow_filter("operations_inbox_service_flow")
 
     completed_action = st.session_state.pop("operations_last_completed_action", None)
@@ -3635,6 +3580,30 @@ def render_operations_inbox() -> None:
                 key="operations_request_type_filter",
             )
 
+        sort_col, direction_col, page_size_col = st.columns([2, 1, 1])
+        with sort_col:
+            sort_by = st.selectbox(
+                "Sort by",
+                list(QUEUE_SORT_COLUMNS),
+                index=0,
+                key="operations_queue_sort_by",
+            )
+        with direction_col:
+            sort_direction = st.segmented_control(
+                "Direction",
+                ["Descending", "Ascending"],
+                default="Descending",
+                key="operations_queue_sort_direction",
+                width="stretch",
+            ) or "Descending"
+        with page_size_col:
+            page_size = st.selectbox(
+                "Page size",
+                [10, 25, 50],
+                index=1,
+                key="operations_queue_page_size",
+            )
+
     filtered_df = inbox_df.copy()
     if perspective_filter == "Dispatch":
         filtered_df = filtered_df[
@@ -3750,23 +3719,8 @@ def render_operations_inbox() -> None:
     # Hide completed/outbound/stale conversation rows before building queue counts.
     filtered_df = _ops_filter_active_conversation_work_items(filtered_df)
 
-    sort_col, direction_col = st.columns([2, 1])
-    with sort_col:
-        sort_by = st.selectbox(
-            "Sort by",
-            list(QUEUE_SORT_COLUMNS),
-            index=0,
-            key="operations_queue_sort_by",
-        )
-    with direction_col:
-        sort_direction = st.segmented_control(
-            "Direction",
-            ["Descending", "Ascending"],
-            default="Descending",
-            key="operations_queue_sort_direction",
-            width="stretch",
-        ) or "Descending"
-
+    # sort_by / sort_direction / page_size are set inside the Control
+    # Filters expander above, closer to the other queue-scoping controls.
     visible_review_ids: set[int] = set()
     queue_titles = {
         queue: f"{queue} ({int(filtered_df['dispatcher_queue'].eq(queue).sum())})"
@@ -3809,14 +3763,8 @@ def render_operations_inbox() -> None:
         # redesign - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md,
         # "Known limitations"); only the render step is now bounded.
         total_items = len(tab_df)
-        page_size_col, page_info_col, prev_col, next_col = st.columns([1, 2.4, 0.6, 0.6])
-        with page_size_col:
-            page_size = st.selectbox(
-                "Page size",
-                [10, 25, 50],
-                index=1,
-                key="operations_queue_page_size",
-            )
+        page_info_col, prev_col, next_col = st.columns([3.4, 0.6, 0.6])
+        # page_size is set inside the Control Filters expander above.
         total_pages = max(math.ceil(total_items / page_size), 1)
         page_state_key = f"operations_queue_page__{selected_queue}"
         current_page = min(max(int(st.session_state.get(page_state_key, 1)), 1), total_pages)
@@ -3880,7 +3828,7 @@ def render_operations_inbox() -> None:
             key="operations_queue_header",
         ):
             header = st.columns(
-                [width for _, _, width in queue_columns] + [0.65],
+                [width for _, _, width in queue_columns] + [1.0],
                 vertical_alignment="center",
             )
             for column, (_, label, _) in zip(header, queue_columns):
@@ -3894,7 +3842,7 @@ def render_operations_inbox() -> None:
                 key=f"operations_queue_row_{work_item_id}",
             ):
                 row_columns = st.columns(
-                    [width for _, _, width in queue_columns] + [0.65],
+                    [width for _, _, width in queue_columns] + [1.0],
                     vertical_alignment="center",
                 )
                 for column, (field, _, _) in zip(row_columns, queue_columns):

@@ -7,7 +7,7 @@ import streamlit as st
 
 from application.auth.models import AuthenticatedActor
 from application.auth.permissions import Permission, has_permission
-from application.exceptions import AuthorizationError
+from application.exceptions import AuthorizationError, ConflictError
 from application.loads.commands import (
     cancel_load,
     mark_load_missing_info,
@@ -28,6 +28,7 @@ from services.dispatch_workflow_service import (
 )
 from services.driver_roster_service import find_driver_in_roster, list_active_drivers
 from services.load_grouping_service import group_loads_by_booking
+from ui_components.dialog_presets import DIALOG_SIZE_PRESETS
 from ui_components.flow_filters import apply_service_flow_filter, render_service_flow_filter
 
 
@@ -814,8 +815,11 @@ def _render_ready_to_dispatch_panel(
                 phone=phone,
                 message=edited_message,
                 note=_safe_str(selected_load.get("Dispatcher Notes", "")),
+                expected_updated_at=selected_load.get("updated_at"),
             )
         except AuthorizationError as exc:
+            st.error(str(exc))
+        except ConflictError as exc:
             st.error(str(exc))
         else:
             if result.ok:
@@ -853,16 +857,32 @@ def render_orders_management(df: pd.DataFrame, principal: AuthenticatedActor) ->
     k3.metric("Booking Verified", len(verified_df))
     k4.metric("Cancel", len(cancelled_df))
 
-    columns = [
-        "_row_id", "TYPE", "Booking Number", "Containers", "Load ID", "Customer",
-        "Container Number", "Port", "Warehouse", "Delivery Need Date",
-        "LFD", "Status", "Driver Name", "Truck Assigned",
-        "Chassis", "Dispatcher Notes",
+    _ORDER_ROW_COLUMNS = [
+        ("Booking Number", "Booking", 1.3),
+        ("Container Number", "Container", 1.3),
+        ("Customer", "Customer", 1.6),
+        ("Status", "Status", 1.1),
     ]
 
     def clear_order_editor() -> None:
         st.session_state.pop("orders_management_selected_row_id", None)
         st.session_state.pop("orders_management_selected_context", None)
+        st.session_state.pop("orders_management_selected_group_ids", None)
+
+    def _open_order_group(*, context_key: str, group_ids: list[int]) -> None:
+        """Open action for a booking row - a single-container booking opens
+        straight to the editor; a multi-container booking opens the
+        container picker below the list."""
+        st.session_state["orders_management_selected_context"] = context_key
+        st.session_state["orders_management_selected_group_ids"] = list(group_ids)
+        if len(group_ids) == 1:
+            st.session_state["orders_management_selected_row_id"] = int(group_ids[0])
+        else:
+            st.session_state.pop("orders_management_selected_row_id", None)
+
+    def _open_order_container(*, context_key: str, row_id: int) -> None:
+        st.session_state["orders_management_selected_context"] = context_key
+        st.session_state["orders_management_selected_row_id"] = int(row_id)
 
     if st.session_state.get("orders_management_last_service_flow") != selected_flow:
         st.session_state["orders_management_last_service_flow"] = selected_flow
@@ -877,37 +897,41 @@ def render_orders_management(df: pd.DataFrame, principal: AuthenticatedActor) ->
             return
 
         grouped_df = group_loads_by_booking(table_df)
-        display_cols = [c for c in columns if c in grouped_df.columns]
         sorted_type_df = grouped_df.sort_values("_row_id", ascending=False)
         context_key = f"{title}_{selected_flow}"
-        styled_type_df = (
-            sorted_type_df[display_cols]
-            .style.apply(_status_row_style, axis=1)
-            .map(
-                lambda value: "font-weight: 800; color: #003B8E;" if value else "",
-                subset=["Containers"],
-            )
-        )
 
-        event = st.dataframe(
-            styled_type_df,
-            use_container_width=True,
-            hide_index=True,
-            selection_mode="single-row",
-            on_select="rerun",
-            key=f"orders_table_{title}_{selected_flow}",
-        )
+        # Explicit "Open" action per row, not checkbox/row selection - a
+        # dataframe's own selection_mode keeps its selected-row state
+        # sticky across reruns (including after the dialog it opens is
+        # closed), which is the wrong interaction model for "open this
+        # record". Same bordered-row + Open-button pattern as Operations
+        # Inbox's queue table (pages_app/operations_inbox.py).
+        row_col_widths = [width for _, _, width in _ORDER_ROW_COLUMNS] + [1.0]
+        header_cols = st.columns(row_col_widths, vertical_alignment="center")
+        for header_col, (_, label, _) in zip(header_cols, _ORDER_ROW_COLUMNS):
+            header_col.caption(label)
+        header_cols[-1].caption("Action")
 
-        selected_rows = event.selection.rows
-
-        if selected_rows:
-            selected_group_ids = list(sorted_type_df.iloc[selected_rows[0]]["_grouped_row_ids"])
-            st.session_state["orders_management_selected_group_ids"] = selected_group_ids
-            st.session_state["orders_management_selected_context"] = context_key
-            if len(selected_group_ids) == 1:
-                st.session_state["orders_management_selected_row_id"] = int(selected_group_ids[0])
-            else:
-                st.session_state.pop("orders_management_selected_row_id", None)
+        for _, row in sorted_type_df.iterrows():
+            row_id_for_key = int(row["_row_id"])
+            with st.container(border=True, key=f"orders_row_{context_key}_{row_id_for_key}"):
+                row_cols = st.columns(row_col_widths, vertical_alignment="center")
+                container_label = _safe_str(row.get("Containers", "")) or _safe_str(row.get("Container Number", ""))
+                row_values = [
+                    _safe_str(row.get("Booking Number", "")) or "-",
+                    container_label or "-",
+                    _safe_str(row.get("Customer", "")) or "-",
+                    _safe_str(row.get("Status", "")) or "-",
+                ]
+                for row_col, value in zip(row_cols, row_values):
+                    row_col.write(value)
+                row_cols[-1].button(
+                    "Open",
+                    key=f"open_order_{context_key}_{row_id_for_key}",
+                    width="stretch",
+                    on_click=_open_order_group,
+                    kwargs={"context_key": context_key, "group_ids": list(row["_grouped_row_ids"])},
+                )
 
         selected_context = st.session_state.get("orders_management_selected_context")
         selected_group_ids = st.session_state.get("orders_management_selected_group_ids")
@@ -920,25 +944,75 @@ def render_orders_management(df: pd.DataFrame, principal: AuthenticatedActor) ->
             st.divider()
             st.markdown(f"#### {len(selected_group_ids)} containers in this booking")
             containers_df = work_df[work_df["_row_id"].astype(int).isin(selected_group_ids)]
-            container_cols = [c for c in ["_row_id", "Container Number", "Status", "Driver Name", "Delivery Need Date"] if c in containers_df.columns]
-            container_event = st.dataframe(
-                containers_df[container_cols],
-                use_container_width=True,
-                hide_index=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                key=f"orders_table_containers_{context_key}",
-            )
-            if container_event.selection.rows:
-                picked_row_id = int(containers_df.iloc[container_event.selection.rows[0]]["_row_id"])
-                st.session_state["orders_management_selected_row_id"] = picked_row_id
-                selected_row_id = picked_row_id
+            container_col_widths = [1.3, 1.3, 1.3, 1.0]
+            container_header_cols = st.columns(container_col_widths, vertical_alignment="center")
+            for header_col, label in zip(container_header_cols, ["Container", "Status", "Driver"]):
+                header_col.caption(label)
+            container_header_cols[-1].caption("Action")
+            for _, crow in containers_df.iterrows():
+                crow_id = int(crow["_row_id"])
+                with st.container(border=True, key=f"orders_container_row_{context_key}_{crow_id}"):
+                    crow_cols = st.columns(container_col_widths, vertical_alignment="center")
+                    crow_values = [
+                        _safe_str(crow.get("Container Number", "")) or "-",
+                        _safe_str(crow.get("Status", "")) or "-",
+                        _safe_str(crow.get("Driver Name", "")) or "-",
+                    ]
+                    for crow_col, value in zip(crow_cols, crow_values):
+                        crow_col.write(value)
+                    crow_cols[-1].button(
+                        "Open",
+                        key=f"open_order_container_{context_key}_{crow_id}",
+                        width="stretch",
+                        on_click=_open_order_container,
+                        kwargs={"context_key": context_key, "row_id": crow_id},
+                    )
 
         if selected_row_id is not None:
             visible_ids = set(work_df["_row_id"].dropna().astype(int).tolist())
             if int(selected_row_id) in visible_ids:
-                st.divider()
-                detail_renderer(work_df, int(selected_row_id), context_key, principal)
+                row_id = int(selected_row_id)
+                row_match = work_df[work_df["_row_id"].astype(int).eq(row_id)]
+                booking_label = (
+                    str(row_match.iloc[0].get("Booking Number", "") or "").strip()
+                    if not row_match.empty
+                    else ""
+                )
+                dialog_title = f"Order {booking_label}" if booking_label else f"Order row {row_id}"
+
+                # Same interaction pattern as Dispatch Board's booking workspace
+                # and Operations Inbox's work-item popup - @st.dialog +
+                # on_dismiss, plus the shared Compact/Medium/Large/Full Screen
+                # size preset (ui_components/dialog_presets.py) so this dialog
+                # can use as much of the viewport as the other two.
+                @st.dialog(dialog_title, width="large", on_dismiss=clear_order_editor)
+                def _order_detail_dialog() -> None:
+                    size_labels = list(DIALOG_SIZE_PRESETS.keys())
+                    current_size = st.session_state.get("orders_management_dialog_size", "Large")
+                    if current_size not in DIALOG_SIZE_PRESETS:
+                        current_size = "Large"
+                    dialog_header_cols = st.columns([2, 1])
+                    with dialog_header_cols[0]:
+                        if st.button("Back to List", key="clear_orders_management_selection", use_container_width=True):
+                            clear_order_editor()
+                            st.rerun()
+                    with dialog_header_cols[1]:
+                        selected_size = st.radio(
+                            "Popup size",
+                            size_labels,
+                            index=size_labels.index(current_size),
+                            horizontal=True,
+                            key="orders_management_dialog_size",
+                            label_visibility="collapsed",
+                        )
+                    dialog_width, dialog_height = DIALOG_SIZE_PRESETS[selected_size]
+                    st.markdown(
+                        '<style>div[data-testid="stDialog"]{width:' + dialog_width + ' !important;height:' + dialog_height + ' !important;}</style>',
+                        unsafe_allow_html=True,
+                    )
+                    detail_renderer(work_df, row_id, context_key, principal)
+
+                _order_detail_dialog()
 
     queue_options = [
         "New",

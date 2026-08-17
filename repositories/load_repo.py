@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from db_client import execute, read_df
+from utils.text_helpers import safe_str
 
 
 LOAD_MATCH_COLUMNS = [
@@ -58,13 +59,6 @@ LOAD_UPDATE_FIELD_MAP = {
     "Size": "size",
     "Dispatcher Notes": "dispatcher_notes",
 }
-
-
-def safe_str(value: Any) -> str:
-    value_str = str(value or "").strip()
-    if value_str.lower() in {"nan", "none", "nat", "null"}:
-        return ""
-    return value_str
 
 
 def int_or_none(value):
