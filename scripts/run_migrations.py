@@ -69,6 +69,7 @@ MIGRATION_ORDER = [
     "outbox_migration.sql",
     "document_lifecycle_migration.sql",
     "worker_jobs_migration.sql",
+    "load_query_indexes_migration.sql",
 ]
 
 

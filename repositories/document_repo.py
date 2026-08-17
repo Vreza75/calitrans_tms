@@ -73,3 +73,31 @@ def get_document(conn: Connection, document_id: int) -> dict[str, Any] | None:
         {"id": document_id},
     ).mappings().first()
     return dict(row) if row else None
+
+
+def list_documents_for_load(load_id: int, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Phase 8: metadata-only read for a load's document list API
+    (GET /api/v1/loads/{load_id}/documents) - deliberately excludes
+    `file_path` (a storage key, not a field the API should ever return;
+    STEP 12: "Do not expose unrestricted local storage paths" - same
+    rule application/work_items/models.py::AttachmentMeta.attachment_ref
+    already follows for Operations Inbox attachments). No `size`/
+    `available_at` fields - the `documents` table has no such columns
+    (database/schema.sql + database/document_lifecycle_migration.sql);
+    not fabricated (STEP 5's "only implement fields actually present"
+    rule, applied here too). Framework-neutral: uses db_client.read_df,
+    not a caller-supplied conn - this is a standalone read, not part of
+    a larger transaction."""
+    from db_client import read_df
+
+    df = read_df(
+        """
+        select id, document_type, filename, source, status, created_at
+        from documents
+        where load_id = :load_id
+        order by created_at desc
+        limit :limit
+        """,
+        {"load_id": int(load_id), "limit": max(min(int(limit or 50), 200), 1)},
+    )
+    return df.to_dict(orient="records")
