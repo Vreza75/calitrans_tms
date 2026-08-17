@@ -1,7 +1,7 @@
 import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 
-import { loadKeys } from "@/lib/api/queryKeys";
+import { inboxKeys, loadKeys } from "@/lib/api/queryKeys";
 import { invalidateForEvent } from "@/lib/realtime/invalidationMap";
 import type { RealtimeDomainEvent } from "@/lib/realtime/types";
 
@@ -42,6 +42,32 @@ describe("invalidateForEvent", () => {
     );
 
     expect(spy).toHaveBeenCalledWith({ queryKey: loadKeys.communications("381") });
+  });
+
+  it("invalidates inbox lists/detail/counts (not the whole cache) for inbox.received", () => {
+    const queryClient = new QueryClient();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+
+    invalidateForEvent(queryClient, "inbox.received", event({ aggregate_type: "order_intake_item", aggregate_id: "42" }));
+
+    const invalidatedKeys = spy.mock.calls.map((call) => call[0]?.queryKey);
+    expect(invalidatedKeys).toContainEqual(inboxKeys.lists());
+    expect(invalidatedKeys).toContainEqual(inboxKeys.detail("42"));
+    expect(invalidatedKeys).toContainEqual([...inboxKeys.all, "counts"]);
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+
+  it("invalidates inbox queries for inbox.review_status_changed too", () => {
+    const queryClient = new QueryClient();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+
+    invalidateForEvent(
+      queryClient,
+      "inbox.review_status_changed",
+      event({ aggregate_type: "order_intake_item", aggregate_id: "42" }),
+    );
+
+    expect(spy).toHaveBeenCalledWith({ queryKey: inboxKeys.detail("42") });
   });
 
   it("does nothing for an unrecognized event_type rather than throwing", () => {

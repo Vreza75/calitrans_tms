@@ -129,6 +129,33 @@ def get_work_item_queue_page(
     )
 
 
+def get_work_item_queue_counts(
+    *,
+    service_flow: str | None = None,
+    customer: str | None = None,
+    search: str | None = None,
+    subject: str | None = None,
+    status: str | None = None,
+    attachment_status: str | None = None,
+    only_open: bool = True,
+) -> dict[str, int]:
+    """One bounded aggregation query for queue-nav counts (Phase 10A) -
+    counts reflect the same active filters as get_work_item_queue_page,
+    minus queue itself (a queue's own count must not be pre-filtered to
+    that queue)."""
+    where_sql, params = work_item_repo.build_work_item_filters(
+        queue=None,
+        service_flow=service_flow,
+        customer=customer,
+        search=search,
+        subject=subject,
+        status=status,
+        attachment_status=attachment_status,
+        only_open=only_open,
+    )
+    return work_item_repo.count_work_items_by_queue(where_sql, params)
+
+
 def _allowed_actions(request_type: str, matched_load_id: int | None) -> list[str]:
     """Lightweight capability hint for API consumers (e.g. a future
     Next.js UI) - not a redefinition of the dispatcher classification/

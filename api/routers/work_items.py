@@ -11,8 +11,10 @@ from api.schemas.work_items import (
     CloseWorkItemIn,
     CommandResultOut,
     LinkLoadIn,
+    QueueCountOut,
     WorkItemDetailOut,
     WorkItemPageOut,
+    WorkItemQueueCountsOut,
 )
 from application.attachments.queries import get_attachments_for_work_item
 from application.conversations.queries import get_conversation_history
@@ -20,7 +22,11 @@ from application.loads.commands import create_load_from_work_item, update_load_f
 from application.order_drafts.commands import update_order_draft
 from application.order_drafts.queries import get_order_draft
 from application.work_items import commands as work_item_commands
-from application.work_items.queries import get_work_item_detail, get_work_item_queue_page
+from application.work_items.queries import (
+    get_work_item_detail,
+    get_work_item_queue_counts,
+    get_work_item_queue_page,
+)
 
 router = APIRouter(
     prefix="/work-items",
@@ -65,6 +71,29 @@ def list_work_items(
         attachment_status=attachment_status,
     )
     return WorkItemPageOut.from_domain(result)
+
+
+# Registered before "/{work_item_id}" - that path is an untyped single
+# segment, so Starlette would otherwise try to match "/counts" against it
+# first (registration order) and 422 on int-coercing "counts".
+@router.get("/counts", response_model=WorkItemQueueCountsOut)
+def get_work_item_queue_counts_route(
+    service_flow: str | None = None,
+    customer: str | None = None,
+    search: str | None = None,
+    subject: str | None = None,
+    status: str | None = None,
+    attachment_status: str | None = None,
+) -> WorkItemQueueCountsOut:
+    counts = get_work_item_queue_counts(
+        service_flow=service_flow,
+        customer=customer,
+        search=search,
+        subject=subject,
+        status=status,
+        attachment_status=attachment_status,
+    )
+    return WorkItemQueueCountsOut(counts=[QueueCountOut(queue=queue, count=count) for queue, count in counts.items()])
 
 
 @router.get("/{work_item_id}", response_model=WorkItemDetailOut)

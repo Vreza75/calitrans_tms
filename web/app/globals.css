@@ -317,3 +317,167 @@ input {
 .connection-indicator--error {
   color: color-mix(in srgb, var(--foreground) 45%, transparent);
 }
+
+/* Phase 10A: Operations Inbox two-pane workspace. Desktop uses a
+   3-column CSS grid (queue nav | work-item list | selected detail);
+   narrower viewports collapse to a single stacked column instead of a
+   hardcoded wide canvas (Step 22). */
+.inbox-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(280px, 420px) 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .inbox-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.inbox-queue-nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.inbox-queue-nav__item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.inbox-queue-nav__item--active {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  border-color: color-mix(in srgb, var(--foreground) 16%, transparent);
+  font-weight: 600;
+}
+
+.inbox-queue-nav__count {
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.inbox-work-item-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.inbox-work-item-row {
+  display: grid;
+  grid-template-columns: 3.5rem 1fr auto;
+  gap: 0.5rem;
+  align-items: start;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid color-mix(in srgb, var(--foreground) 12%, transparent);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.inbox-work-item-row--active {
+  border-color: var(--accent, currentColor);
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+}
+
+.inbox-work-item-row__time {
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+  font-size: 0.85em;
+}
+
+.inbox-work-item-row__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.inbox-work-item-row__sender {
+  font-weight: 600;
+}
+
+.inbox-work-item-row__subject {
+  color: color-mix(in srgb, var(--foreground) 65%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inbox-work-item-row__meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.25rem;
+  font-size: 0.85em;
+}
+
+.inbox-detail {
+  border: 1px solid color-mix(in srgb, var(--foreground) 12%, transparent);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.inbox-detail__empty {
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+}
+
+.inbox-detail-header__chips {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 0.4rem 0;
+}
+
+.inbox-conversation,
+.inbox-attachments {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.inbox-conversation__meta {
+  display: block;
+  font-size: 0.85em;
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+}
+
+.inbox-actions__row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.inbox-actions__group {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.inbox-actions__group input[type="number"] {
+  width: 6rem;
+}
