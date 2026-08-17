@@ -218,17 +218,42 @@ def update_load_from_work_item(
 # ---------------------------------------------------------------------------
 
 
+def _update_load_fields_with_event(
+    *, load_id: int, updates: dict[str, Any], actor: AuthenticatedActor
+) -> None:
+    """Phase 9 STEP 8: shared helper for the direct-field-update commands
+    below - wraps DispatchDatabaseClient.update_row_fields in an explicit
+    transaction() (previously each call opened its own separate
+    transaction per internal statement) so the load.updated domain event
+    can be recorded in the SAME transaction as the field write (STEP 6).
+    A side benefit, not the point of this change: the write and its
+    status_events audit row (when status changes) are now also atomic
+    with each other, which they were not before."""
+    from db_client import DispatchDatabaseClient, transaction
+    from realtime.events import publish_event, time_bucketed_key
+
+    with transaction() as conn:
+        DispatchDatabaseClient().update_row_fields(load_id, updates, conn=conn, created_by=actor.actor)
+        publish_event(
+            conn=conn,
+            event_type="load.updated",
+            aggregate_type="load",
+            aggregate_id=str(load_id),
+            idempotency_key=time_bucketed_key("load.updated", str(load_id), ",".join(sorted(updates.keys()))),
+            actor=actor.actor,
+            metadata={"updated_fields": sorted(updates.keys())},
+        )
+
+
 def mark_load_missing_info(*, actor: AuthenticatedActor, load_id: int, note: str = "") -> LoadCommandResult:
     """Set a load's status to Hold/Need Info, with an optional note."""
     require_permission(actor, Permission.LOAD_EDIT)
-
-    from db_client import DispatchDatabaseClient
 
     updates: dict[str, Any] = {"Status": "Hold/Need Info"}
     if note:
         updates["Dispatcher Notes"] = note
 
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor)
     return LoadCommandResult(ok=True, load_id=load_id, status="Hold/Need Info")
 
 
@@ -236,11 +261,7 @@ def save_load_note(*, actor: AuthenticatedActor, load_id: int, note: str) -> Loa
     """Update Dispatcher Notes only - no status change."""
     require_permission(actor, Permission.LOAD_EDIT)
 
-    from db_client import DispatchDatabaseClient
-
-    DispatchDatabaseClient().update_row_fields(
-        load_id, {"Dispatcher Notes": note}, created_by=actor.actor
-    )
+    _update_load_fields_with_event(load_id=load_id, updates={"Dispatcher Notes": note}, actor=actor)
     return LoadCommandResult(ok=True, load_id=load_id)
 
 
@@ -248,13 +269,11 @@ def verify_load_booking(*, actor: AuthenticatedActor, load_id: int, note: str = 
     """Set a load's status to Booking Verified, with an optional note."""
     require_permission(actor, Permission.LOAD_VERIFY)
 
-    from db_client import DispatchDatabaseClient
-
     updates: dict[str, Any] = {"Status": "Booking Verified"}
     if note:
         updates["Dispatcher Notes"] = note
 
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor)
     return LoadCommandResult(ok=True, load_id=load_id, status="Booking Verified")
 
 
@@ -262,13 +281,11 @@ def cancel_load(*, actor: AuthenticatedActor, load_id: int, note: str = "") -> L
     """Set a load's status to Cancelled, with an optional note."""
     require_permission(actor, Permission.LOAD_CANCEL)
 
-    from db_client import DispatchDatabaseClient
-
     updates: dict[str, Any] = {"Status": "Cancelled"}
     if note:
         updates["Dispatcher Notes"] = note
 
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor)
     return LoadCommandResult(ok=True, load_id=load_id, status="Cancelled")
 
 
@@ -283,9 +300,7 @@ def update_load_fields(*, actor: AuthenticatedActor, load_id: int, updates: dict
     if not updates:
         raise ValidationError("No fields supplied to update.")
 
-    from db_client import DispatchDatabaseClient
-
-    DispatchDatabaseClient().update_row_fields(load_id, updates, created_by=actor.actor)
+    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor)
     return LoadCommandResult(ok=True, load_id=load_id, status=str(updates.get("status") or updates.get("Status") or ""))
 
 
@@ -376,6 +391,26 @@ def mark_load_ready_to_dispatch(
             payload={"to": normalized_phone, "message": message, "dispatch_message_id": dispatch_message_id},
             idempotency_key=idempotency_key,
             actor=actor.actor,
+        )
+
+        # Phase 9 STEP 11: communication.queued, in the same transaction
+        # as the outbox enqueue it describes. Keyed on dispatch_message_id
+        # (fresh per call, unique per actual insert) rather than a
+        # time-bucketed key - no "legitimate resend" ambiguity to guard
+        # against here, since a genuine retry of this whole command hits
+        # the outbox's own idempotency_key first and produces the same
+        # dispatch_message_id only if the caller passed one through
+        # (it doesn't - each call inserts a fresh dispatch_messages row).
+        from realtime.events import publish_event
+
+        publish_event(
+            conn=conn,
+            event_type="communication.queued",
+            aggregate_type="dispatch_message",
+            aggregate_id=str(dispatch_message_id),
+            idempotency_key=f"communication.queued:{dispatch_message_id}",
+            actor=actor.actor,
+            metadata={"load_id": load_id, "dispatch_message_id": dispatch_message_id},
         )
 
     return ReadyToDispatchResult(ok=True, load_id=load_id, status="Ready to Dispatch", sms_status="queued")

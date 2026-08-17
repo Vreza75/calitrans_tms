@@ -86,7 +86,8 @@ def test_dispatcher_actor_bypassing_streamlit_can_still_cancel_a_booking():
     Streamlit-free call path."""
     dispatcher_actor = AuthenticatedActor(actor="dispatcher@calitranscorp.com", role=Role.DISPATCHER)
 
-    with mock.patch("db_client.DispatchDatabaseClient") as client_cls:
+    with mock.patch("db_client.DispatchDatabaseClient") as client_cls, mock.patch("db_client.transaction") as transaction:
+        transaction.return_value.__enter__.return_value = mock.MagicMock()
         result = cancel_load(actor=dispatcher_actor, load_id=999, note="bad order, cancelling")
 
     assert result.ok is True

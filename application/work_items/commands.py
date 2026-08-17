@@ -54,6 +54,23 @@ def close_work_item(work_item_id: int, *, actor: AuthenticatedActor, reason: str
                 conn=conn,
             )
 
+        # Phase 9 STEP 10: inbox.review_status_changed, in the same
+        # transaction as the status write. Time-bucketed idempotency key
+        # (a double-click "Close" retry collapses to one event) rather
+        # than a flat key - unlike inbox.received's insert-based dedup,
+        # update_review_status has no ON CONFLICT to lean on for free.
+        from realtime.events import publish_event, time_bucketed_key
+
+        publish_event(
+            conn=conn,
+            event_type="inbox.review_status_changed",
+            aggregate_type="order_intake_item",
+            aggregate_id=str(work_item_id),
+            idempotency_key=time_bucketed_key("inbox.review_status_changed", str(work_item_id), "Closed"),
+            actor=actor.actor,
+            metadata={"review_status": "Closed"},
+        )
+
     return CommandResult(ok=True, work_item_id=int(work_item_id), detail="Closed")
 
 

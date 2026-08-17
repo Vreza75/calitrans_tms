@@ -39,6 +39,20 @@ def sqlite_order_intake(monkeypatch, tmp_path):
                 "title text, details text, actor text)"
             )
         )
+        # Phase 9: close_work_item now also records an inbox.review_status_
+        # changed domain event in the same transaction (realtime/events.py::
+        # publish_event) - same minimal SQLite-compat shape as
+        # tests/test_outbox_repo.py's sqlite_outbox fixture.
+        conn.execute(
+            text(
+                "create table domain_events ("
+                "id integer primary key autoincrement, event_type text not null, "
+                "aggregate_type text not null, aggregate_id text not null, version text, "
+                "payload text not null default '{}', idempotency_key text not null unique, "
+                "status text not null default 'pending', attempt_count integer not null default 0, "
+                "actor text)"
+            )
+        )
         conn.execute(text("insert into loads (id) values (100)"))
         conn.execute(
             text("insert into order_intake (id, case_id, review_status) values (1, NULL, 'Open')")

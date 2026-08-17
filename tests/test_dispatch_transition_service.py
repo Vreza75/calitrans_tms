@@ -13,6 +13,7 @@ class _FakeDb:
         self.audit_notes = []
         self.conns_seen = []
         self.created_by_seen = []
+        self.realtime_events = []
 
     def read_load_for_update(self, load_id: int, *, conn=None) -> dict | None:
         self.conns_seen.append(conn)
@@ -35,6 +36,14 @@ class _FakeDb:
         self.conns_seen.append(conn)
         self.audit_notes.append(notes)
         self.created_by_seen.append(actor_display_name)
+
+    def emit_status_changed_event(self, load_id: int, *, old_status: str, new_status: str, conn=None, actor: str) -> None:
+        self.conns_seen.append(conn)
+        self.realtime_events.append(("load.status_changed", load_id, old_status, new_status))
+
+    def emit_assignment_changed_event(self, load_id: int, assignment_updates: dict, *, conn=None, actor: str) -> None:
+        self.conns_seen.append(conn)
+        self.realtime_events.append(("load.assignment_changed", load_id, dict(assignment_updates)))
 
 
 @pytest.fixture
@@ -61,6 +70,8 @@ def _wire(fake, monkeypatch):
     monkeypatch.setattr(svc, "_update_load", fake.update_row_fields)
     monkeypatch.setattr(svc, "_set_closeout_stage", fake.set_closeout_stage)
     monkeypatch.setattr(svc, "_insert_assignment_audit", fake.insert_assignment_audit)
+    monkeypatch.setattr(svc, "_emit_load_status_changed_event", fake.emit_status_changed_event)
+    monkeypatch.setattr(svc, "_emit_load_assignment_changed_event", fake.emit_assignment_changed_event)
     monkeypatch.setattr(svc, "transaction", _fake_transaction)
 
 
@@ -84,9 +95,32 @@ def test_assignment_status_and_audit_share_one_transaction(import_load, monkeypa
 
     svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
 
-    # locked row read + assignment write + assignment audit + status write
-    assert len(fake.conns_seen) == 4
+    # locked row read + assignment write + assignment audit +
+    # assignment_changed event + status write + status_changed event
+    # (Phase 9 STEP 6: both realtime events recorded in the same
+    # transaction as the writes they describe)
+    assert len(fake.conns_seen) == 6
     assert len(set(id(c) for c in fake.conns_seen)) == 1
+
+
+def test_transition_emits_status_changed_and_assignment_changed_events(import_load, monkeypatch):
+    fake = _FakeDb(import_load)
+    _wire(fake, monkeypatch)
+
+    svc.apply_transition(1, "En Route to Pickup", driver="Alex", truck="T1")
+
+    assert ("load.assignment_changed", 1, {"Driver Name": "Alex", "Truck Assigned": "T1"}) in fake.realtime_events
+    assert ("load.status_changed", 1, "Ready to Dispatch", "En Route to Pickup") in fake.realtime_events
+
+
+def test_invalid_transition_emits_no_realtime_events(import_load, monkeypatch):
+    fake = _FakeDb(import_load)
+    _wire(fake, monkeypatch)
+
+    result = svc.apply_transition(1, "En Route to Pickup")
+
+    assert result["ok"] is False
+    assert fake.realtime_events == []
 
 
 def test_forced_failure_mid_transaction_rolls_back_status_write(import_load, monkeypatch):

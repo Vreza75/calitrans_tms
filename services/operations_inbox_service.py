@@ -4653,21 +4653,6 @@ def _prepare_operations_email_records(message: dict, *, pre_saved_attachments: l
     return records
 
 
-def _execute_returning_id(sql: str, params: dict) -> int | None:
-    """Same connection/commit semantics as this module's module-level
-    execute() (db_client.execute: one engine.begin() per call, commits on
-    clean exit) but returns a scalar instead of discarding the result -
-    needed for _insert_operations_email_record_row's ON CONFLICT ...
-    RETURNING id below. Not a general-purpose replacement for execute();
-    only used where a caller needs the inserted/conflicting row's id."""
-    from sqlalchemy import text
-
-    from db_client import get_engine, get_secret
-
-    with get_engine(get_secret("DATABASE_URL")).begin() as conn:
-        return conn.execute(text(sql), params).scalar_one_or_none()
-
-
 def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     subject = record["subject"]
     sender = record["sender"]
@@ -4696,14 +4681,29 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     # write committing (the job gets reclaimed and re-run) - without this,
     # that retry would raise a raw unique-violation and the job would
     # terminal-fail even though the message was already correctly
-    # persisted by the first attempt. new_id is intentionally unused when
-    # None (conflict fired) - the dict this function returns is built
-    # entirely from `record`/`message` locals below, not from the insert
-    # result, and those are deterministic given the same message content,
-    # so no re-query of the existing row is needed for a retry to resolve
-    # correctly.
-    _execute_returning_id(
-        """
+    # persisted by the first attempt. The dict this function returns is
+    # built entirely from `record`/`message` locals below, not from the
+    # insert result, and those are deterministic given the same message
+    # content, so no re-query of the existing row is needed for a retry
+    # to resolve correctly.
+    #
+    # Phase 9 STEP 10: this insert now runs inside an explicit
+    # transaction() (previously _execute_returning_id opened its own
+    # engine.begin()) so an inbox.received domain event can be recorded
+    # in the SAME transaction (STEP 6) - only when new_id is not None
+    # (a real insert happened, not a conflict-skip on retry), which also
+    # gives inbox.received natural retry-idempotency for free: a retried
+    # insert that hits the ON CONFLICT DO NOTHING branch returns None and
+    # emits zero events, matching "same logical operation retried -> one
+    # event" without needing a separate time-bucketed key.
+    from sqlalchemy import text as _sql_text
+
+    from db_client import transaction as _transaction
+
+    with _transaction() as conn:
+        new_id = conn.execute(
+            _sql_text(
+                """
         insert into order_intake (
             source,
             source_subject,
@@ -4779,9 +4779,10 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
         on conflict (source_message_id) where source_message_id is not null
         do nothing
         returning id
-        """,
-        {
-            "source": source,
+        """
+            ),
+            {
+                "source": source,
             "source_subject": subject,
             "source_sender": sender,
             "source_received_at": received_at,
@@ -4811,8 +4812,21 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             "work_queue": safe_str(triage.get("work_queue")),
             "llm_review_required": bool(triage.get("llm_required") or triage.get("llm_review_required")),
             "llm_review_reason": safe_str(triage.get("llm_reason")) or safe_str(triage.get("llm_review_reason")),
-        },
-    )
+            },
+        ).scalar_one_or_none()
+
+        if new_id is not None:
+            from realtime.events import publish_event
+
+            publish_event(
+                conn=conn,
+                event_type="inbox.received",
+                aggregate_type="order_intake_item",
+                aggregate_id=str(new_id),
+                idempotency_key=f"inbox.received:{new_id}",
+                actor="system:inbox-sync",
+                metadata={"request_type": classification.get("request_type", "Customer Request")},
+            )
 
     return {
         "message_id": message_id,

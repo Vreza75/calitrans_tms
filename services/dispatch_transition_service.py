@@ -169,6 +169,7 @@ def apply_transition(
             _insert_assignment_audit(
                 load_id, current_status, "; ".join(parts), conn=conn, actor_display_name=actor_display_name
             )
+            _emit_load_assignment_changed_event(load_id, assignment_updates, conn=conn, actor=actor_display_name)
 
         _update_load(load_id, status_updates, conn=conn, actor_display_name=actor_display_name)
 
@@ -176,4 +177,54 @@ def apply_transition(
             closeout_stage = "POD Needed"
             _set_closeout_stage(load_id, closeout_stage, conn=conn)
 
+        _emit_load_status_changed_event(
+            load_id, old_status=current_status, new_status=new_status, conn=conn, actor=actor_display_name
+        )
+
     return {"ok": True, "reason": "", "status": new_status, "closeout_stage": closeout_stage}
+
+
+def _emit_load_status_changed_event(
+    load_id: int, *, old_status: str, new_status: str, conn, actor: str
+) -> None:
+    """Phase 9 STEP 8: one load.status_changed event per real transition,
+    recorded in the same transaction as the status write it describes
+    (STEP 6) - a rolled-back transition never leaves a stray event, a
+    committed one never commits without its event. Time-bucketed
+    idempotency key: a retried transition request (double-click, client
+    timeout+resubmit) collapses to one event; a later, genuinely separate
+    transition to the same new_status gets its own."""
+    from realtime.events import publish_event, time_bucketed_key
+
+    publish_event(
+        conn=conn,
+        event_type="load.status_changed",
+        aggregate_type="load",
+        aggregate_id=str(load_id),
+        idempotency_key=time_bucketed_key("load.status_changed", str(load_id), old_status, new_status),
+        version=None,
+        actor=actor,
+        metadata={"old_status": old_status, "new_status": new_status},
+    )
+
+
+def _emit_load_assignment_changed_event(load_id: int, assignment_updates: dict, *, conn, actor: str) -> None:
+    """Phase 9 STEP 8: driver/truck assignment is data, not a board stage
+    (see apply_transition's docstring) - a separate event from
+    load.status_changed so a client that only cares about assignment
+    changes (e.g. a driver-facing view) doesn't have to special-case a
+    status_changed event that happens to also carry assignment fields."""
+    from realtime.events import publish_event, time_bucketed_key
+
+    driver_name = assignment_updates.get("Driver Name", "")
+    truck = assignment_updates.get("Truck Assigned", "")
+    publish_event(
+        conn=conn,
+        event_type="load.assignment_changed",
+        aggregate_type="load",
+        aggregate_id=str(load_id),
+        idempotency_key=time_bucketed_key("load.assignment_changed", str(load_id), driver_name, truck),
+        version=None,
+        actor=actor,
+        metadata={k: v for k, v in {"driver_name": driver_name, "truck": truck}.items() if v},
+    )

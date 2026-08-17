@@ -118,7 +118,7 @@ def _parse_payload(raw: Any) -> dict[str, Any]:
 
 
 def _project_dispatch_message_status(
-    conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None
+    conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None, attempt_count: int
 ) -> None:
     dispatch_message_id = payload.get("dispatch_message_id")
     if dispatch_message_id is None:
@@ -131,8 +131,27 @@ def _project_dispatch_message_status(
         int(dispatch_message_id), conn=conn, delivery_status=delivery_status, provider_message_id=provider_message_id
     )
 
+    # Phase 9 STEP 11: communication.delivery_status_changed, in the same
+    # transaction as the delivery-status write. Keyed on
+    # (outbox event id, attempt_count) rather than a flat id-only key -
+    # attempt_count increments on each retry, so repeated 'retrying'
+    # outcomes for the same outbox event still each get their own event
+    # instead of colliding on ON CONFLICT DO NOTHING after the first.
+    from realtime.events import publish_event
 
-def _project_document_status(conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None) -> None:
+    publish_event(
+        conn=conn,
+        event_type="communication.delivery_status_changed",
+        aggregate_type="dispatch_message",
+        aggregate_id=str(dispatch_message_id),
+        idempotency_key=f"communication.delivery_status_changed:{dispatch_message_id}:{attempt_count}",
+        metadata={"delivery_status": delivery_status},
+    )
+
+
+def _project_document_status(
+    conn, payload: dict[str, Any], outcome: str, provider_message_id: str | None, attempt_count: int
+) -> None:
     document_id = payload.get("document_id")
     if document_id is None:
         return
@@ -142,24 +161,47 @@ def _project_document_status(conn, payload: dict[str, Any], outcome: str, provid
     status = {"delivered": "available", "retrying": "pending", "failed": "failed"}[outcome]
     update_document_status(conn, int(document_id), status=status)
 
+    # Phase 9 STEP 12: document.available / document.failed - only for
+    # the two terminal outcomes a client actually needs to react to
+    # (STEP 8: "only implement events where the distinction is
+    # meaningful" - a mid-retry 'pending' document isn't a state change a
+    # UI needs a push notification for; it already shows "pending").
+    if outcome not in ("delivered", "failed"):
+        return
 
-# event_type -> projector(conn, payload, outcome, provider_message_id).
+    from repositories.document_repo import get_document
+    from realtime.events import publish_event
+
+    document = get_document(conn, int(document_id))
+    load_id = document.get("load_id") if document else None
+
+    publish_event(
+        conn=conn,
+        event_type="document.available" if outcome == "delivered" else "document.failed",
+        aggregate_type="document",
+        aggregate_id=str(document_id),
+        idempotency_key=f"document.{status}:{document_id}",
+        metadata={k: v for k, v in {"load_id": load_id, "status": status}.items() if v is not None},
+    )
+
+
+# event_type -> projector(conn, payload, outcome, provider_message_id, attempt_count).
 # Projects an outbox result onto the audit/domain row it accompanies, if
 # the payload references one. Not every event_type has a corresponding
 # row to update - a projector is only called when its event_type has one
 # registered here.
-_PROJECTORS: dict[str, Callable[[Any, dict[str, Any], str, str | None], None]] = {
+_PROJECTORS: dict[str, Callable[[Any, dict[str, Any], str, str | None, int], None]] = {
     "driver_dispatch_sms": _project_dispatch_message_status,
     "document.file.finalize": _project_document_status,
 }
 
 
 def _project_delivery_status(
-    conn, event_type: str, payload: dict[str, Any], outcome: str, provider_message_id: str | None
+    conn, event_type: str, payload: dict[str, Any], outcome: str, provider_message_id: str | None, attempt_count: int
 ) -> None:
     projector = _PROJECTORS.get(event_type)
     if projector is not None:
-        projector(conn, payload, outcome, provider_message_id)
+        projector(conn, payload, outcome, provider_message_id, attempt_count)
 
 
 def process_one() -> dict[str, Any] | None:
@@ -203,7 +245,9 @@ def process_one() -> dict[str, Any] | None:
             outbox_repo.mark_retry(conn, event["id"], error=error, delay=_backoff_for(event["attempt_count"]))
             outcome = "retrying"
 
-        _project_delivery_status(conn, event["event_type"], payload, outcome, provider_message_id)
+        _project_delivery_status(
+            conn, event["event_type"], payload, outcome, provider_message_id, event["attempt_count"]
+        )
 
     return {"id": event["id"], "event_type": event["event_type"], "outcome": outcome, "error": error}
 

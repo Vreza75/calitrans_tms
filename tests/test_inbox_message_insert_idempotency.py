@@ -106,6 +106,20 @@ def sqlite_order_intake(monkeypatch, tmp_path):
                 "on order_intake (source_message_id) where source_message_id is not null"
             )
         )
+        # Phase 9: a successful insert here also records an inbox.received
+        # domain event in the same transaction (realtime/events.py::
+        # publish_event) - same minimal SQLite-compat shape as
+        # tests/test_outbox_repo.py's sqlite_outbox fixture.
+        conn.execute(
+            text(
+                "create table domain_events ("
+                "id integer primary key autoincrement, event_type text not null, "
+                "aggregate_type text not null, aggregate_id text not null, version text, "
+                "payload text not null default '{}', idempotency_key text not null unique, "
+                "status text not null default 'pending', attempt_count integer not null default 0, "
+                "actor text)"
+            )
+        )
 
     yield url
 
@@ -114,6 +128,13 @@ def sqlite_order_intake(monkeypatch, tmp_path):
 
 def _row_count() -> int:
     df = db_client.read_df("select count(*) as n from order_intake")
+    return int(df.iloc[0]["n"])
+
+
+def _event_count(event_type: str = "inbox.received") -> int:
+    df = db_client.read_df(
+        "select count(*) as n from domain_events where event_type = :event_type", {"event_type": event_type}
+    )
     return int(df.iloc[0]["n"])
 
 
@@ -130,6 +151,10 @@ def test_retrying_the_same_message_insert_does_not_raise_or_duplicate(sqlite_ord
     assert second["message_id"] == first["message_id"]
     assert second["conversation_key"] == first["conversation_key"]
 
+    # Phase 9 STEP 25: retried insert hits ON CONFLICT DO NOTHING (new_id
+    # is None) and must not emit a second inbox.received event.
+    assert _event_count() == 1
+
 
 def test_two_distinct_messages_both_insert_normally(sqlite_order_intake):
     other_message = {**MESSAGE, "id": "2", "subject": "Different booking"}
@@ -138,3 +163,6 @@ def test_two_distinct_messages_both_insert_normally(sqlite_order_intake):
     ops._insert_operations_email_message(other_message)
 
     assert _row_count() == 2
+    # Phase 9 STEP 25: two genuinely distinct messages => two events, not
+    # deduped away.
+    assert _event_count() == 2
