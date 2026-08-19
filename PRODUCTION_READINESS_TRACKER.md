@@ -29,7 +29,7 @@ An implementation is not complete merely because code was written. Use `[R]` aft
 | Package | Finding | Priority | Status | Owner | Branch/PR | Evidence |
 |---|---|---:|---|---|---|---|
 | PR-00 Credential incident response | Exposed credential in traceback | P1 | `[ ] Not started` | Victor/provider admin | — | — |
-| PR-01 Database test isolation | CTMS-001 | P1 | `[V] Verified` | — | `fix/pr-01-database-test-isolation` @ `859db96` | Full suite: 1391 passed, 98 skipped, 0 failed |
+| PR-01 Database test isolation | CTMS-001 | P1 | `[x] Complete` | Vreza75 | PR #13 @ `decfaad` (merged into `feat/operations-inbox-web`) | Full suite post-merge: 1391 passed, 98 skipped, 0 failed |
 | PR-02 Disposable PostgreSQL certification | Certification gap | P1 | `[?] Blocked` | — | — | Needs approved disposable DB |
 | PR-03 Upload and parser hardening | CTMS-002 | P1 | `[ ] Not started` | — | — | — |
 | PR-04 Browser and Streamlit session hardening | CTMS-003 | P1 | `[ ] Not started` | — | — | — |
@@ -77,7 +77,7 @@ Evidence/notes:
 
 ## PR-01 — Database test isolation
 
-Status: `[V] Verified`
+Status: `[x] Complete`
 
 - [x] Remove inherited `DATABASE_URL` during ordinary pytest runs.
 - [x] Prevent dotenv from repopulating database configuration in tests.
@@ -90,7 +90,9 @@ Status: `[V] Verified`
 - [x] Confirm database URLs are sanitized from failures and tracebacks.
 - [x] Run the broader safe backend suite after final changes.
 - [x] Commit the package on a dedicated branch.
-- [x] Independent review/retest (this session, see "Independent review" below). Not `[x] Complete`: a second human reviewer has not yet looked at the branch.
+- [x] Independent review/retest (see "Independent review" below).
+- [x] Human-approved merge: GitHub PR #13 merged by Vreza75.
+- [x] Post-merge validation on `feat/operations-inbox-web`.
 
 Root cause: `config.get_secret()` resolved Streamlit secrets and local `.env`/`.streamlit/secrets.toml` fallbacks *before* honoring a caller-set `DATABASE_URL`, and `config.py`'s own module-level `_load_local_env_file()` copied `.env` straight into `os.environ` at import time. Both files hold this repository's real database URL, so an unmocked `db_client` call during a normal test run silently reached the real dev/prod-configured database instead of failing. The version already committed at `5faaf0f` closed three of the four vectors but still special-cased a caller-set `DATABASE_URL` (leaving it live if the invoking shell happened to have one exported) and never cleared the `config.DATABASE_URL` module attribute itself.
 
@@ -114,8 +116,12 @@ Verification performed this session (see Files changed / Tests below for exact c
 Evidence/notes:
 
 - Starting commit: `5faaf0f8007ac0f1e3073761d57282ed7e1a73ce`
-- Completion commit: `859db96` on branch `fix/pr-01-database-test-isolation` (`f22984b` PR-01 code, `a85d48e` tracker, `859db96` CTMS-010 fix — all three in scope for this package's closure)
-- Files changed: `conftest.py`, `tests/test_api_auth.py`, `tests/test_communications_schema.py`, `tests/test_conftest_database_isolation.py`, `tests/test_db_client_column_exists.py`, `tests/integration/operations_inbox/harness.py`, `tests/integration/operations_inbox/test_harness_safety.py` (new), `docs/operations_inbox_certification/README.md`
+- Branch commits: `f22984b` (PR-01 code), `a85d48e` (tracker), `859db96` (CTMS-010 fix), `b41886d` (verification/tracker) on `fix/pr-01-database-test-isolation`
+- **Merge commit: `decfaad5d86ae2937d0afa3dcb01703c05503e0b`** — GitHub PR #13, merged into `feat/operations-inbox-web` (merge type: merge commit, branch not deleted)
+- Merge date: 2026-08-19T17:57:38Z
+- Merged by: Vreza75 (human-approved; explicit merge instruction given directly by the repository owner in this session)
+- `feat/operations-inbox-web` local branch fast-forwarded `5faaf0f` → `decfaad` to match `origin/feat/operations-inbox-web` and re-validated post-merge (see "Post-merge validation" below)
+- Files changed: `conftest.py`, `tests/test_api_auth.py`, `tests/test_communications_schema.py`, `tests/test_conftest_database_isolation.py`, `tests/test_db_client_column_exists.py`, `tests/integration/operations_inbox/harness.py`, `tests/integration/operations_inbox/test_harness_safety.py` (new), `docs/operations_inbox_certification/README.md`, `PRODUCTION_READINESS_TRACKER.md` (new)
 - Commands run and results:
   - `python -m compileall -q conftest.py tests/test_api_auth.py tests/test_communications_schema.py tests/test_conftest_database_isolation.py tests/test_db_client_column_exists.py api/auth.py config.py db_client.py` → no output, exit 0.
   - `python -m pytest -q tests/test_conftest_database_isolation.py tests/test_api_auth.py` → `32 passed, 1 warning`.
@@ -125,9 +131,16 @@ Evidence/notes:
   - Manual reproduction outside pytest: `sqlalchemy.create_engine("postgresql://tms_app:Sup3rS3cret!@127.0.0.1:1/doesnotexist", ...).connect()` and a malformed-scheme URL — neither leaked the username or password in the raised exception.
   - `python -m compileall -q app.py pages_app services ui_components repositories database utils ai_agents ai_core api application scripts tests` → exit 0.
   - `python -m pytest -q tests/integration/operations_inbox/` → `14 passed, 49 skipped` (new harness-safety tests pass; every real-DB certification case still correctly skips with no `INBOX_CERTIFICATION_DATABASE_URL` set — no database was contacted during this review).
-- Issue/PR: not opened (local branch only, per instruction not to push/merge).
-- Reviewer: independent review performed this session (see below); a second human reviewer has not yet looked at the branch — required before `[x] Complete`.
-- Remaining risk: none known for the files this package now touches. CTMS-010 (see below) is resolved as part of this package's closure, not left open.
+- Issue/PR: GitHub PR #13 (`fix/pr-01-database-test-isolation` → `feat/operations-inbox-web`), state `MERGED`.
+- Reviewer: independent review performed pre-merge (see "Independent review" below); merge itself explicitly authorized and executed by Vreza75 (repository owner) in this session.
+- Remaining risk: none known for the files this package touched. CTMS-010 (see below) is resolved as part of this package's closure, not left open.
+
+### Post-merge validation — 2026-08-19
+
+- `git fetch origin` → confirmed `origin/feat/operations-inbox-web` tip is `decfaad`, a merge commit with `5faaf0f` and `b41886d` as parents (PR-01's four commits are ancestors of the base branch).
+- Local `feat/operations-inbox-web` fast-forwarded `5faaf0f` → `decfaad` (`git merge --ff-only origin/feat/operations-inbox-web`) — no local divergence, no manual conflict resolution needed.
+- `python -m pytest -q` on the merged `feat/operations-inbox-web` (commit `decfaad`) → `1391 passed, 98 skipped, 0 failed`, matching the pre-merge branch evidence exactly.
+- Merge state independently confirmed two ways: `gh api`/`gh pr view 13` (`state: MERGED`, `mergedBy: Vreza75`, `mergeCommit.oid: decfaad...`) and `git log origin/feat/operations-inbox-web` (merge commit present, PR-01 commits are ancestors) — not accepted on the user's word alone.
 
 ### Independent review — 2026-08-18
 
@@ -336,6 +349,7 @@ Add one row whenever a package changes state.
 | 2026-08-18 | PR-01 | Not started | In progress | Local changes based on `5faaf0f` | Test isolation implemented during review; still uncommitted and awaiting focused review | 39 focused tests passed |
 | 2026-08-18 | PR-01 | In progress | Ready for review | `fix/pr-01-database-test-isolation` @ `f22984b` | Closed the caller-set-`DATABASE_URL` bypass and uncleared `config.DATABASE_URL` gaps; added 2 regression tests (cross-contamination refusal, credential-leak-in-errors); committed on a dedicated branch; logged CTMS-010 (pre-existing, now-dead harness safety check) as a new finding instead of expanding this package's scope | Full suite: 1377 passed, 98 skipped, 0 failed |
 | 2026-08-18 | PR-01 | Ready for review | Verified | `fix/pr-01-database-test-isolation` @ `859db96` | Independent review: re-derived and re-ran all evidence rather than trusting the prior report; confirmed all 10 requested isolation properties empirically. Resolved CTMS-010 in the same branch (parse-and-validate certification-target gate reusing sample-data's safety convention, 14 new tests). Not marked `[x] Complete` — awaiting a second human reviewer. | Full suite: 1391 passed, 98 skipped, 0 failed; harness safety: 14 passed; operations_inbox integration folder: 14 passed, 49 skipped, no DB contacted |
+| 2026-08-19 | PR-01 | Verified | Complete | GitHub PR #13 merged @ `decfaad` into `feat/operations-inbox-web` | Human (Vreza75) reviewed and explicitly directed the merge of PR #13; merge verified independently via `gh pr view` (`state: MERGED`) and `git log` (merge commit is on `origin/feat/operations-inbox-web`, PR-01 commits are ancestors) before updating status — not accepted on request alone. Local `feat/operations-inbox-web` fast-forwarded to match; full suite re-run post-merge. | Full suite post-merge: 1391 passed, 98 skipped, 0 failed |
 
 ## Per-session update template
 
