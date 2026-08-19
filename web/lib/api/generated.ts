@@ -78,6 +78,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/work-items/counts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Work Item Queue Counts Route */
+        get: operations["get_work_item_queue_counts_route_api_v1_work_items_counts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/work-items/{work_item_id}": {
         parameters: {
             query?: never;
@@ -384,6 +401,14 @@ export interface paths {
          * @description Assignment without a status change: re-applies the load's current
          *     status through the same transactional apply_transition() path, so the
          *     driver/truck write and its audit row are still atomic.
+         *
+         *     new_status=None, not a status read here first - a status read by this
+         *     router before apply_transition's row lock is taken could already be
+         *     stale by the time the lock lands, and handing that stale value back
+         *     as the transition target would make apply_transition validate it as
+         *     a (spurious) backward move instead of the assignment-only request it
+         *     actually is. See application/loads/commands.py::transition_load and
+         *     services/dispatch_transition_service.py::apply_transition.
          */
         post: operations["assign_driver_endpoint_api_v1_loads__load_id__assign_driver_post"];
         delete?: never;
@@ -1036,6 +1061,13 @@ export interface components {
             /** Service Flow */
             service_flow?: string | null;
         };
+        /** QueueCountOut */
+        QueueCountOut: {
+            /** Queue */
+            queue: string;
+            /** Count */
+            count: number;
+        };
         /** SortMetaOut */
         SortMetaOut: {
             /** Sort By */
@@ -1184,6 +1216,11 @@ export interface components {
             total_pages: number;
             sort: components["schemas"]["SortMetaOut"];
             filters: components["schemas"]["FilterMetaOut"];
+        };
+        /** WorkItemQueueCountsOut */
+        WorkItemQueueCountsOut: {
+            /** Counts */
+            counts: components["schemas"]["QueueCountOut"][];
         };
         /** WorkItemSummaryOut */
         WorkItemSummaryOut: {
@@ -1385,6 +1422,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemPageOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_work_item_queue_counts_route_api_v1_work_items_counts_get: {
+        parameters: {
+            query?: {
+                service_flow?: string | null;
+                customer?: string | null;
+                search?: string | null;
+                subject?: string | null;
+                status?: string | null;
+                attachment_status?: string | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemQueueCountsOut"];
                 };
             };
             /** @description Validation Error */

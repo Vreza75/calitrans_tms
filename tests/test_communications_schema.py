@@ -4,8 +4,28 @@ the real dev database, same as tests/test_db_client_column_exists.py —
 column_exists() is a real round trip and the added columns are additive
 and idempotent, so re-running this test (or the app) is always safe.
 """
+import os
+
+import pytest
+
+import db_client
 from db_client import column_exists
 from services.dispatch_data_service import ensure_communications_schema
+
+MIGRATION_TEST_DATABASE_URL = os.environ.get("MIGRATION_TEST_DATABASE_URL")
+pytestmark = pytest.mark.skipif(
+    not MIGRATION_TEST_DATABASE_URL,
+    reason="Requires MIGRATION_TEST_DATABASE_URL pointing at a disposable PostgreSQL database.",
+)
+
+
+@pytest.fixture(autouse=True)
+def _use_disposable_database(monkeypatch):
+    monkeypatch.setattr(
+        db_client,
+        "get_secret",
+        lambda name, default=None: MIGRATION_TEST_DATABASE_URL if name == "DATABASE_URL" else default,
+    )
 
 EXPECTED_COLUMNS = [
     "provider",

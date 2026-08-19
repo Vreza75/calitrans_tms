@@ -32,9 +32,14 @@ disposable PostgreSQL database - same opt-in pattern as
 harness:
 
 - Refuses to run if the variable is unset (`MissingScratchDatabaseError`).
-- Refuses to run if the URL matches the app's configured `DATABASE_URL`
-  secret (`CertificationSafetyError`) - it never reads `.streamlit/secrets.toml`
-  or the environment's `DATABASE_URL` for anything.
+- Refuses to run if the URL can't be parsed, if the database name doesn't
+  carry an unmistakable non-production marker (`dev`/`test`/`qa`/`sandbox`/
+  `scratch`/`disposable`/`cert`/`certification`/`ci`), or if a separate
+  `INBOX_CERTIFICATION_DATABASE_IDENTITY` env var isn't set to the exact
+  sanitized `host[:port]/database` identity being targeted
+  (`CertificationSafetyError`) - it never reads `.streamlit/secrets.toml`,
+  the environment's `DATABASE_URL`, or any other application secret for
+  this decision (see CTMS-010).
 - Applies every migration (idempotent - safe to run against an
   already-migrated scratch DB) before each case.
 - `TRUNCATE ... RESTART IDENTITY CASCADE`s every inbox/load-adjacent table
@@ -48,6 +53,7 @@ This repo already has a scratch Postgres container for this purpose
 
 ```bash
 export INBOX_CERTIFICATION_DATABASE_URL=postgresql://calitrans_test:calitrans_test_pw_2026@localhost:5433/calitrans_inbox_cert
+export INBOX_CERTIFICATION_DATABASE_IDENTITY=localhost:5433/calitrans_inbox_cert
 python scripts/run_inbox_case.py CASE-000
 ```
 

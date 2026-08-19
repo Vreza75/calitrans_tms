@@ -234,11 +234,20 @@ reads alone, confirming the fallback described above.
 ## Migration plan
 
 ```text
-Phase 10  - this phase: auth, API client, realtime foundation, read-only Loads proof
-Phase 10A - Operations Inbox web migration
+Phase 10  - auth, API client, realtime foundation, read-only Loads proof
+Phase 10A - Operations Inbox web migration (in progress - see
+            docs/architecture/OPERATIONS_INBOX_WEB.md)
 Phase 10B - Dispatch Board web migration
 Phase 10C - Load Workspace (full mutation surface) web migration
 ```
 
-Streamlit is not deprecated by this phase - it remains the operational
-system of record for every workflow this phase doesn't touch.
+Operations Inbox is the first operational (not just read-proof) workflow
+being migrated: `/app/inbox` now supports the primary dispatcher
+workflow (queue navigation, search, work-item detail, create/update/
+link/close load actions) against the same `api/routers/work_items.py`
+boundary Streamlit's own Admin/Diagnostics tooling and application
+commands already use. Streamlit's Operations Inbox is **not retired** by
+this work - it remains available as the transitional fallback until an
+explicit later closure step accepts removing it. Streamlit is not
+deprecated by this phase - it remains the operational system of record
+for every workflow Phase 10/10A doesn't yet cover.

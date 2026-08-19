@@ -21,11 +21,28 @@ export const loadKeys = {
   documents: (id: number | string) => [...loadKeys.all, "documents", String(id)] as const,
 };
 
+export type InboxFilters = {
+  queue?: string;
+  service_flow?: string;
+  customer?: string;
+  search?: string;
+  subject?: string;
+  status?: string;
+  attachment_status?: string;
+  page?: number;
+  sort_by?: string;
+  sort_direction?: string;
+};
+
 export const inboxKeys = {
   all: ["inbox"] as const,
   lists: () => [...inboxKeys.all, "list"] as const,
-  list: (filters: Record<string, unknown> = {}) => [...inboxKeys.lists(), filters] as const,
+  list: (filters: InboxFilters = {}) => [...inboxKeys.lists(), filters] as const,
   detail: (id: number | string) => [...inboxKeys.all, "detail", String(id)] as const,
+  counts: (filters: Omit<InboxFilters, "queue" | "page" | "sort_by" | "sort_direction"> = {}) =>
+    [...inboxKeys.all, "counts", filters] as const,
+  conversation: (id: number | string) => [...inboxKeys.all, "conversation", String(id)] as const,
+  attachments: (id: number | string) => [...inboxKeys.all, "attachments", String(id)] as const,
 };
 
 export const meKeys = {
