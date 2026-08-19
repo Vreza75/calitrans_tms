@@ -9,15 +9,22 @@ Safety model (same shape as tests/test_migration_runner.py's
 MIGRATION_TEST_DATABASE_URL gate): this module NEVER reads the app's
 configured DATABASE_URL. It only accepts a URL from the
 INBOX_CERTIFICATION_DATABASE_URL environment variable (or an explicit
-argument), and refuses to run if that URL matches the app's configured
-DATABASE_URL secret, so a misconfigured environment cannot point this at a
-real database.
+argument). require_scratch_database_url() below parses that URL, requires
+its database name to carry an unmistakable non-production marker, and
+requires a second env var (INBOX_CERTIFICATION_DATABASE_IDENTITY) to
+exactly acknowledge the sanitized host[:port]/database identity being
+targeted before any destructive operation runs - see that function's own
+docstring for why this does not compare against config.get_secret
+("DATABASE_URL") (CTMS-010: conftest.py's session-wide pytest guard makes
+that call return None for the whole session, which would make an equality
+check against it permanently unable to fire).
 """
 from __future__ import annotations
 
 import email
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -28,6 +35,7 @@ from typing import Any
 from unittest import mock
 
 import yaml
+from sqlalchemy.engine import make_url
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -35,6 +43,19 @@ if str(REPO_ROOT) not in sys.path:
 
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "operations_inbox"
 ENV_VAR = "INBOX_CERTIFICATION_DATABASE_URL"
+IDENTITY_ENV_VAR = "INBOX_CERTIFICATION_DATABASE_IDENTITY"
+
+# Same convention as scripts/sample_data.py's SAFE_NAME_TOKENS (reused, not
+# duplicated as a competing policy - kept as a separate literal here only
+# because scripts/sample_data.py is not guaranteed to be importable from
+# every context that imports this harness). "cert"/"certification" covers
+# this harness's own documented scratch database name (calitrans_inbox_cert
+# - see docs/operations_inbox_certification/README.md).
+SAFE_NAME_TOKENS = {
+    "dev", "development", "test", "testing", "qa", "sandbox", "scratch",
+    "disposable", "cert", "certification", "ci",
+}
+REJECTED_DATABASE_NAMES = {"postgres", "production", "prod"}
 
 # Tables touched by the intake -> classification -> triage -> load-creation
 # pipeline. Truncated (RESTART IDENTITY CASCADE) before every case to
@@ -88,7 +109,39 @@ class MissingScratchDatabaseError(RuntimeError):
     """Raised when INBOX_CERTIFICATION_DATABASE_URL is not set."""
 
 
+def target_identity(database_url: str) -> str:
+    """Sanitized host[:port]/database identity - never includes a username
+    or password. Same shape as scripts/sample_data.py's target_identity()."""
+    parsed = make_url(database_url)
+    host = (parsed.host or "local").lower()
+    port = f":{parsed.port}" if parsed.port else ""
+    database = (parsed.database or "").strip("/")
+    return f"{host}{port}/{database}"
+
+
 def require_scratch_database_url(explicit_url: str | None = None) -> str:
+    """Fail-closed gate for every certification/integration test that would
+    otherwise TRUNCATE real tables (see RESETTABLE_TABLES / scratch_database()
+    below).
+
+    Deliberately does NOT compare the target against
+    config.get_secret("DATABASE_URL") as its safety control (that was this
+    function's original design and is CTMS-010: conftest.py's session-wide
+    pytest guard - see its own docstring - makes that call return None for
+    the whole pytest session, which made the equality check permanently
+    unable to fire for any test collected under this repository's root
+    conftest.py, i.e. always, since every caller of this function is a
+    pytest test). Instead, mirroring scripts/sample_data.py's
+    assert_safe_target(): the URL is parsed (never partially trusted from a
+    raw string), the database name itself must carry an unmistakable
+    non-production marker, generic/production-shaped names are rejected
+    outright, and the operator must separately set
+    INBOX_CERTIFICATION_DATABASE_IDENTITY to the exact sanitized
+    host[:port]/database identity being targeted - a positive
+    acknowledgement, not a guess - before any destructive operation runs.
+    Every raised message below is built only from the sanitized identity or
+    generic text; the raw URL, username, and password are never included.
+    """
     url = explicit_url or os.environ.get(ENV_VAR)
     if not url:
         raise MissingScratchDatabaseError(
@@ -97,18 +150,43 @@ def require_scratch_database_url(explicit_url: str | None = None) -> str:
             "This is never read from .streamlit/secrets.toml or DATABASE_URL."
         )
 
-    import config
-
-    configured = None
     try:
-        configured = config.get_secret("DATABASE_URL")
+        parsed = make_url(url)
     except Exception:
-        configured = None
-
-    if configured and configured.strip() == url.strip():
         raise CertificationSafetyError(
-            f"{ENV_VAR} is identical to the app's configured DATABASE_URL. "
-            "Refusing to run - certification must target a dedicated scratch database."
+            f"{ENV_VAR} could not be parsed as a database URL. Refusing to run."
+        ) from None
+
+    database = (parsed.database or "").strip("/").lower()
+    host = (parsed.host or "").lower()
+    if not database or not host:
+        raise CertificationSafetyError(
+            f"{ENV_VAR} must identify both a database host and a database name."
+        )
+    if database in REJECTED_DATABASE_NAMES:
+        raise CertificationSafetyError(
+            "Generic or production-like database names are never accepted for certification."
+        )
+
+    name_tokens = {token for token in re.split(r"[^a-z0-9]+", database) if token}
+    if not (name_tokens & SAFE_NAME_TOKENS):
+        raise CertificationSafetyError(
+            "Database name must contain an explicit dev/test/qa/sandbox/scratch/"
+            "disposable/cert marker before certification tests may run against it."
+        )
+
+    identity = f"{host}{f':{parsed.port}' if parsed.port else ''}/{database}"
+    expected_identity = os.environ.get(IDENTITY_ENV_VAR, "").strip().lower()
+    if not expected_identity:
+        raise CertificationSafetyError(
+            f"{IDENTITY_ENV_VAR} must be set to the exact sanitized target identity "
+            f"({identity}) - the operator must positively acknowledge the target "
+            "before any destructive certification test runs."
+        )
+    if expected_identity != identity:
+        raise CertificationSafetyError(
+            f"{IDENTITY_ENV_VAR} does not match the target identity. Refusing to "
+            "run against an unacknowledged database."
         )
 
     return url

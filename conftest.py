@@ -27,12 +27,17 @@ tests/integration/operations_inbox/harness.py's own scratch_database()
 context manager, both bypassing the application's DATABASE_URL).
 
 This module deliberately never sets or mirrors DATABASE_URL itself -
-tests/integration/operations_inbox/harness.py has its own,
-already-correct safety check that refuses to run when
-INBOX_CERTIFICATION_DATABASE_URL equals the app's configured DATABASE_URL
-(see require_scratch_database_url), specifically to catch this exact
-misconfiguration; mirroring the test URL into DATABASE_URL here would
-trip that check and break certification. DATABASE_URL is always discarded
+tests/integration/operations_inbox/harness.py has its own safety gate
+(require_scratch_database_url) that independently requires the target
+database name to carry an explicit non-production marker and requires the
+operator to positively acknowledge the exact sanitized target identity via
+INBOX_CERTIFICATION_DATABASE_IDENTITY; it does not compare against
+config.get_secret("DATABASE_URL") (this hook makes that call return None
+for the whole session - see CTMS-010 - so an equality check against it
+could never fire). Mirroring the test URL into DATABASE_URL here would
+still be pointless for the same underlying reason this hook exists at
+all: the certification harness only ever trusts its own explicit env vars,
+never DATABASE_URL. DATABASE_URL is always discarded
 during pytest, even if the parent process already had a value. Plain
 `pytest -q` therefore makes get_secret("DATABASE_URL") return None and
 db_client.get_engine() raises RuntimeError("DATABASE_URL is missing...")
