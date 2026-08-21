@@ -24,6 +24,27 @@ SAFE_ENVIRONMENTS = {"development", "test"}
 SAFE_NAME_TOKENS = {"dev", "development", "test", "testing", "qa", "sandbox", "scratch", "disposable"}
 DATASET_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,39}$")
 
+# Tables seed() always writes to when the schema has them, and the exact
+# per-dataset row count each one gets (see seed() below - drivers=3 and
+# loads=4 come from its fixed load_specs/driver loops; every other table
+# gets exactly 1 deterministic row per dataset). Used only by validate()
+# to distinguish "dataset absent" / "dataset partially present" / "dataset
+# complete" - list()/seed()/cleanup()/reset() are unaffected and still run
+# the same SQL they always have.
+REQUIRED_DATASET_TABLES = {"customers", "warehouses", "carriers", "drivers", "loads", "order_intake"}
+EXPECTED_DATASET_COUNTS = {
+    "customers": 1,
+    "warehouses": 1,
+    "carriers": 1,
+    "drivers": 3,
+    "loads": 4,
+    "order_intake": 1,
+    "operations_tasks": 1,
+    "worker_jobs": 1,
+    "outbox_events": 1,
+    "domain_events": 1,
+}
+
 
 class SafetyError(RuntimeError):
     pass
@@ -226,6 +247,39 @@ def list_dataset(engine: Engine, dataset: str) -> dict[str, int]:
     return result
 
 
+def validate_dataset(engine: Engine, dataset: str) -> tuple[str, dict[str, Any]]:
+    """Classify a dataset's actual state against seed()'s deterministic
+    expected shape. Returns (status, detail) where status is one of:
+
+    - "schema_missing": a table seed() requires doesn't exist at all -
+      migrations were never applied, or applied against the wrong schema.
+      `detail["missing_tables"]` lists what's absent.
+    - "absent": every required table exists but every count for this
+      dataset is zero - never seeded, or fully cleaned up.
+    - "partial": some counts are present but at least one required or
+      present-optional table doesn't match seed()'s exact expected count -
+      an interrupted seed, a partial cleanup, or an application defect.
+    - "complete": every table present in this schema has exactly the count
+      seed() would have written for this dataset.
+
+    Does not run any query list_dataset() doesn't already run - this only
+    adds a comparison layer over the same counts.
+    """
+    tables = _tables(engine)
+    missing_required_tables = sorted(REQUIRED_DATASET_TABLES - tables)
+    if missing_required_tables:
+        return "schema_missing", {"missing_tables": missing_required_tables}
+
+    counts = list_dataset(engine, dataset)
+
+    if not any(counts.values()):
+        return "absent", counts
+
+    expected_present = {table: expected for table, expected in EXPECTED_DATASET_COUNTS.items() if table in tables}
+    is_complete = all(counts.get(table, 0) == expected for table, expected in expected_present.items())
+    return ("complete" if is_complete else "partial"), counts
+
+
 def cleanup(engine: Engine, dataset: str) -> Summary:
     tag = marker(dataset)
     summary = Summary()
@@ -286,12 +340,26 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "reset":
             cleanup(engine, args.dataset)
             result = seed(engine, args.dataset)
-        else:
-            counts = list_dataset(engine, args.dataset)
-            result = counts
-            if args.command == "validate" and not counts:
-                print("Validation failed: no supported sample records found", file=sys.stderr)
+        elif args.command == "validate":
+            status, detail = validate_dataset(engine, args.dataset)
+            result = detail
+            if status == "schema_missing":
+                print(
+                    f"Validation failed: required tables missing from schema: {detail['missing_tables']}",
+                    file=sys.stderr,
+                )
+                return 6
+            if status == "absent":
+                print("Validation failed: dataset absent - no supported sample records found", file=sys.stderr)
                 return 4
+            if status == "partial":
+                print(
+                    "Validation failed: dataset partially present (some tables missing their expected count)",
+                    file=sys.stderr,
+                )
+                return 5
+        else:
+            result = list_dataset(engine, args.dataset)
         print(json.dumps(result.__dict__ if isinstance(result, Summary) else result, indent=2, sort_keys=True))
         return 0
     except Exception as exc:

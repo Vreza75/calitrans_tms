@@ -76,11 +76,15 @@ These database-backed checks were not run during the 2026-08-18 review because n
 
 | Code | Meaning |
 |---:|---|
-| 0 | Requested operation or dry-run succeeded |
+| 0 | Requested operation or dry-run succeeded (for `validate`, only when the dataset is complete - see below) |
 | 1 | Connection/schema/operation failure; external error details are not printed |
 | 2 | Invalid dataset identifier |
 | 3 | Safety refusal before database access |
-| 4 | Validation found no supported records |
+| 4 | `validate` only: dataset absent - every required table exists but every count for this dataset is zero (never seeded, or cleaned up) |
+| 5 | `validate` only: dataset partially present - at least one table's count doesn't match seed()'s exact expected shape |
+| 6 | `validate` only: required tables missing from the schema entirely - migrations were never applied, or applied against the wrong database |
+
+`validate` never treats "the count queries executed" as success by itself. It compares actual counts against `seed()`'s exact deterministic shape (customers=1, warehouses=1, carriers=1, drivers=3, loads=4, order_intake=1, and 1 each for any present optional table) and only exits `0` when every table matches exactly. `cleanup` followed by `validate` is expected to exit `4`, not `0` - cleanup does not drop tables, only rows. `reset` followed by `validate` is expected to exit `0`, since reset re-seeds the exact same shape.
 
 ## Schema expectations
 
