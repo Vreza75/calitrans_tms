@@ -30,7 +30,7 @@ An implementation is not complete merely because code was written. Use `[R]` aft
 |---|---|---:|---|---|---|---|
 | PR-00 Credential incident response | Exposed credential in traceback | P1 | `[ ] Not started` | Victor/provider admin | — | — |
 | PR-01 Database test isolation | CTMS-001 | P1 | `[x] Complete` | Vreza75 | PR #13 @ `decfaad` (merged into `feat/operations-inbox-web`) | Full suite post-merge: 1391 passed, 98 skipped, 0 failed |
-| PR-02 Disposable PostgreSQL certification | Certification gap | P1 | `[?] Blocked` | — | — | Needs approved disposable DB |
+| PR-02 Disposable PostgreSQL certification | Certification gap | P1 | `[R] Ready for review` | — | `fix/pr-02-postgres-certification` @ `f43ac7d` | 20/20 migrations applied clean; schema PASS (32 tables/102 indexes/3 triggers); seed/validate/idempotency/list/cleanup/reset all proven; full suite: 1391 passed, 98 skipped, 0 failed |
 | PR-03 Upload and parser hardening | CTMS-002 | P1 | `[ ] Not started` | — | — | — |
 | PR-04 Browser and Streamlit session hardening | CTMS-003 | P1 | `[ ] Not started` | — | — | — |
 | PR-05 Database lifecycle constraints | CTMS-005 | P2 | `[ ] Not started` | — | — | — |
@@ -179,23 +179,72 @@ Documentation corrected for accuracy: `conftest.py`'s docstring and `docs/operat
 
 ## PR-02 — Disposable PostgreSQL certification
 
-Status: `[?] Blocked`
+Status: `[R] Ready for review`
 
-- [ ] Provision an empty, disposable PostgreSQL database.
-- [ ] Record its sanitized `host[:port]/database` identity.
-- [ ] Explicitly approve that identity for destructive QA operations.
-- [ ] Apply every migration from an empty database.
-- [ ] Run schema/migration integration tests.
-- [ ] Run sample-data dry run.
-- [ ] Run `seed`.
-- [ ] Run `validate`.
-- [ ] Run a second `seed` and prove idempotency.
-- [ ] Run `list`.
-- [ ] Run `cleanup` and prove unrelated records remain.
-- [ ] Run `reset` and validate final state.
-- [ ] Record exact commands and sanitized results.
+- [x] Provision an empty, disposable PostgreSQL database.
+- [x] Record its sanitized `host[:port]/database` identity.
+- [x] Explicitly approve that identity for destructive QA operations.
+- [x] Apply every migration from an empty database.
+- [x] Run schema/migration integration tests.
+- [x] Run sample-data dry run.
+- [x] Run `seed`.
+- [x] Run `validate`.
+- [x] Run a second `seed` and prove idempotency.
+- [x] Run `list`.
+- [x] Run `cleanup` and prove unrelated records remain (dataset-scoped, not just "cleanup ran").
+- [x] Run `reset` and validate final state.
+- [x] Record exact commands and sanitized results.
+- [ ] Independent review/retest (not yet performed — this session implemented and validated PR-02 directly; ends at `[R]`, not `[V]`/`[x]`, per instruction).
 
-Blocker: No approved disposable PostgreSQL URL and exact identity have been supplied.
+Approved identity: `localhost:5433/calitrans_qa_test` (human-confirmed disposable, empty, local-only, approved for destructive QA operations, including schema/migration application, sample-data seed/validate/seed-again/cleanup/reset, and destructive certification testing). The credentialed URL was handed off via a private, session-only file outside the repository and outside chat, read only through shell command substitution, and deleted at the end of this session — the raw URL, username, and password were never printed, logged, or committed at any point.
+
+Pre-write verification performed before any write (all passed):
+1. Branch `fix/pr-02-postgres-certification` confirmed current.
+2. PR-01 confirmed incorporated (`git log` showed commit `d439a89`, PR-01's tracker-close commit, at HEAD — same tip as `feat/operations-inbox-web` post-merge).
+3. Working tree confirmed clean apart from the same preserved unrelated untracked files from prior sessions.
+4. Sanitized identity resolved and displayed via `scripts/sample_data.py`'s own `assert_safe_target()`/`target_identity()` (reused, not reimplemented): `localhost:5433/calitrans_qa_test`.
+5. Live-connected identity verified via `_verify_live_identity()` (queries `current_database()` against the actual open connection) — matched.
+6. Confirmed identity exactly equals `localhost:5433/calitrans_qa_test` (case-insensitive compare, both sides normalized).
+7. Confirmed the database name (`calitrans_qa_test`) passes every disposable-target safety gate: contains explicit `qa`/`test` markers, is not in the generic/production-rejected set (`postgres`/`production`/`prod`), and the `CALITRANS_ALLOW_QA_DATA`/`CALITRANS_QA_DATABASE_IDENTITY` operator-acknowledgement gates both passed.
+8. Confirmed the database was empty before any migration: `inspect(engine).get_table_names()` returned 0 tables.
+
+No step differed from the approved identity; nothing was refused.
+
+### Certification sequence — exact commands, results, and evidence
+
+1. **Migration ordering inspected**: `MIGRATION_ORDER` (20 entries) confirmed to exactly match the 20 `.sql` files on disk in `database/`. Repository's actual migration command: `python scripts/run_migrations.py --database-url <url>`.
+2. **Migrations applied from empty**: `python scripts/run_migrations.py --database-url "$(cat <cred-file>)"` → `Target database: postgresql://***@localhost:5433/calitrans_qa_test` then all 20 migrations `OK`, `Done. 20 newly applied, 0 already applied, 20 total.` Exit 0.
+3. **Schema readiness verification**: `python scripts/verify_schema.py --database-url "$(cat <cred-file>)"` → 32 tables / 102 indexes / 3 triggers checked, all `OK`, final line `PASS`. Exit 0.
+4. **Migration/schema integration tests** (real DB, `MIGRATION_TEST_DATABASE_URL` set to the approved URL): `pytest -q tests/test_migration_runner.py` → **11 passed** (includes the two real-DB tests: fresh-apply-then-verify, and second-run-is-idempotent-and-skips-everything). `pytest -q tests/test_db_client_column_exists.py tests/test_communications_schema.py` → **5 passed** (all 5 were `skipped` under PR-01's review with no DB configured; now exercised for real).
+5. **Operations Inbox database certification tests: not applicable, skipped.** `services.operations_inbox_service.sync_operations_email_engine` routes through `ai_core/llm.py`, which requires `OPENAI_API_KEY` (a real external AI provider call) to classify the fixture email. Contacting external providers was explicitly out of scope for this session and no such key was configured or authorized. Not a defect — correctly excluded, not silently skipped without explanation.
+6. **Sample-data dry-run**: `python scripts/sample_data.py seed --database-url "$(cat <cred-file>)" --environment test --dataset baseline-01 --dry-run` → prints sanitized target only, `DRY RUN: seed would operate only on marker SYNTHETIC-CALITRANS-QA::baseline-01`. Exit 0. No connection made.
+7. **Seed**: same command without `--dry-run` → `created: 15, reused: 0, failed: 0` across `carriers(1) customers(1) domain_events(1) drivers(3) loads(4) operations_tasks(1) order_intake(1) outbox_events(1) warehouses(1) worker_jobs(1)`. Exit 0.
+8. **Validate**: `python scripts/sample_data.py validate ... --dataset baseline-01` → same 10-table counts as seeded, all present. Exit 0.
+9. **Second seed (idempotency)**: same seed command run again → `created: 0, reused: 15, failed: 0` — byte-for-byte the same 15 records reused, nothing duplicated. Exit 0.
+10. **List**: `python scripts/sample_data.py list ... --dataset baseline-01` → identical counts to validate. Exit 0.
+11. **Cleanup proven dataset-scoped** (docs/SAMPLE_DATA_GUIDE.md's own prescribed 5-step procedure, executed in full): inserted one unrelated control row (`customers.company_name = "PR02-CONTROL-ROW-UNRELATED-TO-QA-MARKER"`, no QA marker) → seeded a second, independent dataset `alternate-01` (15 records, same shape as baseline-01) → ran `cleanup --dataset baseline-01` (dry-run first, then real: `deleted: 15`, matching exactly what baseline-01 had) → verified: control row still present (`CONTROL_ROW_INTACT: True`), `alternate-01`'s `list` output completely unchanged (still 15 across the same 10 tables), `baseline-01`'s `validate` output zeroed on every table. Cleanup only ever touched rows tagged with `baseline-01`'s exact marker — confirmed, not assumed.
+12. **Cleanup executed**: see step 11 (`deleted: 15`, 0 failed).
+13. **Cleaned state validated**: see step 11 (`baseline-01` all-zero counts after cleanup).
+14. **Reset**: `python scripts/sample_data.py reset ... --dataset baseline-01` → cleanup (0 remaining, already clean) then seed → `created: 15, reused: 0, failed: 0`, identical shape to the original seed.
+15. **Reset state validated**: `validate ... --dataset baseline-01` → identical 15-record counts to the original seed. Exit 0.
+16. **Full safe backend suite**: `pytest -q` (no ambient DB env vars, matching the standard baseline) → **1391 passed, 98 skipped, 0 failed** — no regression from PR-01's post-merge count.
+17. **Python compilation**: `python -m compileall -q app.py pages_app services ui_components repositories database utils ai_agents ai_core api application scripts tests` → exit 0.
+18. **`git diff --check`**: exit 0, no whitespace/conflict-marker issues.
+
+Post-certification cleanup: the ad-hoc `alternate-01` dataset (15 records, `deleted: 15`) and the unrelated control row (1 record) created solely for the scoping proof in step 11 were removed afterward, leaving the disposable database in the same `baseline-01`-seeded state produced by the `reset` step — a clean, reusable starting point for future PR-02/PR-03 work on this same instance.
+
+Files changed (this package): `scripts/sample_data.py` (new), `tests/test_sample_data.py` (new, 7 unit tests, no DB connection — all pass), `docs/SAMPLE_DATA_GUIDE.md` (new).
+
+Evidence/notes:
+
+- Starting commit (branch base): `d439a89` (PR-01 fully merged and closed)
+- Completion commit: `f43ac7d` on branch `fix/pr-02-postgres-certification`
+- Reviewer: none yet — this package ends at `[R] Ready for review`, not `[V]`/`[x]`, per instruction.
+- Remaining risk: none known against the files/behavior this package touched. Operations Inbox certification cases (step 5) remain uncertified against this database — blocked on `OPENAI_API_KEY` authorization, tracked as a prerequisite for a future pass, not a defect.
+
+### New finding discovered during PR-02 (recorded, not fixed)
+
+`scripts/sample_data.py`'s `validate` command returns exit code 0 even when every counted table's row count is `0` for the given dataset (e.g., immediately after `cleanup`). It only returns exit code `4` ("no supported sample records found") when the counted-table dict itself is empty (i.e., none of the checked tables exist in the schema at all) — not when the tables exist but simply have zero matching rows. Observed directly in this session: `validate` after `cleanup` printed all-zero counts but exited `0`, not `4`. The printed JSON counts are correct and sufficient evidence either way, so this did not block PR-02, but the exit code cannot currently be used alone to detect "dataset was cleaned/never seeded" — a caller must inspect the printed values. Not fixed here per instruction (minimal correction not essential to complete PR-02 safely); see CTMS-011 in "New findings" below.
 
 ## PR-03 — Upload and parser hardening
 
@@ -339,6 +388,7 @@ Add newly discovered defects here before changing the active package scope.
 | ID | Date | Severity | Description | Discovered during | Issue | Status |
 |---|---|---:|---|---|---|---|
 | CTMS-010 | 2026-08-18 | P2 | `tests/integration/operations_inbox/harness.py::require_scratch_database_url()` compared `INBOX_CERTIFICATION_DATABASE_URL` against `config.get_secret("DATABASE_URL")` to reject a production-identical target, but PR-01's session-wide pytest guard makes `config.get_secret("DATABASE_URL")` unconditionally return `None` for the entire pytest session (by design), so that comparison could never fire inside a normal pytest run. Resolved in commit `859db96` (same branch as PR-01): replaced with a parse-and-validate model reusing `scripts/sample_data.py`'s `assert_safe_target()` convention — explicit safe-name-marker requirement, rejection of generic/production names, and operator identity acknowledgement via `INBOX_CERTIFICATION_DATABASE_IDENTITY`. 14 new regression tests in `tests/integration/operations_inbox/test_harness_safety.py`. | PR-01 diff review | — | `[x] Resolved` |
+| CTMS-011 | 2026-08-21 | P3 | `scripts/sample_data.py`'s `validate` command only returns exit code `4` ("no supported sample records found") when the counted-table dict is empty (no checked tables exist in the schema at all) — it returns `0` even when every table exists but every count is `0` for the given dataset (e.g., right after `cleanup`, or for a never-seeded dataset name). Observed directly against the approved disposable database during PR-02 certification: `validate` after `cleanup` printed all-zero counts but exited `0`. The printed JSON is correct evidence either way, so this did not block PR-02 certification, but automation that greps only the exit code (not the printed values) would misread a cleaned/never-seeded dataset as "validated". Not fixed — minimal correction not essential to complete PR-02 safely. | PR-02 certification | — | `[ ] Not started` |
 
 ## Change log
 
@@ -350,6 +400,7 @@ Add one row whenever a package changes state.
 | 2026-08-18 | PR-01 | In progress | Ready for review | `fix/pr-01-database-test-isolation` @ `f22984b` | Closed the caller-set-`DATABASE_URL` bypass and uncleared `config.DATABASE_URL` gaps; added 2 regression tests (cross-contamination refusal, credential-leak-in-errors); committed on a dedicated branch; logged CTMS-010 (pre-existing, now-dead harness safety check) as a new finding instead of expanding this package's scope | Full suite: 1377 passed, 98 skipped, 0 failed |
 | 2026-08-18 | PR-01 | Ready for review | Verified | `fix/pr-01-database-test-isolation` @ `859db96` | Independent review: re-derived and re-ran all evidence rather than trusting the prior report; confirmed all 10 requested isolation properties empirically. Resolved CTMS-010 in the same branch (parse-and-validate certification-target gate reusing sample-data's safety convention, 14 new tests). Not marked `[x] Complete` — awaiting a second human reviewer. | Full suite: 1391 passed, 98 skipped, 0 failed; harness safety: 14 passed; operations_inbox integration folder: 14 passed, 49 skipped, no DB contacted |
 | 2026-08-19 | PR-01 | Verified | Complete | GitHub PR #13 merged @ `decfaad` into `feat/operations-inbox-web` | Human (Vreza75) reviewed and explicitly directed the merge of PR #13; merge verified independently via `gh pr view` (`state: MERGED`) and `git log` (merge commit is on `origin/feat/operations-inbox-web`, PR-01 commits are ancestors) before updating status — not accepted on request alone. Local `feat/operations-inbox-web` fast-forwarded to match; full suite re-run post-merge. | Full suite post-merge: 1391 passed, 98 skipped, 0 failed |
+| 2026-08-21 | PR-02 | Blocked | Ready for review | `fix/pr-02-postgres-certification` @ `f43ac7d` | Human supplied approved disposable identity `localhost:5433/calitrans_qa_test` via a private, session-only credential file (never printed/logged/committed, deleted on completion). Full certification sequence run for real against it: migrations from empty, schema verify, migration/schema integration tests, sample-data seed/validate/second-seed-idempotency/list/dataset-scoped-cleanup-with-control-row-proof/reset, full safe suite, compile checks, diff-check. Operations Inbox AI-classification certification (step 5) excluded — requires `OPENAI_API_KEY`, an external-provider contact out of scope this session. Logged CTMS-011 (sample_data.py `validate` exit-code gap) as a new finding instead of patching mid-certification. Committed `scripts/sample_data.py`, `tests/test_sample_data.py`, `docs/SAMPLE_DATA_GUIDE.md`. | 20/20 migrations OK; schema PASS (32 tables/102 indexes/3 triggers); 11+5 real-DB integration tests passed; sample-data: 15 created → 15 reused (idempotent) → dataset-scoped cleanup proven → reset restores 15; full suite: 1391 passed, 98 skipped, 0 failed |
 
 ## Per-session update template
 
