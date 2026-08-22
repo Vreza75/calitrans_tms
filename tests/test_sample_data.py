@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from scripts import sample_data
 
 
 SAFE_URL = "postgresql+psycopg2://qa:secret@127.0.0.1:5433/calitrans_qa"
 SAFE_IDENTITY = "127.0.0.1:5433/calitrans_qa"
+
+FULL_DATASET_COUNTS = {
+    "customers": 1,
+    "warehouses": 1,
+    "carriers": 1,
+    "drivers": 3,
+    "loads": 4,
+    "order_intake": 1,
+    "operations_tasks": 1,
+    "worker_jobs": 1,
+    "outbox_events": 1,
+    "domain_events": 1,
+}
 
 
 def test_production_like_database_name_is_refused_without_connecting(monkeypatch, capsys):
@@ -254,3 +268,214 @@ def test_validate_query_failure_is_sanitized_not_success(monkeypatch, capsys):
     assert "password" not in err
     assert "authentication failed" not in err
     assert "ERROR: RuntimeError: sample-data operation failed" in err
+
+
+# --- CTMS-012: cleanup()/list_dataset() used an unanchored LIKE prefix
+# ("<marker>%"), so dataset "baseline-01" would also match "baseline-010",
+# "baseline-01-extra", or any dataset whose marker text happens to start
+# with baseline-01's marker text. Fixed via _dataset_prefix_pattern()
+# (marker + a literal trailing space, escaped for LIKE metacharacters) -
+# a dataset id can only ever contain lowercase letters/digits/hyphens
+# (DATASET_RE), never a space, so the space anchor cannot collide.
+#
+# These tests use a private, in-memory SQLite database - no network
+# connection, no credential, not the approved disposable Postgres
+# instance - purely to exercise the real seed()/list_dataset()/cleanup()
+# SQL (including genuine transaction rollback) without touching any
+# external resource. ---
+
+
+def test_dataset_prefix_pattern_is_escaped_and_anchored():
+    pattern = sample_data._dataset_prefix_pattern("baseline-01")
+    assert pattern == "SYNTHETIC-CALITRANS-QA::baseline-01 %"
+
+
+def test_escape_like_neutralizes_percent_underscore_and_backslash():
+    assert sample_data._escape_like("a_b%c\\d") == r"a\_b\%c\\d"
+
+
+@pytest.fixture
+def sqlite_engine():
+    """Minimal, in-memory schema covering only the columns seed()/
+    list_dataset()/cleanup()/validate_dataset() actually touch. Not a
+    stand-in for the real disposable Postgres certification - just enough
+    to run the real functions end-to-end, including real transaction
+    rollback, without any network connection or credential."""
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql("pragma foreign_keys = on")
+        conn.exec_driver_sql(
+            "create table customers (id integer primary key autoincrement, "
+            "company_name text not null, contact_name text, email text, phone text)"
+        )
+        conn.exec_driver_sql(
+            "create table warehouses (id integer primary key autoincrement, "
+            "warehouse_name text not null, address text, city text, state text, "
+            "zip_code text, contact_name text, phone text)"
+        )
+        conn.exec_driver_sql(
+            "create table carriers (id integer primary key autoincrement, "
+            "company_name text not null, contact_name text, email text, phone text, mc_number text)"
+        )
+        conn.exec_driver_sql(
+            "create table drivers (id integer primary key autoincrement, "
+            "driver_name text not null, carrier_id integer references carriers(id), "
+            "phone text, email text, truck_number text)"
+        )
+        conn.exec_driver_sql(
+            "create table loads (id integer primary key autoincrement, "
+            "booking_number text not null, type text, load_id text, reference_number text, "
+            "customer text, port text, warehouse text, address text, status text, "
+            "driver_name text, truck_assigned text, size text, dispatcher_notes text)"
+        )
+        conn.exec_driver_sql(
+            "create table order_intake (id integer primary key autoincrement, "
+            "source text, source_subject text, source_sender text, raw_text text, "
+            "parsed_data text, intake_status text, action_required text, source_message_id text)"
+        )
+        conn.exec_driver_sql(
+            "create table operations_tasks (id integer primary key autoincrement, "
+            "task_title text not null, task_description text, task_status text, "
+            "task_priority text, owner text, intake_id integer references order_intake(id), "
+            "load_id integer references loads(id), customer text, booking_number text, created_by text)"
+        )
+        for table, type_column, terminal_column in (
+            ("worker_jobs", "job_type", "completed_at"),
+            ("outbox_events", "event_type", "processed_at"),
+            ("domain_events", "event_type", "published_at"),
+        ):
+            conn.exec_driver_sql(
+                f"create table {table} (id integer primary key autoincrement, "
+                f"{type_column} text, aggregate_type text, aggregate_id text, payload text, "
+                f"idempotency_key text, status text, actor text, {terminal_column} timestamp)"
+            )
+    return engine
+
+
+def test_cleanup_deletes_exactly_the_requested_dataset(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    summary = sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    assert summary.deleted == 15
+    assert sample_data.list_dataset(sqlite_engine, "baseline-01") == {t: 0 for t in FULL_DATASET_COUNTS}
+
+
+@pytest.mark.parametrize(
+    "colliding_dataset",
+    ["baseline-010", "baseline-01-extra", "x-baseline-01"],
+)
+def test_cleanup_baseline_01_does_not_touch_prefix_colliding_datasets(sqlite_engine, colliding_dataset):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, colliding_dataset)
+
+    sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    assert sample_data.list_dataset(sqlite_engine, colliding_dataset) == FULL_DATASET_COUNTS
+    assert sample_data.list_dataset(sqlite_engine, "baseline-01") == {t: 0 for t in FULL_DATASET_COUNTS}
+
+
+def test_cleanup_baseline_010_does_not_touch_baseline_01(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, "baseline-010")
+
+    sample_data.cleanup(sqlite_engine, "baseline-010")
+
+    assert sample_data.list_dataset(sqlite_engine, "baseline-01") == FULL_DATASET_COUNTS
+    assert sample_data.list_dataset(sqlite_engine, "baseline-010") == {t: 0 for t in FULL_DATASET_COUNTS}
+
+
+def test_cleanup_wildcard_dataset_id_cannot_broaden_matching(sqlite_engine):
+    """Bypasses the CLI's DATASET_RE gate on purpose - calls cleanup()
+    directly with a dataset id containing a SQL LIKE metacharacter, to
+    prove the pattern builder itself (not just the CLI regex) is safe."""
+    sample_data.seed(sqlite_engine, "baseline-01")
+
+    summary = sample_data.cleanup(sqlite_engine, "x%")
+
+    assert summary.deleted == 0
+    assert sample_data.list_dataset(sqlite_engine, "baseline-01") == FULL_DATASET_COUNTS
+
+
+def test_cleanup_is_scoped_across_every_seeded_table(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, "alternate-01")
+
+    sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    baseline_counts = sample_data.list_dataset(sqlite_engine, "baseline-01")
+    alternate_counts = sample_data.list_dataset(sqlite_engine, "alternate-01")
+    for table in FULL_DATASET_COUNTS:
+        assert baseline_counts[table] == 0, f"{table} not cleaned"
+        assert alternate_counts[table] == FULL_DATASET_COUNTS[table], f"{table} lost unrelated rows"
+
+
+def test_unrelated_synthetic_dataset_survives_cleanup(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, "alternate-01")
+
+    sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    assert sample_data.list_dataset(sqlite_engine, "alternate-01") == FULL_DATASET_COUNTS
+
+
+def test_non_synthetic_record_survives_cleanup(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    with sqlite_engine.begin() as conn:
+        conn.execute(
+            text("insert into customers (company_name, contact_name, email, phone) values (:n, 'Real Contact', 'real@example.com', '+1-555-0000')"),
+            {"n": "Acme Real Customer Inc"},
+        )
+
+    sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    with sqlite_engine.connect() as conn:
+        remaining = conn.execute(
+            text("select count(*) from customers where company_name = :n"), {"n": "Acme Real Customer Inc"}
+        ).scalar_one()
+    assert remaining == 1
+
+
+def test_cleanup_counts_are_accurate(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+
+    summary = sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    assert summary.deleted == 15
+    assert summary.by_table == {
+        "domain_events": 1, "outbox_events": 1, "worker_jobs": 1,
+        "operations_tasks": 1, "order_intake": 1, "loads": 4,
+        "drivers": 3, "warehouses": 1, "customers": 1, "carriers": 1,
+    }
+
+
+def test_cleanup_rolls_back_completely_on_mid_operation_failure(sqlite_engine):
+    sample_data.seed(sqlite_engine, "baseline-01")
+    with sqlite_engine.begin() as conn:
+        # Break carriers' predicate column specifically (last table in
+        # cleanup()'s iteration order) so every other delete in the same
+        # transaction has already run before this one raises.
+        conn.exec_driver_sql("alter table carriers rename column company_name to company_name_broken")
+
+    with pytest.raises(Exception):
+        sample_data.cleanup(sqlite_engine, "baseline-01")
+
+    with sqlite_engine.connect() as conn:
+        for table in (
+            "operations_tasks", "order_intake", "loads", "drivers",
+            "warehouses", "customers", "domain_events", "outbox_events", "worker_jobs",
+        ):
+            count = conn.execute(text(f"select count(*) from {table}")).scalar_one()
+            assert count > 0, f"{table} was not rolled back after the forced failure"
+
+
+def test_reset_cleanup_phase_stays_exactly_scoped(sqlite_engine):
+    """reset() = cleanup() then seed() on the same dataset (see main()) -
+    reproduced here directly since reset itself is only wired in main()."""
+    sample_data.seed(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, "baseline-010")
+
+    sample_data.cleanup(sqlite_engine, "baseline-01")
+    sample_data.seed(sqlite_engine, "baseline-01")
+
+    assert sample_data.list_dataset(sqlite_engine, "baseline-01") == FULL_DATASET_COUNTS
+    assert sample_data.list_dataset(sqlite_engine, "baseline-010") == FULL_DATASET_COUNTS

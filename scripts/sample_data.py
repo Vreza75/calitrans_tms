@@ -99,6 +99,43 @@ def marker(dataset: str) -> str:
     return f"SYNTHETIC-CALITRANS-QA::{dataset}"
 
 
+_LIKE_ESCAPE_CHAR = "\\"
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE metacharacters (the escape character itself, then
+    % and _) so a dataset id can never widen or alter what a LIKE pattern
+    matches. DATASET_RE already forbids these characters in a dataset id
+    accepted through the CLI, but list_dataset()/cleanup()/validate_dataset()
+    are importable and callable directly, so this does not rely on that
+    gate alone."""
+    return (
+        value.replace(_LIKE_ESCAPE_CHAR, _LIKE_ESCAPE_CHAR * 2)
+        .replace("%", f"{_LIKE_ESCAPE_CHAR}%")
+        .replace("_", f"{_LIKE_ESCAPE_CHAR}_")
+    )
+
+
+def _dataset_prefix_pattern(dataset: str) -> str:
+    """The one canonical, anchored LIKE prefix for every freetext marker
+    column - used by list_dataset() and cleanup() (validate_dataset() goes
+    through list_dataset(), so it gets this for free). Never rebuild this
+    pattern ad hoc elsewhere (CTMS-012).
+
+    A single trailing space after marker(dataset) is the anchor: a dataset
+    id can only ever contain lowercase letters, digits, and hyphens (see
+    DATASET_RE) - never a space - so "<marker> " can never be a true
+    prefix of a *different* dataset's marker text. This is what makes
+    "baseline-01 " fail to match "baseline-010 ...", "baseline-01-extra
+    ...", or "x-baseline-01 ..." (that last one already differed before
+    the marker text even starts, but is covered by regression tests
+    anyway). seed() writes every freetext column - including loads.load_id,
+    previously "<marker>-<suffix>" with no such anchor - as
+    "<marker> <suffix>" so every column shares this one boundary rule.
+    """
+    return f"{_escape_like(marker(dataset))} %"
+
+
 def _tables(engine: Engine) -> set[str]:
     return set(inspect(engine).get_table_names())
 
@@ -173,7 +210,7 @@ def seed(engine: Engine, dataset: str) -> Summary:
             load_id, created = _upsert_named(
                 conn, table="loads", key_column="booking_number", key_value=booking,
                 values={
-                    "type": flow, "load_id": f"{tag}-{suffix}", "reference_number": f"QA-REF-{dataset.upper()}-{suffix}",
+                    "type": flow, "load_id": f"{tag} {suffix}", "reference_number": f"QA-REF-{dataset.upper()}-{suffix}",
                     "customer": f"{tag} Fictional Shipper", "port": "QA Port", "warehouse": f"{tag} Test Warehouse",
                     "address": "100 QA Way, Testville, TX 00000", "status": status, "driver_name": driver,
                     "truck_assigned": "QA-TRACTOR-02" if driver else None, "size": "40HC", "dispatcher_notes": f"{tag} deterministic sample record",
@@ -228,19 +265,19 @@ def seed(engine: Engine, dataset: str) -> Summary:
 
 
 def list_dataset(engine: Engine, dataset: str) -> dict[str, int]:
-    tag = marker(dataset)
+    pattern = _dataset_prefix_pattern(dataset)
     tables = _tables(engine)
     checks = {
-        "customers": ("company_name", f"{tag}%"), "warehouses": ("warehouse_name", f"{tag}%"),
-        "carriers": ("company_name", f"{tag}%"), "drivers": ("driver_name", f"{tag}%"),
-        "loads": ("load_id", f"{tag}%"), "order_intake": ("source_subject", f"{tag}%"),
-        "operations_tasks": ("task_title", f"{tag}%"),
+        "customers": ("company_name", pattern), "warehouses": ("warehouse_name", pattern),
+        "carriers": ("company_name", pattern), "drivers": ("driver_name", pattern),
+        "loads": ("load_id", pattern), "order_intake": ("source_subject", pattern),
+        "operations_tasks": ("task_title", pattern),
     }
     result: dict[str, int] = {}
     with engine.connect() as conn:
         for table, (column, pattern) in checks.items():
             if table in tables:
-                result[table] = int(conn.execute(text(f"select count(*) from {table} where {column} like :pattern"), {"pattern": pattern}).scalar_one())
+                result[table] = int(conn.execute(text(f"select count(*) from {table} where {column} like :pattern escape '\\'"), {"pattern": pattern}).scalar_one())
         for table in ("worker_jobs", "outbox_events", "domain_events"):
             if table in tables:
                 result[table] = int(conn.execute(text(f"select count(*) from {table} where idempotency_key = :key"), {"key": f"qa-sample:{dataset}:{table}"}).scalar_one())
@@ -281,10 +318,14 @@ def validate_dataset(engine: Engine, dataset: str) -> tuple[str, dict[str, Any]]
 
 
 def cleanup(engine: Engine, dataset: str) -> Summary:
-    tag = marker(dataset)
+    pattern = _dataset_prefix_pattern(dataset)
     summary = Summary()
     tables = _tables(engine)
     with engine.begin() as conn:
+        # Children before parents (FK order, unchanged from before this fix):
+        # operations_tasks references order_intake/loads; drivers references
+        # carriers. Only the WHERE-clause pattern changed below, not this
+        # table order.
         for table in ("domain_events", "outbox_events", "worker_jobs"):
             if table in tables:
                 count = conn.execute(text(f"delete from {table} where idempotency_key = :key"), {"key": f"qa-sample:{dataset}:{table}"}).rowcount
@@ -292,7 +333,7 @@ def cleanup(engine: Engine, dataset: str) -> Summary:
                 summary.by_table[table] = count
         for table, column in (("operations_tasks", "task_title"), ("order_intake", "source_subject"), ("loads", "load_id"), ("drivers", "driver_name"), ("warehouses", "warehouse_name"), ("customers", "company_name"), ("carriers", "company_name")):
             if table in tables:
-                count = conn.execute(text(f"delete from {table} where {column} like :pattern"), {"pattern": f"{tag}%"}).rowcount
+                count = conn.execute(text(f"delete from {table} where {column} like :pattern escape '\\'"), {"pattern": pattern}).rowcount
                 summary.deleted += count
                 summary.by_table[table] = count
     return summary
