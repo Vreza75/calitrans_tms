@@ -479,3 +479,206 @@ def test_reset_cleanup_phase_stays_exactly_scoped(sqlite_engine):
 
     assert sample_data.list_dataset(sqlite_engine, "baseline-01") == FULL_DATASET_COUNTS
     assert sample_data.list_dataset(sqlite_engine, "baseline-010") == FULL_DATASET_COUNTS
+
+
+# --- CTMS-013: _verify_live_identity() claimed to verify the exact
+# live-connected identity but only ever compared current_database() to the
+# expected database name - it queried inet_server_addr() and never used
+# the result, and never checked host or port at all. Fixed by reading the
+# DBAPI driver's own effective connection parameters (psycopg2's
+# get_dsn_parameters() - the documented, credential-safe libpq PQconninfo
+# interface, which never includes the password) instead of PostgreSQL's
+# own inet_server_addr()/inet_server_port(), which report the server's
+# view of the connection and are wrong inside a Docker container (a
+# host-mapped port like 5433 is reported by the server as its
+# container-internal 5432).
+#
+# These tests use a fake object standing in for a SQLAlchemy Connection -
+# no real database, no network connection, no credential. ---
+
+
+class _FakeDbapiConnection:
+    def __init__(self, dsn_parameters, raise_on_get=False):
+        self._dsn_parameters = dsn_parameters
+        self._raise_on_get = raise_on_get
+
+    def get_dsn_parameters(self):
+        if self._raise_on_get:
+            raise RuntimeError("driver failure")
+        return self._dsn_parameters
+
+
+class _FakePoolProxiedConnection:
+    def __init__(self, dbapi_connection):
+        self.dbapi_connection = dbapi_connection
+
+
+class _FakeResult:
+    def __init__(self, database_name):
+        self._database_name = database_name
+
+    def mappings(self):
+        return self
+
+    def one(self):
+        return {"database_name": self._database_name}
+
+
+class _FakeLiveConnection:
+    """Stands in for a SQLAlchemy Connection - implements only what
+    _verify_live_identity() touches: .connection.dbapi_connection and
+    .execute()."""
+
+    def __init__(self, dsn_parameters, current_database, *, raise_on_get=False, no_dbapi=False):
+        self.connection = None if no_dbapi else _FakePoolProxiedConnection(
+            _FakeDbapiConnection(dsn_parameters, raise_on_get=raise_on_get)
+        )
+        self._current_database = current_database
+        self.executed_sql: list[str] = []
+
+    def execute(self, clause, *args, **kwargs):
+        self.executed_sql.append(str(clause))
+        return _FakeResult(self._current_database)
+
+
+def test_verify_live_identity_accepts_exact_host_port_database():
+    conn = _FakeLiveConnection({"host": "localhost", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+    sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_rejects_database_mismatch():
+    conn = _FakeLiveConnection({"host": "localhost", "port": "5433", "dbname": "wrong_db"}, "wrong_db")
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_rejects_port_mismatch():
+    conn = _FakeLiveConnection({"host": "localhost", "port": "5432", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_rejects_host_mismatch():
+    conn = _FakeLiveConnection(
+        {"host": "unexpected-host.internal", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test"
+    )
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "db.internal.example.test:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_accepts_localhost_127_normalization():
+    conn = _FakeLiveConnection({"host": "127.0.0.1", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+    sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_accepts_localhost_ipv6_loopback_normalization():
+    conn = _FakeLiveConnection({"host": "::1", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+    sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_rejects_remote_host_when_localhost_expected():
+    conn = _FakeLiveConnection(
+        {"host": "db.remote.example.test", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test"
+    )
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+@pytest.mark.parametrize(
+    "dsn_parameters",
+    [
+        {"port": "5433", "dbname": "calitrans_qa_test"},  # host missing
+        {"host": "localhost", "dbname": "calitrans_qa_test"},  # port missing
+        {"host": "localhost", "port": "5433"},  # dbname missing
+    ],
+)
+def test_verify_live_identity_rejects_missing_effective_metadata(dsn_parameters):
+    conn = _FakeLiveConnection(dsn_parameters, "calitrans_qa_test")
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_fails_closed_when_driver_lacks_dsn_parameters():
+    conn = _FakeLiveConnection({}, "calitrans_qa_test", no_dbapi=True)
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_fails_closed_when_driver_raises():
+    conn = _FakeLiveConnection({}, "calitrans_qa_test", raise_on_get=True)
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_rejects_malformed_expected_identity():
+    conn = _FakeLiveConnection({"host": "localhost", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "not-a-valid-identity")
+
+
+def test_verify_live_identity_errors_never_leak_credentials():
+    conn = _FakeLiveConnection(
+        {"host": "db.example.test", "port": "5433", "dbname": "calitrans_qa_test", "user": "qa_user"},
+        "calitrans_qa_test",
+    )
+    with pytest.raises(sample_data.SafetyError) as exc_info:
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+    message = str(exc_info.value)
+    assert "qa_user" not in message
+    assert "password" not in message.lower()
+    assert "postgresql://" not in message
+    assert "@" not in message
+
+
+def test_verify_live_identity_still_checks_current_database_even_when_dsn_matches():
+    """DBAPI-reported params can match while the session is actually
+    pointed at a different live database (e.g. via SET search_path/a
+    connection-pool quirk) - current_database() must still be checked."""
+    conn = _FakeLiveConnection(
+        {"host": "localhost", "port": "5433", "dbname": "calitrans_qa_test"}, "some_other_live_database"
+    )
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+
+def test_verify_live_identity_never_queries_inet_server_functions():
+    """inet_server_addr()/inet_server_port() report PostgreSQL's own view
+    of the connection, which is wrong inside a container - they must never
+    be queried or presented as proof of the client-side endpoint."""
+    conn = _FakeLiveConnection({"host": "localhost", "port": "5433", "dbname": "calitrans_qa_test"}, "calitrans_qa_test")
+
+    sample_data._verify_live_identity(conn, "localhost:5433/calitrans_qa_test")
+
+    executed = " ".join(conn.executed_sql)
+    assert "inet_server_addr" not in executed
+    assert "inet_server_port" not in executed
+
+
+def test_parse_identity_round_trips_through_target_identity():
+    identity = sample_data.target_identity("postgresql://u:p@localhost:5433/calitrans_qa_test")
+    assert sample_data._parse_identity(identity) == ("localhost", 5433, "calitrans_qa_test")
+
+
+def test_parse_identity_handles_bracketed_ipv6_host():
+    identity = sample_data.target_identity("postgresql://u:p@[::1]:5433/calitrans_qa_test")
+    assert identity == "[::1]:5433/calitrans_qa_test"
+    assert sample_data._parse_identity(identity) == ("::1", 5433, "calitrans_qa_test")
+
+
+def test_parse_identity_allows_missing_port():
+    assert sample_data._parse_identity("localhost/calitrans_qa_test") == ("localhost", None, "calitrans_qa_test")
+
+
+@pytest.mark.parametrize("malformed", ["", "no-slash-at-all", "/missing-host", "localhost:notaport/db"])
+def test_parse_identity_rejects_malformed_input(malformed):
+    with pytest.raises(sample_data.SafetyError):
+        sample_data._parse_identity(malformed)
+
+
+def test_hosts_match_loopback_class_only():
+    assert sample_data._hosts_match("localhost", "127.0.0.1") is True
+    assert sample_data._hosts_match("localhost", "::1") is True
+    assert sample_data._hosts_match("127.0.0.1", "::1") is True
+    assert sample_data._hosts_match("localhost", "db.example.test") is False
+    assert sample_data._hosts_match("db.example.test", "db.other.test") is False

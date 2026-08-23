@@ -67,6 +67,10 @@ class Summary:
 def target_identity(database_url: str) -> str:
     url = make_url(database_url)
     host = (url.host or "local").lower()
+    if ":" in host:
+        # IPv6 literal (e.g. "::1") - bracket it so a trailing ":<port>" is
+        # unambiguous, matching standard host:port notation (RFC 3986).
+        host = f"[{host}]"
     port = f":{url.port}" if url.port else ""
     database = (url.database or "").strip("/")
     return f"{host}{port}/{database}"
@@ -140,12 +144,98 @@ def _tables(engine: Engine) -> set[str]:
     return set(inspect(engine).get_table_names())
 
 
+_IDENTITY_RE = re.compile(
+    r"^(?:\[(?P<v6host>[0-9a-fA-F:]+)\]|(?P<host>[^:/\[\]]+))(?::(?P<port>\d+))?/(?P<database>.+)$"
+)
+
+# The only host-normalization CTMS-013 permits: localhost/127.0.0.1/::1 are
+# treated as the same loopback class, and nothing else - see _hosts_match().
+_LOOPBACK_HOST_ALIASES = {"localhost", "127.0.0.1", "::1"}
+
+
+def _parse_identity(identity: str) -> tuple[str, int | None, str]:
+    """Parse target_identity()'s 'host[:port]/database' format (bracketed
+    host for IPv6, e.g. '[::1]:5433/db') back into structured components.
+    Raises SafetyError - never silently guesses - on anything that doesn't
+    unambiguously parse."""
+    match = _IDENTITY_RE.fullmatch((identity or "").strip())
+    if not match:
+        raise SafetyError("Approved identity could not be parsed as host[:port]/database.")
+    host = match.group("v6host") or match.group("host")
+    database = match.group("database")
+    if not host or not database:
+        raise SafetyError("Approved identity is missing a host or database name.")
+    port_str = match.group("port")
+    port = int(port_str) if port_str else None
+    return host.lower(), port, database
+
+
+def _hosts_match(expected_host: str, effective_host: str) -> bool:
+    expected = expected_host.strip().lower()
+    effective = effective_host.strip().lower()
+    if expected == effective:
+        return True
+    return expected in _LOOPBACK_HOST_ALIASES and effective in _LOOPBACK_HOST_ALIASES
+
+
 def _verify_live_identity(conn: Connection, expected_identity: str) -> None:
-    row = conn.execute(text("select current_database() as database_name, inet_server_addr()::text as server_addr")).mappings().one()
-    database_name = str(row["database_name"] or "").lower()
-    expected_database = expected_identity.rsplit("/", 1)[-1].lower()
-    if database_name != expected_database:
-        raise SafetyError(f"Connected database {database_name!r} does not match approved identity")
+    """Verify the DBAPI driver's own effective connection parameters -
+    never PostgreSQL's inet_server_addr()/inet_server_port(), which report
+    the server's view of the connection and are wrong inside a container
+    (a host-mapped port like 5433 is reported by the server as its
+    container-internal 5432) - match the approved identity, then
+    double-checks with current_database(). CTMS-013: the previous version
+    of this function queried inet_server_addr() but never used the
+    result, and never verified host or port at all - only database name.
+
+    Uses psycopg2's get_dsn_parameters(), the documented, credential-safe
+    libpq PQconninfo interface (never includes the password), reached via
+    SQLAlchemy's PoolProxiedConnection.dbapi_connection. If the active
+    driver connection doesn't expose this, fails closed rather than
+    silently skipping host/port verification.
+    """
+    expected_host, expected_port, expected_database = _parse_identity(expected_identity)
+
+    dbapi_connection = getattr(getattr(conn, "connection", None), "dbapi_connection", None)
+    get_dsn_parameters = getattr(dbapi_connection, "get_dsn_parameters", None)
+    if not callable(get_dsn_parameters):
+        raise SafetyError(
+            "The active database driver does not expose credential-safe effective "
+            "connection parameters. Refusing to claim exact live endpoint verification occurred."
+        )
+
+    try:
+        effective = get_dsn_parameters()
+    except Exception:
+        raise SafetyError("Could not read effective connection parameters from the active driver connection.") from None
+
+    effective_host = str(effective.get("host") or "").strip()
+    effective_port_raw = effective.get("port")
+    effective_database = str(effective.get("dbname") or "").strip()
+
+    if not effective_host or not effective_port_raw or not effective_database:
+        raise SafetyError("Effective connection parameters are incomplete. Refusing to proceed.")
+
+    try:
+        effective_port = int(effective_port_raw)
+    except (TypeError, ValueError):
+        raise SafetyError("Effective connection port could not be determined. Refusing to proceed.")
+
+    if not _hosts_match(expected_host, effective_host):
+        raise SafetyError(f"Connected host {effective_host!r} does not match the approved host {expected_host!r}.")
+    if expected_port is not None and effective_port != expected_port:
+        raise SafetyError(f"Connected client port {effective_port!r} does not match the approved port {expected_port!r}.")
+    if effective_database.lower() != expected_database.lower():
+        raise SafetyError(
+            f"Connected database {effective_database!r} does not match the approved database {expected_database!r}."
+        )
+
+    row = conn.execute(text("select current_database() as database_name")).mappings().one()
+    live_database_name = str(row["database_name"] or "").strip().lower()
+    if live_database_name != expected_database.lower():
+        raise SafetyError(
+            f"current_database() {live_database_name!r} does not match the approved database {expected_database!r}."
+        )
 
 
 def _upsert_named(conn: Connection, *, table: str, key_column: str, key_value: str, values: dict[str, Any]) -> tuple[int, bool]:
