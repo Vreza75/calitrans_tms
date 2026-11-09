@@ -52,6 +52,8 @@ DATABASE_DIR = REPO_ROOT / "database"
 #   worker_jobs_migration.sql                - independent, no FKs (Phase 7 durable worker job queue)
 #   load_query_indexes_migration.sql         - independent, no FKs (Phase 8 read-model indexes)
 #   domain_events_migration.sql              - independent, no FKs (Phase 9 durable realtime domain events)
+#   operations_ai_feedback_idempotency_migration.sql - ALTERs operations_ai_feedback
+#                                               (needs operations_email_workflow_migration.sql)
 MIGRATION_ORDER = [
     "schema.sql",
     "portpro_style_migration.sql",
@@ -73,6 +75,7 @@ MIGRATION_ORDER = [
     "worker_jobs_migration.sql",
     "load_query_indexes_migration.sql",
     "domain_events_migration.sql",
+    "operations_ai_feedback_idempotency_migration.sql",
 ]
 
 
