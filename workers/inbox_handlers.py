@@ -34,7 +34,7 @@ from typing import Any
 SYSTEM_ACTOR_INBOX_WORKER = "system:inbox-worker"
 
 
-def _fetch_failure_reason(diagnostics: dict) -> str:
+def _fetch_failure_reason(diagnostics: dict, *, fetched_count: int = 0) -> str:
     """Infrastructure-failure reason for a sync fetch, or "" when the fetch
     itself succeeded. Distinguishes "the inbox.sync job ran" from "a mailbox
     was actually retrieved" (the P2 observability gap): a job that logged
@@ -43,13 +43,19 @@ def _fetch_failure_reason(diagnostics: dict) -> str:
     worker job's status + sanitized last_error instead of a silently
     "completed" sync that fetched nothing.
 
+    - fetched_count > 0 -> messages came back, so a mailbox was unambiguously
+      retrieved; success regardless of per-account diagnostic flags.
     - accounts_attempted == 0 with errors -> no mailbox could even be
       attempted (unchanged behavior).
     - accounts_attempted == 0 with no errors -> nothing configured; left a
       no-op success, as before (not this change's concern).
-    - accounts_attempted > 0 but zero successful logins -> every attempted
-      mailbox login failed; now a failure (previously misreported success).
+    - accounts_attempted > 0, nothing fetched, and zero successful logins ->
+      every attempted mailbox login failed; now a failure (previously
+      misreported success).
     - at least one successful login -> success (an empty inbox is healthy)."""
+    if fetched_count > 0:
+        return ""
+
     errors = diagnostics.get("errors") or []
     accounts_attempted = int(diagnostics.get("accounts_attempted", 0) or 0)
     successful_logins = sum(
@@ -182,7 +188,7 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
         result["successful_logins"] = sum(
             1 for acct in (diagnostics.get("per_account") or []) if acct.get("login_success")
         )
-        result["error"] = _fetch_failure_reason(diagnostics)
+        result["error"] = _fetch_failure_reason(diagnostics, fetched_count=len(messages))
         result["fetched"] = len(messages)
         result["inbound_fetched"] = sum(
             1 for item in messages if safe_str(item.get("direction")).lower() != "outbound"

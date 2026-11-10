@@ -205,6 +205,14 @@ def test_fetch_failure_reason_distinguishes_job_run_from_mailbox_retrieval():
         }
     )
     assert reason and "login" in reason.lower()
+    # Messages fetched -> retrieval unambiguously happened, success even if the
+    # diagnostics flags are incomplete (a mailbox clearly answered).
+    assert (
+        _fetch_failure_reason(
+            {"accounts_attempted": 2, "errors": [], "per_account": []}, fetched_count=3
+        )
+        == ""
+    )
     # At least one login succeeded -> success even with a partial error.
     assert (
         _fetch_failure_reason(
