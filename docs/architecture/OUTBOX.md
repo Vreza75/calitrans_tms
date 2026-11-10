@@ -54,11 +54,11 @@ outbox_events
   aggregate_id     text        -- str(load_id)
   payload          jsonb       -- handler-specific, no secrets (see Security)
   idempotency_key  text unique -- see Idempotency
-  status           text        -- pending | processing | delivered | failed
+  status           text        -- pending | processing | delivered | failed | skipped
   attempt_count    integer
   available_at     timestamptz -- claimable once now() >= this
   created_at       timestamptz
-  processed_at     timestamptz -- set on delivered
+  processed_at     timestamptz -- set on delivered or skipped
   last_error       text        -- sanitized, see Security
   actor            text        -- who triggered the originating command
 ```
@@ -192,6 +192,27 @@ Bounded, exponential, capped (`services/outbox_processor.py`):
 - Backoff: `30s * 2^attempt_count`, capped at `3600s` (1 hour) -
   30s, 60s, 120s, 240s, capped from there. Not a full scheduler; just
   enough to avoid hammering a provider that's already failing.
+
+## Feature gate: SMS_ENABLED (terminal `skipped`)
+
+Outbound driver SMS is gated by the `SMS_ENABLED` secret/env (default
+**false** - `services/driver_sms_service.py::sms_enabled`, mirroring
+`REALTIME_ENABLED`). When off, `_handle_driver_dispatch_sms` raises
+`SkipEvent("SMS disabled")` **before importing or calling Twilio**, and
+`process_one` marks the event terminally `'skipped'` (`outbox_repo.mark_skipped`):
+
+- **No Twilio call, no retry.** `'skipped'` is terminal, not `'failed'`, so
+  the CLI/workflow run stays green (`scripts/process_outbox.py` only counts
+  `'failed'`).
+- **Re-enabling never resends old events.** Because `'skipped'` is terminal
+  (not `'pending'`), `claim_next_pending` never picks it up again - events
+  enqueued while SMS was off stay skipped forever. Turning `SMS_ENABLED` on
+  only affects newly-enqueued events.
+- **UI.** `application/loads/commands.py::mark_load_ready_to_dispatch` still
+  enqueues the event (audit + atomicity) but returns `sms_status="disabled"`,
+  so the dispatcher UI shows "SMS off: notify the driver manually" instead of
+  a queued/sent status. The projected `dispatch_messages.delivery_status`
+  becomes `'skipped'`.
 
 ## Idempotency
 

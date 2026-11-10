@@ -826,7 +826,12 @@ def _render_ready_to_dispatch_panel(
                 st.session_state.pop("orders_management_selected_row_id", None)
                 st.session_state.pop("orders_management_selected_context", None)
                 refresh_data()
-                st.success(f"Load marked Ready to Dispatch. Text to {driver_name} is queued for delivery.")
+                if result.sms_status == "disabled":
+                    st.success(
+                        f"Load marked Ready to Dispatch. SMS off: notify {driver_name} manually."
+                    )
+                else:
+                    st.success(f"Load marked Ready to Dispatch. Text to {driver_name} is queued for delivery.")
                 st.rerun()
             else:
                 st.error(f"Could not queue the text — no changes were made. {result.reason}")

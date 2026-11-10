@@ -63,6 +63,20 @@ _MAX_BACKOFF_SECONDS = 3600
 RECLAIM_STALE_AFTER = timedelta(minutes=10)
 
 
+class SkipEvent(Exception):
+    """Raised by a handler to mark its event terminally 'skipped' - the side
+    effect was deliberately not performed (e.g. SMS globally disabled), which
+    is neither success (nothing was delivered) nor failure (nothing went
+    wrong, no retry wanted). process_one catches this before the generic
+    exception path and calls outbox_repo.mark_skipped - a terminal state, so
+    re-enabling the feature later never re-delivers events created while it
+    was off."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _backoff_for(attempt_count: int) -> timedelta:
     """Exponential backoff, capped - not a full scheduler, just enough to
     avoid hammering a provider that's already failing (30s, 60s, 120s,
@@ -76,7 +90,17 @@ def _handle_driver_dispatch_sms(payload: dict[str, Any]) -> tuple[bool, str | No
     event type (application/loads/commands.py::
     mark_load_ready_to_dispatch). Returns (success, provider_message_id,
     error) - error is "" on success, never None, so callers can always
-    str() it safely."""
+    str() it safely.
+
+    If SMS is globally disabled (SMS_ENABLED false - the default), this raises
+    SkipEvent BEFORE importing or calling the Twilio-backed send_sms, so no
+    external request is ever made; process_one then marks the event terminally
+    'skipped' with no retry."""
+    from services.driver_sms_service import sms_enabled
+
+    if not sms_enabled():
+        raise SkipEvent("SMS disabled")
+
     from services.driver_sms_service import send_sms
 
     sent, sid_or_error = send_sms(payload["to"], payload["message"])
@@ -126,7 +150,12 @@ def _project_dispatch_message_status(
 
     from services.dispatch_data_service import update_dispatch_message_delivery
 
-    delivery_status = {"delivered": "delivered", "retrying": "pending_delivery", "failed": "failed"}[outcome]
+    delivery_status = {
+        "delivered": "delivered",
+        "retrying": "pending_delivery",
+        "failed": "failed",
+        "skipped": "skipped",
+    }[outcome]
     update_dispatch_message_delivery(
         int(dispatch_message_id), conn=conn, delivery_status=delivery_status, provider_message_id=provider_message_id
     )
@@ -231,6 +260,15 @@ def process_one() -> dict[str, Any] | None:
         # write to outbox_events.last_error goes through this one choke
         # point regardless of which path produced the error text.
         error = sanitize_message(error) if error else error
+    except SkipEvent as skip:
+        # Terminal, deliberate non-delivery (e.g. SMS globally disabled) -
+        # NOT a failure, NOT retried, and the run stays green (the CLI only
+        # counts 'failed'). Still project the status/realtime so the UI shows
+        # the event as skipped rather than stuck pending_delivery.
+        with transaction() as conn:
+            outbox_repo.mark_skipped(conn, event["id"], reason=skip.reason)
+            _project_delivery_status(conn, event["event_type"], payload, "skipped", None, event["attempt_count"])
+        return {"id": event["id"], "event_type": event["event_type"], "outcome": "skipped", "error": skip.reason}
     except Exception as exc:  # noqa: BLE001 - a handler bug must not crash the whole processor loop
         success, provider_message_id, error = False, None, sanitize_exception_message(exc)
 

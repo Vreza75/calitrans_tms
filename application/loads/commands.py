@@ -426,4 +426,12 @@ def mark_load_ready_to_dispatch(
             metadata={"load_id": load_id, "dispatch_message_id": dispatch_message_id},
         )
 
-    return ReadyToDispatchResult(ok=True, load_id=load_id, status="Ready to Dispatch", sms_status="queued")
+    # The outbox event is always enqueued (audit trail + atomic with the
+    # business write); whether it will actually be sent depends on the global
+    # SMS switch. Report "disabled" so the UI tells the dispatcher to notify
+    # the driver manually instead of implying a text is on its way - the
+    # processor will terminally skip the event (services/outbox_processor.py).
+    from services.driver_sms_service import sms_enabled
+
+    sms_status = "queued" if sms_enabled() else "disabled"
+    return ReadyToDispatchResult(ok=True, load_id=load_id, status="Ready to Dispatch", sms_status=sms_status)
