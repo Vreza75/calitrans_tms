@@ -68,6 +68,78 @@ two concurrent invocations claim different rows, never the same one
 exists only to avoid wasting Actions minutes on a genuinely overlapping
 run, not to prevent a correctness problem.
 
+### Scheduled inbox.sync producer (unattended sync)
+
+The process-jobs workflow's first step runs `python scripts/
+enqueue_inbox_sync.py enqueue` (needs only `DATABASE_URL`), which calls
+`application/inbox/commands.py::request_scheduled_inbox_sync`. This is the
+unattended counterpart of the dispatcher's "Sync Email Engine" button: it
+enqueues the **same** `inbox.sync` job and reuses the entire existing
+fetch/dedupe/process/retry pipeline unchanged - it does not fetch mail,
+send email, create loads, or change assignments.
+
+- **System identity, not a dispatcher.** It runs under the narrowly scoped
+  actor `system:inbox-scheduler` and never calls `require_permission` -
+  there is no human in the loop to authorize. `request_inbox_sync`'s
+  `Permission.WORK_ITEM_MANAGE` boundary on the interactive path is
+  untouched.
+- **No duplicates, future runs still allowed.** Three guards, all reported as
+  `status="skipped"` (never a misleading "queued"):
+  - *Concurrent producers* (`worker_job_repo.try_acquire_mailbox_sync_lock`):
+    a transaction-scoped PostgreSQL advisory lock keyed by the mailbox, taken
+    before the read-then-write guards below. Two producers racing across an
+    interval boundary would otherwise each see no active job and no existing
+    key (neither insert committed yet) and enqueue two different-bucket jobs
+    that are both active at once - which the per-key unique index cannot
+    prevent, since the two keys differ. The lock is non-blocking (the losing
+    producer skips, it does not wait) and auto-released at transaction end, so
+    it never leaks on a crash and never interferes with stale-job reclaim.
+  - *Overlap* (`worker_job_repo.has_active_job`): skip whenever an
+    `inbox.sync` is already pending or processing, so a slow fetch never
+    accumulates a backlog of redundant syncs.
+  - *Same interval* (`worker_job_repo.job_exists_for_idempotency_key`): the
+    idempotency key is bucketed by `INBOX_SYNC_INTERVAL_MINUTES` (default 5);
+    if a job for the current window already exists in any status (including a
+    completed/failed one this interval), skip. This is checked explicitly
+    rather than relying on `enqueue_job`'s `ON CONFLICT (idempotency_key) DO
+    UPDATE`, which is a deliberate no-op (re-sets the key to itself, returns
+    the existing row's id, and **never reverts a completed/failed job to
+    pending**) and would otherwise be reported as a fresh enqueue.
+
+  The next interval gets a genuinely new job. A worker crash that leaves a
+  job stuck `processing` does not block syncing forever: `process_pending`
+  reclaims stale `processing` jobs (`RECLAIM_STALE_AFTER`, 15 min) back to
+  `pending` and runs them, after which the next interval enqueues normally.
+  Downstream, `inbox.process_message:<provider-message-id>` +
+  `operations_email_already_imported` still prevent any duplicate
+  `order_intake` row even if two syncs overlap.
+- **Failure-isolated.** The producer step is `continue-on-error: true`, so a
+  producer hiccup never blocks SMS/document/realtime processing; the final
+  gate step still surfaces its outcome for visibility.
+- **Cadence.** The polling frequency is the GitHub Actions cron
+  (`*/5 * * * *` - every 5 minutes); that is what decides how often a sync is
+  attempted. `INBOX_SYNC_INTERVAL_MINUTES` (default 5) is **not** the
+  frequency - it only sets the width of the enqueue-dedup bucket. Set above 5,
+  some 5-minute fires fall in the same bucket and are skipped (sync happens
+  less often than the cron fires); set at or below 5, it is a no-op relative
+  to the cron (each fire is already a fresh bucket). **To sync more often than
+  every 5 minutes you must change the cron itself** - this value cannot make
+  the producer fire faster than it is scheduled.
+- **Observability.** `python scripts/enqueue_inbox_sync.py status`
+  (`application/inbox/queries.py::get_inbox_sync_health`) reports last
+  successful sync, last run duration, per-status backlog, and the most recent
+  (already-sanitized) failure. Note that a **completed** `inbox.sync` means
+  the fetch job ran and logged into at least one mailbox - not that any new
+  mail existed. A total authentication/connectivity failure (zero successful
+  mailbox logins) now fails the job rather than completing silently
+  (`workers/inbox_handlers.py::_fetch_failure_reason`), so a broken Yahoo app
+  password surfaces as `failed` + a sanitized `last_error` in this health
+  view. Per-message/partial fetch errors are still counted, not failed (the
+  fetch continues), and are not individually persisted - persisting fetch
+  diagnostics (fetched/enqueued/errors per run) would be the next useful
+  health step, deferred as it needs a storage change, not a monitoring
+  platform.
+
 ## Worker loop (per invocation)
 
 ```text

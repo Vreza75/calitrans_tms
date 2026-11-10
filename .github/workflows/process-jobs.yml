@@ -55,6 +55,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Scheduled producer for unattended email sync: enqueues one inbox.sync
+      # job (idempotent + overlap-guarded - see application/inbox/commands.py
+      # ::request_scheduled_inbox_sync) so the Process step below has something
+      # to drain without a dispatcher pressing "Sync Email Engine". Needs only
+      # DATABASE_URL - it does not fetch mail (the worker-jobs step does, with
+      # the mailbox secrets). continue-on-error so a producer hiccup never
+      # blocks SMS/document/realtime processing. Effective cadence is
+      # configurable via the INBOX_SYNC_INTERVAL_MINUTES secret (default 5),
+      # independent of this cron.
+      - name: Enqueue scheduled inbox.sync
+        id: enqueue_inbox_sync
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          INBOX_SYNC_INTERVAL_MINUTES: ${{ secrets.INBOX_SYNC_INTERVAL_MINUTES }}
+        run: python scripts/enqueue_inbox_sync.py enqueue
+
       - name: Process worker jobs (inbox.sync, inbox.process_message, ...)
         id: worker_jobs
         continue-on-error: true
@@ -99,8 +116,9 @@ jobs:
         run: python scripts/process_realtime_events.py process
 
       - name: Fail the run if any subsystem terminally failed a job/event this run
-        if: steps.worker_jobs.outcome == 'failure' || steps.outbox.outcome == 'failure' || steps.realtime_events.outcome == 'failure'
+        if: steps.enqueue_inbox_sync.outcome == 'failure' || steps.worker_jobs.outcome == 'failure' || steps.outbox.outcome == 'failure' || steps.realtime_events.outcome == 'failure'
         run: |
+          echo "enqueue_inbox_sync step outcome: ${{ steps.enqueue_inbox_sync.outcome }}"
           echo "worker_jobs step outcome: ${{ steps.worker_jobs.outcome }}"
           echo "outbox step outcome: ${{ steps.outbox.outcome }}"
           echo "realtime_events step outcome: ${{ steps.realtime_events.outcome }}"

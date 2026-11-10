@@ -269,3 +269,108 @@ def retry_all_failed(conn: Connection, *, reset_attempts: bool = False) -> int:
         sql = "update worker_jobs set status='pending', available_at=now() where status='failed'"
     result = conn.execute(text(sql))
     return result.rowcount or 0
+
+
+def has_active_job(conn: Connection, job_type: str) -> bool:
+    """True if a job of this type is currently 'pending' or 'processing'
+    (not yet terminal). The scheduled inbox.sync producer
+    (application/inbox/commands.py::request_scheduled_inbox_sync) uses this
+    to avoid stacking a new sync on top of one still queued or mid-fetch -
+    overlap prevention, distinct from the idempotency-key window (which only
+    collapses same-bucket re-enqueues, not a slow-processing backlog).
+    Read-only: no claim, no mutation."""
+    row = conn.execute(
+        text(
+            "select 1 from worker_jobs "
+            "where job_type = :job_type and status in ('pending', 'processing') limit 1"
+        ),
+        {"job_type": job_type},
+    ).first()
+    return row is not None
+
+
+def try_acquire_mailbox_sync_lock(conn: Connection, lock_name: str) -> bool:
+    """Acquire a transaction-scoped PostgreSQL advisory lock keyed by
+    `lock_name`; return True if acquired, False if another session already
+    holds it. Used by application/inbox/commands.py::request_scheduled_inbox_sync
+    to serialize concurrent scheduled producers.
+
+    Without it, two producers racing across an interval boundary could each
+    pass has_active_job + job_exists_for_idempotency_key (neither's INSERT
+    committed yet) and enqueue two different-bucket inbox.sync jobs that are
+    both active at once - the one guarantee the per-key unique index cannot
+    give, since the two keys differ. pg_try_advisory_xact_lock is
+    non-blocking (the losing producer skips rather than waits and holds a
+    connection) and auto-releases at transaction end, so it cannot leak the
+    lock on a crash or interfere with stale-job reclaim.
+
+    PostgreSQL-only, like claim_next_job's FOR UPDATE SKIP LOCKED; the unit
+    tests that exercise the command mock this out."""
+    return bool(
+        conn.execute(
+            text("select pg_try_advisory_xact_lock(hashtext(:lock_name))"),
+            {"lock_name": lock_name},
+        ).scalar()
+    )
+
+
+def job_exists_for_idempotency_key(conn: Connection, idempotency_key: str) -> bool:
+    """True if a worker_jobs row already carries this idempotency_key, in
+    ANY status (pending/processing/completed/failed). The scheduled
+    inbox.sync producer uses this to report an honest "skipped" when a job
+    for the current interval window already exists, instead of routing a
+    same-window repeat through enqueue_job - whose ON CONFLICT (idempotency_key)
+    DO UPDATE is a deliberate no-op (it re-sets the key to its own value and
+    returns the existing row's id without ever reverting a completed/failed
+    job to pending), which would otherwise be misreported as a fresh
+    "queued" enqueue. Read-only."""
+    row = conn.execute(
+        text("select 1 from worker_jobs where idempotency_key = :key limit 1"),
+        {"key": idempotency_key},
+    ).first()
+    return row is not None
+
+
+def get_job_type_health(conn: Connection, job_type: str) -> dict[str, Any]:
+    """Sanitized health snapshot for one job_type: per-status backlog, the
+    last successful completion and that run's processing duration, and the
+    most recent failure's already-sanitized last_error (workers/processor.py
+    sanitizes before persisting last_error - this never exposes raw SQL,
+    credentials, or message bodies). Read-only."""
+    counts = conn.execute(
+        text("select status, count(*) as n from worker_jobs where job_type = :job_type group by status"),
+        {"job_type": job_type},
+    ).mappings().all()
+    by_status = {row["status"]: int(row["n"]) for row in counts}
+
+    last_success = conn.execute(
+        text(
+            "select completed_at, extract(epoch from (completed_at - claimed_at)) as duration_seconds "
+            "from worker_jobs where job_type = :job_type and status = 'completed' "
+            "order by completed_at desc nulls last limit 1"
+        ),
+        {"job_type": job_type},
+    ).mappings().first()
+
+    last_failure = conn.execute(
+        text(
+            "select last_error from worker_jobs "
+            "where job_type = :job_type and status = 'failed' order by id desc limit 1"
+        ),
+        {"job_type": job_type},
+    ).mappings().first()
+
+    return {
+        "job_type": job_type,
+        "pending": by_status.get("pending", 0),
+        "processing": by_status.get("processing", 0),
+        "completed": by_status.get("completed", 0),
+        "failed": by_status.get("failed", 0),
+        "last_success_at": last_success["completed_at"] if last_success else None,
+        "last_duration_seconds": (
+            float(last_success["duration_seconds"])
+            if last_success and last_success["duration_seconds"] is not None
+            else None
+        ),
+        "last_error": last_failure["last_error"] if last_failure else None,
+    }
