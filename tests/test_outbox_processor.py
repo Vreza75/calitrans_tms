@@ -10,7 +10,19 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
 from services import outbox_processor
+
+
+@pytest.fixture(autouse=True)
+def _enable_sms(monkeypatch):
+    """These tests exercise the driver_dispatch_sms delivery/retry/failure
+    mechanics, which only run when SMS is enabled. SMS_ENABLED now defaults
+    off (see services/driver_sms_service.sms_enabled + test_sms_enabled_gate.py
+    for the disabled-skip behavior), so enable it here to keep testing the
+    delivery pipeline rather than the skip path."""
+    monkeypatch.setattr("services.driver_sms_service.sms_enabled", lambda: True)
 
 
 def _fake_transaction(conn):

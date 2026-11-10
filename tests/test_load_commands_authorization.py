@@ -222,7 +222,7 @@ def test_mark_ready_to_dispatch_succeeds_and_queues_sms_without_sending_it(mock_
         "services.dispatch_data_service._insert_dispatch_message", return_value=99
     ) as insert_msg, mock.patch("repositories.outbox_repo.enqueue_outbox_event") as enqueue_event, mock.patch(
         "services.driver_sms_service.send_sms"
-    ) as send_sms:
+    ) as send_sms, mock.patch("services.driver_sms_service.sms_enabled", return_value=True):
         transaction.return_value.__enter__.return_value = conn
         result = commands.mark_load_ready_to_dispatch(
             actor=DISPATCHER,

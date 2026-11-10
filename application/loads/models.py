@@ -50,8 +50,11 @@ class ReadyToDispatchResult:
     is now enqueued to the transactional outbox (services/
     outbox_processor.py delivers it asynchronously), so this command can
     no longer truthfully report "sent" by the time it returns. Values:
-    "queued" on success, "" when ok is False (invalid phone/unauthorized -
-    nothing was enqueued)."""
+    "queued" on success when SMS is enabled; "disabled" on success when SMS
+    is globally off (SMS_ENABLED false - the event is still enqueued for audit
+    but the processor will terminally skip it, so the UI tells the dispatcher
+    to notify the driver manually); "" when ok is False (invalid phone/
+    unauthorized - nothing was enqueued)."""
 
     ok: bool
     load_id: int

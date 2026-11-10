@@ -7,6 +7,20 @@ from config import get_secret
 TWILIO_API_BASE = "https://api.twilio.com/2010-04-01"
 
 
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def sms_enabled() -> bool:
+    """Master switch for outbound driver SMS. Default OFF (SMS_ENABLED unset
+    -> False) so a deployment without Twilio provisioned never attempts a
+    send. Mirrors realtime/publisher.py's REALTIME_ENABLED gate. When this
+    is False, services/outbox_processor.py terminally skips driver_dispatch_sms
+    events (no Twilio call, no retry) and application/loads/commands.py tells
+    the dispatcher to notify the driver manually - see docs/architecture/OUTBOX.md."""
+    return _truthy(get_secret("SMS_ENABLED", "false"))
+
+
 def format_phone_e164(phone) -> str | None:
     """Normalize a free-text US/Canada phone number to +1XXXXXXXXXX.
 

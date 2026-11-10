@@ -171,6 +171,28 @@ def mark_retry(conn: Connection, event_id: int, *, error: str, delay: timedelta)
     )
 
 
+def mark_skipped(conn: Connection, event_id: int, *, reason: str) -> None:
+    """Terminal 'skipped' state - the event was deliberately not delivered
+    (e.g. SMS globally disabled, see services/outbox_processor.py), not
+    attempted-and-failed. Distinct from 'failed': it is not an error, needs
+    no operator action, and is never retried by the processor. Crucially,
+    because it is terminal (not 'pending'), re-enabling the side effect later
+    never causes the processor to pick this event back up - events created
+    while the feature was off stay skipped forever. attempt_count is left
+    unchanged (no delivery was attempted). `reason` is a fixed internal
+    string, not external/provider text."""
+    conn.execute(
+        text(
+            """
+            update outbox_events
+            set status = 'skipped', processed_at = now(), claimed_at = null, last_error = :reason
+            where id = :id
+            """
+        ),
+        {"id": event_id, "reason": reason},
+    )
+
+
 def mark_failed(conn: Connection, event_id: int, *, error: str) -> None:
     """Terminal state - attempt_count reached the processor's configured
     max. Requires an operator to look at last_error and decide (resend
