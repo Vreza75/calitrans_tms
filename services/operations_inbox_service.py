@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from contextlib import nullcontext
@@ -18,6 +19,7 @@ from sqlalchemy.engine import Connection
 import services.operations_attachment_service as attachment_service
 
 from db_client import execute, read_df, require_schema_ready, transaction
+from utils.error_sanitizer import sanitize_exception_message
 from services.email_parser import (
     _append_note,
     detect_container_quantity_mismatch,
@@ -130,6 +132,9 @@ except Exception:
 # ============================================================
 # Basic helpers
 # ============================================================
+
+logger = logging.getLogger(__name__)
+
 
 def safe_str(value: Any) -> str:
     value_str = str(value or "").strip()
@@ -6056,13 +6061,155 @@ def _save_load_communication(
     execute(str(sql), params)
 
 
-def _save_operations_ai_feedback(**kwargs) -> None:
+def ensure_operations_ai_feedback_table() -> None:
+    """Verify the operations_ai_feedback table and its idempotency column are
+    present. The table itself is owned by
+    database/operations_email_workflow_migration.sql and the idempotency
+    column by database/operations_ai_feedback_idempotency_migration.sql -
+    this never runs DDL (migrations do), it only raises an actionable
+    SchemaNotReadyError if the responsible migration has not been applied,
+    matching ensure_operations_fast_triage_schema's require_schema_ready
+    pattern."""
+    require_schema_ready(
+        "operations_ai_feedback",
+        "idempotency_key",
+        migration_hint="database/operations_ai_feedback_idempotency_migration.sql",
+    )
+
+
+def _operations_ai_feedback_idempotency_key(
+    *,
+    intake_id: Any,
+    correction_type: str,
+    final_request_type: str,
+    final_action_required: str,
+    final_reply_body: str,
+    source_subject: str,
+) -> str:
+    """Deterministic dedupe key for one dispatcher correction. A Streamlit
+    rerun or an accidental double-click submits byte-identical inputs and so
+    produces the same key (deduped by the unique index); a genuinely
+    different edit (different final reply/request/action) produces a
+    different key and is correctly recorded as a new correction. Whitespace
+    in free-text fields is normalized so cosmetic reflow is not treated as a
+    new correction."""
+    parts = [
+        str(int_or_none(intake_id) if intake_id is not None else ""),
+        safe_str(correction_type).lower(),
+        safe_str(final_request_type).lower(),
+        safe_str(final_action_required).lower(),
+        " ".join(safe_str(final_reply_body).split()),
+        " ".join(safe_str(source_subject).split()),
+    ]
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    return f"opsfb:{digest}"
+
+
+def save_operations_ai_feedback(
+    *,
+    intake_id: Any = None,
+    load_id: Any = None,
+    source_subject: str = "",
+    source_sender: str = "",
+    ai_suggestion: dict | None = None,
+    final_request_type: str = "",
+    final_action_required: str = "",
+    final_reply_body: str = "",
+    correction_type: str = "",
+    feedback_notes: str = "",
+    created_by: str = "dispatcher",
+) -> None:
+    """Canonical writer for operations_ai_feedback - persists one dispatcher
+    acceptance/correction of an AI suggestion so recent_operations_ai_feedback_examples
+    can feed it back into generate_operations_ai_suggestion's prompt.
+
+    Parameterized (no string interpolation of values) and idempotent: the
+    INSERT is keyed on a deterministic idempotency_key with ON CONFLICT DO
+    NOTHING, so the manual Email Action Center (reply_accepted/reply_edited)
+    and the bulk cleanup path (bulk_rule_archive) can both re-fire safely.
+
+    The AI-side columns are extracted from the normalized suggestion dict
+    (services.operations_ai._normalize_suggestion's shape); for paths with no
+    suggestion (ai_suggestion=None) they are stored NULL. This is the single
+    implementation - services.operational_ai_feedback_service delegates here,
+    and _save_operations_ai_feedback wraps it with failure isolation."""
+    suggestion = ai_suggestion or {}
     try:
-        from services.operational_ai_feedback_service import save_operations_ai_feedback
+        ai_confidence_score = (
+            int(suggestion["confidence_score"])
+            if suggestion.get("confidence_score") is not None
+            else None
+        )
+    except (TypeError, ValueError, KeyError):
+        ai_confidence_score = None
+
+    params = {
+        "intake_id": int_or_none(intake_id),
+        "load_id": int_or_none(load_id),
+        "source_subject": safe_str(source_subject) or None,
+        "source_sender": safe_str(source_sender) or None,
+        "ai_request_type": safe_str(suggestion.get("request_type")) or None,
+        "final_request_type": safe_str(final_request_type) or None,
+        "ai_confidence_score": ai_confidence_score,
+        "ai_priority": safe_str(suggestion.get("priority")) or None,
+        "ai_action_required": safe_str(suggestion.get("action_required")) or None,
+        "final_action_required": safe_str(final_action_required) or None,
+        "ai_reply_body": safe_str(suggestion.get("reply_body")) or None,
+        "final_reply_body": safe_str(final_reply_body) or None,
+        "correction_type": safe_str(correction_type) or "unspecified",
+        "feedback_notes": safe_str(feedback_notes) or None,
+        "created_by": safe_str(created_by) or "dispatcher",
+        "idempotency_key": _operations_ai_feedback_idempotency_key(
+            intake_id=intake_id,
+            correction_type=correction_type,
+            final_request_type=final_request_type,
+            final_action_required=final_action_required,
+            final_reply_body=final_reply_body,
+            source_subject=source_subject,
+        ),
+    }
+
+    execute(
+        """
+        insert into operations_ai_feedback (
+            intake_id, load_id, source_subject, source_sender,
+            ai_request_type, final_request_type,
+            ai_confidence_score, ai_priority,
+            ai_action_required, final_action_required,
+            ai_reply_body, final_reply_body,
+            correction_type, feedback_notes, created_by, idempotency_key
+        ) values (
+            :intake_id, :load_id, :source_subject, :source_sender,
+            :ai_request_type, :final_request_type,
+            :ai_confidence_score, :ai_priority,
+            :ai_action_required, :final_action_required,
+            :ai_reply_body, :final_reply_body,
+            :correction_type, :feedback_notes, :created_by, :idempotency_key
+        )
+        on conflict (idempotency_key) do nothing
+        """,
+        params,
+    )
+
+
+def _save_operations_ai_feedback(**kwargs) -> None:
+    """Failure-isolated wrapper used by the Streamlit page/in-module call
+    sites: dispatcher feedback persistence must never block the send/dispatch
+    workflow. Delegates to the canonical save_operations_ai_feedback and, on
+    failure, logs a sanitized error (never raw SQL, credentials, or message
+    bodies) instead of silently swallowing it - the previous bare
+    `except: pass` hid the fact that no row was ever written."""
+    try:
         save_operations_ai_feedback(**kwargs)
-    except Exception:
-        # Feedback should never block dispatch workflow.
-        pass
+    except Exception as exc:  # noqa: BLE001 - feedback persistence must not break dispatch
+        logger.warning(
+            "operations_ai_feedback persistence failed (%s); dispatcher workflow continues",
+            sanitize_exception_message(exc),
+            extra={
+                "intake_id": kwargs.get("intake_id"),
+                "correction_type": kwargs.get("correction_type"),
+            },
+        )
 
 
 try:
