@@ -62,9 +62,23 @@ caller had actually set it themselves.
 """
 import os
 
+import pytest
+
 
 def _blocked_secret_lookup(name: str) -> str | None:
     return None
+
+
+@pytest.fixture(autouse=True)
+def _enable_email_load_creation_for_tests(monkeypatch):
+    """Email-driven load creation defaults OFF in production (the learning-phase
+    switch EMAIL_LOAD_CREATION_ENABLED, see
+    services/operations_inbox_service.py::email_load_creation_enabled). The
+    existing suite exercises the load-creation mechanics and assumes they run,
+    so enable the switch by default for tests; the dedicated gate tests
+    (tests/test_email_load_creation_gate.py) override this to assert the
+    disabled behavior."""
+    monkeypatch.setenv("EMAIL_LOAD_CREATION_ENABLED", "true")
 
 
 def pytest_configure(config) -> None:

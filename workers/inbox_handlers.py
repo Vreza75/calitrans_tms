@@ -22,8 +22,11 @@ calls it (see below); the two paths are now independent, and neither's
 behavior depends on the other.
 """
 
+import logging
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Recorded as the `actor` on inbox.process_message jobs enqueued by the
 # worker itself - Phase 7 STEP 22: background processing is system
@@ -201,11 +204,20 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
         existing_lookup = load_existing_operations_email_lookup(limit=lookup_limit)
         enqueue_deadline = compute_insert_loop_deadline(deadline, time.perf_counter())
 
+        # Per-mailbox skip/queue tallies, keyed by the sanitized alias carried
+        # on each message's `mailbox` field - used for the per-mailbox log
+        # lines emitted after the loop (see _log_per_mailbox_sync).
+        per_mailbox_counts: dict[str, dict[str, int]] = {}
+
+        def _bump(alias: str, key: str) -> None:
+            per_mailbox_counts.setdefault(alias, {"skipped": 0, "queued": 0})[key] += 1
+
         for message in messages:
             subject = safe_str(message.get("subject")) or "(no subject)"
             sender = safe_str(message.get("from")) or safe_str(message.get("sender")) or "(unknown sender)"
             received_at = safe_str(message.get("received_at")) or None
             message_id = _email_sync_unique_message_id(message)
+            alias = email_client.operations_mailbox_alias(message.get("mailbox"))
 
             if time.perf_counter() >= enqueue_deadline:
                 result["stopped_early"] = True
@@ -218,6 +230,7 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                 message_id, subject=subject, sender=sender, received_at=received_at, lookup=existing_lookup
             ):
                 result["skipped"] += 1
+                _bump(alias, "skipped")
                 continue
 
             try:
@@ -240,6 +253,7 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                         actor=SYSTEM_ACTOR_INBOX_WORKER,
                     )
                 result["enqueued"] += 1
+                _bump(alias, "queued")
                 existing_lookup.setdefault("by_message_id", {})[message_id.lower()] = {
                     "source_message_id": message_id
                 }
@@ -247,11 +261,37 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                 result["errors"] += 1
                 result["error_messages"].append(f"{subject[:80]}: enqueue failed: {exc}")
 
+        _log_per_mailbox_sync(diagnostics, per_mailbox_counts)
+
     except Exception as exc:
         result["error"] = str(exc)
 
     result["elapsed_seconds"] = round(time.perf_counter() - started, 2)
     return result
+
+
+def _log_per_mailbox_sync(diagnostics: dict, per_mailbox_counts: dict[str, dict[str, int]]) -> None:
+    """One sanitized log line per mailbox: alias, login ok/failed (error type
+    only), messages found, skipped-as-already-imported, and jobs queued.
+    Never logs an address, subject, body, or password - only the role alias,
+    a boolean-ish login state, an exception class name, and integer counts."""
+    from services import email_client
+
+    for account in diagnostics.get("per_account") or []:
+        alias = email_client.operations_mailbox_alias(account.get("email"))
+        counts = per_mailbox_counts.get(alias, {})
+        login_ok = bool(account.get("login_success"))
+        error_type = "" if login_ok else (str(account.get("error_type") or "") or "unknown")
+        found = int(account.get("messages_found") or account.get("messages_fetched") or 0)
+        logger.info(
+            "inbox.sync mailbox=%s login=%s error_type=%s found=%d skipped_already_imported=%d jobs_queued=%d",
+            alias,
+            "ok" if login_ok else "failed",
+            error_type,
+            found,
+            int(counts.get("skipped", 0)),
+            int(counts.get("queued", 0)),
+        )
 
 
 def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:

@@ -1742,6 +1742,28 @@ def update_intake_classification(
     )
 
 
+EMAIL_LOAD_CREATION_DISABLED_MESSAGE = "Load creation from email is disabled during the learning phase"
+
+
+def email_load_creation_enabled() -> bool:
+    """Learning-phase switch for creating loads FROM EMAIL. Default OFF
+    (EMAIL_LOAD_CREATION_ENABLED unset -> False): while the system is still
+    being tuned against historical mail, email-driven load creation is
+    refused so the AI/parsing pipeline can be observed without mutating
+    operational records. Manual, non-email load entry (create_load_from_intake
+    and the dispatch/orders paths) is unaffected - only create_load_from_inbox_item
+    and application/loads/commands.py::create_load_from_work_item consult this."""
+    from config import get_secret
+
+    return str(get_secret("EMAIL_LOAD_CREATION_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
 def create_load_from_inbox_item(
     work_item_id: int,
     approved_fields: dict[str, Any],
@@ -1776,6 +1798,13 @@ def create_load_from_inbox_item(
     stays outside this transaction, unchanged from its prior own-commit
     behavior - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md, "Known
     limitations" for the remaining scope."""
+    if not email_load_creation_enabled():
+        # Learning-phase guard: refuse before any read/write. This is the one
+        # chokepoint for every email-driven load creation (work-item command,
+        # multi-container children, the Operations Inbox page), so no
+        # email-sourced load is created while the switch is off.
+        raise PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
+
     review_status_sql = text(
         """
         update order_intake
