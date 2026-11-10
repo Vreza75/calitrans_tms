@@ -83,14 +83,27 @@ send email, create loads, or change assignments.
   there is no human in the loop to authorize. `request_inbox_sync`'s
   `Permission.WORK_ITEM_MANAGE` boundary on the interactive path is
   untouched.
-- **No duplicates, future runs still allowed.** The idempotency key is
-  bucketed by `INBOX_SYNC_INTERVAL_MINUTES` (default 5), so repeated fires
-  inside one interval collapse to one job while the next interval gets a
-  fresh job. An overlap guard (`worker_job_repo.has_active_job`) additionally
-  skips enqueueing whenever an `inbox.sync` is already pending or processing,
-  so a slow fetch never accumulates a backlog of redundant syncs. Downstream,
-  `inbox.process_message:<provider-message-id>` + `operations_email_already_imported`
-  still prevent any duplicate `order_intake` row even if two syncs overlap.
+- **No duplicates, future runs still allowed.** Two guards, both reported as
+  `status="skipped"` (never a misleading "queued"):
+  - *Overlap* (`worker_job_repo.has_active_job`): skip whenever an
+    `inbox.sync` is already pending or processing, so a slow fetch never
+    accumulates a backlog of redundant syncs.
+  - *Same interval* (`worker_job_repo.job_exists_for_idempotency_key`): the
+    idempotency key is bucketed by `INBOX_SYNC_INTERVAL_MINUTES` (default 5);
+    if a job for the current window already exists in any status (including a
+    completed/failed one this interval), skip. This is checked explicitly
+    rather than relying on `enqueue_job`'s `ON CONFLICT (idempotency_key) DO
+    UPDATE`, which is a deliberate no-op (re-sets the key to itself, returns
+    the existing row's id, and **never reverts a completed/failed job to
+    pending**) and would otherwise be reported as a fresh enqueue.
+
+  The next interval gets a genuinely new job. A worker crash that leaves a
+  job stuck `processing` does not block syncing forever: `process_pending`
+  reclaims stale `processing` jobs (`RECLAIM_STALE_AFTER`, 15 min) back to
+  `pending` and runs them, after which the next interval enqueues normally.
+  Downstream, `inbox.process_message:<provider-message-id>` +
+  `operations_email_already_imported` still prevent any duplicate
+  `order_intake` row even if two syncs overlap.
 - **Failure-isolated.** The producer step is `continue-on-error: true`, so a
   producer hiccup never blocks SMS/document/realtime processing; the final
   gate step still surfaces its outcome for visibility.

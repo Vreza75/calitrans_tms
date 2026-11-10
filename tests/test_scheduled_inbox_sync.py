@@ -41,6 +41,7 @@ def test_scheduled_sync_enqueues_under_system_identity(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(db_client, "transaction", _fake_txn)
     monkeypatch.setattr(worker_job_repo, "has_active_job", lambda conn, job_type: False)
+    monkeypatch.setattr(worker_job_repo, "job_exists_for_idempotency_key", lambda conn, key: False)
     monkeypatch.setattr(worker_job_repo, "enqueue_job", lambda **kw: (captured.update(kw) or 777))
 
     result = commands.request_scheduled_inbox_sync(now=0.0)
@@ -80,6 +81,26 @@ def test_scheduled_sync_skips_when_a_sync_is_already_active(monkeypatch):
     assert result.job_id is None
     assert "already pending or processing" in result.reason
     assert enqueue_called["n"] == 0, "overlap guard must not enqueue a second sync"
+
+
+def test_scheduled_sync_skips_when_same_interval_job_exists(monkeypatch):
+    """A completed/failed job for the current interval window must yield an
+    honest "skipped", not a "queued" that routes through enqueue_job's
+    no-op ON CONFLICT and returns a terminal job's id."""
+    enqueue_called = {"n": 0}
+    monkeypatch.setattr(db_client, "transaction", _fake_txn)
+    monkeypatch.setattr(worker_job_repo, "has_active_job", lambda conn, job_type: False)
+    monkeypatch.setattr(worker_job_repo, "job_exists_for_idempotency_key", lambda conn, key: True)
+    monkeypatch.setattr(
+        worker_job_repo, "enqueue_job", lambda **kw: enqueue_called.update(n=enqueue_called["n"] + 1)
+    )
+
+    result = commands.request_scheduled_inbox_sync(now=0.0)
+
+    assert result.status == "skipped"
+    assert result.job_id is None
+    assert "this interval window" in result.reason
+    assert enqueue_called["n"] == 0
 
 
 def test_idempotency_key_buckets_by_interval():
@@ -238,3 +259,104 @@ def test_db_health_reports_backlog_success_and_failure(scratch_db):
     assert health.last_success_at is not None
     assert health.last_duration_seconds is not None and health.last_duration_seconds >= 2
     assert health.last_error == "sanitized failure detail"
+
+
+@requires_db
+def test_db_stuck_processing_job_is_reclaimed_so_sync_resumes(scratch_db):
+    """A worker crash can leave an inbox.sync stuck 'processing'. The overlap
+    guard skips once, but process_pending's reclaim recovers the job so the
+    sync actually runs and the next interval enqueues again - the guard can
+    never block syncing forever."""
+    from datetime import timedelta
+
+    from db_client import transaction
+    from repositories.worker_job_repo import claim_next_job, mark_completed, reclaim_stuck_processing
+
+    # Crashed worker: an inbox.sync claimed 20 minutes ago, never finished.
+    db_client.execute(
+        "insert into worker_jobs "
+        "(job_type, aggregate_type, aggregate_id, payload, idempotency_key, actor, status, claimed_at) "
+        "values ('inbox.sync','mailbox','primary_mailbox', cast('{}' as jsonb), "
+        "'inbox.sync:stuck-test','system:inbox-scheduler','processing', now() - interval '20 minutes')",
+        {},
+    )
+
+    # One skip while the stuck job is still (apparently) processing.
+    assert commands.request_scheduled_inbox_sync(now=0.0).status == "skipped"
+
+    # Reclaim resets the stale 'processing' row to 'pending' ...
+    with transaction() as conn:
+        assert reclaim_stuck_processing(conn, older_than=timedelta(minutes=15)) == 1
+    # ... and it is now claimable, so a worker will actually run the sync.
+    with transaction() as conn:
+        claimed = claim_next_job(conn)
+    assert claimed is not None and claimed["job_type"] == "inbox.sync"
+    with transaction() as conn:
+        mark_completed(conn, claimed["id"])
+
+    # Syncing resumes: a later interval enqueues a fresh job.
+    resumed = commands.request_scheduled_inbox_sync(now=3600.0)
+    assert resumed.status == "queued"
+    assert resumed.job_id is not None
+
+
+@requires_db
+def test_db_same_window_conflict_skips_and_never_reverts_terminal(scratch_db):
+    """A second fire in the same interval window after the job already
+    completed must report "skipped" (not "queued") and must not revert the
+    completed job."""
+    first = commands.request_scheduled_inbox_sync(now=0.0)
+    assert first.status == "queued"
+    db_client.execute(
+        "update worker_jobs set status='completed', claimed_at=now(), completed_at=now() where id=:id",
+        {"id": first.job_id},
+    )
+
+    second = commands.request_scheduled_inbox_sync(now=1.0)  # same 5-min bucket
+    assert second.status == "skipped"
+    assert second.job_id is None
+
+    status = db_client.read_df(
+        "select status from worker_jobs where id=:id", {"id": first.job_id}
+    ).iloc[0]["status"]
+    assert status == "completed", "a same-window conflict must never revert a completed job"
+    assert _count_inbox_sync() == 1
+
+
+@requires_db
+def test_db_enqueue_job_on_conflict_does_not_revert_terminal(scratch_db):
+    """Repo-level proof of enqueue_job's ON CONFLICT (idempotency_key) DO
+    UPDATE contract: re-enqueueing a key whose job is already terminal
+    returns the same id and never resets status to pending."""
+    from db_client import transaction
+    from repositories.worker_job_repo import enqueue_job
+
+    key = "inbox.sync:conflict-test"
+    with transaction() as conn:
+        first_id = enqueue_job(
+            conn=conn,
+            job_type="inbox.sync",
+            aggregate_type="mailbox",
+            aggregate_id="primary_mailbox",
+            payload={},
+            idempotency_key=key,
+            actor="system:inbox-scheduler",
+        )
+    db_client.execute("update worker_jobs set status='failed', last_error='x' where id=:id", {"id": first_id})
+
+    with transaction() as conn:
+        second_id = enqueue_job(
+            conn=conn,
+            job_type="inbox.sync",
+            aggregate_type="mailbox",
+            aggregate_id="primary_mailbox",
+            payload={},
+            idempotency_key=key,
+            actor="system:inbox-scheduler",
+        )
+
+    assert second_id == first_id
+    status = db_client.read_df(
+        "select status from worker_jobs where id=:id", {"id": first_id}
+    ).iloc[0]["status"]
+    assert status == "failed", "ON CONFLICT DO UPDATE must not revert a failed job to pending"

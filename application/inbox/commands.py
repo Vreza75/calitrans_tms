@@ -114,17 +114,30 @@ def request_scheduled_inbox_sync(*, now: float | None = None) -> InboxSyncReques
       boundary is left exactly as-is for the interactive path.
     - Overlap guard: if an inbox.sync is already pending or processing, it
       enqueues nothing (a slow fetch must not accumulate redundant syncs).
-    - Idempotency key is bucketed by INBOX_SYNC_INTERVAL_MINUTES (default 5),
-      so repeated scheduler fires inside one interval collapse to one job
-      while the next interval gets a fresh job - "no duplicates, future runs
-      still allowed".
+      A worker crash that leaves a job stuck 'processing' does NOT block
+      syncing forever: workers/processor.py::process_pending reclaims stale
+      'processing' jobs (RECLAIM_STALE_AFTER) back to 'pending' and runs
+      them, after which the next interval enqueues normally.
+    - Same-interval guard: the idempotency key is bucketed by
+      INBOX_SYNC_INTERVAL_MINUTES (default 5). If a job for the current
+      window already exists in ANY status (including a completed/failed one
+      this interval), it is reported "skipped" rather than routed through
+      enqueue_job - whose ON CONFLICT (idempotency_key) DO UPDATE is a
+      deliberate no-op that returns the existing row's id without reverting a
+      terminal job, and so would otherwise be misreported as a fresh
+      "queued". The next interval gets a genuinely new job: "no duplicates,
+      future runs still allowed".
 
-    Returns status="queued" (with job_id) when a new job was enqueued, or
-    status="skipped" (job_id None, with a reason) when the overlap guard or
-    the idempotency key suppressed it. "skipped" is a normal outcome, not an
-    error - ok stays True."""
+    Returns status="queued" (with job_id) only when a genuinely new job was
+    enqueued, or status="skipped" (job_id None, with a reason) when either
+    guard suppressed it. "skipped" is a normal outcome, not an error - ok
+    stays True."""
     from db_client import transaction
-    from repositories.worker_job_repo import enqueue_job, has_active_job
+    from repositories.worker_job_repo import (
+        enqueue_job,
+        has_active_job,
+        job_exists_for_idempotency_key,
+    )
 
     interval_minutes = _sync_interval_minutes()
     idempotency_key = _scheduled_inbox_sync_idempotency_key(interval_minutes=interval_minutes, now=now)
@@ -136,6 +149,14 @@ def request_scheduled_inbox_sync(*, now: float | None = None) -> InboxSyncReques
                 job_id=None,
                 status="skipped",
                 reason="An inbox.sync job is already pending or processing.",
+            )
+
+        if job_exists_for_idempotency_key(conn, idempotency_key):
+            return InboxSyncRequestResult(
+                ok=True,
+                job_id=None,
+                status="skipped",
+                reason="An inbox.sync job was already enqueued for this interval window.",
             )
 
         job_id = enqueue_job(

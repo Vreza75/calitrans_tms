@@ -289,6 +289,23 @@ def has_active_job(conn: Connection, job_type: str) -> bool:
     return row is not None
 
 
+def job_exists_for_idempotency_key(conn: Connection, idempotency_key: str) -> bool:
+    """True if a worker_jobs row already carries this idempotency_key, in
+    ANY status (pending/processing/completed/failed). The scheduled
+    inbox.sync producer uses this to report an honest "skipped" when a job
+    for the current interval window already exists, instead of routing a
+    same-window repeat through enqueue_job - whose ON CONFLICT (idempotency_key)
+    DO UPDATE is a deliberate no-op (it re-sets the key to its own value and
+    returns the existing row's id without ever reverting a completed/failed
+    job to pending), which would otherwise be misreported as a fresh
+    "queued" enqueue. Read-only."""
+    row = conn.execute(
+        text("select 1 from worker_jobs where idempotency_key = :key limit 1"),
+        {"key": idempotency_key},
+    ).first()
+    return row is not None
+
+
 def get_job_type_health(conn: Connection, job_type: str) -> dict[str, Any]:
     """Sanitized health snapshot for one job_type: per-status backlog, the
     last successful completion and that run's processing duration, and the
