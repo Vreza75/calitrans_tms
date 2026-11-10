@@ -228,3 +228,49 @@ def test_db_skipped_event_is_never_reclaimed_after_enable():
         assert claimed is None, "a terminally skipped event must never be re-claimed"
 
         db_client.execute("delete from outbox_events where event_type = 'driver_dispatch_sms'", {})
+
+
+@pytest.mark.skipif(
+    not MIGRATION_TEST_DATABASE_URL,
+    reason="Set MIGRATION_TEST_DATABASE_URL to a disposable Postgres to run the delivery_status write test.",
+)
+def test_db_dispatch_message_delivery_status_accepts_skipped():
+    """dispatch_messages.delivery_status is plain text (no CHECK/enum), so the
+    skip projection must be able to persist 'skipped'. Drives the exact
+    projector call the SMS-disabled skip branch runs and reads the row back -
+    a real write, not a mock, against real PostgreSQL."""
+    from sqlalchemy import text
+
+    import db_client
+    from db_client import transaction
+    from scripts.run_migrations import run as run_migrations
+    from services import outbox_processor
+
+    url = MIGRATION_TEST_DATABASE_URL
+    assert run_migrations(url) == 0
+    with _scratch_database(url):
+        db_client.execute("delete from dispatch_messages where sent_by = 'sms-gate-test'", {})
+        # load_id left NULL -> no loads FK dependency to satisfy.
+        with transaction() as conn:
+            message_id = conn.execute(
+                text(
+                    "insert into dispatch_messages "
+                    "(message_type, direction, recipient, message_body, sent_by, delivery_status) "
+                    "values ('driver_dispatch_sms','outbound','+15551234567','hi','sms-gate-test','pending_delivery') "
+                    "returning id"
+                )
+            ).scalar()
+
+        # Exactly what process_one's skip branch does: project outcome 'skipped'.
+        payload = {"to": "+15551234567", "message": "hi", "dispatch_message_id": int(message_id)}
+        with transaction() as conn:
+            outbox_processor._project_delivery_status(
+                conn, "driver_dispatch_sms", payload, "skipped", None, 0
+            )
+
+        got = db_client.read_df(
+            "select delivery_status from dispatch_messages where id = :id", {"id": int(message_id)}
+        ).iloc[0]["delivery_status"]
+        assert got == "skipped", "dispatch_messages.delivery_status must accept 'skipped'"
+
+        db_client.execute("delete from dispatch_messages where id = :id", {"id": int(message_id)})
