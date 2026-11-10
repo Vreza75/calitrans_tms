@@ -37,11 +37,21 @@ _SYNC_SOURCE = "primary_mailbox"
 # inbox_handlers.py::SYSTEM_ACTOR_INBOX_WORKER.
 _SYNC_SCHEDULER_ACTOR = "system:inbox-scheduler"
 
-# Default polling cadence for the scheduled producer. Overridable via the
-# INBOX_SYNC_INTERVAL_MINUTES secret/env without touching the workflow cron,
-# so the effective frequency is configurable independently of GitHub
-# Actions' fixed */5 schedule (a finer cron simply collapses into one job
-# per interval via the bucketed idempotency key below).
+# Transaction-scoped advisory-lock name serializing concurrent scheduled
+# producers (see repositories/worker_job_repo.py::try_acquire_mailbox_sync_lock
+# and request_scheduled_inbox_sync's P1 note). One mailbox -> one lock name.
+_SYNC_LOCK_NAME = f"inbox.sync:{_SYNC_SOURCE}"
+
+# INBOX_SYNC_INTERVAL_MINUTES is the enqueue-DEDUPE window, NOT the polling
+# frequency. The polling frequency is the GitHub Actions cron in
+# .github/workflows/process-jobs.yml, which fires every 5 minutes; this value
+# only sets how wide the idempotency bucket is (how long two fires collapse
+# into one job). Setting it ABOVE 5 means some 5-minute fires land in the same
+# bucket and are skipped (effectively sync less often than every 5 min);
+# setting it AT/BELOW 5 is a no-op relative to the cron (each fire is already a
+# new bucket). To sync MORE often than every 5 minutes you must change the
+# cron itself - this value cannot make the producer fire faster than it is
+# scheduled.
 _DEFAULT_SYNC_INTERVAL_MINUTES = 5
 
 
@@ -112,6 +122,11 @@ def request_scheduled_inbox_sync(*, now: float | None = None) -> InboxSyncReques
       never a dispatcher actor, and never calls require_permission - there
       is no human to authorize. request_inbox_sync's Permission.WORK_ITEM_MANAGE
       boundary is left exactly as-is for the interactive path.
+    - Concurrency guard: takes a transaction-scoped advisory lock keyed by the
+      mailbox (try_acquire_mailbox_sync_lock) before the guards below, so two
+      scheduled producers racing across an interval boundary cannot both pass
+      the read-then-write checks and enqueue two simultaneously-active jobs.
+      The loser skips; the lock auto-releases at transaction end.
     - Overlap guard: if an inbox.sync is already pending or processing, it
       enqueues nothing (a slow fetch must not accumulate redundant syncs).
       A worker crash that leaves a job stuck 'processing' does NOT block
@@ -137,12 +152,28 @@ def request_scheduled_inbox_sync(*, now: float | None = None) -> InboxSyncReques
         enqueue_job,
         has_active_job,
         job_exists_for_idempotency_key,
+        try_acquire_mailbox_sync_lock,
     )
 
     interval_minutes = _sync_interval_minutes()
     idempotency_key = _scheduled_inbox_sync_idempotency_key(interval_minutes=interval_minutes, now=now)
 
     with transaction() as conn:
+        # Serialize concurrent scheduled producers FIRST, before the
+        # read-then-write guards below. Two producers racing across an
+        # interval boundary would otherwise each see no active job / no
+        # existing key (neither insert committed yet) and enqueue two
+        # different-bucket jobs that are both active at once. The advisory
+        # lock is transaction-scoped (auto-released on commit, so stale-job
+        # reclaim is unaffected); the loser skips rather than blocks.
+        if not try_acquire_mailbox_sync_lock(conn, _SYNC_LOCK_NAME):
+            return InboxSyncRequestResult(
+                ok=True,
+                job_id=None,
+                status="skipped",
+                reason="Another scheduled producer is enqueuing (mailbox sync lock held).",
+            )
+
         if has_active_job(conn, "inbox.sync"):
             return InboxSyncRequestResult(
                 ok=True,

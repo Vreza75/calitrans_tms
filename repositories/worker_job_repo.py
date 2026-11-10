@@ -289,6 +289,31 @@ def has_active_job(conn: Connection, job_type: str) -> bool:
     return row is not None
 
 
+def try_acquire_mailbox_sync_lock(conn: Connection, lock_name: str) -> bool:
+    """Acquire a transaction-scoped PostgreSQL advisory lock keyed by
+    `lock_name`; return True if acquired, False if another session already
+    holds it. Used by application/inbox/commands.py::request_scheduled_inbox_sync
+    to serialize concurrent scheduled producers.
+
+    Without it, two producers racing across an interval boundary could each
+    pass has_active_job + job_exists_for_idempotency_key (neither's INSERT
+    committed yet) and enqueue two different-bucket inbox.sync jobs that are
+    both active at once - the one guarantee the per-key unique index cannot
+    give, since the two keys differ. pg_try_advisory_xact_lock is
+    non-blocking (the losing producer skips rather than waits and holds a
+    connection) and auto-releases at transaction end, so it cannot leak the
+    lock on a crash or interfere with stale-job reclaim.
+
+    PostgreSQL-only, like claim_next_job's FOR UPDATE SKIP LOCKED; the unit
+    tests that exercise the command mock this out."""
+    return bool(
+        conn.execute(
+            text("select pg_try_advisory_xact_lock(hashtext(:lock_name))"),
+            {"lock_name": lock_name},
+        ).scalar()
+    )
+
+
 def job_exists_for_idempotency_key(conn: Connection, idempotency_key: str) -> bool:
     """True if a worker_jobs row already carries this idempotency_key, in
     ANY status (pending/processing/completed/failed). The scheduled

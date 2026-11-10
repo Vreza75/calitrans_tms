@@ -34,6 +34,45 @@ from typing import Any
 SYSTEM_ACTOR_INBOX_WORKER = "system:inbox-worker"
 
 
+def _fetch_failure_reason(diagnostics: dict) -> str:
+    """Infrastructure-failure reason for a sync fetch, or "" when the fetch
+    itself succeeded. Distinguishes "the inbox.sync job ran" from "a mailbox
+    was actually retrieved" (the P2 observability gap): a job that logged
+    into ZERO mailboxes must fail (bad credentials / connectivity) rather
+    than complete as a healthy empty inbox, so the failure is visible via the
+    worker job's status + sanitized last_error instead of a silently
+    "completed" sync that fetched nothing.
+
+    - accounts_attempted == 0 with errors -> no mailbox could even be
+      attempted (unchanged behavior).
+    - accounts_attempted == 0 with no errors -> nothing configured; left a
+      no-op success, as before (not this change's concern).
+    - accounts_attempted > 0 but zero successful logins -> every attempted
+      mailbox login failed; now a failure (previously misreported success).
+    - at least one successful login -> success (an empty inbox is healthy)."""
+    errors = diagnostics.get("errors") or []
+    accounts_attempted = int(diagnostics.get("accounts_attempted", 0) or 0)
+    successful_logins = sum(
+        1 for acct in (diagnostics.get("per_account") or []) if acct.get("login_success")
+    )
+
+    if accounts_attempted == 0:
+        if errors:
+            return (
+                "No operations email mailbox could be attempted. "
+                "Check email addresses and Yahoo app passwords in secrets."
+            )
+        return ""
+
+    if successful_logins == 0:
+        return (
+            "Every attempted mailbox login failed - no mailbox was successfully "
+            "retrieved. Check Yahoo app passwords in secrets."
+        )
+
+    return ""
+
+
 def handle_inbox_sync(payload: dict[str, Any]) -> tuple[bool, str]:
     """Handler for job_type='inbox.sync' (application/inbox/commands.py::
     request_inbox_sync).
@@ -140,11 +179,10 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
         )
         diagnostics = email_client.get_last_operations_email_sync_diagnostics()
         result["diagnostics"] = diagnostics
-        if diagnostics.get("errors") and diagnostics.get("accounts_attempted", 0) == 0:
-            result["error"] = (
-                "No operations email mailbox could be attempted. "
-                "Check email addresses and Yahoo app passwords in secrets."
-            )
+        result["successful_logins"] = sum(
+            1 for acct in (diagnostics.get("per_account") or []) if acct.get("login_success")
+        )
+        result["error"] = _fetch_failure_reason(diagnostics)
         result["fetched"] = len(messages)
         result["inbound_fetched"] = sum(
             1 for item in messages if safe_str(item.get("direction")).lower() != "outbound"

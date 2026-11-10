@@ -40,6 +40,7 @@ def _fake_txn():
 def test_scheduled_sync_enqueues_under_system_identity(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(db_client, "transaction", _fake_txn)
+    monkeypatch.setattr(worker_job_repo, "try_acquire_mailbox_sync_lock", lambda conn, name: True)
     monkeypatch.setattr(worker_job_repo, "has_active_job", lambda conn, job_type: False)
     monkeypatch.setattr(worker_job_repo, "job_exists_for_idempotency_key", lambda conn, key: False)
     monkeypatch.setattr(worker_job_repo, "enqueue_job", lambda **kw: (captured.update(kw) or 777))
@@ -69,6 +70,7 @@ def test_scheduled_sync_takes_no_authenticated_actor():
 def test_scheduled_sync_skips_when_a_sync_is_already_active(monkeypatch):
     enqueue_called = {"n": 0}
     monkeypatch.setattr(db_client, "transaction", _fake_txn)
+    monkeypatch.setattr(worker_job_repo, "try_acquire_mailbox_sync_lock", lambda conn, name: True)
     monkeypatch.setattr(worker_job_repo, "has_active_job", lambda conn, job_type: True)
     monkeypatch.setattr(
         worker_job_repo, "enqueue_job", lambda **kw: enqueue_called.update(n=enqueue_called["n"] + 1)
@@ -83,12 +85,38 @@ def test_scheduled_sync_skips_when_a_sync_is_already_active(monkeypatch):
     assert enqueue_called["n"] == 0, "overlap guard must not enqueue a second sync"
 
 
+def test_scheduled_sync_skips_when_another_producer_holds_the_lock(monkeypatch):
+    """Concurrency guard: if the mailbox advisory lock is held by another
+    scheduled producer, this one skips and enqueues nothing - without even
+    reaching the overlap/same-window checks."""
+    enqueue_called = {"n": 0}
+    monkeypatch.setattr(db_client, "transaction", _fake_txn)
+    monkeypatch.setattr(worker_job_repo, "try_acquire_mailbox_sync_lock", lambda conn, name: False)
+
+    def _should_not_run(*a, **k):
+        raise AssertionError("must not reach the per-job guards or enqueue when the lock is held")
+
+    monkeypatch.setattr(worker_job_repo, "has_active_job", _should_not_run)
+    monkeypatch.setattr(worker_job_repo, "job_exists_for_idempotency_key", _should_not_run)
+    monkeypatch.setattr(
+        worker_job_repo, "enqueue_job", lambda **kw: enqueue_called.update(n=enqueue_called["n"] + 1)
+    )
+
+    result = commands.request_scheduled_inbox_sync(now=0.0)
+
+    assert result.status == "skipped"
+    assert result.job_id is None
+    assert "lock held" in result.reason
+    assert enqueue_called["n"] == 0
+
+
 def test_scheduled_sync_skips_when_same_interval_job_exists(monkeypatch):
     """A completed/failed job for the current interval window must yield an
     honest "skipped", not a "queued" that routes through enqueue_job's
     no-op ON CONFLICT and returns a terminal job's id."""
     enqueue_called = {"n": 0}
     monkeypatch.setattr(db_client, "transaction", _fake_txn)
+    monkeypatch.setattr(worker_job_repo, "try_acquire_mailbox_sync_lock", lambda conn, name: True)
     monkeypatch.setattr(worker_job_repo, "has_active_job", lambda conn, job_type: False)
     monkeypatch.setattr(worker_job_repo, "job_exists_for_idempotency_key", lambda conn, key: True)
     monkeypatch.setattr(
@@ -153,6 +181,41 @@ def test_scheduled_job_type_is_processable_by_the_worker():
     from workers.processor import JOB_HANDLERS
 
     assert "inbox.sync" in JOB_HANDLERS
+
+
+def test_fetch_failure_reason_distinguishes_job_run_from_mailbox_retrieval():
+    """A completed inbox.sync must mean a mailbox was actually logged into,
+    not merely that the job ran. _fetch_failure_reason turns a zero-login
+    fetch into a job failure so it surfaces in health, while a healthy empty
+    inbox (>=1 login) stays a success."""
+    from workers.inbox_handlers import _fetch_failure_reason
+
+    # Nothing could be attempted (e.g. all credentials missing) -> failure.
+    assert _fetch_failure_reason(
+        {"accounts_attempted": 0, "errors": ["account: Missing password"], "per_account": []}
+    )
+    # Nothing attempted, no errors (nothing configured) -> preserved no-op success.
+    assert _fetch_failure_reason({"accounts_attempted": 0, "errors": [], "per_account": []}) == ""
+    # Accounts attempted but EVERY login failed -> failure (the P2 gap).
+    reason = _fetch_failure_reason(
+        {
+            "accounts_attempted": 2,
+            "errors": ["a: auth", "b: auth"],
+            "per_account": [{"login_success": False}, {"login_success": False}],
+        }
+    )
+    assert reason and "login" in reason.lower()
+    # At least one login succeeded -> success even with a partial error.
+    assert (
+        _fetch_failure_reason(
+            {
+                "accounts_attempted": 2,
+                "errors": ["b: auth"],
+                "per_account": [{"login_success": True}, {"login_success": False}],
+            }
+        )
+        == ""
+    )
 
 
 # --------------------------------------------------------------------------
@@ -360,3 +423,40 @@ def test_db_enqueue_job_on_conflict_does_not_revert_terminal(scratch_db):
         "select status from worker_jobs where id=:id", {"id": first_id}
     ).iloc[0]["status"]
     assert status == "failed", "ON CONFLICT DO UPDATE must not revert a failed job to pending"
+
+
+@requires_db
+def test_db_concurrent_producers_cannot_both_enqueue(scratch_db):
+    """P1: two scheduled producers on separate PostgreSQL sessions must not
+    both enqueue an active inbox.sync. Simulate producer A by holding the
+    mailbox advisory lock on its own connection/transaction; producer B
+    (request_scheduled_inbox_sync, via the db_client engine = a separate
+    session) must then skip and enqueue nothing. Releasing A's lock lets a
+    later run enqueue."""
+    from sqlalchemy import create_engine, text
+
+    from application.inbox.commands import _SYNC_LOCK_NAME
+
+    other = create_engine(MIGRATION_TEST_DATABASE_URL, future=True)
+    conn = other.connect()
+    trans = conn.begin()
+    try:
+        acquired = conn.execute(
+            text("select pg_try_advisory_xact_lock(hashtext(:n))"), {"n": _SYNC_LOCK_NAME}
+        ).scalar()
+        assert acquired is True, "test setup could not take the advisory lock"
+
+        # Separate session cannot acquire the same xact lock -> skip.
+        result = commands.request_scheduled_inbox_sync(now=0.0)
+        assert result.status == "skipped"
+        assert "lock held" in result.reason
+        assert _count_inbox_sync() == 0, "a concurrent producer must not enqueue while the lock is held"
+    finally:
+        trans.rollback()  # releases the advisory lock
+        conn.close()
+        other.dispose()
+
+    # Lock released: the producer proceeds normally.
+    resumed = commands.request_scheduled_inbox_sync(now=0.0)
+    assert resumed.status == "queued"
+    assert _count_inbox_sync() == 1
