@@ -84,12 +84,20 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
     search_query = _build_search_query(since, until)
     existing_lookup = load_existing_operations_email_lookup(limit=max(3000, FETCH_CAP))
 
-    totals = {"fetched": 0, "skipped": 0, "queued": 0, "errors": 0, "per_mailbox": []}
+    totals = {"fetched": 0, "skipped": 0, "queued": 0, "already_queued": 0, "errors": 0, "per_mailbox": []}
 
     for account in accounts:
         email_address = account.get("email")
         alias = email_client.operations_mailbox_alias(account.get("mailbox") or email_address)
-        mb = {"alias": alias, "login": "failed", "error_type": "", "found": 0, "skipped": 0, "queued": 0}
+        mb = {
+            "alias": alias,
+            "login": "failed",
+            "error_type": "",
+            "found": 0,
+            "skipped": 0,
+            "queued": 0,
+            "already_queued": 0,
+        }
 
         if not email_address or not account.get("password"):
             mb["error_type"] = "MissingCredentials"
@@ -140,8 +148,15 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
                 totals["skipped"] += 1
                 continue
 
+            from db_client import transaction
+            from repositories.worker_job_repo import enqueue_job, job_exists_for_idempotency_key
+
+            from workers.inbox_handlers import _embed_attachment_content
+
+            idempotency_key = f"inbox.process_message:{message_id}"
+
             if dry_run:
-                mb["queued"] += 1  # would enqueue
+                mb["queued"] += 1  # would enqueue a new job
                 totals["queued"] += 1
                 continue
 
@@ -149,24 +164,33 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
                 pre_saved = _save_operations_email_attachments(message, message_id)
             except Exception:
                 pre_saved = []
-
+            pre_saved = _embed_attachment_content(pre_saved, message)
             job_message = {key: value for key, value in message.items() if key != "attachments"}
 
-            from db_client import transaction
-            from repositories.worker_job_repo import enqueue_job
-
             with transaction() as conn:
-                enqueue_job(
-                    conn=conn,
-                    job_type="inbox.process_message",
-                    aggregate_type="email_message",
-                    aggregate_id=message_id,
-                    payload={"message": job_message, "pre_saved_attachments": pre_saved},
-                    idempotency_key=f"inbox.process_message:{message_id}",
-                    actor=SYSTEM_ACTOR_INBOX_BACKFILL,
-                )
-            mb["queued"] += 1
-            totals["queued"] += 1
+                # Distinguish a genuinely NEW job from an idempotency-key conflict
+                # (a job this message already has from an earlier run / the live
+                # sync): enqueue_job's ON CONFLICT would otherwise silently
+                # resolve to the existing row and be miscounted as newly queued.
+                if job_exists_for_idempotency_key(conn, idempotency_key):
+                    mb["already_queued"] += 1
+                    totals["already_queued"] += 1
+                else:
+                    enqueue_job(
+                        conn=conn,
+                        job_type="inbox.process_message",
+                        aggregate_type="email_message",
+                        aggregate_id=message_id,
+                        payload={
+                            "message": job_message,
+                            "pre_saved_attachments": pre_saved,
+                            "backfill": True,
+                        },
+                        idempotency_key=idempotency_key,
+                        actor=SYSTEM_ACTOR_INBOX_BACKFILL,
+                    )
+                    mb["queued"] += 1
+                    totals["queued"] += 1
             existing_lookup.setdefault("by_message_id", {})[message_id.lower()] = {"source_message_id": message_id}
 
         totals["per_mailbox"].append(mb)
@@ -180,7 +204,8 @@ def _log_mailbox(mb: dict) -> None:
     and integer counts. No addresses, subjects, bodies, or passwords."""
     print(
         f"backfill mailbox={mb['alias']} login={mb['login']} error_type={mb['error_type'] or '-'} "
-        f"found={mb['found']} skipped_already_imported={mb['skipped']} jobs_queued={mb['queued']}"
+        f"found={mb['found']} skipped_already_imported={mb['skipped']} "
+        f"jobs_queued={mb['queued']} already_queued={mb.get('already_queued', 0)}"
     )
 
 
@@ -213,7 +238,8 @@ def main() -> int:
     print(
         f"backfill {args.since}..{args.until} {mode}: "
         f"fetched={totals['fetched']} skipped={totals['skipped']} "
-        f"{'would_queue' if args.dry_run else 'queued'}={totals['queued']} mailbox_errors={totals['errors']}"
+        f"{'would_queue' if args.dry_run else 'queued'}={totals['queued']} "
+        f"already_queued={totals['already_queued']} mailbox_errors={totals['errors']}"
     )
     return 1 if totals["errors"] else 0
 

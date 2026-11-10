@@ -422,13 +422,38 @@ REQUEST_TYPES = [
 REPLY_LANGUAGE_OPTIONS = ["Auto", "English", "Spanish", "Bilingual"]
 REPLY_TONE_OPTIONS = ["Professional", "Concise", "Friendly", "Apology / Delay"]
 
+# Historical/backfill intake rows carry this review_status so they are
+# isolated from the live operational inbox - it is a terminal status (below),
+# so inbox_review_where_clause() excludes it from every active queue. Set by
+# workers/inbox_handlers.py::handle_inbox_process_message for backfilled
+# messages (scripts/backfill_inbox.py). Learning/evaluation data only; never
+# active dispatch work.
+HISTORICAL_BACKFILL_REVIEW_STATUS = "Historical (Backfill)"
+
 INBOX_TERMINAL_REVIEW_STATUSES = [
     "Order Created",
     "Attached",
     "Quote Created",
     "Order Cancelled",
     "Closed",
+    HISTORICAL_BACKFILL_REVIEW_STATUS,
 ]
+
+
+def mark_intake_historical_backfill(source_message_id: str) -> None:
+    """Move a just-inserted backfilled intake row to the isolated historical
+    status, unless it already reached a terminal status. Keyed on the unique
+    source_message_id so it needs no returned row id. Best-effort."""
+    terminal = ", ".join(f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES)
+    execute(
+        f"""
+        update order_intake
+        set review_status = :status
+        where source_message_id = :mid
+          and coalesce(review_status, 'Open') not in ({terminal})
+        """,
+        {"status": HISTORICAL_BACKFILL_REVIEW_STATUS, "mid": source_message_id},
+    )
 
 OPERATIONS_EMAIL_SYNC_SOURCES = [
     "operations_email",

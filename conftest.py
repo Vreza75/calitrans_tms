@@ -69,16 +69,33 @@ def _blocked_secret_lookup(name: str) -> str | None:
     return None
 
 
+# Email-driven load creation defaults OFF in production (the learning-phase
+# switch EMAIL_LOAD_CREATION_ENABLED, see
+# services/operations_inbox_service.py::email_load_creation_enabled). Rather
+# than force it ON for the whole suite (which would mask the production default
+# everywhere), enable it ONLY for the specific modules that exercise the
+# load-creation mechanics. Every other test runs with the production default
+# (off). The dedicated gate tests assert both states explicitly.
+_EMAIL_LOAD_CREATION_TEST_MODULES = {
+    "test_operations_inbox_load_creation_atomicity",
+    "test_case_006_one_booking_four_containers",
+    "test_work_item_command_authorization",
+    "test_application_loads_commands_error_sanitization",
+    "test_api_error_sanitization",
+    "test_api_work_items",
+    "test_operations_multi_container_service",
+    "test_operations_multi_container",
+}
+
+
 @pytest.fixture(autouse=True)
-def _enable_email_load_creation_for_tests(monkeypatch):
-    """Email-driven load creation defaults OFF in production (the learning-phase
-    switch EMAIL_LOAD_CREATION_ENABLED, see
-    services/operations_inbox_service.py::email_load_creation_enabled). The
-    existing suite exercises the load-creation mechanics and assumes they run,
-    so enable the switch by default for tests; the dedicated gate tests
-    (tests/test_email_load_creation_gate.py) override this to assert the
-    disabled behavior."""
-    monkeypatch.setenv("EMAIL_LOAD_CREATION_ENABLED", "true")
+def _email_load_creation_flag(request, monkeypatch):
+    """Enable email-driven load creation ONLY for the modules that exercise the
+    creation mechanics - every other test keeps the production default (off),
+    so the switch is never enabled suite-wide."""
+    module_name = getattr(getattr(request, "module", None), "__name__", "").rsplit(".", 1)[-1]
+    if module_name in _EMAIL_LOAD_CREATION_TEST_MODULES:
+        monkeypatch.setenv("EMAIL_LOAD_CREATION_ENABLED", "true")
 
 
 def pytest_configure(config) -> None:

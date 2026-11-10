@@ -28,6 +28,74 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Attachment durability across ephemeral GitHub-Actions runners: the files
+# _save_operations_email_attachments writes live on the runner's local disk,
+# which is destroyed between runs, so an inbox.process_message job processed in
+# a LATER run would find them gone. To survive without new infrastructure, a
+# bounded base64 copy of each saved attachment's bytes rides along in the
+# durable worker_jobs.payload (PostgreSQL); the process handler rehydrates any
+# missing file from it before parsing. Bounded so a huge attachment can't bloat
+# the jobs table - oversized ones fall back to the same-run-only disk file.
+_ATTACHMENT_EMBED_PER_FILE_CAP = 3 * 1024 * 1024  # 3 MB raw per attachment
+_ATTACHMENT_EMBED_TOTAL_CAP = 8 * 1024 * 1024  # 8 MB raw per message
+
+
+def _embed_attachment_content(pre_saved_attachments: list, message: dict) -> list:
+    """Return pre_saved metadata with a bounded base64 copy of each saved
+    attachment's bytes (`_content_b64`) so the file can be rehydrated on a
+    different runner. Matches saved metadata to message attachments by
+    content_sha256; silently leaves `_content_b64` absent when bytes are
+    unavailable or over the cap (that attachment stays same-run-only)."""
+    import base64
+    import hashlib
+
+    by_sha: dict[str, bytes] = {}
+    for att in message.get("attachments") or []:
+        content = att.get("content")
+        if isinstance(content, (bytes, bytearray)) and content:
+            by_sha[hashlib.sha256(bytes(content)).hexdigest()] = bytes(content)
+
+    embedded_total = 0
+    enriched = []
+    for saved in pre_saved_attachments or []:
+        item = dict(saved)
+        sha = str(item.get("content_sha256") or "")
+        content = by_sha.get(sha)
+        if (
+            content
+            and len(content) <= _ATTACHMENT_EMBED_PER_FILE_CAP
+            and embedded_total + len(content) <= _ATTACHMENT_EMBED_TOTAL_CAP
+        ):
+            item["_content_b64"] = base64.b64encode(content).decode("ascii")
+            embedded_total += len(content)
+        enriched.append(item)
+    return enriched
+
+
+def _rehydrate_attachment_files(pre_saved_attachments: list) -> int:
+    """Write any embedded attachment bytes back to their file_path when the
+    file is missing (fresh runner). Returns how many files were restored.
+    Best-effort: a rehydrate failure never aborts message processing."""
+    import base64
+    from pathlib import Path
+
+    restored = 0
+    for saved in pre_saved_attachments or []:
+        file_path = str(saved.get("file_path") or "")
+        content_b64 = saved.get("_content_b64")
+        if not file_path or not content_b64:
+            continue
+        path = Path(file_path)
+        if path.exists():
+            continue
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(base64.b64decode(content_b64))
+            restored += 1
+        except Exception as exc:  # noqa: BLE001 - durability is best-effort
+            logger.warning("attachment rehydrate failed (%s)", type(exc).__name__)
+    return restored
+
 # Recorded as the `actor` on inbox.process_message jobs enqueued by the
 # worker itself - Phase 7 STEP 22: background processing is system
 # execution of previously-authorized work (request_inbox_sync already
@@ -240,6 +308,7 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                 result["error_messages"].append(f"{subject[:80]}: attachment save failed: {exc}")
 
             job_message = {key: value for key, value in message.items() if key != "attachments"}
+            pre_saved_attachments = _embed_attachment_content(pre_saved_attachments, message)
 
             try:
                 with transaction() as conn:
@@ -336,12 +405,30 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
     failure, correctly left to propagate to workers/processor.py's
     generic exception handling (retry, then terminal-fail) rather than
     caught and misreported as success here."""
-    from services.operations_inbox_service import _insert_operations_email_message, sync_conversation_status
+    from services.operations_inbox_service import (
+        _email_sync_unique_message_id,
+        _insert_operations_email_message,
+        mark_intake_historical_backfill,
+        sync_conversation_status,
+    )
 
     message = payload.get("message") or {}
     pre_saved_attachments = payload.get("pre_saved_attachments") or []
+    # Durability: on a fresh runner the saved attachment files are gone -
+    # restore them from the bytes embedded in this (durable) job payload before
+    # the pipeline tries to read them.
+    _rehydrate_attachment_files(pre_saved_attachments)
 
     inserted = _insert_operations_email_message(message, pre_saved_attachments=pre_saved_attachments)
+
+    # Backfill isolation: a historical message must never surface as live
+    # dispatch work. Mark its intake row with the terminal historical status so
+    # every active inbox queue excludes it (inbox_review_where_clause).
+    if payload.get("backfill"):
+        try:
+            mark_intake_historical_backfill(_email_sync_unique_message_id(message))
+        except Exception:
+            pass
 
     conversation_key = inserted.get("conversation_key")
     if conversation_key:
