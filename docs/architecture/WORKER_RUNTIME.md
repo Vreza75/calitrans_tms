@@ -68,6 +68,40 @@ two concurrent invocations claim different rows, never the same one
 exists only to avoid wasting Actions minutes on a genuinely overlapping
 run, not to prevent a correctness problem.
 
+### Scheduled inbox.sync producer (unattended sync)
+
+The process-jobs workflow's first step runs `python scripts/
+enqueue_inbox_sync.py enqueue` (needs only `DATABASE_URL`), which calls
+`application/inbox/commands.py::request_scheduled_inbox_sync`. This is the
+unattended counterpart of the dispatcher's "Sync Email Engine" button: it
+enqueues the **same** `inbox.sync` job and reuses the entire existing
+fetch/dedupe/process/retry pipeline unchanged - it does not fetch mail,
+send email, create loads, or change assignments.
+
+- **System identity, not a dispatcher.** It runs under the narrowly scoped
+  actor `system:inbox-scheduler` and never calls `require_permission` -
+  there is no human in the loop to authorize. `request_inbox_sync`'s
+  `Permission.WORK_ITEM_MANAGE` boundary on the interactive path is
+  untouched.
+- **No duplicates, future runs still allowed.** The idempotency key is
+  bucketed by `INBOX_SYNC_INTERVAL_MINUTES` (default 5), so repeated fires
+  inside one interval collapse to one job while the next interval gets a
+  fresh job. An overlap guard (`worker_job_repo.has_active_job`) additionally
+  skips enqueueing whenever an `inbox.sync` is already pending or processing,
+  so a slow fetch never accumulates a backlog of redundant syncs. Downstream,
+  `inbox.process_message:<provider-message-id>` + `operations_email_already_imported`
+  still prevent any duplicate `order_intake` row even if two syncs overlap.
+- **Failure-isolated.** The producer step is `continue-on-error: true`, so a
+  producer hiccup never blocks SMS/document/realtime processing; the final
+  gate step still surfaces its outcome for visibility.
+- **Configurable cadence.** `INBOX_SYNC_INTERVAL_MINUTES` tunes the effective
+  frequency independently of the fixed `*/5` cron (a finer cron simply
+  collapses into one job per interval).
+- **Observability.** `python scripts/enqueue_inbox_sync.py status`
+  (`application/inbox/queries.py::get_inbox_sync_health`) reports last
+  successful sync, last run duration, per-status backlog, and the most recent
+  (already-sanitized) failure.
+
 ## Worker loop (per invocation)
 
 ```text

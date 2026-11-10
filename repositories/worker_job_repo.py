@@ -269,3 +269,66 @@ def retry_all_failed(conn: Connection, *, reset_attempts: bool = False) -> int:
         sql = "update worker_jobs set status='pending', available_at=now() where status='failed'"
     result = conn.execute(text(sql))
     return result.rowcount or 0
+
+
+def has_active_job(conn: Connection, job_type: str) -> bool:
+    """True if a job of this type is currently 'pending' or 'processing'
+    (not yet terminal). The scheduled inbox.sync producer
+    (application/inbox/commands.py::request_scheduled_inbox_sync) uses this
+    to avoid stacking a new sync on top of one still queued or mid-fetch -
+    overlap prevention, distinct from the idempotency-key window (which only
+    collapses same-bucket re-enqueues, not a slow-processing backlog).
+    Read-only: no claim, no mutation."""
+    row = conn.execute(
+        text(
+            "select 1 from worker_jobs "
+            "where job_type = :job_type and status in ('pending', 'processing') limit 1"
+        ),
+        {"job_type": job_type},
+    ).first()
+    return row is not None
+
+
+def get_job_type_health(conn: Connection, job_type: str) -> dict[str, Any]:
+    """Sanitized health snapshot for one job_type: per-status backlog, the
+    last successful completion and that run's processing duration, and the
+    most recent failure's already-sanitized last_error (workers/processor.py
+    sanitizes before persisting last_error - this never exposes raw SQL,
+    credentials, or message bodies). Read-only."""
+    counts = conn.execute(
+        text("select status, count(*) as n from worker_jobs where job_type = :job_type group by status"),
+        {"job_type": job_type},
+    ).mappings().all()
+    by_status = {row["status"]: int(row["n"]) for row in counts}
+
+    last_success = conn.execute(
+        text(
+            "select completed_at, extract(epoch from (completed_at - claimed_at)) as duration_seconds "
+            "from worker_jobs where job_type = :job_type and status = 'completed' "
+            "order by completed_at desc nulls last limit 1"
+        ),
+        {"job_type": job_type},
+    ).mappings().first()
+
+    last_failure = conn.execute(
+        text(
+            "select last_error from worker_jobs "
+            "where job_type = :job_type and status = 'failed' order by id desc limit 1"
+        ),
+        {"job_type": job_type},
+    ).mappings().first()
+
+    return {
+        "job_type": job_type,
+        "pending": by_status.get("pending", 0),
+        "processing": by_status.get("processing", 0),
+        "completed": by_status.get("completed", 0),
+        "failed": by_status.get("failed", 0),
+        "last_success_at": last_success["completed_at"] if last_success else None,
+        "last_duration_seconds": (
+            float(last_success["duration_seconds"])
+            if last_success and last_success["duration_seconds"] is not None
+            else None
+        ),
+        "last_error": last_failure["last_error"] if last_failure else None,
+    }

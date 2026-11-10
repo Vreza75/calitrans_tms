@@ -29,10 +29,41 @@ from application.inbox.models import InboxSyncRequestResult
 _SYNC_DEDUPE_WINDOW_SECONDS = 60
 _SYNC_SOURCE = "primary_mailbox"
 
+# Narrowly scoped identity recorded on inbox.sync jobs enqueued by the
+# unattended scheduler (scripts/enqueue_inbox_sync.py). Deliberately NOT a
+# dispatcher/manager/admin role and NOT an AuthenticatedActor: scheduled
+# execution is system-initiated background work, so it must never be
+# attributed to - or authorized as - a human. Mirrors workers/
+# inbox_handlers.py::SYSTEM_ACTOR_INBOX_WORKER.
+_SYNC_SCHEDULER_ACTOR = "system:inbox-scheduler"
+
+# Default polling cadence for the scheduled producer. Overridable via the
+# INBOX_SYNC_INTERVAL_MINUTES secret/env without touching the workflow cron,
+# so the effective frequency is configurable independently of GitHub
+# Actions' fixed */5 schedule (a finer cron simply collapses into one job
+# per interval via the bucketed idempotency key below).
+_DEFAULT_SYNC_INTERVAL_MINUTES = 5
+
 
 def _inbox_sync_idempotency_key(*, now: float | None = None) -> str:
     window = int((now if now is not None else time.time()) // _SYNC_DEDUPE_WINDOW_SECONDS)
     return f"inbox.sync:{_SYNC_SOURCE}:{window}"
+
+
+def _sync_interval_minutes() -> int:
+    from config import get_secret
+
+    raw = get_secret("INBOX_SYNC_INTERVAL_MINUTES", str(_DEFAULT_SYNC_INTERVAL_MINUTES))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_SYNC_INTERVAL_MINUTES
+    return value if value >= 1 else _DEFAULT_SYNC_INTERVAL_MINUTES
+
+
+def _scheduled_inbox_sync_idempotency_key(*, interval_minutes: int, now: float | None = None) -> str:
+    bucket = int((now if now is not None else time.time()) // (interval_minutes * 60))
+    return f"inbox.sync:scheduled:{_SYNC_SOURCE}:{bucket}"
 
 
 def request_inbox_sync(*, actor: AuthenticatedActor) -> InboxSyncRequestResult:
@@ -63,6 +94,58 @@ def request_inbox_sync(*, actor: AuthenticatedActor) -> InboxSyncRequestResult:
             payload={},
             idempotency_key=idempotency_key,
             actor=actor.actor,
+        )
+
+    return InboxSyncRequestResult(ok=True, job_id=job_id, status="queued")
+
+
+def request_scheduled_inbox_sync(*, now: float | None = None) -> InboxSyncRequestResult:
+    """System-scheduled inbox.sync producer - the unattended counterpart of
+    request_inbox_sync. Enqueues the SAME inbox.sync job the dispatcher
+    "Sync Email Engine" button does, reusing the entire existing
+    fetch/dedupe/process/retry pipeline unchanged (handle_inbox_sync ->
+    _fetch_and_enqueue_inbox_messages -> inbox.process_message). It does NOT
+    fetch, parse, send email, create loads, or change assignments itself.
+
+    Differences from the human path:
+    - Runs under a narrowly scoped system identity (_SYNC_SCHEDULER_ACTOR),
+      never a dispatcher actor, and never calls require_permission - there
+      is no human to authorize. request_inbox_sync's Permission.WORK_ITEM_MANAGE
+      boundary is left exactly as-is for the interactive path.
+    - Overlap guard: if an inbox.sync is already pending or processing, it
+      enqueues nothing (a slow fetch must not accumulate redundant syncs).
+    - Idempotency key is bucketed by INBOX_SYNC_INTERVAL_MINUTES (default 5),
+      so repeated scheduler fires inside one interval collapse to one job
+      while the next interval gets a fresh job - "no duplicates, future runs
+      still allowed".
+
+    Returns status="queued" (with job_id) when a new job was enqueued, or
+    status="skipped" (job_id None, with a reason) when the overlap guard or
+    the idempotency key suppressed it. "skipped" is a normal outcome, not an
+    error - ok stays True."""
+    from db_client import transaction
+    from repositories.worker_job_repo import enqueue_job, has_active_job
+
+    interval_minutes = _sync_interval_minutes()
+    idempotency_key = _scheduled_inbox_sync_idempotency_key(interval_minutes=interval_minutes, now=now)
+
+    with transaction() as conn:
+        if has_active_job(conn, "inbox.sync"):
+            return InboxSyncRequestResult(
+                ok=True,
+                job_id=None,
+                status="skipped",
+                reason="An inbox.sync job is already pending or processing.",
+            )
+
+        job_id = enqueue_job(
+            conn=conn,
+            job_type="inbox.sync",
+            aggregate_type="mailbox",
+            aggregate_id=_SYNC_SOURCE,
+            payload={},
+            idempotency_key=idempotency_key,
+            actor=_SYNC_SCHEDULER_ACTOR,
         )
 
     return InboxSyncRequestResult(ok=True, job_id=job_id, status="queued")
