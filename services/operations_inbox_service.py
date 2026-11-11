@@ -1775,6 +1775,27 @@ def email_load_creation_enabled() -> bool:
     }
 
 
+def create_load_from_document_fields(
+    intake_id: int, parsed: dict[str, Any], document_fields: dict[str, Any]
+) -> int:
+    """Create a load from an Operations Inbox document (email attachment),
+    merging parsed-document fields over the message's parsed fields.
+
+    Email-originated, so it is fail-closed behind the learning-phase switch:
+    refuses with PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE) when
+    email_load_creation_enabled() is False - the create_load_from_intake
+    primitive it calls stays ungated for legitimate manual/non-email entry, so
+    the gate is enforced here at the email call site. Returns the new load id."""
+    if not email_load_creation_enabled():
+        raise PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
+
+    merged_for_load = dict(parsed)
+    for key, value in (document_fields or {}).items():
+        if not str(key).startswith("_") and safe_str(value):
+            merged_for_load[key] = value
+    return create_load_from_intake(intake_id, merged_for_load)
+
+
 def create_load_from_inbox_item(
     work_item_id: int,
     approved_fields: dict[str, Any],
@@ -5455,20 +5476,15 @@ def render_operations_pdf_panel(
                 use_container_width=True,
                 disabled=not doc_create_enabled,
             ):
-                if not email_load_creation_enabled():
+                try:
+                    new_load_id = create_load_from_document_fields(intake_id, parsed, document_fields)
+                    st.success(f"Created load #{new_load_id} from document fields.")
+                    refresh_data()
+                    st.rerun()
+                except PermissionError:
                     st.info(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
-                else:
-                    try:
-                        merged_for_load = dict(parsed)
-                        for key, value in document_fields.items():
-                            if not str(key).startswith("_") and safe_str(value):
-                                merged_for_load[key] = value
-                        new_load_id = create_load_from_intake(intake_id, merged_for_load)
-                        st.success(f"Created load #{new_load_id} from document fields.")
-                        refresh_data()
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Unable to create load from document fields: {exc}")
+                except Exception as exc:
+                    st.error(f"Unable to create load from document fields: {exc}")
 
 
 # Compatibility aliases for page code that still uses old names

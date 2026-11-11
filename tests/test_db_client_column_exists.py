@@ -4,7 +4,16 @@ of relying only on an st.session_state flag that doesn't reliably survive
 across reruns/process restarts - that flag falling through was silently
 eating the entire interactive sync time budget on every "cold" attempt.
 """
+import pytest
+
 from db_client import column_exists
+
+
+@pytest.fixture(autouse=True)
+def _require_disposable_db(disposable_db):
+    """Every test here does a real DB round trip; run only against an explicit
+    disposable database (skips otherwise) instead of the inherited app one."""
+    yield
 
 
 def test_known_column_reports_true():

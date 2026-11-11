@@ -248,22 +248,38 @@ def test_terminal_status_filter_is_single_canonical_source_across_layers():
     assert svc.HISTORICAL_BACKFILL_REVIEW_STATUS == inbox_repo.HISTORICAL_BACKFILL_REVIEW_STATUS
 
 
-def test_active_queue_clause_excludes_historical_backfill_everywhere():
-    from repositories import inbox_repo
+def test_active_queue_clause_excludes_historical_rows_behaviorally():
+    """Behavioral: run the real inbox_review_where_clause() SQL against a
+    disposable in-memory SQLite table and confirm historical/terminal rows are
+    filtered out while live rows (including NULL->'Open') survive. This is the
+    exact clause every active-queue surface (Streamlit, FastAPI work-item queue
+    via work_item_repo, dispatcher workspace) runs."""
+    import sqlite3
 
-    clause = inbox_repo.inbox_review_where_clause()
-    assert inbox_repo.HISTORICAL_BACKFILL_REVIEW_STATUS in inbox_repo.INBOX_TERMINAL_REVIEW_STATUSES
-    assert "'Historical (Backfill)'" in clause  # excluded from the active-queue SQL
+    from repositories.inbox_repo import (
+        HISTORICAL_BACKFILL_REVIEW_STATUS,
+        inbox_review_where_clause,
+    )
 
-    # repositories.work_item_repo (the FastAPI / Next.js work-item queue) builds
-    # its active-queue query from this same clause - so the API queue filters the
-    # historical status identically to the Streamlit inbox.
-    from repositories import work_item_repo
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("create table order_intake (id integer primary key, review_status text)")
+        conn.executemany(
+            "insert into order_intake (id, review_status) values (?, ?)",
+            [
+                (1, "Open"),  # active
+                (2, None),  # coalesced to 'Open' -> active
+                (3, "Order Created"),  # terminal -> excluded
+                (4, HISTORICAL_BACKFILL_REVIEW_STATUS),  # the regression: must be excluded
+            ],
+        )
+        rows = conn.execute(
+            f"select id from order_intake {inbox_review_where_clause()} order by id"
+        ).fetchall()
+    finally:
+        conn.close()
 
-    import inspect
-
-    src = inspect.getsource(work_item_repo)
-    assert "inbox_review_where_clause" in src
+    assert [r[0] for r in rows] == [1, 2]  # historical + order-created filtered out
 
 
 # --------------------------------------------------------------------------
@@ -271,29 +287,55 @@ def test_active_queue_clause_excludes_historical_backfill_everywhere():
 # (email-originated create), while manual create_load_from_intake stays ungated.
 # --------------------------------------------------------------------------
 
-def test_create_load_from_document_consults_learning_phase_gate():
-    import inspect
+def test_create_load_from_document_refuses_when_learning_phase_disabled(monkeypatch):
+    """Behavioral: the 'Create Load From Document' button delegates to
+    create_load_from_document_fields. With the learning-phase flag OFF it must
+    refuse (PermissionError) WITHOUT ever reaching the create primitive; with it
+    ON it creates, merging document fields over parsed fields and dropping
+    underscore-prefixed internals."""
+    import pytest
 
     from services import operations_inbox_service as svc
 
-    src = inspect.getsource(svc.render_operations_pdf_panel)
-    assert "Create Load From Document" in src
-    # The email-document create path checks the gate, disables the button, and
-    # refuses with the fixed disabled message when the flag is off.
-    assert "email_load_creation_enabled()" in src
-    assert "EMAIL_LOAD_CREATION_DISABLED_MESSAGE" in src
-    assert "disabled=not doc_create_enabled" in src
+    created: list = []
+    monkeypatch.setattr(
+        svc, "create_load_from_intake", lambda intake_id, merged: created.append((intake_id, merged)) or 999
+    )
+
+    monkeypatch.setattr(svc, "email_load_creation_enabled", lambda: False)
+    with pytest.raises(PermissionError):
+        svc.create_load_from_document_fields(7, {"Customer": "X"}, {"Booking Number": "B1"})
+    assert created == []  # gate fired before the primitive
+
+    monkeypatch.setattr(svc, "email_load_creation_enabled", lambda: True)
+    load_id = svc.create_load_from_document_fields(
+        7, {"Customer": "X", "Booking Number": "OLD"}, {"Booking Number": "B1", "_internal": "skip"}
+    )
+    assert load_id == 999
+    intake_id, merged = created[0]
+    assert intake_id == 7
+    assert merged["Booking Number"] == "B1"  # document field overrides parsed
+    assert merged["Customer"] == "X"
+    assert "_internal" not in merged  # underscore-prefixed internals dropped
 
 
-def test_manual_create_load_from_intake_stays_ungated():
-    import inspect
-
+def test_manual_create_load_from_intake_is_not_gated_behaviorally(monkeypatch):
+    """Behavioral companion: the shared manual primitive create_load_from_intake
+    creates WITHOUT consulting the email learning-phase flag, so legitimate
+    non-email load entry keeps working even while email creation is disabled."""
     from services import order_intake
 
-    # The shared manual/non-email primitive must NOT consult the email flag -
-    # legitimate manual load entry outside email workflows keeps working.
-    src = inspect.getsource(order_intake.create_load_from_intake)
-    assert "email_load_creation_enabled" not in src
+    captured: list = []
+    monkeypatch.setattr(
+        order_intake,
+        "create_load_from_intake_with_status",
+        lambda record_id, edited_data, *, conn=None: (captured.append(record_id) or (555, True)),
+    )
+    # Email flag explicitly OFF - manual path must still succeed.
+    monkeypatch.setenv("EMAIL_LOAD_CREATION_ENABLED", "false")
+    load_id = order_intake.create_load_from_intake(42, {"Customer": "Acme"})
+    assert load_id == 555
+    assert captured == [42]
 
 
 # --------------------------------------------------------------------------

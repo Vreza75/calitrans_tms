@@ -1,64 +1,39 @@
 """Session-wide guard: pytest must never resolve DATABASE_URL to the real
-Streamlit-secrets/.env-configured database.
+application database, by ANY path - inherited from the shell, injected from
+.env via dotenv at config import time, read from .streamlit/secrets.toml, or
+reintroduced by a late dotenv reload / import-order variation.
 
-Root cause this closes: config.get_secret(name) checks Streamlit's own
-st.secrets (which reads .streamlit/secrets.toml directly, via
-_read_local_streamlit_secret as a fallback even when streamlit itself was
-never imported) and .env (loaded into os.environ at config.py's own
-import time, via _load_local_env_file) BEFORE the environment variable a
-caller sets. Both files hold the real production DATABASE_URL in this
-repository. Exporting DATABASE_URL before running pytest does NOT
-override either fallback, so any test exercising an unmocked
-db_client.get_engine()/read_df()/execute() call (e.g. load matching
-inside classification) was silently reading live production data -
-confirmed directly: with DATABASE_URL explicitly set to a disposable
-Postgres instance, get_config_source("DATABASE_URL") still reported
-"streamlit secrets" and get_secret("DATABASE_URL") still returned the
-production URL.
+Root cause this closes: config.get_secret(name) consults Streamlit's own
+st.secrets, a local .streamlit/secrets.toml read, and a local .env read as
+fallbacks, and config.py ALSO has two import-time side effects (dotenv's
+load_dotenv() and the hand-rolled _load_local_env_file()) that copy every key
+from .env straight into os.environ - including the production DATABASE_URL in
+this repository. Exporting a different DATABASE_URL before pytest did not
+reliably override those, and simply inheriting an ambient DATABASE_URL (which
+could itself be production) silently pointed tests at a live database.
 
-Fix: neutralize every local-secret-file fallback for the whole pytest
-session (get_streamlit_secret / _read_local_streamlit_secret /
-_read_local_env_secret all return None, for every key, not just
-DATABASE_URL - no automated test run should depend on real local secrets
-for anything). That leaves get_secret() resolving purely from
-os.environ, matching this project's existing MIGRATION_TEST_DATABASE_URL/
-INBOX_CERTIFICATION_DATABASE_URL convention (already used directly by
-tests/test_migration_runner.py, and by
-tests/integration/operations_inbox/harness.py's own scratch_database()
-context manager, both bypassing config.py entirely and therefore already
-unaffected by this gap on their own).
+Fix (defense in depth, all idempotent - see _install_database_isolation):
+  * Replace every file-backed secret fallback (get_streamlit_secret,
+    _read_local_streamlit_secret, _read_local_env_secret) with a lookup that
+    returns None for EVERY key, so get_secret() resolves purely from os.environ.
+  * Neutralize config's own dotenv/.env loaders (load_dotenv, _load_local_env_file)
+    so a reload or explicit re-invocation cannot re-inject DATABASE_URL.
+  * Strip DATABASE_URL from os.environ entirely. pytest NEVER silently uses the
+    application DATABASE_URL. Approved integration tests do not need it: they use
+    their own explicit, disposable-database env vars - MIGRATION_TEST_DATABASE_URL
+    (tests/test_migration_runner.py, @skipif-gated) and
+    INBOX_CERTIFICATION_DATABASE_URL (tests/integration/operations_inbox/harness.py,
+    which bypasses config entirely via its scratch_database() override and already
+    refuses to run against a URL equal to the app's configured DATABASE_URL). We
+    deliberately do NOT copy either test URL into DATABASE_URL.
 
-This module deliberately never sets or mirrors DATABASE_URL itself -
-tests/integration/operations_inbox/harness.py has its own,
-already-correct safety check that refuses to run when
-INBOX_CERTIFICATION_DATABASE_URL equals the app's configured DATABASE_URL
-(see require_scratch_database_url), specifically to catch this exact
-misconfiguration; mirroring the test URL into DATABASE_URL here would
-trip that check and break certification. With the fallback files
-neutralized, a caller-set DATABASE_URL env var is honored normally (it
-was previously being silently shadowed by the higher-priority streamlit-
-secrets layer even when explicitly exported - see the reproduction
-above); with no DATABASE_URL set at all (the common case, plain
-`pytest -q`), get_secret("DATABASE_URL") returns None and
-db_client.get_engine() raises RuntimeError("DATABASE_URL is missing...")
-for any test that unexpectedly reaches it, instead of silently
-succeeding against production. Tests that require a real database
-already skip themselves via their own
-@pytest.mark.skipif(not MIGRATION_TEST_DATABASE_URL, ...) gate, or use
-the certification harness's scoped scratch_database() context manager,
-and are unaffected either way.
-
-A fourth vector, separate from the three get_secret() fallbacks above:
-config.py's OWN module-level import-time side effect
-(_load_local_env_file(), called unconditionally at the bottom of
-config.py) copies every key from .env straight into os.environ for any
-key not already set there - including DATABASE_URL, again from the same
-production-valued .env file, and entirely independent of get_secret()'s
-lookup order. Since config.py may be imported here for the first time
-(triggering that side effect) before this hook gets a chance to react,
-the caller-provided value (if any) is snapshotted *before* importing
-config, and DATABASE_URL is stripped back out afterward unless the
-caller had actually set it themselves.
+Timing: _install_database_isolation() runs (1) at this module's import, which
+pytest performs before collecting/importing any test module - so config's
+import-time .env side effects are stripped immediately, even though importing
+config here is what first triggers them; (2) again in pytest_configure; and
+(3) again via an autouse fixture at the start of every test, so a prior test
+that reloaded config/dotenv cannot leak a DATABASE_URL into a later one. The
+operation is idempotent, so running it repeatedly is harmless.
 """
 import os
 
@@ -67,6 +42,78 @@ import pytest
 
 def _blocked_secret_lookup(name: str) -> str | None:
     return None
+
+
+def _blocked_dotenv(*args, **kwargs) -> bool:
+    return False
+
+
+def _blocked_env_loader(*args, **kwargs) -> None:
+    return None
+
+
+def _install_database_isolation() -> None:
+    """Neutralize every path to the real DATABASE_URL and strip any value already
+    present. Idempotent: safe to call at import, in pytest_configure, and per test."""
+    import config as app_config  # importing (first time) triggers config's .env side effects
+
+    app_config.get_streamlit_secret = _blocked_secret_lookup
+    app_config._read_local_streamlit_secret = _blocked_secret_lookup
+    app_config._read_local_env_secret = _blocked_secret_lookup
+    app_config.load_dotenv = _blocked_dotenv
+    app_config._load_local_env_file = _blocked_env_loader
+    os.environ.pop("DATABASE_URL", None)
+
+
+# Earliest safe point: runs before any test module imports config/db_client.
+_install_database_isolation()
+
+
+@pytest.fixture(autouse=True)
+def _enforce_database_isolation():
+    """Re-assert isolation at the start of every test, defending against a prior
+    test that reloaded config or re-ran dotenv and re-injected DATABASE_URL."""
+    _install_database_isolation()
+    yield
+
+
+def pytest_configure(config) -> None:
+    _install_database_isolation()
+
+
+@pytest.fixture
+def disposable_db(monkeypatch):
+    """Bind db_client to an explicitly-provided DISPOSABLE PostgreSQL database for
+    the few tests that need a real DB round trip (schema DDL, column_exists).
+
+    Skips unless MIGRATION_TEST_DATABASE_URL is set - the established opt-in var
+    for an empty, disposable Postgres (same one tests/test_migration_runner.py
+    uses). The URL is bound by patching db_client.get_secret (never by writing
+    DATABASE_URL into the environment), so these tests can ONLY ever touch the
+    operator-approved disposable database, never a silently-inherited app one."""
+    url = os.environ.get("MIGRATION_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip(
+            "requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable "
+            "PostgreSQL database (these tests were previously running against the "
+            "inherited application database - that silent coupling is now closed)."
+        )
+
+    import db_client
+
+    original_get_secret = db_client.get_secret
+
+    def _forced_get_secret(name: str, default: str | None = None):
+        if name == "DATABASE_URL":
+            return url
+        return original_get_secret(name, default)
+
+    monkeypatch.setattr(db_client, "get_secret", _forced_get_secret)
+    db_client._ENGINE_CACHE.pop(url, None)
+    try:
+        yield url
+    finally:
+        db_client._ENGINE_CACHE.pop(url, None)
 
 
 # Email-driven load creation defaults OFF in production (the learning-phase
@@ -96,16 +143,3 @@ def _email_load_creation_flag(request, monkeypatch):
     module_name = getattr(getattr(request, "module", None), "__name__", "").rsplit(".", 1)[-1]
     if module_name in _EMAIL_LOAD_CREATION_TEST_MODULES:
         monkeypatch.setenv("EMAIL_LOAD_CREATION_ENABLED", "true")
-
-
-def pytest_configure(config) -> None:
-    caller_set_database_url = os.environ.get("DATABASE_URL")
-
-    import config as _app_config  # noqa: F811 - first import may side-load .env into os.environ
-
-    if caller_set_database_url is None:
-        os.environ.pop("DATABASE_URL", None)
-
-    _app_config.get_streamlit_secret = _blocked_secret_lookup
-    _app_config._read_local_streamlit_secret = _blocked_secret_lookup
-    _app_config._read_local_env_secret = _blocked_secret_lookup

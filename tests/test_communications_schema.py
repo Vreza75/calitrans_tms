@@ -4,8 +4,17 @@ the real dev database, same as tests/test_db_client_column_exists.py —
 column_exists() is a real round trip and the added columns are additive
 and idempotent, so re-running this test (or the app) is always safe.
 """
+import pytest
+
 from db_client import column_exists
 from services.dispatch_data_service import ensure_communications_schema
+
+
+@pytest.fixture(autouse=True)
+def _require_disposable_db(disposable_db):
+    """Real DDL round trips; run only against an explicit disposable database
+    (skips otherwise) instead of the inherited application one."""
+    yield
 
 EXPECTED_COLUMNS = [
     "provider",

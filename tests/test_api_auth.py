@@ -152,7 +152,10 @@ def test_dispatcher_role_can_read_work_items(configured_client: TestClient, monk
 def test_dev_mode_bypasses_token_check_only_when_explicitly_enabled(monkeypatch) -> None:
     monkeypatch.setenv("API_AUTH_DEV_MODE", "true")
     monkeypatch.delenv("API_AUTH_TOKENS", raising=False)
-    client = TestClient(app)
+    # raise_server_exceptions=False: without a (disposable) database the handler
+    # raises past the auth layer and surfaces as 500 - we only assert the auth
+    # layer did NOT reject (401/403); the DB round trip is not under test here.
+    client = TestClient(app, raise_server_exceptions=False)
 
     r = client.get("/api/v1/work-items")
     # Reaches the real handler (which will hit the DB or error some other
@@ -337,7 +340,9 @@ def test_dev_mode_value_must_be_exactly_true(monkeypatch) -> None:
     for value in ("1", "yes", "TRUE ", "enabled"):
         monkeypatch.setenv("API_AUTH_DEV_MODE", value)
         monkeypatch.delenv("API_AUTH_TOKENS", raising=False)
-        client = TestClient(app)
+        # raise_server_exceptions=False: a dev-mode-honored call reaches the DB-less
+        # handler and surfaces as 500 (not 401); we assert only the auth decision.
+        client = TestClient(app, raise_server_exceptions=False)
         r = client.get("/api/v1/work-items")
         if value.strip().lower() == "true":
             assert r.status_code != 401
