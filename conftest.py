@@ -39,6 +39,8 @@ import os
 
 import pytest
 
+import pytest_db_guard
+
 
 def _blocked_secret_lookup(name: str) -> str | None:
     return None
@@ -63,6 +65,12 @@ def _install_database_isolation() -> None:
     app_config.load_dotenv = _blocked_dotenv
     app_config._load_local_env_file = _blocked_env_loader
     os.environ.pop("DATABASE_URL", None)
+    # Last-resort net: every SQLAlchemy create_engine (db_client AND the direct
+    # calls in scripts/*, certification harness) is routed through the fail-closed
+    # test-database policy, so no test can open a connection to a real or unknown
+    # database even via mid-test injection, dotenv/config reload, or a bypass of
+    # db_client.get_engine().
+    pytest_db_guard.install_engine_guard()
 
 
 # Earliest safe point: runs before any test module imports config/db_client.
@@ -72,7 +80,8 @@ _install_database_isolation()
 @pytest.fixture(autouse=True)
 def _enforce_database_isolation():
     """Re-assert isolation at the start of every test, defending against a prior
-    test that reloaded config or re-ran dotenv and re-injected DATABASE_URL."""
+    test that reloaded config / dotenv, re-injected DATABASE_URL, or imported a
+    module that freshly bound an unguarded create_engine."""
     _install_database_isolation()
     yield
 
@@ -83,21 +92,17 @@ def pytest_configure(config) -> None:
 
 @pytest.fixture
 def disposable_db(monkeypatch):
-    """Bind db_client to an explicitly-provided DISPOSABLE PostgreSQL database for
+    """Bind db_client to an explicitly-approved DISPOSABLE PostgreSQL database for
     the few tests that need a real DB round trip (schema DDL, column_exists).
 
-    Skips unless MIGRATION_TEST_DATABASE_URL is set - the established opt-in var
-    for an empty, disposable Postgres (same one tests/test_migration_runner.py
-    uses). The URL is bound by patching db_client.get_secret (never by writing
-    DATABASE_URL into the environment), so these tests can ONLY ever touch the
-    operator-approved disposable database, never a silently-inherited app one."""
-    url = os.environ.get("MIGRATION_TEST_DATABASE_URL")
-    if not url:
-        pytest.skip(
-            "requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable "
-            "PostgreSQL database (these tests were previously running against the "
-            "inherited application database - that silent coupling is now closed)."
-        )
+    Routes through the central policy (pytest_db_guard.require_disposable_database):
+    skips unless MIGRATION_TEST_DATABASE_URL is set, destructive access is
+    acknowledged, and the target passes disposable-shape validation. The URL is
+    bound by patching db_client.get_secret (never by writing DATABASE_URL into the
+    environment), so these tests can ONLY ever touch the operator-approved
+    disposable database, never a silently-inherited app one - and the create_engine
+    guard enforces the same policy at connect time regardless."""
+    url = pytest_db_guard.require_disposable_database("MIGRATION_TEST_DATABASE_URL", scope="disposable_db")
 
     import db_client
 

@@ -134,6 +134,17 @@ def test_parse_expected_schema_finds_unique_indexes():
     ),
 )
 class TestMigrationRunnerAgainstARealScratchDatabase:
+    @pytest.fixture(autouse=True)
+    def _central_policy_gate(self):
+        """Route this real-database class through the one central safety policy:
+        skip (not error) unless destructive access is acknowledged and the target
+        passes disposable-shape validation, in addition to the var being set."""
+        import pytest_db_guard
+
+        pytest_db_guard.require_disposable_database(
+            "MIGRATION_TEST_DATABASE_URL", scope="migration runner"
+        )
+
     def test_fresh_run_applies_every_migration_then_verify_schema_passes(self):
         from scripts.verify_schema import verify
 
