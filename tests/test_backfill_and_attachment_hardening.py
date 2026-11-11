@@ -229,3 +229,87 @@ def test_per_mailbox_sync_log_has_no_address_subject_or_password(caplog):
     assert "@" not in text  # no address
     assert "calitranscorp.com" not in text  # no domain
     assert "jobs_queued=3" in text and "skipped_already_imported=1" in text
+
+
+# --------------------------------------------------------------------------
+# Stage 1 #2 - ONE canonical terminal-status filter across every active queue
+# (Streamlit inbox, FastAPI work-item queue, dispatcher workspace). A second
+# divergent copy is exactly how backfilled mail leaked into a live queue.
+# --------------------------------------------------------------------------
+
+def test_terminal_status_filter_is_single_canonical_source_across_layers():
+    from repositories import inbox_repo
+    from services import operations_inbox_service as svc
+
+    # Re-exported, not re-defined: the service shares the repository's exact list
+    # object and where-clause function, so the two can never drift apart.
+    assert svc.INBOX_TERMINAL_REVIEW_STATUSES is inbox_repo.INBOX_TERMINAL_REVIEW_STATUSES
+    assert svc.inbox_review_where_clause is inbox_repo.inbox_review_where_clause
+    assert svc.HISTORICAL_BACKFILL_REVIEW_STATUS == inbox_repo.HISTORICAL_BACKFILL_REVIEW_STATUS
+
+
+def test_active_queue_clause_excludes_historical_backfill_everywhere():
+    from repositories import inbox_repo
+
+    clause = inbox_repo.inbox_review_where_clause()
+    assert inbox_repo.HISTORICAL_BACKFILL_REVIEW_STATUS in inbox_repo.INBOX_TERMINAL_REVIEW_STATUSES
+    assert "'Historical (Backfill)'" in clause  # excluded from the active-queue SQL
+
+    # repositories.work_item_repo (the FastAPI / Next.js work-item queue) builds
+    # its active-queue query from this same clause - so the API queue filters the
+    # historical status identically to the Streamlit inbox.
+    from repositories import work_item_repo
+
+    import inspect
+
+    src = inspect.getsource(work_item_repo)
+    assert "inbox_review_where_clause" in src
+
+
+# --------------------------------------------------------------------------
+# Stage 1 #3 - "Create Load From Document" is gated by the learning-phase flag
+# (email-originated create), while manual create_load_from_intake stays ungated.
+# --------------------------------------------------------------------------
+
+def test_create_load_from_document_consults_learning_phase_gate():
+    import inspect
+
+    from services import operations_inbox_service as svc
+
+    src = inspect.getsource(svc.render_operations_pdf_panel)
+    assert "Create Load From Document" in src
+    # The email-document create path checks the gate, disables the button, and
+    # refuses with the fixed disabled message when the flag is off.
+    assert "email_load_creation_enabled()" in src
+    assert "EMAIL_LOAD_CREATION_DISABLED_MESSAGE" in src
+    assert "disabled=not doc_create_enabled" in src
+
+
+def test_manual_create_load_from_intake_stays_ungated():
+    import inspect
+
+    from services import order_intake
+
+    # The shared manual/non-email primitive must NOT consult the email flag -
+    # legitimate manual load entry outside email workflows keeps working.
+    src = inspect.getsource(order_intake.create_load_from_intake)
+    assert "email_load_creation_enabled" not in src
+
+
+# --------------------------------------------------------------------------
+# Stage 1 #4 - historical backfill never changes LIVE conversation status.
+# --------------------------------------------------------------------------
+
+def test_backfill_does_not_reconcile_live_conversation_status():
+    import workers.inbox_handlers as h
+
+    with mock.patch(
+        "services.operations_inbox_service._insert_operations_email_message",
+        return_value={"conversation_key": "conv-1"},
+    ), mock.patch("services.operations_inbox_service.sync_conversation_status") as sync:
+        h.handle_inbox_process_message({"message": {"subject": "x"}, "backfill": True})
+        sync.assert_not_called()  # historical mail must not touch live status
+
+        sync.reset_mock()
+        h.handle_inbox_process_message({"message": {"subject": "x"}})  # live sync
+        sync.assert_called_once_with("conv-1")

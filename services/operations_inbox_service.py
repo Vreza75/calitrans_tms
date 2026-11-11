@@ -28,6 +28,11 @@ from services.email_parser import (
     parse_email_text,
 )
 from services.order_intake import create_load_from_intake, create_load_from_intake_with_status
+from repositories.inbox_repo import (  # canonical terminal-status source (re-exported)
+    HISTORICAL_BACKFILL_REVIEW_STATUS,
+    INBOX_TERMINAL_REVIEW_STATUSES,
+    inbox_review_where_clause,
+)
 from services.operations_field_service import derive_review_state, extract_operational_fields
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
@@ -422,22 +427,12 @@ REQUEST_TYPES = [
 REPLY_LANGUAGE_OPTIONS = ["Auto", "English", "Spanish", "Bilingual"]
 REPLY_TONE_OPTIONS = ["Professional", "Concise", "Friendly", "Apology / Delay"]
 
-# Historical/backfill intake rows carry this review_status so they are
-# isolated from the live operational inbox - it is a terminal status (below),
-# so inbox_review_where_clause() excludes it from every active queue. Set by
-# workers/inbox_handlers.py::handle_inbox_process_message for backfilled
-# messages (scripts/backfill_inbox.py). Learning/evaluation data only; never
-# active dispatch work.
-HISTORICAL_BACKFILL_REVIEW_STATUS = "Historical (Backfill)"
-
-INBOX_TERMINAL_REVIEW_STATUSES = [
-    "Order Created",
-    "Attached",
-    "Quote Created",
-    "Order Cancelled",
-    "Closed",
-    HISTORICAL_BACKFILL_REVIEW_STATUS,
-]
+# Terminal review-status handling is defined ONCE, canonically, in
+# repositories/inbox_repo.py and re-exported here (see imports at the top of this
+# module) so the Streamlit inbox, the FastAPI work-item queue, and the dispatcher
+# workspace all exclude the same terminal statuses - including
+# HISTORICAL_BACKFILL_REVIEW_STATUS - from active queues. Do NOT redefine these
+# here; a second copy is exactly how backfilled mail leaked into a live queue.
 
 
 # Historical/backfill rows are now assigned HISTORICAL_BACKFILL_REVIEW_STATUS
@@ -1411,9 +1406,9 @@ def ensure_operations_email_sync_schema() -> None:
     ensure_operations_case_schema()
 
 
-def inbox_review_where_clause() -> str:
-    terminal = ", ".join([f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES])
-    return f"where coalesce(review_status, 'Open') not in ({terminal})"
+# inbox_review_where_clause is imported from repositories.inbox_repo (the single
+# canonical definition) at the top of this module and re-exported for page code
+# that calls ops._inbox_review_where_clause().
 
 
 @st.cache_data(show_spinner=False, ttl=30)
@@ -5447,18 +5442,33 @@ def render_operations_pdf_panel(
                     st.info(result.get("error") or "No load fields needed updating.")
 
         with load_cols[2]:
-            if st.button("Create Load From Document", key=f"create_load_from_ops_attachment_{intake_id}_{selected_index}", use_container_width=True):
-                try:
-                    merged_for_load = dict(parsed)
-                    for key, value in document_fields.items():
-                        if not str(key).startswith("_") and safe_str(value):
-                            merged_for_load[key] = value
-                    new_load_id = create_load_from_intake(intake_id, merged_for_load)
-                    st.success(f"Created load #{new_load_id} from document fields.")
-                    refresh_data()
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"Unable to create load from document fields: {exc}")
+            # This is an EMAIL-originated load creation (the document came from an
+            # Operations Inbox attachment), so it is gated by the same
+            # learning-phase switch as every other email-driven create path.
+            # create_load_from_intake itself stays ungated - it is the shared
+            # function legitimate manual/non-email load entry also uses - so the
+            # gate is enforced here at the email call site, not in the primitive.
+            doc_create_enabled = email_load_creation_enabled()
+            if st.button(
+                "Create Load From Document",
+                key=f"create_load_from_ops_attachment_{intake_id}_{selected_index}",
+                use_container_width=True,
+                disabled=not doc_create_enabled,
+            ):
+                if not email_load_creation_enabled():
+                    st.info(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
+                else:
+                    try:
+                        merged_for_load = dict(parsed)
+                        for key, value in document_fields.items():
+                            if not str(key).startswith("_") and safe_str(value):
+                                merged_for_load[key] = value
+                        new_load_id = create_load_from_intake(intake_id, merged_for_load)
+                        st.success(f"Created load #{new_load_id} from document fields.")
+                        refresh_data()
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Unable to create load from document fields: {exc}")
 
 
 # Compatibility aliases for page code that still uses old names

@@ -463,8 +463,14 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
         message, pre_saved_attachments=pre_saved_attachments, force_review_status=force_review_status
     )
 
+    # A backfilled (historical) message must never change LIVE conversation
+    # state: it is inserted terminal (Historical (Backfill)) and excluded from
+    # active queues, but sync_conversation_status recomputes the shared
+    # conversation's status from all its rows and could flip a currently-active
+    # conversation (same conversation_key) based on old mail. Reconcile status
+    # only for live sync; backfill deliberately leaves live conversations alone.
     conversation_key = inserted.get("conversation_key")
-    if conversation_key:
+    if conversation_key and not payload.get("backfill"):
         try:
             sync_conversation_status(conversation_key)
         except Exception:
