@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from unittest import mock
 
 import pytest
+import pytest_db_guard
 
 import db_client
 import repositories.worker_job_repo as worker_job_repo
@@ -231,7 +232,7 @@ def test_fetch_failure_reason_distinguishes_job_run_from_mailbox_retrieval():
 # --------------------------------------------------------------------------
 
 requires_db = pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Set MIGRATION_TEST_DATABASE_URL to a disposable Postgres to run scheduled-sync DB tests.",
 )
 

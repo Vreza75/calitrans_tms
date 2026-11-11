@@ -65,12 +65,14 @@ def _install_database_isolation() -> None:
     app_config.load_dotenv = _blocked_dotenv
     app_config._load_local_env_file = _blocked_env_loader
     os.environ.pop("DATABASE_URL", None)
-    # Last-resort net: every SQLAlchemy create_engine (db_client AND the direct
-    # calls in scripts/*, certification harness) is routed through the fail-closed
-    # test-database policy, so no test can open a connection to a real or unknown
-    # database even via mid-test injection, dotenv/config reload, or a bypass of
-    # db_client.get_engine().
-    pytest_db_guard.install_engine_guard()
+    # Fail-closed net enforced at CONNECTION time: a global SQLAlchemy do_connect
+    # listener (covering every engine, including cached ones and any aliased
+    # create_engine) plus wrapped psycopg/psycopg2.connect validate the effective
+    # target of every physical connection against the approved disposable-identity
+    # allowlist. No test can open a connection to a real or unknown database -
+    # even via mid-test injection, dotenv/config reload, a cached engine, a
+    # routing override, or a direct DBAPI connect.
+    pytest_db_guard.install_connection_guard()
 
 
 # Earliest safe point: runs before any test module imports config/db_client.
@@ -102,7 +104,7 @@ def disposable_db(monkeypatch):
     environment), so these tests can ONLY ever touch the operator-approved
     disposable database, never a silently-inherited app one - and the create_engine
     guard enforces the same policy at connect time regardless."""
-    url = pytest_db_guard.require_disposable_database("MIGRATION_TEST_DATABASE_URL", scope="disposable_db")
+    url = pytest_db_guard.require_disposable_database("migration", scope="disposable_db")
 
     import db_client
 

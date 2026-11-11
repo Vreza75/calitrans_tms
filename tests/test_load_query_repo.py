@@ -16,6 +16,7 @@ import datetime as dt
 import os
 
 import pytest
+import pytest_db_guard
 from sqlalchemy import event, text
 
 import db_client
@@ -219,7 +220,7 @@ def test_no_filters_produces_true_where_clause():
 
 
 @pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable PostgreSQL database.",
 )
 class TestPostgresLoadQueries:

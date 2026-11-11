@@ -28,12 +28,13 @@ from __future__ import annotations
 import os
 
 import pytest
+import pytest_db_guard
 from sqlalchemy import text
 
 MIGRATION_TEST_DATABASE_URL = os.environ.get("MIGRATION_TEST_DATABASE_URL")
 
 pytestmark = pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable PostgreSQL database.",
 )
 

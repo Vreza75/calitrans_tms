@@ -98,7 +98,7 @@ def require_scratch_database_url(explicit_url: str | None = None) -> str:
         import pytest_db_guard
 
         url = pytest_db_guard.require_disposable_database(
-            ENV_VAR, scope="Operations Inbox certification"
+            "inbox_certification", scope="Operations Inbox certification"
         )
     if not url:
         raise MissingScratchDatabaseError(
