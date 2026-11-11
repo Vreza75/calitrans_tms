@@ -39,6 +39,9 @@ class _Dialect:
 def _approve_migration(monkeypatch, url: str = _APPROVED_URL) -> None:
     monkeypatch.setenv("MIGRATION_TEST_DATABASE_URL", url)
     monkeypatch.setenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", "1")
+    # Independent positive disposability evidence (correction 3): approval now
+    # also requires the identity to be enumerated here, not just URL + ack.
+    monkeypatch.setenv("DISPOSABLE_DB_IDENTITIES", url)
 
 
 def _clear_all(monkeypatch) -> None:
@@ -47,6 +50,8 @@ def _clear_all(monkeypatch) -> None:
         "ALLOW_DESTRUCTIVE_MIGRATION_DB",
         "INBOX_CERTIFICATION_DATABASE_URL",
         "ALLOW_DESTRUCTIVE_INBOX_CERTIFICATION_DB",
+        "DISPOSABLE_DB_IDENTITIES",
+        "FORBIDDEN_DATABASE_IDENTITIES",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -60,13 +65,16 @@ def test_no_identities_approved_by_default(monkeypatch):
     assert guard.approved_identities() == set()
 
 
-def test_only_configured_and_acknowledged_identity_is_approved(monkeypatch):
+def test_url_ack_and_positive_evidence_all_required_for_approval(monkeypatch):
     _clear_all(monkeypatch)
     # URL set but NOT acknowledged -> not approved.
     monkeypatch.setenv("MIGRATION_TEST_DATABASE_URL", _APPROVED_URL)
     assert guard.approved_identities() == set()
-    # URL + acknowledgement -> exactly that identity approved.
+    # URL + ack but NO positive disposability evidence -> still not approved.
     monkeypatch.setenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", "1")
+    assert guard.approved_identities() == set()
+    # URL + ack + DISPOSABLE_DB_IDENTITIES -> exactly that identity approved.
+    monkeypatch.setenv("DISPOSABLE_DB_IDENTITIES", _APPROVED_URL)
     assert guard.approved_identities() == {_APPROVED_IDENTITY}
 
 
@@ -246,3 +254,134 @@ def test_install_wraps_psycopg2_connect():
 
     guard.install_connection_guard()
     assert getattr(psycopg2.connect, "_is_db_guard", False) is True
+
+
+# --------------------------------------------------------------------------
+# Correction 1 - mixed DSN + routing kwargs cannot smuggle a different target.
+# --------------------------------------------------------------------------
+
+def test_dbapi_dsn_plus_kwarg_host_override_is_validated_as_effective_target(monkeypatch):
+    _approve_migration(monkeypatch)
+    real = mock.Mock(return_value=mock.sentinel.conn)
+    guarded = guard._make_guarded_dbapi_connect(real)
+    # Positional DSN is approved, but a host= kwarg (libpq precedence) would move
+    # the real connection to production - must be refused on the EFFECTIVE target.
+    with pytest.raises(DatabaseSafetyError):
+        guarded(_APPROVED_URL, host="db.internal.example.com")
+    real.assert_not_called()
+
+
+def test_dbapi_dsn_kwarg_is_normalized_and_allowed_when_approved(monkeypatch):
+    _approve_migration(monkeypatch)
+    real = mock.Mock(return_value=mock.sentinel.conn)
+    guarded = guard._make_guarded_dbapi_connect(real)
+    assert guarded(dsn=_APPROVED_URL) is mock.sentinel.conn  # no over-rejection
+    real.assert_called_once()
+
+
+def test_dbapi_kwarg_host_override_wins_over_dsn_for_approval(monkeypatch):
+    # The reverse: DSN points at production, but kwargs move it to the approved
+    # target -> the effective (approved) target is what gets validated + allowed.
+    _approve_migration(monkeypatch)
+    real = mock.Mock(return_value=mock.sentinel.conn)
+    guarded = guard._make_guarded_dbapi_connect(real)
+    result = guarded(
+        _PROD_URL, host="db-scratch.example.net", port=6543, dbname="calitrans_scratch_test"
+    )
+    assert result is mock.sentinel.conn
+
+
+# --------------------------------------------------------------------------
+# Correction 2 - pooled connection re-validated on checkout (revocation).
+# --------------------------------------------------------------------------
+
+class _ConnRecord:
+    def __init__(self):
+        self.info = {}
+
+
+def test_pool_checkout_revalidates_and_blocks_after_revocation(monkeypatch):
+    _approve_migration(monkeypatch)
+    record = _ConnRecord()
+    # do_connect stamps the validated identity onto the pooled record.
+    guard._validate_sqlalchemy_connect(_Dialect("postgresql"), record, [], guard._pg_cparams_from_url(_APPROVED_URL))
+    assert record.info[guard._CONN_RECORD_IDENTITY_KEY] == _APPROVED_IDENTITY
+    # While still approved, checkout passes.
+    guard._validate_pool_checkout(object(), record, object())
+    # Revoke approval mid-session -> the SAME pooled connection is refused.
+    monkeypatch.delenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", raising=False)
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_pool_checkout(object(), record, object())
+
+
+def test_pool_checkout_ignores_unstamped_sqlite_records():
+    guard._validate_pool_checkout(object(), _ConnRecord(), object())  # no identity -> no raise
+
+
+def test_checkout_listener_is_registered():
+    guard.install_connection_guard()
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    assert event.contains(Engine, "checkout", guard._validate_pool_checkout)
+
+
+# --------------------------------------------------------------------------
+# Correction 3 - independent production backstop (deny + positive evidence).
+# --------------------------------------------------------------------------
+
+def test_forbidden_identity_is_denied_even_when_otherwise_approved(monkeypatch):
+    _approve_migration(monkeypatch)  # url + ack + evidence for the approved id
+    # Operator ALSO (mistakenly) lists it as forbidden -> deny wins.
+    monkeypatch.setenv("FORBIDDEN_DATABASE_IDENTITIES", _APPROVED_URL)
+    assert guard.approved_identities() == set()
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_sqlalchemy_connect(
+            _Dialect("postgresql"), _ConnRecord(), [], guard._pg_cparams_from_url(_APPROVED_URL)
+        )
+
+
+def test_url_and_ack_without_evidence_is_refused_at_connect(monkeypatch):
+    _clear_all(monkeypatch)
+    # Naming + acknowledgement alone must NOT authorize (no positive evidence).
+    monkeypatch.setenv("MIGRATION_TEST_DATABASE_URL", _APPROVED_URL)
+    monkeypatch.setenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", "1")
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_sqlalchemy_connect(
+            _Dialect("postgresql"), _ConnRecord(), [], guard._pg_cparams_from_url(_APPROVED_URL)
+        )
+
+
+def test_compact_host_port_db_evidence_token_is_accepted(monkeypatch):
+    _clear_all(monkeypatch)
+    monkeypatch.setenv("MIGRATION_TEST_DATABASE_URL", _APPROVED_URL)
+    monkeypatch.setenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", "1")
+    monkeypatch.setenv("DISPOSABLE_DB_IDENTITIES", "db-scratch.example.net:6543/calitrans_scratch_test")
+    assert guard.approved_identities() == {_APPROVED_IDENTITY}
+
+
+# --------------------------------------------------------------------------
+# Correction 4 - reload re-wraps; aliases/limitation documented.
+# --------------------------------------------------------------------------
+
+def test_install_rewraps_psycopg_connect_after_reload(monkeypatch):
+    import importlib.util
+
+    if importlib.util.find_spec("psycopg2") is None:
+        pytest.skip("psycopg2 not installed")
+    import psycopg2
+
+    guard.install_connection_guard()
+    # Simulate a reload restoring the original (unmarked) connect.
+    guarded_before = psycopg2.connect
+    original = getattr(guarded_before, "_real_connect", guarded_before)
+    monkeypatch.setattr(psycopg2, "connect", original, raising=False)
+    assert getattr(psycopg2.connect, "_is_db_guard", False) is False
+    # Next install must re-wrap it.
+    guard.install_connection_guard()
+    assert getattr(psycopg2.connect, "_is_db_guard", False) is True
+
+
+def test_network_isolation_limitation_is_documented():
+    assert "network-isolated" in guard.__doc__
+    assert "alias" in guard.__doc__.lower()
