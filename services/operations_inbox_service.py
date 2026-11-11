@@ -440,20 +440,11 @@ INBOX_TERMINAL_REVIEW_STATUSES = [
 ]
 
 
-def mark_intake_historical_backfill(source_message_id: str) -> None:
-    """Move a just-inserted backfilled intake row to the isolated historical
-    status, unless it already reached a terminal status. Keyed on the unique
-    source_message_id so it needs no returned row id. Best-effort."""
-    terminal = ", ".join(f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES)
-    execute(
-        f"""
-        update order_intake
-        set review_status = :status
-        where source_message_id = :mid
-          and coalesce(review_status, 'Open') not in ({terminal})
-        """,
-        {"status": HISTORICAL_BACKFILL_REVIEW_STATUS, "mid": source_message_id},
-    )
+# Historical/backfill rows are now assigned HISTORICAL_BACKFILL_REVIEW_STATUS
+# atomically at INSERT time (workers/inbox_handlers.py::handle_inbox_process_message
+# passes force_review_status into _insert_operations_email_message), so the old
+# best-effort post-insert UPDATE has been removed - there is no window in which
+# a historical row is briefly 'Open'/active.
 
 OPERATIONS_EMAIL_SYNC_SOURCES = [
     "operations_email",
@@ -4527,7 +4518,7 @@ def _prepare_operations_email_records(message: dict, *, pre_saved_attachments: l
     return records
 
 
-def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
+def _insert_operations_email_record_row(message: dict, record: dict, *, review_status: str = "Open") -> dict:
     subject = record["subject"]
     sender = record["sender"]
     received_at = record["received_at"]
@@ -4633,7 +4624,7 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             cast(:parsed_data as jsonb),
             :raw_text,
             'Synced',
-            'Open',
+            :review_status,
             :request_type,
             :conversation_key,
             :matched_load_id,
@@ -4672,6 +4663,7 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             "file_path": safe_str(saved_attachments[0].get("file_path")) if saved_attachments else None,
             "parsed_data": json_dump(parsed),
             "raw_text": latest_body,
+            "review_status": review_status,
             "request_type": classification.get("request_type", "Customer Request"),
             "conversation_key": conversation_key,
             "matched_load_id": int_or_none(classification.get("matched_load_id")),
@@ -4715,12 +4707,22 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     }
 
 
-def _insert_operations_email_message(message: dict, *, pre_saved_attachments: list | None = None) -> dict:
+def _insert_operations_email_message(
+    message: dict, *, pre_saved_attachments: list | None = None, force_review_status: str | None = None
+) -> dict:
     records = _prepare_operations_email_records(message, pre_saved_attachments=pre_saved_attachments)
     base_message_id = _email_sync_unique_message_id(message)
     records = _assign_split_row_identity(records, base_message_id)
 
-    results = [_insert_operations_email_record_row(message, record) for record in records]
+    # Atomic isolation: the row is INSERTED with this review_status (no
+    # separate best-effort UPDATE afterwards), so a backfilled/historical
+    # message can never briefly exist as active work, even if the worker
+    # crashes right after the insert commits. Default 'Open' = unchanged live
+    # behavior.
+    review_status = force_review_status or "Open"
+    results = [
+        _insert_operations_email_record_row(message, record, review_status=review_status) for record in records
+    ]
 
     primary = results[0]
     return {

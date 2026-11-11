@@ -193,9 +193,22 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
                     totals["queued"] += 1
             existing_lookup.setdefault("by_message_id", {})[message_id.lower()] = {"source_message_id": message_id}
 
+        # Explicit progress accounting for this run of this mailbox.
+        mb["remaining"] = max(0, mb["found"] - mb["skipped"] - mb["queued"] - mb["already_queued"])
+        # The fetch window is capped at FETCH_CAP messages; if it filled, older
+        # messages in the date range were not even seen this run. Surface it
+        # loudly so the operator narrows the window rather than silently
+        # stalling (a durable UID cursor is the longer-term fix - see docstring).
+        mb["window_truncated"] = mb["found"] >= FETCH_CAP
+        if mb["window_truncated"]:
+            print(
+                f"backfill WARNING mailbox={mb['alias']} window hit FETCH_CAP={FETCH_CAP}; "
+                f"narrow --since/--until to reach older messages."
+            )
         totals["per_mailbox"].append(mb)
         _log_mailbox(mb)
 
+    totals["remaining"] = sum(m.get("remaining", 0) for m in totals["per_mailbox"])
     return totals
 
 
@@ -204,8 +217,9 @@ def _log_mailbox(mb: dict) -> None:
     and integer counts. No addresses, subjects, bodies, or passwords."""
     print(
         f"backfill mailbox={mb['alias']} login={mb['login']} error_type={mb['error_type'] or '-'} "
-        f"found={mb['found']} skipped_already_imported={mb['skipped']} "
-        f"jobs_queued={mb['queued']} already_queued={mb.get('already_queued', 0)}"
+        f"found={mb['found']} imported_skipped={mb['skipped']} "
+        f"jobs_queued={mb['queued']} already_queued={mb.get('already_queued', 0)} "
+        f"remaining={mb.get('remaining', 0)}"
     )
 
 
@@ -239,7 +253,8 @@ def main() -> int:
         f"backfill {args.since}..{args.until} {mode}: "
         f"fetched={totals['fetched']} skipped={totals['skipped']} "
         f"{'would_queue' if args.dry_run else 'queued'}={totals['queued']} "
-        f"already_queued={totals['already_queued']} mailbox_errors={totals['errors']}"
+        f"already_queued={totals['already_queued']} remaining={totals.get('remaining', 0)} "
+        f"mailbox_errors={totals['errors']}"
     )
     return 1 if totals["errors"] else 0
 

@@ -73,23 +73,69 @@ def test_backfill_row_status_is_terminal_so_active_queue_excludes_it():
     assert HISTORICAL_BACKFILL_REVIEW_STATUS in INBOX_TERMINAL_REVIEW_STATUSES
 
 
-def test_process_message_marks_backfill_rows_historical_only_when_flagged():
+def test_process_message_inserts_backfill_rows_with_atomic_historical_status():
     import workers.inbox_handlers as h
+    from services.operations_inbox_service import HISTORICAL_BACKFILL_REVIEW_STATUS
 
     with mock.patch(
         "services.operations_inbox_service._insert_operations_email_message",
         return_value={"conversation_key": ""},
-    ), mock.patch("services.operations_inbox_service.sync_conversation_status"), mock.patch(
-        "services.operations_inbox_service.mark_intake_historical_backfill"
-    ) as mark, mock.patch(
-        "services.operations_inbox_service._email_sync_unique_message_id", return_value="mid-1"
-    ):
+    ) as insert, mock.patch("services.operations_inbox_service.sync_conversation_status"):
         h.handle_inbox_process_message({"message": {"subject": "x"}, "backfill": True})
-        mark.assert_called_once_with("mid-1")
+        assert insert.call_args.kwargs["force_review_status"] == HISTORICAL_BACKFILL_REVIEW_STATUS
 
-        mark.reset_mock()
+        insert.reset_mock()
         h.handle_inbox_process_message({"message": {"subject": "x"}})  # live, no flag
-        mark.assert_not_called()
+        assert insert.call_args.kwargs["force_review_status"] is None
+
+
+def test_rehydrate_fails_closed_when_missing_and_no_durable_copy(tmp_path):
+    from workers.inbox_handlers import AttachmentDurabilityError, _rehydrate_attachment_files
+
+    import hashlib
+
+    pre_saved = [
+        {"file_path": str(tmp_path / "gone.pdf"), "content_sha256": hashlib.sha256(b"x").hexdigest()}
+    ]  # no _content_b64, file never created
+    import pytest
+
+    with pytest.raises(AttachmentDurabilityError):
+        _rehydrate_attachment_files(pre_saved)
+
+
+def test_rehydrate_fails_closed_on_sha_mismatch(tmp_path):
+    import base64
+
+    import pytest
+
+    from workers.inbox_handlers import AttachmentDurabilityError, _rehydrate_attachment_files
+
+    pre_saved = [
+        {
+            "file_path": str(tmp_path / "gone.pdf"),
+            "content_sha256": "deadbeef",  # won't match the embedded bytes
+            "_content_b64": base64.b64encode(b"real bytes").decode("ascii"),
+        }
+    ]
+    with pytest.raises(AttachmentDurabilityError):
+        _rehydrate_attachment_files(pre_saved)
+
+
+def test_rehydrate_restores_corrupted_on_disk_file_from_durable_copy(tmp_path):
+    import base64
+    import hashlib
+
+    from workers.inbox_handlers import _rehydrate_attachment_files
+
+    good = b"%PDF good bytes"
+    sha = hashlib.sha256(good).hexdigest()
+    path = tmp_path / "doc.pdf"
+    path.write_bytes(b"corrupted")  # on-disk copy is wrong
+    pre_saved = [
+        {"file_path": str(path), "content_sha256": sha, "_content_b64": base64.b64encode(good).decode("ascii")}
+    ]
+    assert _rehydrate_attachment_files(pre_saved) == 1
+    assert path.read_bytes() == good
 
 
 # --------------------------------------------------------------------------

@@ -72,28 +72,62 @@ def _embed_attachment_content(pre_saved_attachments: list, message: dict) -> lis
     return enriched
 
 
+class AttachmentDurabilityError(Exception):
+    """A saved attachment could not be durably restored and SHA-256 verified.
+    Raised so the inbox.process_message job fails (retries, then terminal-fails
+    for an operator) rather than silently persisting a message with a missing
+    or corrupted attachment."""
+
+
 def _rehydrate_attachment_files(pre_saved_attachments: list) -> int:
-    """Write any embedded attachment bytes back to their file_path when the
-    file is missing (fresh runner). Returns how many files were restored.
-    Best-effort: a rehydrate failure never aborts message processing."""
+    """Ensure every saved attachment is present on disk and matches its
+    recorded SHA-256, restoring from the durable base64 copy in the job payload
+    when the local file is gone (fresh runner) or corrupted. FAIL-CLOSED: if an
+    attachment file is missing or fails verification and there is no durable
+    copy to restore it from, raise AttachmentDurabilityError - never proceed
+    with the attachment silently lost. Returns the number of files restored."""
     import base64
+    import hashlib
     from pathlib import Path
 
     restored = 0
     for saved in pre_saved_attachments or []:
         file_path = str(saved.get("file_path") or "")
+        if not file_path:
+            # No durable file was ever produced for this entry (e.g. the save
+            # itself errored and recorded a parse_error) - nothing to restore.
+            continue
+
+        expected_sha = str(saved.get("content_sha256") or "")
         content_b64 = saved.get("_content_b64")
-        if not file_path or not content_b64:
-            continue
         path = Path(file_path)
-        if path.exists():
+
+        if not expected_sha:
+            # No recorded hash (malformed/legacy/parse-error entry) - a real
+            # saved attachment always records content_sha256, so this is not a
+            # verifiable attachment to fail the message over. Best-effort:
+            # restore from an embedded copy if the file is gone, else leave it.
+            if content_b64 and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(base64.b64decode(content_b64))
+                restored += 1
             continue
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(base64.b64decode(content_b64))
-            restored += 1
-        except Exception as exc:  # noqa: BLE001 - durability is best-effort
-            logger.warning("attachment rehydrate failed (%s)", type(exc).__name__)
+
+        if path.exists():
+            if hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha:
+                continue  # present and verified
+            # On-disk file is corrupted - fall through to restore from the copy.
+
+        if not content_b64:
+            raise AttachmentDurabilityError(
+                f"attachment {path.name} is missing/corrupted and no durable copy was embedded"
+            )
+        data = base64.b64decode(content_b64)
+        if expected_sha and hashlib.sha256(data).hexdigest() != expected_sha:
+            raise AttachmentDurabilityError(f"restored attachment {path.name} failed SHA-256 verification")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        restored += 1
     return restored
 
 # Recorded as the `actor` on inbox.process_message jobs enqueued by the
@@ -406,29 +440,28 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
     generic exception handling (retry, then terminal-fail) rather than
     caught and misreported as success here."""
     from services.operations_inbox_service import (
-        _email_sync_unique_message_id,
+        HISTORICAL_BACKFILL_REVIEW_STATUS,
         _insert_operations_email_message,
-        mark_intake_historical_backfill,
         sync_conversation_status,
     )
 
     message = payload.get("message") or {}
     pre_saved_attachments = payload.get("pre_saved_attachments") or []
     # Durability: on a fresh runner the saved attachment files are gone -
-    # restore them from the bytes embedded in this (durable) job payload before
-    # the pipeline tries to read them.
+    # restore them from the bytes embedded in this (durable) job payload. Any
+    # attachment that cannot be restored and verified fails the whole message
+    # (raises) so it is never silently dropped - see _rehydrate_attachment_files.
     _rehydrate_attachment_files(pre_saved_attachments)
 
-    inserted = _insert_operations_email_message(message, pre_saved_attachments=pre_saved_attachments)
-
-    # Backfill isolation: a historical message must never surface as live
-    # dispatch work. Mark its intake row with the terminal historical status so
-    # every active inbox queue excludes it (inbox_review_where_clause).
-    if payload.get("backfill"):
-        try:
-            mark_intake_historical_backfill(_email_sync_unique_message_id(message))
-        except Exception:
-            pass
+    # Backfill isolation (atomic): a historical message must never surface as
+    # live dispatch work. The row is INSERTED with the terminal historical
+    # review_status in the same transaction - no separate post-insert update to
+    # race or silently fail - so every active inbox queue excludes it even if
+    # the worker crashes immediately after the insert commits.
+    force_review_status = HISTORICAL_BACKFILL_REVIEW_STATUS if payload.get("backfill") else None
+    inserted = _insert_operations_email_message(
+        message, pre_saved_attachments=pre_saved_attachments, force_review_status=force_review_status
+    )
 
     conversation_key = inserted.get("conversation_key")
     if conversation_key:

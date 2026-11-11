@@ -236,7 +236,9 @@ def test_process_message_passes_pre_saved_attachments_through():
     assert success is True
     assert error == ""
     insert.assert_called_once_with(
-        _JOB_PAYLOAD["message"], pre_saved_attachments=_JOB_PAYLOAD["pre_saved_attachments"]
+        _JOB_PAYLOAD["message"],
+        pre_saved_attachments=_JOB_PAYLOAD["pre_saved_attachments"],
+        force_review_status=None,
     )
     sync_status.assert_called_once_with("ck1")
 
