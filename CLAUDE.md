@@ -143,20 +143,14 @@ Delete only confirmed dead or safely consolidated duplicate code.
 
 Pay special attention to:
 
-pages_app/operations_inbox.py
-services/operations_inbox_service.py
-Email-sync services
-Parser services
-Attachment services
-Pending draft code
-Conversation-history code
-Load-matching code
 Root db_client.py
 database/db_client.py
 Compatibility aliases
 Old backup modules
 Debug panels
 Unused migrations
+
+Operations Inbox-specific dead-code sensitivity (pages_app/operations_inbox.py, services/operations_inbox_service.py, email-sync/parser/attachment/pending-draft/conversation-history/load-matching code) lives in `.claude/rules/operations-inbox.md`.
 #Database Safety
 
 Never run destructive database changes without first providing:
