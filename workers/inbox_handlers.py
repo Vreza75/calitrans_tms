@@ -445,6 +445,8 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
         sync_conversation_status,
     )
 
+    from services.inbox_backfill_policy import message_is_historical
+
     message = payload.get("message") or {}
     pre_saved_attachments = payload.get("pre_saved_attachments") or []
     # Durability: on a fresh runner the saved attachment files are gone -
@@ -453,24 +455,34 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
     # (raises) so it is never silently dropped - see _rehydrate_attachment_files.
     _rehydrate_attachment_files(pre_saved_attachments)
 
+    # Deterministic classification (Stage 2 / Task B): historical-vs-live is
+    # decided from the message's OWN received date vs the configured live cutoff
+    # (services.inbox_backfill_policy), NOT from the producer-stamped `backfill`
+    # payload flag. Live sync and backfill share one idempotency key and
+    # enqueue_job's ON CONFLICT never rewrites the payload, so a flag-driven
+    # classification let whichever producer enqueued first freeze the outcome -
+    # a backfill of recent mail could bury a live, actionable email. The flag is
+    # now only a fallback for the no-cutoff / undated edges (see that module).
+    is_historical = message_is_historical(message, backfill_flag=bool(payload.get("backfill")))
+
     # Backfill isolation (atomic): a historical message must never surface as
     # live dispatch work. The row is INSERTED with the terminal historical
     # review_status in the same transaction - no separate post-insert update to
     # race or silently fail - so every active inbox queue excludes it even if
     # the worker crashes immediately after the insert commits.
-    force_review_status = HISTORICAL_BACKFILL_REVIEW_STATUS if payload.get("backfill") else None
+    force_review_status = HISTORICAL_BACKFILL_REVIEW_STATUS if is_historical else None
     inserted = _insert_operations_email_message(
         message, pre_saved_attachments=pre_saved_attachments, force_review_status=force_review_status
     )
 
-    # A backfilled (historical) message must never change LIVE conversation
-    # state: it is inserted terminal (Historical (Backfill)) and excluded from
-    # active queues, but sync_conversation_status recomputes the shared
-    # conversation's status from all its rows and could flip a currently-active
-    # conversation (same conversation_key) based on old mail. Reconcile status
-    # only for live sync; backfill deliberately leaves live conversations alone.
+    # A historical message must never change LIVE conversation state: it is
+    # inserted terminal (Historical (Backfill)) and excluded from active queues,
+    # but sync_conversation_status recomputes the shared conversation's status
+    # from all its rows and could flip a currently-active conversation (same
+    # conversation_key) based on old mail. Reconcile status only for live
+    # messages; historical mail deliberately leaves live conversations alone.
     conversation_key = inserted.get("conversation_key")
-    if conversation_key and not payload.get("backfill"):
+    if conversation_key and not is_historical:
         try:
             sync_conversation_status(conversation_key)
         except Exception:

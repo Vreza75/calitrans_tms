@@ -13,6 +13,14 @@ stop there. Load creation is a separate, human-reviewed, learning-phase-gated
 step (services.operations_inbox_service.create_load_from_inbox_item), which
 this script never calls.
 
+Historical-vs-live classification is NOT decided by this script: it stamps the
+enqueued job with `backfill: True` only as a fallback hint. The authoritative
+decision happens at process time in workers/inbox_handlers.py from each
+message's own received date vs INBOX_LIVE_CUTOFF (services.inbox_backfill_policy),
+so enqueue order between this backfill and the live sync cannot change the
+outcome. If a window overlaps live (post-cutoff) dates, those messages are
+correctly processed as live work, not buried as historical.
+
 Usage:
     python scripts/backfill_inbox.py --since 2026-01-01 --until 2026-02-01 --batch 100
     python scripts/backfill_inbox.py --since 2026-01-01 --until 2026-02-01 --batch 100 --dry-run
