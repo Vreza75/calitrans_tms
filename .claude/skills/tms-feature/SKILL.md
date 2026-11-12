@@ -54,16 +54,25 @@ tests.
 
 ## 4. Hand off for planning / implementation
 
-- Multi-step or architecturally non-trivial → invoke `superpowers:writing-plans` (save under
-  `docs/superpowers/plans/`, check `INDEX.md` first for existing coverage).
-- New feature or bugfix → invoke `superpowers:test-driven-development`.
-- Executing an existing plan → invoke `superpowers:executing-plans` or
+Follow the installed Superpowers 6.1.1 prerequisites in order — do not skip a stage or jump
+straight to a plan or to code:
+
+- **New substantial feature** → `superpowers:brainstorming` first. Get design approval. Only
+  then → `superpowers:writing-plans` (save under `docs/superpowers/plans/`, check `INDEX.md`
+  first for existing coverage) → execution via `superpowers:executing-plans` or
   `superpowers:subagent-driven-development`.
-- Unexplained failure → invoke `superpowers:systematic-debugging` before proposing a fix.
+- **Bug investigation** → `superpowers:systematic-debugging` first. Only once root cause is
+  established → `superpowers:test-driven-development` (failing test that reproduces the root
+  cause, then the fix) → implementation.
+- **Executing an already-approved plan** (brainstorming/writing-plans already done) → invoke
+  `superpowers:executing-plans` or `superpowers:subagent-driven-development` directly.
 
 Before deleting anything, follow CLAUDE.md `#Code Review and Dead-Code Rules` in full (search
 imports/call sites/aliases/`getattr`/Streamlit callback keys/routers/tests/config; classify;
 delete only confirmed-dead or safely-consolidated duplicates).
+
+Before reporting any of the above complete, run `superpowers:verification-before-completion` —
+this applies regardless of which path above was taken.
 
 ## 5. Full suite + report (CLAUDE.md `#First Audit Response`)
 
