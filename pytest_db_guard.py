@@ -147,12 +147,35 @@ def _reject_unvalidatable_routing(params: dict) -> None:
             )
 
 
+def _resolve_dbname(params: dict):
+    """Collapse the libpq/psycopg `database` alias into `dbname` using the driver's
+    actual precedence. psycopg2 REFUSES both at once ("you can't specify both
+    'database' and 'dbname'"), so if both are present with different values there
+    is no single effective target - reject as ambiguous (fail closed). If both
+    are present and identical, or only one is given, resolve to that value."""
+    has_dbname = params.get("dbname") is not None
+    has_database = params.get("database") is not None
+    if has_dbname and has_database:
+        if str(params["dbname"]) != str(params["database"]):
+            raise DatabaseSafetyError(
+                "ambiguous database target: both 'dbname'="
+                f"{params['dbname']!r} and 'database'={params['database']!r} were given "
+                "with different values; the driver cannot use both."
+            )
+        return params["dbname"]
+    if has_dbname:
+        return params["dbname"]
+    if has_database:
+        return params["database"]
+    return None
+
+
 def _identity_from_cparams(cparams: dict) -> tuple:
     _reject_unvalidatable_routing(cparams)
     return _identity_from_effective_params(
         cparams.get("host"),
         cparams.get("port"),
-        cparams.get("dbname") if cparams.get("dbname") is not None else cparams.get("database"),
+        _resolve_dbname(cparams),
     )
 
 
@@ -187,16 +210,20 @@ def _parse_identity_token(token: str) -> tuple:
 
 
 def _identity_set_from_env(env_var: str) -> set[tuple]:
+    """Parse an identity list env var STRICTLY. Any malformed or ambiguous entry
+    raises (fail closed) rather than being silently dropped: a bad deny-list entry
+    must never weaken the backstop, and a bad evidence entry must never leave a
+    partial allowlist. A broken list therefore prevents all PostgreSQL
+    authorization until the operator fixes it."""
     raw = os.environ.get(env_var) or ""
     identities: set[tuple] = set()
     for token in raw.replace(",", " ").split():
         try:
             identities.add(_parse_identity_token(token))
-        except DatabaseSafetyError:
-            # A malformed entry is ignored for the allowlist, but for the DENY
-            # list we cannot silently drop it - callers below re-check the raw
-            # presence so a broken forbidden entry never weakens the backstop.
-            continue
+        except DatabaseSafetyError as exc:
+            raise DatabaseSafetyError(
+                f"{env_var} contains a malformed/ambiguous entry {token!r}: {exc}"
+            ) from exc
     return identities
 
 
@@ -219,6 +246,9 @@ def approved_identities() -> set[tuple]:
         disposability - not derived from the URL or the acknowledgement), and
       * it is NOT in FORBIDDEN_DATABASE_IDENTITIES (the production backstop).
     If no positive disposability evidence is configured, nothing is approved."""
+    # Strict: a malformed backstop list propagates (fail closed) - callers that
+    # must not hard-error (category_authorized / require_disposable_database)
+    # catch it and refuse/skip.
     evidence = disposable_evidence_identities()
     forbidden = forbidden_identities()
     identities: set[tuple] = set()
@@ -253,20 +283,31 @@ def category_authorized(category: str) -> bool:
         return False
     try:
         identity = _identity_from_url(url.strip())
+        # Must also clear the independent backstop (positive disposability
+        # evidence and not denied) - identical to the connection-time allowlist.
+        # A malformed backstop list makes approved_identities() raise; treat that
+        # as not-authorized (fail closed).
+        return identity in approved_identities()
     except DatabaseSafetyError:
         return False
-    # Must also clear the independent backstop (positive disposability evidence
-    # and not denied) - identical to the connection-time allowlist.
-    return identity in approved_identities()
 
 
 def _assert_identity_approved(identity: tuple, *, source: str) -> None:
-    if identity in forbidden_identities():
+    try:
+        forbidden = forbidden_identities()
+        approved = approved_identities()
+    except DatabaseSafetyError as exc:
+        # Malformed deny/evidence list -> cannot prove this target is safe.
+        raise DatabaseSafetyError(
+            f"refusing {source} connection: database-identity backstop configuration is "
+            f"invalid, so no PostgreSQL target can be authorized ({exc})."
+        ) from exc
+    if identity in forbidden:
         raise DatabaseSafetyError(
             f"refusing {source} connection to a FORBIDDEN (production) database target "
             f"{identity!r}; this identity is explicitly denied regardless of approval."
         )
-    if identity not in approved_identities():
+    if identity not in approved:
         raise DatabaseSafetyError(
             f"refusing {source} connection to unapproved database target {identity!r}. "
             "A target is permitted only if its category is configured + acknowledged, "
@@ -301,18 +342,37 @@ def _validate_sqlalchemy_connect(dialect, conn_record, cargs, cparams):  # noqa:
     return None
 
 
+def _is_sqlite_dbapi_connection(dbapi_connection) -> bool:
+    """True only if the raw DBAPI connection is verifiably a sqlite3 connection.
+    Used to decide whether an UNSTAMPED pooled connection (one whose do_connect
+    never ran - e.g. an engine created before the listener was installed) may be
+    allowed. Anything not provably sqlite is treated as PostgreSQL/unknown."""
+    module = (getattr(type(dbapi_connection), "__module__", "") or "").split(".")[0]
+    return module in ("sqlite3", "pysqlite2", "_sqlite3")
+
+
 def _validate_pool_checkout(dbapi_connection, conn_record, connection_proxy):  # noqa: ANN001
     """Re-validate on every pool checkout: a connection opened while a target was
     approved must NOT keep being handed out after approval is revoked mid-session
-    (correction 2). sqlite connections carry no stamped identity and are allowed."""
+    (correction 2). An UNSTAMPED record (do_connect never ran for it - e.g. an
+    engine created before the listener was installed) is allowed ONLY if the raw
+    connection is verifiably sqlite; an unstamped PostgreSQL/unknown connection is
+    refused (correction 3 - defect: unstamped connections must not auto-pass)."""
     identity = None
     try:
         identity = conn_record.info.get(_CONN_RECORD_IDENTITY_KEY)
     except Exception:
         identity = None
-    if identity is None:
-        return  # sqlite / unstamped - nothing to revoke
-    _assert_identity_approved(identity, source="pooled (checkout)")
+    if identity is not None:
+        _assert_identity_approved(identity, source="pooled (checkout)")
+        return
+    if _is_sqlite_dbapi_connection(dbapi_connection):
+        return  # verifiably disposable, no network
+    raise DatabaseSafetyError(
+        "refusing an UNSTAMPED non-sqlite pooled connection at checkout; it was not "
+        "validated at connect time (likely created before the guard was installed) and "
+        "cannot be proven to target an approved disposable database."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -432,11 +492,16 @@ def require_disposable_database(category: str, *, scope: str = ""):
         identity = _identity_from_url(url.strip())
     except DatabaseSafetyError as exc:
         pytest.skip(f"{url_env} is not a valid disposable target{label}: {exc}")
-    if identity in forbidden_identities():
+    try:
+        forbidden = forbidden_identities()
+        evidence = disposable_evidence_identities()
+    except DatabaseSafetyError as exc:
+        pytest.skip(f"database-identity backstop configuration is invalid{label}: {exc}")
+    if identity in forbidden:
         pytest.skip(
             f"{url_env} resolves to a FORBIDDEN (production) identity{label}; refusing."
         )
-    if identity not in disposable_evidence_identities():
+    if identity not in evidence:
         pytest.skip(
             f"{url_env} identity is not listed in {DISPOSABLE_IDENTITIES_ENV_VAR}{label}; "
             "positive disposability evidence is required (naming/ack alone is insufficient)."

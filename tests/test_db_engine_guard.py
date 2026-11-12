@@ -314,8 +314,29 @@ def test_pool_checkout_revalidates_and_blocks_after_revocation(monkeypatch):
         guard._validate_pool_checkout(object(), record, object())
 
 
-def test_pool_checkout_ignores_unstamped_sqlite_records():
-    guard._validate_pool_checkout(object(), _ConnRecord(), object())  # no identity -> no raise
+def test_pool_checkout_allows_unstamped_verifiable_sqlite():
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        guard._validate_pool_checkout(conn, _ConnRecord(), object())  # unstamped sqlite -> allowed
+    finally:
+        conn.close()
+
+
+def test_pool_checkout_rejects_unstamped_non_sqlite_connection():
+    # Defect 3: an unstamped record whose raw connection is NOT verifiably sqlite
+    # (e.g. a PostgreSQL connection created before the listener installed) must be
+    # refused, not auto-allowed.
+    class _FakePgConn:
+        pass
+
+    _FakePgConn.__module__ = "psycopg2"
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_pool_checkout(_FakePgConn(), _ConnRecord(), object())
+    # An unknown/opaque connection object is likewise refused.
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_pool_checkout(object(), _ConnRecord(), object())
 
 
 def test_checkout_listener_is_registered():
@@ -385,3 +406,83 @@ def test_install_rewraps_psycopg_connect_after_reload(monkeypatch):
 def test_network_isolation_limitation_is_documented():
     assert "network-isolated" in guard.__doc__
     assert "alias" in guard.__doc__.lower()
+
+
+# --------------------------------------------------------------------------
+# Defect 1 (P0) - database/dbname alias precedence (both scenarios).
+# --------------------------------------------------------------------------
+
+def test_dsn_dbname_approved_plus_kwarg_database_unapproved_is_refused(monkeypatch):
+    _approve_migration(monkeypatch)
+    real = mock.Mock(return_value=mock.sentinel.conn)
+    guarded = guard._make_guarded_dbapi_connect(real)
+    # DSN carries the approved dbname; a conflicting `database` kwarg would make
+    # the driver refuse (and must not be validated as the approved target).
+    with pytest.raises(DatabaseSafetyError):
+        guarded(_APPROVED_URL, database="some_production_db")
+    real.assert_not_called()
+
+
+def test_dsn_database_approved_plus_kwarg_dbname_unapproved_is_refused(monkeypatch):
+    _approve_migration(monkeypatch)
+    real = mock.Mock(return_value=mock.sentinel.conn)
+    guarded = guard._make_guarded_dbapi_connect(real)
+    # libpq keyword/value DSN using the `database` alias, plus a conflicting
+    # `dbname` kwarg -> ambiguous effective target -> refused.
+    dsn = "host=db-scratch.example.net port=6543 database=calitrans_scratch_test"
+    with pytest.raises(DatabaseSafetyError):
+        guarded(dsn, dbname="some_production_db")
+    real.assert_not_called()
+
+
+def test_database_alias_alone_resolves_to_dbname(monkeypatch):
+    _approve_migration(monkeypatch)
+    # Only the `database` alias is supplied (no dbname) -> resolves to the same
+    # identity and is approved.
+    ident = guard._identity_from_cparams(
+        {"host": "db-scratch.example.net", "port": 6543, "database": "calitrans_scratch_test"}
+    )
+    assert ident == _APPROVED_IDENTITY
+
+
+def test_matching_dbname_and_database_are_accepted():
+    ident = guard._identity_from_cparams(
+        {"host": "h.example.net", "port": 6543, "dbname": "x_test", "database": "x_test"}
+    )
+    assert ident == ("h.example.net", 6543, "x_test")
+
+
+# --------------------------------------------------------------------------
+# Defect 2 (P1) - strict, fail-closed parsing of backstop identity lists.
+# --------------------------------------------------------------------------
+
+def test_malformed_forbidden_entry_refuses_all_postgres(monkeypatch):
+    _approve_migration(monkeypatch)  # a fully-approved target...
+    # ...but the deny list has a malformed entry (bad port) -> cannot be parsed.
+    monkeypatch.setenv("FORBIDDEN_DATABASE_IDENTITIES", "db-scratch.example.net:notaport/db")
+    with pytest.raises(DatabaseSafetyError):
+        guard.approved_identities()
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_sqlalchemy_connect(
+            _Dialect("postgresql"), _ConnRecord(), [], guard._pg_cparams_from_url(_APPROVED_URL)
+        )
+    assert guard.category_authorized("migration") is False  # fail closed, no hard error
+
+
+def test_malformed_disposable_entry_refuses_all_postgres(monkeypatch):
+    _clear_all(monkeypatch)
+    monkeypatch.setenv("MIGRATION_TEST_DATABASE_URL", _APPROVED_URL)
+    monkeypatch.setenv("ALLOW_DESTRUCTIVE_MIGRATION_DB", "1")
+    # Evidence list carries a malformed entry (multi-host) -> strict reject.
+    monkeypatch.setenv("DISPOSABLE_DB_IDENTITIES", "a.example.net,b.example.net/db_test")
+    with pytest.raises(DatabaseSafetyError):
+        guard._validate_sqlalchemy_connect(
+            _Dialect("postgresql"), _ConnRecord(), [], guard._pg_cparams_from_url(_APPROVED_URL)
+        )
+    assert guard.category_authorized("migration") is False
+
+
+def test_malformed_entry_is_never_silently_discarded(monkeypatch):
+    monkeypatch.setenv("FORBIDDEN_DATABASE_IDENTITIES", "mysql://u@h/db")  # non-postgres -> malformed
+    with pytest.raises(DatabaseSafetyError):
+        guard.forbidden_identities()
