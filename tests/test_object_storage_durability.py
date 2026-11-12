@@ -237,20 +237,87 @@ def test_producer_falls_back_to_base64_when_storage_unconfigured(tmp_path):
     assert "storage_key" not in result[0]
 
 
-def test_oversized_attachment_is_skipped_from_object_store(tmp_path):
-    """An attachment over the durable-store per-file cap is not uploaded (and
-    not base64-embedded); it stays same-run-only, recorded explicitly."""
+def test_oversized_beyond_store_cap_raises_not_silent(tmp_path):
+    """Task A blocker 3: an attachment over the object-store per-file limit
+    cannot be made durable, so it is an EXPLICIT failure (raises) - never a
+    silent same-run-only drop that would fail later at rehydrate time."""
     from workers import inbox_handlers
-    from workers.inbox_handlers import store_attachments_durably
+    from workers.inbox_handlers import AttachmentDurabilityError, store_attachments_durably
 
-    big = b"x" * (inbox_handlers._ATTACHMENT_STORE_PER_FILE_CAP + 1)
+    big = b"x" * (inbox_handlers._ATTACHMENT_STORE_HARD_CAP + 1)
     sha = hashlib.sha256(big).hexdigest()
     pre_saved = [{"file_path": str(tmp_path / "big.bin"), "content_sha256": sha}]
     message = {"attachments": [{"content": big, "filename": "big.bin"}]}
 
     store = _FakeStore()
-    result = store_attachments_durably(pre_saved, message, storage=store)
-    assert "storage_key" not in result[0]
-    assert "_content_b64" not in result[0]
-    assert result[0].get("durable") is False  # explicitly flagged non-durable
+    with pytest.raises(AttachmentDurabilityError):
+        store_attachments_durably(pre_saved, message, storage=store)
     assert store.objects == {}
+
+
+def test_oversized_without_storage_raises(tmp_path):
+    """No object storage AND over the base64 budget -> no durable alternative ->
+    explicit failure, never silent local-only."""
+    from workers import inbox_handlers
+    from workers.inbox_handlers import AttachmentDurabilityError, store_attachments_durably
+
+    big = b"x" * (inbox_handlers._ATTACHMENT_EMBED_PER_FILE_CAP + 1)
+    sha = hashlib.sha256(big).hexdigest()
+    pre_saved = [{"file_path": str(tmp_path / "big.bin"), "content_sha256": sha}]
+    message = {"attachments": [{"content": big, "filename": "big.bin"}]}
+
+    with pytest.raises(AttachmentDurabilityError):
+        store_attachments_durably(pre_saved, message, storage=None)
+
+
+def test_missing_bytes_for_saved_attachment_raises(tmp_path):
+    """A saved attachment (real file + sha) whose bytes are no longer available
+    to persist cannot be made durable -> explicit failure."""
+    from workers.inbox_handlers import AttachmentDurabilityError, store_attachments_durably
+
+    pre_saved = [{"file_path": str(tmp_path / "a.pdf"), "content_sha256": "deadbeef", "filename": "a.pdf"}]
+    message = {"attachments": []}  # no bytes on the message for that sha
+    with pytest.raises(AttachmentDurabilityError):
+        store_attachments_durably(pre_saved, message, storage=_FakeStore())
+
+
+def test_parse_error_placeholder_without_file_passes_through():
+    """An entry with no saved file/hash (a parse-error placeholder) carries no
+    bytes to lose and is not a durability failure - it passes through."""
+    from workers.inbox_handlers import store_attachments_durably
+
+    pre_saved = [{"filename": "broken", "parse_error": "boom"}]
+    result = store_attachments_durably(pre_saved, {"attachments": []}, storage=_FakeStore())
+    assert result == [{"filename": "broken", "parse_error": "boom"}]
+
+
+def test_durable_attachments_are_flagged_durable_true(tmp_path):
+    from workers.inbox_handlers import store_attachments_durably
+
+    content = b"%PDF small"
+    sha = hashlib.sha256(content).hexdigest()
+    pre_saved = [{"file_path": str(tmp_path / "a.pdf"), "content_sha256": sha, "filename": "a.pdf"}]
+    message = {"attachments": [{"content": content, "filename": "a.pdf"}]}
+    result = store_attachments_durably(pre_saved, message, storage=_FakeStore())
+    assert result[0]["durable"] is True
+    assert result[0]["storage_key"]
+
+
+def test_transient_upload_failure_falls_back_to_base64(tmp_path):
+    """A transient upload failure with a small file degrades to the base64
+    fallback (still durable) rather than failing the message."""
+    from services.object_storage import ObjectStorageError
+    from workers.inbox_handlers import store_attachments_durably
+
+    class _FailingStore:
+        def upload(self, key, content, *, content_type="application/octet-stream"):
+            raise ObjectStorageError("transient")
+
+    content = b"small pdf"
+    sha = hashlib.sha256(content).hexdigest()
+    pre_saved = [{"file_path": str(tmp_path / "a.pdf"), "content_sha256": sha, "filename": "a.pdf"}]
+    message = {"attachments": [{"content": content, "filename": "a.pdf"}]}
+    result = store_attachments_durably(pre_saved, message, storage=_FailingStore())
+    assert result[0]["_content_b64"] == base64.b64encode(content).decode("ascii")
+    assert result[0]["durable"] is True
+    assert "storage_key" not in result[0]

@@ -7,10 +7,18 @@ resilience.py and friends).
 """
 from __future__ import annotations
 
+import hashlib
 from unittest import mock
 
 import pytest
 from sqlalchemy import text
+
+# Shared synthetic attachment bytes + their real sha, so saved-attachment
+# metadata and the message's attachment content agree - durability (Task A) can
+# only make an attachment durable when the recorded content_sha256 matches bytes
+# actually present on the message.
+_ATTACH_BYTES = b"%PDF-fake-bytes"
+_ATTACH_SHA = hashlib.sha256(_ATTACH_BYTES).hexdigest()
 
 import db_client
 from workers.inbox_handlers import (
@@ -94,7 +102,7 @@ _MESSAGE_A = {
     "direction": "inbound",
     "mailbox": "dispatch@calitranscorp.com:INBOX",
     "id": "a1",
-    "attachments": [{"filename": "rate.pdf", "content": b"%PDF-fake-bytes", "content_type": "application/pdf"}],
+    "attachments": [{"filename": "rate.pdf", "content": _ATTACH_BYTES, "content_type": "application/pdf"}],
 }
 _MESSAGE_B = {
     "subject": "Booking B",
@@ -104,6 +112,7 @@ _MESSAGE_B = {
     "direction": "inbound",
     "mailbox": "dispatch@calitranscorp.com:INBOX",
     "id": "b1",
+    "attachments": [{"filename": "rate.pdf", "content": _ATTACH_BYTES, "content_type": "application/pdf"}],
 }
 
 
@@ -113,7 +122,7 @@ def _patch_fetch_deps(**overrides):
         fetch_messages=[_MESSAGE_A, _MESSAGE_B],
         diagnostics={"errors": False, "accounts_attempted": 1},
         already_imported=False,
-        saved_attachments=[{"filename": "rate.pdf", "file_path": "/storage/rate.pdf", "content_sha256": "abc"}],
+        saved_attachments=[{"filename": "rate.pdf", "file_path": "/storage/rate.pdf", "content_sha256": _ATTACH_SHA}],
         enqueue_job_return=1,
     )
     defaults.update(overrides)

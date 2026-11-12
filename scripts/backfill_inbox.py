@@ -75,8 +75,14 @@ def _build_search_query(since: date, until: date) -> str:
     return f"SINCE {_imap_date(since)} BEFORE {_imap_date(until + timedelta(days=1))}"
 
 
+class BackfillConfigurationError(RuntimeError):
+    """Backfill cannot run safely in the current configuration (e.g. no live
+    cutoff). Raised before any mailbox is touched so nothing is enqueued."""
+
+
 def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict:
     from services import email_client
+    from services.inbox_backfill_policy import INBOX_LIVE_CUTOFF_SETTING, cutoff_is_configured
     from services.operations_inbox_service import (
         _email_sync_unique_message_id,
         _save_operations_email_attachments,
@@ -85,6 +91,18 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
         operations_email_already_imported,
         safe_str,
     )
+
+    # Refuse to run without a configured live cutoff. Classification is decided
+    # at process time from each message's date vs the cutoff; with no cutoff
+    # every message is INDETERMINATE and resolves to LIVE (the safe default),
+    # which for a historical backfill would flood the active dispatch queue with
+    # old mail. The cutoff is the one explicit input that makes "historical"
+    # meaningful - require it here rather than silently mislabel old mail live.
+    if not cutoff_is_configured():
+        raise BackfillConfigurationError(
+            f"{INBOX_LIVE_CUTOFF_SETTING} must be set to a valid date before backfilling; "
+            "without it historical mail cannot be distinguished from live."
+        )
 
     ensure_operations_email_sync_schema()
 
@@ -159,7 +177,7 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
             from db_client import transaction
             from repositories.worker_job_repo import enqueue_job, job_exists_for_idempotency_key
 
-            from workers.inbox_handlers import store_attachments_durably
+            from workers.inbox_handlers import AttachmentDurabilityError, store_attachments_durably
 
             idempotency_key = f"inbox.process_message:{message_id}"
 
@@ -172,7 +190,15 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
                 pre_saved = _save_operations_email_attachments(message, message_id)
             except Exception:
                 pre_saved = []
-            pre_saved = store_attachments_durably(pre_saved, message)
+            # Durability prerequisite (Task A blocker 3): a non-durable attachment
+            # must not be enqueued runner-local-only. Skip the message (un-imported
+            # dedupe leaves it for a later run) and count it, never silent loss.
+            try:
+                pre_saved = store_attachments_durably(pre_saved, message)
+            except AttachmentDurabilityError:
+                mb["errors"] = mb.get("errors", 0) + 1
+                totals["errors"] += 1
+                continue
             job_message = {key: value for key, value in message.items() if key != "attachments"}
 
             with transaction() as conn:
@@ -254,7 +280,11 @@ def main() -> int:
         print("--batch must be a positive integer.", file=sys.stderr)
         return 2
 
-    totals = run_backfill(since=since, until=until, batch=args.batch, dry_run=args.dry_run)
+    try:
+        totals = run_backfill(since=since, until=until, batch=args.batch, dry_run=args.dry_run)
+    except BackfillConfigurationError as exc:
+        print(f"backfill refused: {exc}", file=sys.stderr)
+        return 2
 
     mode = "DRY-RUN (no jobs enqueued)" if args.dry_run else "enqueued"
     print(

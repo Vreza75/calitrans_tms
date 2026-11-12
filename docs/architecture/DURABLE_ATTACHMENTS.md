@@ -32,20 +32,58 @@ SHA-256. No base64 body in `worker_jobs`.
   dependency, no SDK). Bounded retry with backoff on transient (connection,
   timeout, 5xx); hard failures raise `ObjectStorageError`.
 
-### Explicit handling of edge cases
-- **Oversized** (> `_ATTACHMENT_STORE_PER_FILE_CAP`, 25 MB): not uploaded, flagged
-  `durable=False`, stays same-run-only. Not silently uploaded unbounded.
-- **Missing bytes** (save errored): left disk-only, no durable copy claimed.
+### Durability is a prerequisite to enqueue (blocker 3)
+`store_attachments_durably` runs **before** the `inbox.process_message` job is
+enqueued and never leaves a saved attachment silently runner-local-only. Each
+attachment ends up `durable=True` with either a `storage_key` or a bounded
+`_content_b64`; anything that cannot be made durable raises
+`AttachmentDurabilityError` and the producer **skips enqueuing** that message
+(counted, surfaced; dedupe leaves it for a later run) instead of enqueuing a job
+doomed to fail at rehydrate.
+- **Oversized** (> `_ATTACHMENT_STORE_HARD_CAP`, 50 MB, the bucket limit; or over
+  the base64 budget when storage is unconfigured): explicit `AttachmentDurabilityError`.
+- **Missing bytes** for a saved attachment: explicit failure.
 - **Corrupted** (on-disk or restored): SHA-256 verification fails closed.
-- **Transient upload failure**: degrades to the base64 stopgap for that one
-  attachment rather than failing the whole sync.
+- **Transient upload failure**: degrades to the bounded base64 copy (still
+  durable), or raises if it won't fit.
 
-## Authorization
+## Read lifecycle (blocker 2)
 
-The bucket **must be private**. All access is server-side via the authenticated
-`/storage/v1/object` endpoints with the **service-role** key — never the
-`/public/` path, never the anon key. API/UI clients keep referencing documents by
-the existing opaque `attachment_ref`, never by object key or a public URL.
+Preview / download / reparse resolve bytes durably via
+`operations_attachment_core.resolve_attachment_bytes`: local file first
+(SHA-256-verified), else download from the object store by `storage_key` and
+SHA-256-verify; `AttachmentResolutionError` (fails closed) otherwise. Wired into
+the API (`GET /api/v1/attachments/{ref}/content`), the Streamlit preview/download
+panel, and the "Parse / Reparse / Repair" action. `storage_key` and
+`content_sha256` are carried on the internal `AttachmentMeta` but are **never**
+serialized to an API client (stripped in `AttachmentSummaryOut.from_domain`
+alongside `file_path`).
+
+## No base64 bodies persisted (blocker 4)
+
+`_content_b64` is stripped before attachment metadata is written to
+`order_intake.parsed_data` (`strip_attachment_runtime_bytes`), and a completed
+job's payload is scrubbed in the same transaction as `mark_completed`
+(`worker_job_repo.scrub_completed_payload_bytes`) — never on a pending/processing
+job, so an in-flight retry's base64 fallback is preserved. Legacy rows are
+cleaned by `scripts/scrub_attachment_base64.py` (idempotent, `--dry-run`,
+completed-jobs-only).
+
+## Authorization, scoping, retention (blocker 5)
+
+- The bucket **must be private**. All access is server-side via the authenticated
+  `/storage/v1/object` endpoints with the **service-role** key — never the
+  `/public/` path, never the anon key. `object_storage.assert_bucket_private`
+  verifies this at startup/health; clients keep referencing documents by the
+  opaque `attachment_ref`, never by object key or a public URL.
+- **Tenant/account-scoped keys**: `inbox/<tenant>/<account-token>/<sha[:2]>/<sha>`.
+  Tenant from `INBOX_TENANT_ID`; account is a short hash of the mailbox account
+  (isolation without embedding the address). Content-addressed within an account
+  → idempotent re-upload + dedupe.
+- **Reference-aware deletion**: `services/attachment_retention.py` deletes an
+  object only when no active record references it (an `order_intake.parsed_data`
+  row, or a non-terminal `worker_jobs` payload). Retention duration is a bucket
+  TTL/lifecycle policy; deletion is always explicit, never implicit.
 
 ## Required external configuration
 

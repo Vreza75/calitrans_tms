@@ -33,6 +33,7 @@ from services.operations_attachment_core import (
     group_operations_source_documents,
     is_pdf_filename,
     safe_str,
+    strip_attachment_runtime_bytes,
 )
 from services.operations_field_service import (
     derive_review_state,
@@ -376,6 +377,36 @@ def read_operations_attachment_file_cached(file_path: str, modified_ns: int) -> 
 def read_operations_attachment_bytes(file_path: str) -> bytes:
     path = Path(file_path)
     return read_operations_attachment_file_cached(str(path), path.stat().st_mtime_ns)
+
+
+def resolve_operations_attachment_bytes(attachment: dict) -> bytes:
+    """Durably resolve a saved attachment's bytes for preview / download /
+    reparse (Task A blocker 2). Prefers the local file (SHA-256-verified when a
+    checksum is recorded); when it is gone - a different host, or an ephemeral
+    worker runner destroyed it - downloads from the private object store by
+    storage_key and SHA-256-verifies. `attachment` is a saved-attachment
+    metadata dict (file_path, storage_key, content_sha256). Raises
+    AttachmentResolutionError if no durable source yields verified bytes."""
+    from services.operations_attachment_core import resolve_attachment_bytes
+
+    return resolve_attachment_bytes(
+        safe_str(attachment.get("file_path")),
+        storage_key=safe_str(attachment.get("storage_key")),
+        content_sha256=safe_str(attachment.get("content_sha256")),
+    )
+
+
+def reparse_resolved_operations_attachment(attachment: dict) -> tuple[str, dict]:
+    """Reparse a saved attachment from its durably-resolved bytes (Task A
+    blocker 2): resolves disk-or-object-store + SHA-256 verify, then runs the
+    same parser the save path used. Replaces the disk-only reparse so repair
+    still works when the local file is gone."""
+    content = resolve_operations_attachment_bytes(attachment)
+    return parse_operations_attachment_bytes(
+        content,
+        safe_str(attachment.get("filename")) or "attachment",
+        safe_str(attachment.get("content_type")),
+    )
 
 
 def read_operations_pdf_bytes(file_path: str) -> bytes:

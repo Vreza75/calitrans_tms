@@ -39,11 +39,11 @@ logger = logging.getLogger(__name__)
 _ATTACHMENT_EMBED_PER_FILE_CAP = 3 * 1024 * 1024  # 3 MB raw per attachment
 _ATTACHMENT_EMBED_TOTAL_CAP = 8 * 1024 * 1024  # 8 MB raw per message
 
-# Durable object-store cap (Stage 2 / Task A): object storage has no jsonb-
-# payload-bloat concern, so this is a sanity/cost ceiling, far higher than the
-# base64 caps above. An attachment over this stays same-run-only (disk) and is
-# flagged non-durable, rather than silently uploaded unbounded.
-_ATTACHMENT_STORE_PER_FILE_CAP = 25 * 1024 * 1024  # 25 MB raw per attachment
+# Hard per-file ceiling for the object store (Stage 2 / Task A): matches
+# Supabase Storage's default per-object upload limit. An attachment larger than
+# this cannot be made durable in the bucket, so it is an EXPLICIT durability
+# failure (see store_attachments_durably) - never a silent same-run-only drop.
+_ATTACHMENT_STORE_HARD_CAP = 50 * 1024 * 1024  # 50 MB raw per attachment
 
 
 def _attachment_bytes_by_sha(message: dict) -> dict:
@@ -59,13 +59,39 @@ def _attachment_bytes_by_sha(message: dict) -> dict:
     return by_sha
 
 
-def _attachment_object_key(content_sha256: str) -> str:
-    """Content-addressed, sharded object key. Deterministic (same bytes -> same
-    key), so re-uploads on a retried job are idempotent and identical
-    attachments dedupe. No filename in the path (avoids key-injection); the
-    filename rides in the payload metadata."""
+def _tenant_slug() -> str:
+    """Tenant segment for object keys. Single-tenant today (one company), but
+    scoping keys by tenant keeps the store partitioned so a future multi-tenant
+    deployment cannot let one tenant's key collide with or reach another's."""
+    import re
+
+    from config import get_secret
+
+    raw = str(get_secret("INBOX_TENANT_ID") or "calitrans").strip().lower()
+    return re.sub(r"[^a-z0-9_-]+", "-", raw) or "calitrans"
+
+
+def _account_token(mailbox_account: str) -> str:
+    """Account segment for object keys - a short hash of the mailbox account so
+    keys are account-scoped (isolation) without embedding the email address in
+    the object path. Empty account -> a stable 'shared' bucketing token."""
+    import hashlib
+
+    account = str(mailbox_account or "").strip().lower()
+    if not account:
+        return "shared"
+    return hashlib.sha256(account.encode("utf-8")).hexdigest()[:12]
+
+
+def _attachment_object_key(content_sha256: str, *, tenant: str, account: str) -> str:
+    """Tenant/account-scoped, content-addressed, sharded object key.
+    Deterministic (same bytes + same account -> same key), so re-uploads on a
+    retried job are idempotent and identical attachments within one account
+    dedupe. No filename in the path (avoids key-injection); the filename rides in
+    the payload metadata. Scoping by tenant+account prevents cross-account access
+    via key guessing."""
     sha = str(content_sha256 or "")
-    return f"operations_inbox/{sha[:2]}/{sha}"
+    return f"inbox/{tenant}/{account}/{sha[:2]}/{sha}"
 
 
 # Sentinel: distinguishes "storage argument not supplied, resolve from config"
@@ -73,51 +99,93 @@ def _attachment_object_key(content_sha256: str) -> str:
 _STORAGE_UNSET = object()
 
 
+def _embed_one_or_raise(item: dict, content: bytes, embedded_total: int) -> tuple[dict, int]:
+    """Attach a bounded base64 copy of `content` to `item` (the no-object-store
+    durability path). Raises AttachmentDurabilityError when the attachment is too
+    large for the per-file or per-message base64 budget - there is then NO way to
+    make it durable without object storage, so it is an explicit failure, never a
+    silent same-run-only drop (Task A blocker 3)."""
+    import base64
+
+    if len(content) > _ATTACHMENT_EMBED_PER_FILE_CAP or embedded_total + len(content) > _ATTACHMENT_EMBED_TOTAL_CAP:
+        raise AttachmentDurabilityError(
+            f"attachment {item.get('filename') or item.get('content_sha256', '')[:8]} "
+            "is too large to persist durably without object storage; configure object storage "
+            "(SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/INBOX_ATTACHMENTS_BUCKET)"
+        )
+    item["_content_b64"] = base64.b64encode(content).decode("ascii")
+    item["durable"] = True
+    return item, embedded_total + len(content)
+
+
 def store_attachments_durably(pre_saved_attachments: list, message: dict, *, storage=_STORAGE_UNSET) -> list:
-    """Make each saved attachment durable across ephemeral runners and return
-    enriched metadata for the job payload.
+    """Make every saved attachment durable across ephemeral runners BEFORE its
+    inbox.process_message job is enqueued, and return enriched metadata for the
+    payload. Durability is a PREREQUISITE: this never leaves a saved attachment
+    silently runner-local-only (Task A blocker 3). Each attachment ends up with
+    either a `storage_key` (object storage) or a bounded `_content_b64` (the
+    no-infrastructure fallback), both flagged `durable=True`; anything that
+    cannot be made durable raises AttachmentDurabilityError so the producer skips
+    enqueuing a doomed job and surfaces the problem instead.
 
     With object storage configured: upload each attachment's bytes to the
-    private bucket under a content-addressed key, record `storage_key` +
-    `content_sha256`, and keep NO base64 body in the payload (Task A: document
-    bytes must not live in worker_jobs indefinitely). Without it: fall back to
-    the Stage 1 base64-in-payload stopgap so the system still runs with zero
-    external infrastructure. Oversized attachments are uploaded to neither and
-    flagged `durable=False` (same-run-only). A transient upload failure for one
-    attachment degrades to the base64 stopgap rather than failing the sync."""
+    private bucket under a content-addressed key, record `storage_key`, keep NO
+    base64 in the payload. A transient upload failure degrades to the bounded
+    base64 fallback (still durable); a hard failure or an attachment over the
+    bucket's size limit raises. Without object storage: base64 within budget, or
+    raise. An entry with no real saved file/hash (a parse-error placeholder) and
+    no retrievable bytes carries nothing to lose and passes through untouched."""
     from services.object_storage import ObjectStorageError, get_object_storage
 
     store = get_object_storage() if storage is _STORAGE_UNSET else storage
-    if store is None:
-        return _embed_attachment_content(pre_saved_attachments, message)
-
     by_sha = _attachment_bytes_by_sha(message)
+    tenant = _tenant_slug()
+    account = _account_token(message.get("mailbox_account"))
+    embedded_total = 0
     enriched = []
     for saved in pre_saved_attachments or []:
         item = dict(saved)
+        item.pop("_content_b64", None)
+        item.pop("durable", None)
         sha = str(item.get("content_sha256") or "")
-        content = by_sha.get(sha)
-        if not content:
-            enriched.append(item)  # no bytes available - disk-only, unchanged
-            continue
-        if len(content) > _ATTACHMENT_STORE_PER_FILE_CAP:
-            item["durable"] = False  # too big - explicitly same-run-only
-            item.pop("_content_b64", None)
+        file_path = str(item.get("file_path") or "")
+
+        if not file_path or not sha:
+            # Not a real durable attachment (e.g. a parse-error placeholder) -
+            # nothing was persisted, nothing to lose. Pass through.
             enriched.append(item)
             continue
-        key = _attachment_object_key(sha)
-        content_type = str(item.get("content_type") or "application/octet-stream")
-        try:
-            store.upload(key, content, content_type=content_type)
-        except ObjectStorageError:
-            # Storage hiccup: don't fail the whole sync - fall back to the
-            # bounded base64 stopgap for just this attachment so it stays
-            # durable. Logged without any filename/body/credential.
-            logger.warning("attachment durable upload failed; using base64 fallback for one attachment")
-            enriched.extend(_embed_attachment_content([item], message))
-            continue
-        item["storage_key"] = key
-        item.pop("_content_b64", None)  # bytes are in object storage, not the payload
+
+        content = by_sha.get(sha)
+        if not content:
+            # A saved attachment whose bytes we can no longer see cannot be made
+            # durable across runners - explicit, never silent local-only.
+            raise AttachmentDurabilityError(
+                f"attachment {item.get('filename') or sha[:8]} has no retrievable bytes to persist durably"
+            )
+
+        if store is not None:
+            if len(content) > _ATTACHMENT_STORE_HARD_CAP:
+                raise AttachmentDurabilityError(
+                    f"attachment {item.get('filename') or sha[:8]} exceeds the object-store per-file limit "
+                    f"({_ATTACHMENT_STORE_HARD_CAP} bytes) and cannot be stored durably"
+                )
+            key = _attachment_object_key(sha, tenant=tenant, account=account)
+            content_type = str(item.get("content_type") or "application/octet-stream")
+            try:
+                store.upload(key, content, content_type=content_type)
+            except ObjectStorageError:
+                # Storage hiccup: fall back to the bounded base64 copy so the
+                # attachment stays durable (or raise if it won't fit). Logged
+                # without any filename/body/credential.
+                logger.warning("attachment durable upload failed; using base64 fallback for one attachment")
+                item, embedded_total = _embed_one_or_raise(item, content, embedded_total)
+            else:
+                item["storage_key"] = key
+                item["durable"] = True
+        else:
+            item, embedded_total = _embed_one_or_raise(item, content, embedded_total)
+
         enriched.append(item)
     return enriched
 
@@ -449,7 +517,17 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                 result["error_messages"].append(f"{subject[:80]}: attachment save failed: {exc}")
 
             job_message = {key: value for key, value in message.items() if key != "attachments"}
-            pre_saved_attachments = store_attachments_durably(pre_saved_attachments, message)
+
+            # Durability is a prerequisite to enqueue (Task A blocker 3): if an
+            # attachment cannot be made durable, DO NOT enqueue a job doomed to
+            # fail at rehydrate time - skip this message (dedupe leaves it
+            # un-imported so the next sync retries it) and surface the reason.
+            try:
+                pre_saved_attachments = store_attachments_durably(pre_saved_attachments, message)
+            except AttachmentDurabilityError as exc:
+                result["errors"] += 1
+                result["error_messages"].append(f"{subject[:80]}: not durable, not enqueued: {exc}")
+                continue
 
             try:
                 with transaction() as conn:
@@ -552,27 +630,40 @@ def handle_inbox_process_message(payload: dict[str, Any]) -> tuple[bool, str]:
         sync_conversation_status,
     )
 
-    from services.inbox_backfill_policy import message_is_historical
+    from services.inbox_backfill_policy import classify_message
 
     message = payload.get("message") or {}
     pre_saved_attachments = payload.get("pre_saved_attachments") or []
     # Durability: on a fresh runner the saved attachment files are gone -
-    # restore them from the bytes embedded in this (durable) job payload. Any
+    # restore them from the durable copy (object storage, then base64). Any
     # attachment that cannot be restored and verified fails the whole message
     # (raises) so it is never silently dropped - see _rehydrate_attachment_files.
     _rehydrate_attachment_files(pre_saved_attachments)
 
-    # Deterministic classification (Stage 2 / Task B): historical-vs-live is
-    # decided from the message's OWN received date vs the configured live cutoff
-    # (services.inbox_backfill_policy), NOT from the producer-stamped `backfill`
-    # payload flag. Live sync and backfill share one idempotency key and
-    # enqueue_job's ON CONFLICT never rewrites the payload, so a flag-driven
-    # classification let whichever producer enqueued first freeze the outcome -
-    # a backfill of recent mail could bury a live, actionable email. The flag is
-    # now only a fallback for the no-cutoff / undated edges (see that module).
-    is_historical = message_is_historical(message, backfill_flag=bool(payload.get("backfill")))
+    # Flag-independent classification (Stage 2 / Task B + P1): historical-vs-live
+    # is decided from the message's OWN received date vs the configured live
+    # cutoff (services.inbox_backfill_policy.classify_message), NEVER from the
+    # producer-stamped `backfill` payload flag. Live sync and backfill share one
+    # idempotency key and enqueue_job's ON CONFLICT never rewrites the payload,
+    # so a flag-driven decision let whichever producer enqueued first freeze the
+    # outcome - a backfill of recent mail could bury a live, actionable email.
+    #
+    # INDETERMINATE (no valid cutoff, or an unparseable received date) resolves
+    # to LIVE: the safe default never buries a potentially-actionable message
+    # (worst case a human archives an old one). Backfill of genuinely historical
+    # mail cannot reach this path - scripts/backfill_inbox.py refuses to run
+    # without a configured cutoff, and real mail always carries a Date.
+    #
+    # Stable across retries AND cutoff-config changes: the decision persisted on
+    # the order_intake row at first insert is authoritative - the insert's
+    # ON CONFLICT (source_message_id) DO NOTHING means a later retry (even one
+    # that recomputes differently after the cutoff moved) never overwrites it.
+    decision = classify_message(message)
+    is_historical = decision.is_historical
+    if decision.is_indeterminate:
+        logger.info("inbox.process_message classification=indeterminate->live reason=%s", decision.reason)
 
-    # Backfill isolation (atomic): a historical message must never surface as
+    # Historical isolation (atomic): a historical message must never surface as
     # live dispatch work. The row is INSERTED with the terminal historical
     # review_status in the same transaction - no separate post-insert update to
     # race or silently fail - so every active inbox queue excludes it even if

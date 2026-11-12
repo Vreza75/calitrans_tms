@@ -73,6 +73,12 @@ class AttachmentMeta:
     # GET /api/v1/attachments/{attachment_ref}/content. Never the raw
     # server file_path - API schemas must not serialize file_path.
     attachment_ref: str = ""
+    # Internal durable-resolution fields (Task A blocker 2): used server-side to
+    # fetch bytes from the private object store and SHA-256-verify them. Like
+    # file_path, these are NEVER serialized to an API client (see
+    # api/schemas/work_items.py AttachmentSummaryOut.from_domain).
+    storage_key: str = ""
+    content_sha256: str = ""
 
 
 @dataclass(frozen=True)

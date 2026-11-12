@@ -63,6 +63,8 @@ merge_operations_body_parsed_fields = attachment_service.merge_operations_body_p
 parse_saved_operations_attachment = attachment_service.parse_saved_operations_attachment
 parse_saved_operations_pdf = attachment_service.parse_saved_operations_pdf
 read_operations_attachment_bytes = attachment_service.read_operations_attachment_bytes
+resolve_operations_attachment_bytes = attachment_service.resolve_operations_attachment_bytes
+reparse_resolved_operations_attachment = attachment_service.reparse_resolved_operations_attachment
 read_operations_pdf_bytes = attachment_service.read_operations_pdf_bytes
 rescan_operations_request_attachments = attachment_service.rescan_operations_request_attachments
 save_operations_attachment = attachment_service.save_operations_attachment
@@ -4471,10 +4473,15 @@ def _prepare_operations_email_record(message: dict, *, pre_saved_attachments: li
         attachment["matched_load_id"] = matched_load_id
         attachment["mailbox_account"] = safe_str(message.get("mailbox_account"))
     if saved_attachments:
-        parsed[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
+        # Strip runtime-only byte copies (_content_b64 / raw content) before
+        # persisting to parsed_data - the durable copy lives in object storage /
+        # on disk, referenced by storage_key + content_sha256. Keeping base64
+        # bodies in order_intake.parsed_data is the Task A blocker-4 leak.
+        persistable_attachments = attachment_service.strip_attachment_runtime_bytes(saved_attachments)
+        parsed[OPERATIONS_ATTACHMENTS_KEY] = persistable_attachments
         parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = [
             item
-            for item in saved_attachments
+            for item in persistable_attachments
             if is_pdf_filename(item.get("filename", ""), item.get("content_type", ""))
             or bool(item.get("is_pdf"))
         ]
@@ -5080,7 +5087,9 @@ def render_operations_attachment_preview(
                         else nullcontext()
                     )
                     with file_stage:
-                        file_bytes = read_operations_attachment_bytes(file_path)
+                        # Durable resolution (Task A blocker 2): disk-or-object-
+                        # store, SHA-256 verified.
+                        file_bytes = resolve_operations_attachment_bytes(attachment)
                 except Exception:
                     st.warning("The original document could not be opened from attachment storage.")
                     continue
@@ -5272,7 +5281,10 @@ def render_operations_pdf_panel(
 
         if file_path:
             try:
-                file_bytes = read_operations_attachment_bytes(file_path)
+                # Durable resolution (Task A blocker 2): the local file may be
+                # gone (bytes live in the private object store); resolve from
+                # disk-or-storage, SHA-256-verified.
+                file_bytes = resolve_operations_attachment_bytes(selected_attachment)
                 st.download_button(
                     "Download Attachment",
                     data=file_bytes,
@@ -5299,11 +5311,10 @@ def render_operations_pdf_panel(
                     st.error("This attachment has no saved file path.")
                 else:
                     try:
-                        text_preview, reparsed = parse_saved_operations_attachment(
-                            file_path,
-                            filename,
-                            content_type,
-                        )
+                        # Durable reparse (Task A blocker 2): resolve bytes from
+                        # disk-or-object-store (SHA-256 verified) before parsing,
+                        # so repair works even when the local file is gone.
+                        text_preview, reparsed = reparse_resolved_operations_attachment(selected_attachment)
                         updated_attachment = dict(selected_attachment)
                         updated_attachment["parsed_data"] = reparsed
                         updated_attachment["fields_found"] = field_count(reparsed)

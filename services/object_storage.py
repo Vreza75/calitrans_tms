@@ -144,6 +144,34 @@ class SupabaseObjectStorage:
         if resp.status_code >= 400 and resp.status_code != 404:
             raise ObjectStorageError(f"delete {key} failed: HTTP {resp.status_code}")
 
+    def bucket_is_private(self) -> bool:
+        """True iff the configured bucket is PRIVATE (not public). Attachments
+        are customer documents; a public bucket would expose them by URL without
+        the service-role key. Used by assert_bucket_private at startup/health."""
+        import json as _json
+
+        url = f"{self._base_url}/storage/v1/bucket/{self._bucket}"
+        resp = self._request_with_retry("GET", url, headers=self._auth_headers())
+        if resp.status_code != 200:
+            raise ObjectStorageError(f"bucket info for {self._bucket} failed: HTTP {resp.status_code}")
+        try:
+            info = _json.loads(resp.content or getattr(resp, "text", "") or "{}")
+        except Exception as exc:  # noqa: BLE001
+            raise ObjectStorageError(f"bucket info for {self._bucket} could not be parsed: {exc}") from exc
+        return not bool(info.get("public"))
+
+
+def assert_bucket_private(storage: SupabaseObjectStorage | None) -> None:
+    """Fail loudly if the attachments bucket is public. A no-op when object
+    storage is not configured. Call from a startup/health check - never serve or
+    store customer documents in a public bucket."""
+    if storage is None:
+        return
+    if not storage.bucket_is_private():
+        raise ObjectStorageError(
+            "INBOX_ATTACHMENTS_BUCKET must be a PRIVATE Supabase Storage bucket; it is currently public."
+        )
+
 
 def get_object_storage() -> SupabaseObjectStorage | None:
     """Build the configured object-storage client, or None when the required

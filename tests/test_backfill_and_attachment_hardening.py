@@ -73,19 +73,23 @@ def test_backfill_row_status_is_terminal_so_active_queue_excludes_it():
     assert HISTORICAL_BACKFILL_REVIEW_STATUS in INBOX_TERMINAL_REVIEW_STATUSES
 
 
-def test_process_message_inserts_backfill_rows_with_atomic_historical_status():
+def test_process_message_inserts_historical_rows_with_atomic_historical_status(monkeypatch):
     import workers.inbox_handlers as h
     from services.operations_inbox_service import HISTORICAL_BACKFILL_REVIEW_STATUS
 
+    # Classification is now flag-free: decided by the message's date vs the
+    # cutoff, not the producer flag. Pre-cutoff -> historical; post-cutoff ->
+    # live - even for the same (flag-absent) live-sync producer path.
+    monkeypatch.setenv("INBOX_LIVE_CUTOFF", "2026-06-01")
     with mock.patch(
         "services.operations_inbox_service._insert_operations_email_message",
         return_value={"conversation_key": ""},
     ) as insert, mock.patch("services.operations_inbox_service.sync_conversation_status"):
-        h.handle_inbox_process_message({"message": {"subject": "x"}, "backfill": True})
+        h.handle_inbox_process_message({"message": {"subject": "x", "received_at": "2026-02-01T00:00:00+00:00"}})
         assert insert.call_args.kwargs["force_review_status"] == HISTORICAL_BACKFILL_REVIEW_STATUS
 
         insert.reset_mock()
-        h.handle_inbox_process_message({"message": {"subject": "x"}})  # live, no flag
+        h.handle_inbox_process_message({"message": {"subject": "x", "received_at": "2026-09-01T00:00:00+00:00"}})
         assert insert.call_args.kwargs["force_review_status"] is None
 
 
@@ -155,7 +159,7 @@ def _run_backfill_with(messages, *, already_imported, job_exists, batch):
     from repositories import worker_job_repo
 
     enqueued = {"n": 0}
-    with mock.patch("services.email_client._operations_email_accounts", return_value=[{"email": "dispatch@x.com", "password": "p"}]), mock.patch(
+    with mock.patch("services.inbox_backfill_policy.cutoff_is_configured", return_value=True), mock.patch("services.email_client._operations_email_accounts", return_value=[{"email": "dispatch@x.com", "password": "p"}]), mock.patch(
         "services.email_client._fetch_recent_emails", return_value=messages
     ), mock.patch("services.operations_inbox_service.ensure_operations_email_sync_schema"), mock.patch(
         "services.operations_inbox_service.load_existing_operations_email_lookup", return_value={"by_message_id": {}}
@@ -342,16 +346,17 @@ def test_manual_create_load_from_intake_is_not_gated_behaviorally(monkeypatch):
 # Stage 1 #4 - historical backfill never changes LIVE conversation status.
 # --------------------------------------------------------------------------
 
-def test_backfill_does_not_reconcile_live_conversation_status():
+def test_historical_mail_does_not_reconcile_live_conversation_status(monkeypatch):
     import workers.inbox_handlers as h
 
+    monkeypatch.setenv("INBOX_LIVE_CUTOFF", "2026-06-01")
     with mock.patch(
         "services.operations_inbox_service._insert_operations_email_message",
         return_value={"conversation_key": "conv-1"},
     ), mock.patch("services.operations_inbox_service.sync_conversation_status") as sync:
-        h.handle_inbox_process_message({"message": {"subject": "x"}, "backfill": True})
+        h.handle_inbox_process_message({"message": {"subject": "x", "received_at": "2026-02-01T00:00:00+00:00"}})
         sync.assert_not_called()  # historical mail must not touch live status
 
         sync.reset_mock()
-        h.handle_inbox_process_message({"message": {"subject": "x"}})  # live sync
+        h.handle_inbox_process_message({"message": {"subject": "x", "received_at": "2026-09-01T00:00:00+00:00"}})
         sync.assert_called_once_with("conv-1")

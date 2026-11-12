@@ -66,11 +66,89 @@ def read_attachment_bytes(file_path: str) -> bytes:
     return Path(file_path).read_bytes()
 
 
+# Runtime-only attachment keys that carry raw bytes for cross-runner durability
+# (base64 copy, raw content). These must NEVER be persisted into
+# order_intake.parsed_data or a completed worker_jobs payload (PR #19 Stage 2 /
+# Task A blocker 4): the durable copy lives in object storage / on disk, keyed by
+# storage_key + content_sha256. Keeping the bytes in the DB bloats the row and
+# keeps document bodies in Postgres indefinitely.
+ATTACHMENT_RUNTIME_BYTE_KEYS = ("_content_b64", "content")
+
+
+def strip_attachment_runtime_bytes(attachments: Any) -> list[dict]:
+    """Return a copy of an attachment-metadata list with every runtime-only
+    byte-carrying key removed, so it is safe to persist. Reference/checksum
+    fields (storage_key, content_sha256, size_bytes, durable, durability_error,
+    file_path, filename, ...) are preserved. Idempotent."""
+    if not isinstance(attachments, list):
+        return []
+    cleaned = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append({k: v for k, v in item.items() if k not in ATTACHMENT_RUNTIME_BYTE_KEYS})
+    return cleaned
+
+
 def attachment_ref(file_path: str) -> str:
     """Opaque, stable reference derived from a server file_path - exposed
     to API/UI clients instead of the path itself. Deterministic (sha256),
     so the same path always maps to the same ref without a lookup table."""
     return hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:24] if file_path else ""
+
+
+class AttachmentResolutionError(Exception):
+    """An attachment's bytes could not be resolved and SHA-256-verified from any
+    durable source (local disk or the private object store). Raised by
+    resolve_attachment_bytes so a preview/download/reparse surfaces a clear error
+    rather than serving wrong, truncated, or missing content."""
+
+
+_RESOLVE_UNSET = object()
+
+
+def resolve_attachment_bytes(
+    file_path: str,
+    *,
+    storage_key: str = "",
+    content_sha256: str = "",
+    storage: Any = _RESOLVE_UNSET,
+) -> bytes:
+    """Resolve an attachment's bytes durably for preview/download/reparse (Task A
+    blocker 2): prefer the local file when it exists and (if a checksum is
+    recorded) SHA-256-verifies; otherwise download from the private object store
+    by `storage_key` and SHA-256-verify. Raises AttachmentResolutionError when no
+    durable source yields verified bytes.
+
+    Authorization stays at the application boundary: callers resolve WHICH work
+    item's attachment this is (and whether the caller may read it) before calling
+    this; this function only fetches server-side, never exposing storage_key or a
+    public URL to a client."""
+    expected = str(content_sha256 or "")
+
+    path = Path(file_path) if file_path else None
+    if path is not None and path.exists():
+        data = path.read_bytes()
+        if not expected or hashlib.sha256(data).hexdigest() == expected:
+            return data
+        # On-disk file is corrupted/truncated - fall through to the object store.
+
+    if storage_key:
+        from services.object_storage import ObjectStorageError, get_object_storage
+
+        store = get_object_storage() if storage is _RESOLVE_UNSET else storage
+        if store is not None:
+            try:
+                data = store.download(storage_key)
+            except ObjectStorageError as exc:
+                raise AttachmentResolutionError(f"object store fetch failed for {storage_key}: {exc}") from exc
+            if expected and hashlib.sha256(data).hexdigest() != expected:
+                raise AttachmentResolutionError(f"restored attachment {storage_key} failed SHA-256 verification")
+            return data
+
+    raise AttachmentResolutionError(
+        f"attachment could not be resolved from disk or object storage (path={bool(path)}, key={bool(storage_key)})"
+    )
 
 
 def extract_operations_attachments(parsed: dict, record: dict | pd.Series | None = None) -> list[dict]:
