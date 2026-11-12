@@ -169,16 +169,11 @@ Rollback SQL
 Files affected
 Test plan
 
-Database migrations should be:
-
-Versioned
-Idempotent when practical
-Documented
-Committed to the repository
-
 Do not place migration fragments inside page files.
 
 Do not automatically treat ocean rate-sheet charges as CaliTrans customer trucking rates.
+
+Migration versioning/idempotency requirements and worker/script/integration-test specifics live in `.claude/rules/database-safety.md` and load automatically when working in those paths.
 
 #Secrets and Files
 
