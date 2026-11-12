@@ -74,6 +74,8 @@ Use one canonical pending-order-draft merge function.
 Use one canonical work-item completion workflow.
 Use one canonical multi-container child-load creation workflow.
 
+State-changing TMS operations must enforce authorization at the application command boundary (application/), not solely through frontend or API route checks.
+
 Do not split files only to reduce line count. Split by responsibility and data flow.
 
 Operations Inbox-specific rules (purpose/workflow, classification precedence, multi-container booking, parsing rules, pending draft rules, conversation/work-item rules, email action center, email sync rules, required reading) live in `.claude/rules/operations-inbox.md` and load automatically when working in that area.
@@ -95,6 +97,7 @@ Create loads without confirmation
 Change operational records without confirmation
 Change financial records without confirmation
 Replace deterministic parsing for stable customer formats
+Merge, deploy, change production databases, or integrate with production systems without explicit user authorization
 #Code Review and Dead-Code Rules
 
 Do not remove code merely because it appears unused.
