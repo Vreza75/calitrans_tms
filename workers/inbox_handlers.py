@@ -39,6 +39,88 @@ logger = logging.getLogger(__name__)
 _ATTACHMENT_EMBED_PER_FILE_CAP = 3 * 1024 * 1024  # 3 MB raw per attachment
 _ATTACHMENT_EMBED_TOTAL_CAP = 8 * 1024 * 1024  # 8 MB raw per message
 
+# Durable object-store cap (Stage 2 / Task A): object storage has no jsonb-
+# payload-bloat concern, so this is a sanity/cost ceiling, far higher than the
+# base64 caps above. An attachment over this stays same-run-only (disk) and is
+# flagged non-durable, rather than silently uploaded unbounded.
+_ATTACHMENT_STORE_PER_FILE_CAP = 25 * 1024 * 1024  # 25 MB raw per attachment
+
+
+def _attachment_bytes_by_sha(message: dict) -> dict:
+    """Map content_sha256 -> raw bytes for every attachment carrying bytes on
+    the message. Shared by the base64 (embed) and object-store (upload) paths."""
+    import hashlib
+
+    by_sha: dict[str, bytes] = {}
+    for att in message.get("attachments") or []:
+        content = att.get("content")
+        if isinstance(content, (bytes, bytearray)) and content:
+            by_sha[hashlib.sha256(bytes(content)).hexdigest()] = bytes(content)
+    return by_sha
+
+
+def _attachment_object_key(content_sha256: str) -> str:
+    """Content-addressed, sharded object key. Deterministic (same bytes -> same
+    key), so re-uploads on a retried job are idempotent and identical
+    attachments dedupe. No filename in the path (avoids key-injection); the
+    filename rides in the payload metadata."""
+    sha = str(content_sha256 or "")
+    return f"operations_inbox/{sha[:2]}/{sha}"
+
+
+# Sentinel: distinguishes "storage argument not supplied, resolve from config"
+# from "explicitly no storage" (storage=None -> base64 fallback).
+_STORAGE_UNSET = object()
+
+
+def store_attachments_durably(pre_saved_attachments: list, message: dict, *, storage=_STORAGE_UNSET) -> list:
+    """Make each saved attachment durable across ephemeral runners and return
+    enriched metadata for the job payload.
+
+    With object storage configured: upload each attachment's bytes to the
+    private bucket under a content-addressed key, record `storage_key` +
+    `content_sha256`, and keep NO base64 body in the payload (Task A: document
+    bytes must not live in worker_jobs indefinitely). Without it: fall back to
+    the Stage 1 base64-in-payload stopgap so the system still runs with zero
+    external infrastructure. Oversized attachments are uploaded to neither and
+    flagged `durable=False` (same-run-only). A transient upload failure for one
+    attachment degrades to the base64 stopgap rather than failing the sync."""
+    from services.object_storage import ObjectStorageError, get_object_storage
+
+    store = get_object_storage() if storage is _STORAGE_UNSET else storage
+    if store is None:
+        return _embed_attachment_content(pre_saved_attachments, message)
+
+    by_sha = _attachment_bytes_by_sha(message)
+    enriched = []
+    for saved in pre_saved_attachments or []:
+        item = dict(saved)
+        sha = str(item.get("content_sha256") or "")
+        content = by_sha.get(sha)
+        if not content:
+            enriched.append(item)  # no bytes available - disk-only, unchanged
+            continue
+        if len(content) > _ATTACHMENT_STORE_PER_FILE_CAP:
+            item["durable"] = False  # too big - explicitly same-run-only
+            item.pop("_content_b64", None)
+            enriched.append(item)
+            continue
+        key = _attachment_object_key(sha)
+        content_type = str(item.get("content_type") or "application/octet-stream")
+        try:
+            store.upload(key, content, content_type=content_type)
+        except ObjectStorageError:
+            # Storage hiccup: don't fail the whole sync - fall back to the
+            # bounded base64 stopgap for just this attachment so it stays
+            # durable. Logged without any filename/body/credential.
+            logger.warning("attachment durable upload failed; using base64 fallback for one attachment")
+            enriched.extend(_embed_attachment_content([item], message))
+            continue
+        item["storage_key"] = key
+        item.pop("_content_b64", None)  # bytes are in object storage, not the payload
+        enriched.append(item)
+    return enriched
+
 
 def _embed_attachment_content(pre_saved_attachments: list, message: dict) -> list:
     """Return pre_saved metadata with a bounded base64 copy of each saved
@@ -47,13 +129,8 @@ def _embed_attachment_content(pre_saved_attachments: list, message: dict) -> lis
     content_sha256; silently leaves `_content_b64` absent when bytes are
     unavailable or over the cap (that attachment stays same-run-only)."""
     import base64
-    import hashlib
 
-    by_sha: dict[str, bytes] = {}
-    for att in message.get("attachments") or []:
-        content = att.get("content")
-        if isinstance(content, (bytes, bytearray)) and content:
-            by_sha[hashlib.sha256(bytes(content)).hexdigest()] = bytes(content)
+    by_sha = _attachment_bytes_by_sha(message)
 
     embedded_total = 0
     enriched = []
@@ -79,16 +156,45 @@ class AttachmentDurabilityError(Exception):
     or corrupted attachment."""
 
 
-def _rehydrate_attachment_files(pre_saved_attachments: list) -> int:
-    """Ensure every saved attachment is present on disk and matches its
-    recorded SHA-256, restoring from the durable base64 copy in the job payload
-    when the local file is gone (fresh runner) or corrupted. FAIL-CLOSED: if an
-    attachment file is missing or fails verification and there is no durable
-    copy to restore it from, raise AttachmentDurabilityError - never proceed
-    with the attachment silently lost. Returns the number of files restored."""
+def _durable_bytes_for(saved: dict, store) -> bytes | None:
+    """Fetch an attachment's durable bytes for restoration, trying the object
+    store (by `storage_key`) first, then the base64 copy embedded in the
+    payload. Returns None when no durable copy exists. A storage transport
+    failure is swallowed to None so the base64 fallback (if any) can still be
+    tried; a bytes/SHA mismatch is NOT swallowed here - the caller verifies and
+    fails closed."""
     import base64
+
+    storage_key = str(saved.get("storage_key") or "")
+    if storage_key and store is not None:
+        from services.object_storage import ObjectStorageError
+
+        try:
+            return store.download(storage_key)
+        except ObjectStorageError:
+            pass  # fall through to base64, then to fail-closed in the caller
+
+    content_b64 = saved.get("_content_b64")
+    if content_b64:
+        return base64.b64decode(content_b64)
+    return None
+
+
+def _rehydrate_attachment_files(pre_saved_attachments: list, *, storage=_STORAGE_UNSET) -> int:
+    """Ensure every saved attachment is present on disk and matches its
+    recorded SHA-256, restoring from the durable copy - object storage
+    (`storage_key`) first, then the base64 copy in the job payload - when the
+    local file is gone (fresh runner) or corrupted. FAIL-CLOSED: if an
+    attachment file is missing or fails verification and there is no durable
+    copy to restore it from (or the restored bytes fail SHA-256), raise
+    AttachmentDurabilityError - never proceed with the attachment silently lost
+    or wrong. Returns the number of files restored."""
     import hashlib
     from pathlib import Path
+
+    from services.object_storage import get_object_storage
+
+    store = get_object_storage() if storage is _STORAGE_UNSET else storage
 
     restored = 0
     for saved in pre_saved_attachments or []:
@@ -99,18 +205,19 @@ def _rehydrate_attachment_files(pre_saved_attachments: list) -> int:
             continue
 
         expected_sha = str(saved.get("content_sha256") or "")
-        content_b64 = saved.get("_content_b64")
         path = Path(file_path)
 
         if not expected_sha:
             # No recorded hash (malformed/legacy/parse-error entry) - a real
             # saved attachment always records content_sha256, so this is not a
             # verifiable attachment to fail the message over. Best-effort:
-            # restore from an embedded copy if the file is gone, else leave it.
-            if content_b64 and not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(base64.b64decode(content_b64))
-                restored += 1
+            # restore from a durable copy if the file is gone, else leave it.
+            if not path.exists():
+                data = _durable_bytes_for(saved, store)
+                if data is not None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    restored += 1
             continue
 
         if path.exists():
@@ -118,12 +225,12 @@ def _rehydrate_attachment_files(pre_saved_attachments: list) -> int:
                 continue  # present and verified
             # On-disk file is corrupted - fall through to restore from the copy.
 
-        if not content_b64:
+        data = _durable_bytes_for(saved, store)
+        if data is None:
             raise AttachmentDurabilityError(
-                f"attachment {path.name} is missing/corrupted and no durable copy was embedded"
+                f"attachment {path.name} is missing/corrupted and no durable copy is available"
             )
-        data = base64.b64decode(content_b64)
-        if expected_sha and hashlib.sha256(data).hexdigest() != expected_sha:
+        if hashlib.sha256(data).hexdigest() != expected_sha:
             raise AttachmentDurabilityError(f"restored attachment {path.name} failed SHA-256 verification")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
@@ -342,7 +449,7 @@ def _fetch_and_enqueue_inbox_messages(*, limit: int = 12, time_budget_seconds: i
                 result["error_messages"].append(f"{subject[:80]}: attachment save failed: {exc}")
 
             job_message = {key: value for key, value in message.items() if key != "attachments"}
-            pre_saved_attachments = _embed_attachment_content(pre_saved_attachments, message)
+            pre_saved_attachments = store_attachments_durably(pre_saved_attachments, message)
 
             try:
                 with transaction() as conn:

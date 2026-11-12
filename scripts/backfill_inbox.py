@@ -159,7 +159,7 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
             from db_client import transaction
             from repositories.worker_job_repo import enqueue_job, job_exists_for_idempotency_key
 
-            from workers.inbox_handlers import _embed_attachment_content
+            from workers.inbox_handlers import store_attachments_durably
 
             idempotency_key = f"inbox.process_message:{message_id}"
 
@@ -172,7 +172,7 @@ def run_backfill(*, since: date, until: date, batch: int, dry_run: bool) -> dict
                 pre_saved = _save_operations_email_attachments(message, message_id)
             except Exception:
                 pre_saved = []
-            pre_saved = _embed_attachment_content(pre_saved, message)
+            pre_saved = store_attachments_durably(pre_saved, message)
             job_message = {key: value for key, value in message.items() if key != "attachments"}
 
             with transaction() as conn:
