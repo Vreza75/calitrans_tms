@@ -22,10 +22,22 @@ git log --oneline -10
 Only `C:\GitHub\calitrans_tms_postgres_upgrade_clean`. Never the obsolete
 `C:\Users\vreza\OneDrive\Documents\GitHub\calitrans_tms_postgres_upgrade`.
 
-## 2. Canonical locations — verified, don't re-grep these
+## 2. Canonical locations — verified on a specific branch, re-check before relying on them
 
-- Live/historical classification: `classify_message()` in `services/inbox_backfill_policy.py`.
-- Business-conversation-key: `_business_conversation_key_from_context()` in `services/operations_inbox_service.py`.
+These pointers were confirmed against the repo state at skill-write time. A function or file
+that lives only in an unmerged PR is **not present** on `master` or on any branch that doesn't
+carry that PR. Never assume functionality from an unmerged PR exists in the current branch —
+confirm with `git cat-file -e <branch>:<path>` or `grep -n "def <name>" <file>` against the
+branch you're actually on before referencing any of the below.
+
+- Business-conversation-key: `_business_conversation_key_from_context()` in
+  `services/operations_inbox_service.py` — present on `master`.
+- Live/historical classification: `classify_message()` in `services/inbox_backfill_policy.py` —
+  **only exists on branches carrying PR #19's Stage 2 work; absent from `master`** (confirmed via
+  `git cat-file -e origin/master:services/inbox_backfill_policy.py` -> not found). If PR #19 is
+  still unmerged when you read this, verify which branch you're on before assuming this function
+  exists; if it's absent, treat Operations Inbox live/historical classification as not yet
+  implemented on this branch rather than assuming PR #19's behavior is already there.
 - Pending-order-draft merge, work-item completion, multi-container child-load creation: not
   independently verified at skill-write time — before adding new logic for any of these, run
   `grep -n "def " services/operations_inbox_service.py` first and confirm against
