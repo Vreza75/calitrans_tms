@@ -156,6 +156,28 @@ def test_retrying_the_same_message_insert_does_not_raise_or_duplicate(sqlite_ord
     assert _event_count() == 1
 
 
+def test_persisted_classification_is_stable_across_cutoff_changes(sqlite_order_intake):
+    """Stage 2 P1: the classification persisted on first insert is authoritative.
+    A retry that recomputes a DIFFERENT review_status (e.g. because
+    INBOX_LIVE_CUTOFF was changed between runs) must NOT overwrite it - the
+    insert's ON CONFLICT (source_message_id) DO NOTHING guarantees the first
+    decision stands. This is the mechanism workers/inbox_handlers.py relies on
+    for retry/cutoff-change stability."""
+    from services.operations_inbox_service import HISTORICAL_BACKFILL_REVIEW_STATUS
+
+    # First processing classified it historical (cutoff said so) and persisted it.
+    ops._insert_operations_email_message(MESSAGE, force_review_status=HISTORICAL_BACKFILL_REVIEW_STATUS)
+    assert _row_count() == 1
+
+    # A later retry recomputes LIVE (cutoff moved) and tries to insert again.
+    ops._insert_operations_email_message(MESSAGE, force_review_status=None)
+
+    assert _row_count() == 1  # still one row
+    df = db_client.read_df("select review_status from order_intake")
+    # The persisted historical decision is untouched by the recomputed-live retry.
+    assert df.iloc[0]["review_status"] == HISTORICAL_BACKFILL_REVIEW_STATUS
+
+
 def test_two_distinct_messages_both_insert_normally(sqlite_order_intake):
     other_message = {**MESSAGE, "id": "2", "subject": "Different booking"}
 

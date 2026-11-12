@@ -137,6 +137,11 @@ def process_one() -> dict[str, Any] | None:
     with transaction() as conn:
         if success:
             worker_job_repo.mark_completed(conn, job["id"])
+            # Task A blocker 4: now that the job is terminally completed, drop any
+            # base64 attachment bodies from its payload so document bytes don't
+            # linger in worker_jobs. Safe here (never on a pending/processing
+            # job) and in the same transaction as the completion write.
+            worker_job_repo.scrub_completed_payload_bytes(conn, job["id"])
             outcome = "completed"
         elif job["attempt_count"] + 1 >= MAX_ATTEMPTS:
             worker_job_repo.mark_failed(conn, job["id"], error=error)

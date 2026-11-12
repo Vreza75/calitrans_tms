@@ -240,6 +240,8 @@ def get_attachment_summary(
             source_subject=str(item.get("source_subject") or ""),
             source_received_at=str(item.get("source_received_at") or ""),
             attachment_ref=attachment_ref(file_path),
+            storage_key=str(item.get("storage_key") or ""),
+            content_sha256=str(item.get("content_sha256") or ""),
         )
 
     return AttachmentSummary(
@@ -268,7 +270,19 @@ def get_attachment_content(work_item_id: int, attachment_ref_value: str) -> tupl
     if match is None or not match.file_path:
         raise NotFoundError(f"Attachment {attachment_ref_value} not found for work item {work_item_id}.")
 
-    return attachment_core.read_attachment_bytes(match.file_path), match
+    # Durable resolution (Task A blocker 2): the local file may be gone (bytes
+    # live in the private object store on a different host/run). Resolve from
+    # disk-or-storage and SHA-256-verify. Authorization already enforced above -
+    # the ref was matched against THIS work item's own attachments.
+    try:
+        content = attachment_core.resolve_attachment_bytes(
+            match.file_path, storage_key=match.storage_key, content_sha256=match.content_sha256
+        )
+    except attachment_core.AttachmentResolutionError as exc:
+        raise NotFoundError(
+            f"Attachment {attachment_ref_value} for work item {work_item_id} is not available: {exc}"
+        ) from exc
+    return content, match
 
 
 def get_conversation_page(

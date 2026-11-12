@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 
 import pytest
+import pytest_db_guard
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 import db_client
@@ -109,7 +110,7 @@ def test_error_detail_redacts_embedded_credentials(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable PostgreSQL database.",
 )
 def test_readiness_check_issues_zero_ddl_against_a_real_database(monkeypatch):

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 import pytest
+import pytest_db_guard
 from sqlalchemy import text
 
 import db_client
@@ -175,7 +176,7 @@ def test_count_by_status_aggregates_and_omits_zero_statuses(sqlite_outbox) -> No
 
 
 @pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable PostgreSQL database.",
 )
 class TestPostgresOutboxLifecycle:

@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import pytest
+import pytest_db_guard
 
 from scripts.run_migrations import DATABASE_DIR, MIGRATION_ORDER, _mask, run
 from scripts.verify_schema import _parse_expected_schema
@@ -127,13 +128,22 @@ def test_parse_expected_schema_finds_unique_indexes():
 
 
 @pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason=(
         "Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable "
         "PostgreSQL database. Never set this to the app's real DATABASE_URL."
     ),
 )
 class TestMigrationRunnerAgainstARealScratchDatabase:
+    @pytest.fixture(autouse=True)
+    def _central_policy_gate(self):
+        """Route this real-database class through the one central safety policy:
+        skip (not error) unless destructive access is acknowledged and the target
+        passes disposable-shape validation, in addition to the var being set."""
+        import pytest_db_guard
+
+        pytest_db_guard.require_disposable_database("migration", scope="migration runner")
+
     def test_fresh_run_applies_every_migration_then_verify_schema_passes(self):
         from scripts.verify_schema import verify
 

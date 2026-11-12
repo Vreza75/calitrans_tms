@@ -5,6 +5,7 @@ import os
 import threading
 
 import pytest
+import pytest_db_guard
 from sqlalchemy import event, text
 
 import db_client
@@ -149,7 +150,7 @@ def test_add_row_resolves_to_existing_row_on_conflict_without_duplicating(sqlite
 
 
 @pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason=(
         "Requires MIGRATION_TEST_DATABASE_URL pointing at an empty, disposable "
         "PostgreSQL database. Never set this to the app's real DATABASE_URL. "

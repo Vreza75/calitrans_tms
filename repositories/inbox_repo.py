@@ -20,12 +20,24 @@ from db_client import execute, read_df
 OPERATIONS_ATTACHMENTS_KEY = "_operations_attachments"
 OPERATIONS_PDF_ATTACHMENTS_KEY = "_operations_pdf_attachments"
 
+# Historical/backfill intake rows carry this review_status so they are isolated
+# from the live operational inbox. It is a terminal status (listed below), so
+# inbox_review_where_clause() excludes it from EVERY active queue - Streamlit,
+# the FastAPI work-item queue (via repositories.work_item_repo), and the
+# dispatcher workspace (via services.dispatcher_workspace_service). Set at INSERT
+# time by workers/inbox_handlers.py::handle_inbox_process_message for backfilled
+# messages (scripts/backfill_inbox.py). This is the ONE canonical terminal-status
+# list; services.operations_inbox_service re-exports these names rather than
+# redefining them, so the three queue surfaces can never diverge.
+HISTORICAL_BACKFILL_REVIEW_STATUS = "Historical (Backfill)"
+
 INBOX_TERMINAL_REVIEW_STATUSES = [
     "Order Created",
     "Attached",
     "Quote Created",
     "Order Cancelled",
     "Closed",
+    HISTORICAL_BACKFILL_REVIEW_STATUS,
 ]
 
 OPERATIONS_EMAIL_SYNC_SOURCES = [

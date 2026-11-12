@@ -89,7 +89,17 @@ class MissingScratchDatabaseError(RuntimeError):
 
 
 def require_scratch_database_url(explicit_url: str | None = None) -> str:
-    url = explicit_url or os.environ.get(ENV_VAR)
+    if explicit_url:
+        url = explicit_url
+    else:
+        # Route through the one central test-database safety policy: skips (not
+        # errors) unless the scratch URL is set, destructive access is
+        # acknowledged, and the target passes disposable-shape validation.
+        import pytest_db_guard
+
+        url = pytest_db_guard.require_disposable_database(
+            "inbox_certification", scope="Operations Inbox certification"
+        )
     if not url:
         raise MissingScratchDatabaseError(
             f"{ENV_VAR} is not set. Point it at a disposable, empty PostgreSQL "

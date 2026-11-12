@@ -146,6 +146,63 @@ def reclaim_stuck_processing(conn: Connection, *, older_than: timedelta) -> int:
     return result.rowcount or 0
 
 
+def _strip_payload_attachment_bytes(payload: dict[str, Any]) -> bool:
+    """Remove runtime-only base64 attachment bodies (`_content_b64`, raw
+    `content`) from a worker-job payload in place. Returns True if anything was
+    removed. The durable copy lives in object storage / on disk (keyed by
+    storage_key + content_sha256); the base64 in the payload exists only to
+    bridge a cross-runner retry and must not linger once the job is done."""
+    changed = False
+    attachments = payload.get("pre_saved_attachments")
+    if isinstance(attachments, list):
+        for item in attachments:
+            if isinstance(item, dict):
+                for key in ("_content_b64", "content"):
+                    if key in item:
+                        del item[key]
+                        changed = True
+    message = payload.get("message")
+    if isinstance(message, dict) and isinstance(message.get("attachments"), list):
+        # Defensive: the producer strips `attachments` before enqueue, but scrub
+        # any that slipped through so no attachment bytes survive in the payload.
+        del message["attachments"]
+        changed = True
+    return changed
+
+
+def scrub_completed_payload_bytes(conn: Connection, job_id: int) -> bool:
+    """Remove base64 attachment bodies from a COMPLETED job's payload (Task A
+    blocker 4). Read-modify-write, idempotent, a no-op when there's nothing to
+    strip. MUST only be called after a job reaches a terminal 'completed' state -
+    never on a pending/processing job, whose base64 fallback an in-flight retry
+    may still need. Returns True if the payload was rewritten."""
+    row = conn.execute(
+        text("select payload from worker_jobs where id = :id and status = 'completed'"),
+        {"id": job_id},
+    ).mappings().first()
+    if row is None:
+        return False
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return False
+    if not isinstance(payload, dict):
+        return False
+    if not _strip_payload_attachment_bytes(payload):
+        return False
+    # PostgreSQL's payload column is jsonb and needs an explicit text->jsonb
+    # cast; SQLite (unit tests) has no jsonb type and casting to it would coerce
+    # the JSON text to 0 under NUMERIC affinity, so bind the text directly there.
+    value_expr = "cast(:payload as jsonb)" if conn.dialect.name == "postgresql" else ":payload"
+    conn.execute(
+        text(f"update worker_jobs set payload = {value_expr} where id = :id"),
+        {"payload": json.dumps(payload, default=str), "id": job_id},
+    )
+    return True
+
+
 def mark_completed(conn: Connection, job_id: int) -> None:
     conn.execute(
         text(

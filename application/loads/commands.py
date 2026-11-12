@@ -154,7 +154,14 @@ def create_load_from_work_item(
     """
     require_permission(actor, Permission.WORK_ITEM_MANAGE)
 
-    from services.operations_inbox_service import create_load_from_inbox_item
+    from services.operations_inbox_service import (
+        EMAIL_LOAD_CREATION_DISABLED_MESSAGE,
+        create_load_from_inbox_item,
+        email_load_creation_enabled,
+    )
+
+    if not email_load_creation_enabled():
+        raise CommandFailedError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
 
     if not approved_fields.get("Booking Number") and not approved_fields.get("Reference Number"):
         raise ValidationError("Booking Number or Reference Number is required to create a load.")

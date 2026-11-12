@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from unittest import mock
 
 import pytest
+import pytest_db_guard
 
 import services.operations_inbox_service as ops
 
@@ -168,7 +169,7 @@ def test_wrapper_swallows_and_logs_sanitized_error(caplog):
 # --------------------------------------------------------------------------
 
 requires_db = pytest.mark.skipif(
-    not MIGRATION_TEST_DATABASE_URL,
+    not pytest_db_guard.category_authorized("migration"),
     reason="Set MIGRATION_TEST_DATABASE_URL to a disposable Postgres to run feedback persistence DB tests.",
 )
 

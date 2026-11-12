@@ -28,6 +28,11 @@ from services.email_parser import (
     parse_email_text,
 )
 from services.order_intake import create_load_from_intake, create_load_from_intake_with_status
+from repositories.inbox_repo import (  # canonical terminal-status source (re-exported)
+    HISTORICAL_BACKFILL_REVIEW_STATUS,
+    INBOX_TERMINAL_REVIEW_STATUSES,
+    inbox_review_where_clause,
+)
 from services.operations_field_service import derive_review_state, extract_operational_fields
 import services.operations_case_service as case_service
 from services.operations_email_triage_service import (
@@ -58,6 +63,8 @@ merge_operations_body_parsed_fields = attachment_service.merge_operations_body_p
 parse_saved_operations_attachment = attachment_service.parse_saved_operations_attachment
 parse_saved_operations_pdf = attachment_service.parse_saved_operations_pdf
 read_operations_attachment_bytes = attachment_service.read_operations_attachment_bytes
+resolve_operations_attachment_bytes = attachment_service.resolve_operations_attachment_bytes
+reparse_resolved_operations_attachment = attachment_service.reparse_resolved_operations_attachment
 read_operations_pdf_bytes = attachment_service.read_operations_pdf_bytes
 rescan_operations_request_attachments = attachment_service.rescan_operations_request_attachments
 save_operations_attachment = attachment_service.save_operations_attachment
@@ -422,13 +429,19 @@ REQUEST_TYPES = [
 REPLY_LANGUAGE_OPTIONS = ["Auto", "English", "Spanish", "Bilingual"]
 REPLY_TONE_OPTIONS = ["Professional", "Concise", "Friendly", "Apology / Delay"]
 
-INBOX_TERMINAL_REVIEW_STATUSES = [
-    "Order Created",
-    "Attached",
-    "Quote Created",
-    "Order Cancelled",
-    "Closed",
-]
+# Terminal review-status handling is defined ONCE, canonically, in
+# repositories/inbox_repo.py and re-exported here (see imports at the top of this
+# module) so the Streamlit inbox, the FastAPI work-item queue, and the dispatcher
+# workspace all exclude the same terminal statuses - including
+# HISTORICAL_BACKFILL_REVIEW_STATUS - from active queues. Do NOT redefine these
+# here; a second copy is exactly how backfilled mail leaked into a live queue.
+
+
+# Historical/backfill rows are now assigned HISTORICAL_BACKFILL_REVIEW_STATUS
+# atomically at INSERT time (workers/inbox_handlers.py::handle_inbox_process_message
+# passes force_review_status into _insert_operations_email_message), so the old
+# best-effort post-insert UPDATE has been removed - there is no window in which
+# a historical row is briefly 'Open'/active.
 
 OPERATIONS_EMAIL_SYNC_SOURCES = [
     "operations_email",
@@ -1395,9 +1408,9 @@ def ensure_operations_email_sync_schema() -> None:
     ensure_operations_case_schema()
 
 
-def inbox_review_where_clause() -> str:
-    terminal = ", ".join([f"'{status}'" for status in INBOX_TERMINAL_REVIEW_STATUSES])
-    return f"where coalesce(review_status, 'Open') not in ({terminal})"
+# inbox_review_where_clause is imported from repositories.inbox_repo (the single
+# canonical definition) at the top of this module and re-exported for page code
+# that calls ops._inbox_review_where_clause().
 
 
 @st.cache_data(show_spinner=False, ttl=30)
@@ -1742,6 +1755,49 @@ def update_intake_classification(
     )
 
 
+EMAIL_LOAD_CREATION_DISABLED_MESSAGE = "Load creation from email is disabled during the learning phase"
+
+
+def email_load_creation_enabled() -> bool:
+    """Learning-phase switch for creating loads FROM EMAIL. Default OFF
+    (EMAIL_LOAD_CREATION_ENABLED unset -> False): while the system is still
+    being tuned against historical mail, email-driven load creation is
+    refused so the AI/parsing pipeline can be observed without mutating
+    operational records. Manual, non-email load entry (create_load_from_intake
+    and the dispatch/orders paths) is unaffected - only create_load_from_inbox_item
+    and application/loads/commands.py::create_load_from_work_item consult this."""
+    from config import get_secret
+
+    return str(get_secret("EMAIL_LOAD_CREATION_ENABLED", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def create_load_from_document_fields(
+    intake_id: int, parsed: dict[str, Any], document_fields: dict[str, Any]
+) -> int:
+    """Create a load from an Operations Inbox document (email attachment),
+    merging parsed-document fields over the message's parsed fields.
+
+    Email-originated, so it is fail-closed behind the learning-phase switch:
+    refuses with PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE) when
+    email_load_creation_enabled() is False - the create_load_from_intake
+    primitive it calls stays ungated for legitimate manual/non-email entry, so
+    the gate is enforced here at the email call site. Returns the new load id."""
+    if not email_load_creation_enabled():
+        raise PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
+
+    merged_for_load = dict(parsed)
+    for key, value in (document_fields or {}).items():
+        if not str(key).startswith("_") and safe_str(value):
+            merged_for_load[key] = value
+    return create_load_from_intake(intake_id, merged_for_load)
+
+
 def create_load_from_inbox_item(
     work_item_id: int,
     approved_fields: dict[str, Any],
@@ -1776,6 +1832,13 @@ def create_load_from_inbox_item(
     stays outside this transaction, unchanged from its prior own-commit
     behavior - see docs/architecture/BACKEND_BOUNDARY_PHASE_1.md, "Known
     limitations" for the remaining scope."""
+    if not email_load_creation_enabled():
+        # Learning-phase guard: refuse before any read/write. This is the one
+        # chokepoint for every email-driven load creation (work-item command,
+        # multi-container children, the Operations Inbox page), so no
+        # email-sourced load is created while the switch is off.
+        raise PermissionError(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
+
     review_status_sql = text(
         """
         update order_intake
@@ -4410,10 +4473,15 @@ def _prepare_operations_email_record(message: dict, *, pre_saved_attachments: li
         attachment["matched_load_id"] = matched_load_id
         attachment["mailbox_account"] = safe_str(message.get("mailbox_account"))
     if saved_attachments:
-        parsed[OPERATIONS_ATTACHMENTS_KEY] = saved_attachments
+        # Strip runtime-only byte copies (_content_b64 / raw content) before
+        # persisting to parsed_data - the durable copy lives in object storage /
+        # on disk, referenced by storage_key + content_sha256. Keeping base64
+        # bodies in order_intake.parsed_data is the Task A blocker-4 leak.
+        persistable_attachments = attachment_service.strip_attachment_runtime_bytes(saved_attachments)
+        parsed[OPERATIONS_ATTACHMENTS_KEY] = persistable_attachments
         parsed[OPERATIONS_PDF_ATTACHMENTS_KEY] = [
             item
-            for item in saved_attachments
+            for item in persistable_attachments
             if is_pdf_filename(item.get("filename", ""), item.get("content_type", ""))
             or bool(item.get("is_pdf"))
         ]
@@ -4473,7 +4541,7 @@ def _prepare_operations_email_records(message: dict, *, pre_saved_attachments: l
     return records
 
 
-def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
+def _insert_operations_email_record_row(message: dict, record: dict, *, review_status: str = "Open") -> dict:
     subject = record["subject"]
     sender = record["sender"]
     received_at = record["received_at"]
@@ -4579,7 +4647,7 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             cast(:parsed_data as jsonb),
             :raw_text,
             'Synced',
-            'Open',
+            :review_status,
             :request_type,
             :conversation_key,
             :matched_load_id,
@@ -4618,6 +4686,7 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
             "file_path": safe_str(saved_attachments[0].get("file_path")) if saved_attachments else None,
             "parsed_data": json_dump(parsed),
             "raw_text": latest_body,
+            "review_status": review_status,
             "request_type": classification.get("request_type", "Customer Request"),
             "conversation_key": conversation_key,
             "matched_load_id": int_or_none(classification.get("matched_load_id")),
@@ -4661,12 +4730,22 @@ def _insert_operations_email_record_row(message: dict, record: dict) -> dict:
     }
 
 
-def _insert_operations_email_message(message: dict, *, pre_saved_attachments: list | None = None) -> dict:
+def _insert_operations_email_message(
+    message: dict, *, pre_saved_attachments: list | None = None, force_review_status: str | None = None
+) -> dict:
     records = _prepare_operations_email_records(message, pre_saved_attachments=pre_saved_attachments)
     base_message_id = _email_sync_unique_message_id(message)
     records = _assign_split_row_identity(records, base_message_id)
 
-    results = [_insert_operations_email_record_row(message, record) for record in records]
+    # Atomic isolation: the row is INSERTED with this review_status (no
+    # separate best-effort UPDATE afterwards), so a backfilled/historical
+    # message can never briefly exist as active work, even if the worker
+    # crashes right after the insert commits. Default 'Open' = unchanged live
+    # behavior.
+    review_status = force_review_status or "Open"
+    results = [
+        _insert_operations_email_record_row(message, record, review_status=review_status) for record in records
+    ]
 
     primary = results[0]
     return {
@@ -5008,7 +5087,9 @@ def render_operations_attachment_preview(
                         else nullcontext()
                     )
                     with file_stage:
-                        file_bytes = read_operations_attachment_bytes(file_path)
+                        # Durable resolution (Task A blocker 2): disk-or-object-
+                        # store, SHA-256 verified.
+                        file_bytes = resolve_operations_attachment_bytes(attachment)
                 except Exception:
                     st.warning("The original document could not be opened from attachment storage.")
                     continue
@@ -5200,7 +5281,10 @@ def render_operations_pdf_panel(
 
         if file_path:
             try:
-                file_bytes = read_operations_attachment_bytes(file_path)
+                # Durable resolution (Task A blocker 2): the local file may be
+                # gone (bytes live in the private object store); resolve from
+                # disk-or-storage, SHA-256-verified.
+                file_bytes = resolve_operations_attachment_bytes(selected_attachment)
                 st.download_button(
                     "Download Attachment",
                     data=file_bytes,
@@ -5227,11 +5311,10 @@ def render_operations_pdf_panel(
                     st.error("This attachment has no saved file path.")
                 else:
                     try:
-                        text_preview, reparsed = parse_saved_operations_attachment(
-                            file_path,
-                            filename,
-                            content_type,
-                        )
+                        # Durable reparse (Task A blocker 2): resolve bytes from
+                        # disk-or-object-store (SHA-256 verified) before parsing,
+                        # so repair works even when the local file is gone.
+                        text_preview, reparsed = reparse_resolved_operations_attachment(selected_attachment)
                         updated_attachment = dict(selected_attachment)
                         updated_attachment["parsed_data"] = reparsed
                         updated_attachment["fields_found"] = field_count(reparsed)
@@ -5391,16 +5474,26 @@ def render_operations_pdf_panel(
                     st.info(result.get("error") or "No load fields needed updating.")
 
         with load_cols[2]:
-            if st.button("Create Load From Document", key=f"create_load_from_ops_attachment_{intake_id}_{selected_index}", use_container_width=True):
+            # This is an EMAIL-originated load creation (the document came from an
+            # Operations Inbox attachment), so it is gated by the same
+            # learning-phase switch as every other email-driven create path.
+            # create_load_from_intake itself stays ungated - it is the shared
+            # function legitimate manual/non-email load entry also uses - so the
+            # gate is enforced here at the email call site, not in the primitive.
+            doc_create_enabled = email_load_creation_enabled()
+            if st.button(
+                "Create Load From Document",
+                key=f"create_load_from_ops_attachment_{intake_id}_{selected_index}",
+                use_container_width=True,
+                disabled=not doc_create_enabled,
+            ):
                 try:
-                    merged_for_load = dict(parsed)
-                    for key, value in document_fields.items():
-                        if not str(key).startswith("_") and safe_str(value):
-                            merged_for_load[key] = value
-                    new_load_id = create_load_from_intake(intake_id, merged_for_load)
+                    new_load_id = create_load_from_document_fields(intake_id, parsed, document_fields)
                     st.success(f"Created load #{new_load_id} from document fields.")
                     refresh_data()
                     st.rerun()
+                except PermissionError:
+                    st.info(EMAIL_LOAD_CREATION_DISABLED_MESSAGE)
                 except Exception as exc:
                     st.error(f"Unable to create load from document fields: {exc}")
 

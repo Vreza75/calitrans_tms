@@ -123,7 +123,9 @@ class AttachmentSummaryOut(BaseModel):
     def from_domain(cls, summary) -> "AttachmentSummaryOut":
         def _meta(item):
             data = dict(item.__dict__)
-            data.pop("file_path", None)
+            # Internal server-side fields - never serialized to an API client.
+            for internal in ("file_path", "storage_key", "content_sha256"):
+                data.pop(internal, None)
             return AttachmentMetaOut(**data)
 
         return cls(

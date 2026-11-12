@@ -300,6 +300,15 @@ def _account_setting_suffix(email_address):
     return re.sub(r"[^A-Za-z0-9]+", "_", local_part).strip("_").upper()
 
 
+def operations_mailbox_alias(email_or_mailbox):
+    """Sanitized mailbox alias (the uppercased local-part, e.g. 'DISPATCH')
+    for logging - never the full address or domain. Accepts either a bare
+    address or a 'address:folder' mailbox string (the shape carried on each
+    synced message's 'mailbox' key)."""
+    value = str(email_or_mailbox or "").split(":", 1)[0]
+    return _account_setting_suffix(value) or "UNKNOWN"
+
+
 NAMED_EMAIL_ACCOUNTS = {
     "DISPATCH": "dispatch@calitranscorp.com",
     "MARGIE": "margiea@calitranscorp.com",
