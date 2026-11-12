@@ -13,6 +13,23 @@ export type LoginRequest = Schemas["LoginIn"];
 export type LoginResponse = Schemas["LoginOut"];
 export type MeResponse = Schemas["MeOut"];
 
+export type WorkItemSummary = Schemas["WorkItemSummaryOut"];
+export type WorkItemPage = Schemas["WorkItemPageOut"];
+export type WorkItemDetail = Schemas["WorkItemDetailOut"];
+export type WorkItemQueueCounts = Schemas["WorkItemQueueCountsOut"];
+export type QueueCount = Schemas["QueueCountOut"];
+export type AttachmentMeta = Schemas["AttachmentMetaOut"];
+export type AttachmentSummary = Schemas["AttachmentSummaryOut"];
+export type ConversationMessage = Schemas["ConversationMessageOut"];
+export type ConversationPage = Schemas["ConversationPageOut"];
+export type CommandResult = Schemas["CommandResultOut"];
+export type CreateLoadRequest = Schemas["CreateLoadIn"];
+export type CreateLoadResult = Schemas["CreateLoadOut"];
+export type UpdateLoadRequest = Schemas["UpdateLoadIn"];
+export type UpdateLoadResult = Schemas["UpdateLoadOut"];
+export type LinkLoadRequest = Schemas["LinkLoadIn"];
+export type CloseWorkItemRequest = Schemas["CloseWorkItemIn"];
+
 // The FastAPI error envelope every response from api/errors.py uses -
 // {"error": {"code", "message", "details"}} - never {"detail": ...}.
 export type ApiErrorEnvelope = {

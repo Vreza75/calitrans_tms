@@ -150,16 +150,11 @@ def test_dispatcher_role_can_read_work_items(configured_client: TestClient, monk
 
 
 def test_dev_mode_bypasses_token_check_only_when_explicitly_enabled(monkeypatch) -> None:
+    from api.auth import DEV_MODE_ACTOR, require_auth
+
     monkeypatch.setenv("API_AUTH_DEV_MODE", "true")
     monkeypatch.delenv("API_AUTH_TOKENS", raising=False)
-    client = TestClient(app)
-
-    r = client.get("/api/v1/work-items")
-    # Reaches the real handler (which will hit the DB or error some other
-    # way) rather than being rejected at the auth layer - proves dev mode
-    # is honored, not that the whole call necessarily succeeds.
-    assert r.status_code != 401
-    assert r.status_code != 403
+    assert require_auth(None) == DEV_MODE_ACTOR
 
 
 def test_accounting_role_cannot_create_load(configured_client: TestClient) -> None:
@@ -334,15 +329,19 @@ def test_dispatcher_role_can_transition_load(configured_client: TestClient, monk
 
 
 def test_dev_mode_value_must_be_exactly_true(monkeypatch) -> None:
+    from fastapi import HTTPException
+
+    from api.auth import DEV_MODE_ACTOR, require_auth
+
     for value in ("1", "yes", "TRUE ", "enabled"):
         monkeypatch.setenv("API_AUTH_DEV_MODE", value)
         monkeypatch.delenv("API_AUTH_TOKENS", raising=False)
-        client = TestClient(app)
-        r = client.get("/api/v1/work-items")
         if value.strip().lower() == "true":
-            assert r.status_code != 401
+            assert require_auth(None) == DEV_MODE_ACTOR
         else:
-            assert r.status_code == 401, f"value={value!r} should not enable dev mode"
+            with pytest.raises(HTTPException) as exc_info:
+                require_auth(None)
+            assert exc_info.value.status_code == 401, f"value={value!r} should not enable dev mode"
 
 
 def test_malformed_tokens_json_fails_closed_not_open(monkeypatch) -> None:
