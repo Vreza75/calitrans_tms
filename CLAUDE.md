@@ -31,34 +31,15 @@ git rev-parse --show-toplevel
 git branch --show-current
 git status --short
 git log --oneline -10
+```
+
 #Business Context
 
-CaliTrans is a small drayage and transportation company with approximately:
+CaliTrans is a small drayage and transportation company: 10-20 drivers, one dispatcher, one manager, one accounting representative.
 
-10–20 drivers
-One dispatcher
-One manager
-One accounting representative
+The TMS supports: import/export/local-import/local-export container moves, warehouse-to-warehouse transportation, new bookings and booking updates, terminal/gate changes, appointment and PIN requests, driver and delivery status updates, POD and document requests, billing readiness, and customer email communication.
 
-The TMS supports:
-
-Import container moves
-Export container moves
-Local import
-Local export
-Warehouse-to-warehouse transportation
-New bookings
-Booking updates
-Terminal and gate changes
-Appointment and PIN requests
-Driver and delivery status updates
-POD and document requests
-Billing readiness
-Customer email communication
-
-Favor reliability, maintainability, clear workflows, and low operating cost over unnecessary enterprise complexity.
-
-The system should support English and Spanish customer communication.
+Favor reliability, maintainability, clear workflows, and low operating cost over unnecessary enterprise complexity. The system supports English and Spanish customer communication.
 
 #Current Technology
 
