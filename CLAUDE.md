@@ -31,34 +31,15 @@ git rev-parse --show-toplevel
 git branch --show-current
 git status --short
 git log --oneline -10
+```
+
 #Business Context
 
-CaliTrans is a small drayage and transportation company with approximately:
+CaliTrans is a small drayage and transportation company: 10-20 drivers, one dispatcher, one manager, one accounting representative.
 
-10–20 drivers
-One dispatcher
-One manager
-One accounting representative
+The TMS supports: import/export/local-import/local-export container moves, warehouse-to-warehouse transportation, new bookings and booking updates, terminal/gate changes, appointment and PIN requests, driver and delivery status updates, POD and document requests, billing readiness, and customer email communication.
 
-The TMS supports:
-
-Import container moves
-Export container moves
-Local import
-Local export
-Warehouse-to-warehouse transportation
-New bookings
-Booking updates
-Terminal and gate changes
-Appointment and PIN requests
-Driver and delivery status updates
-POD and document requests
-Billing readiness
-Customer email communication
-
-Favor reliability, maintainability, clear workflows, and low operating cost over unnecessary enterprise complexity.
-
-The system should support English and Spanish customer communication.
+Favor reliability, maintainability, clear workflows, and low operating cost over unnecessary enterprise complexity. The system supports English and Spanish customer communication.
 
 #Current Technology
 
@@ -93,6 +74,8 @@ Use one canonical pending-order-draft merge function.
 Use one canonical work-item completion workflow.
 Use one canonical multi-container child-load creation workflow.
 
+State-changing TMS operations must enforce authorization at the application command boundary (application/), not solely through frontend or API route checks.
+
 Do not split files only to reduce line count. Split by responsibility and data flow.
 
 Operations Inbox-specific rules (purpose/workflow, classification precedence, multi-container booking, parsing rules, pending draft rules, conversation/work-item rules, email action center, email sync rules, required reading) live in `.claude/rules/operations-inbox.md` and load automatically when working in that area.
@@ -114,6 +97,7 @@ Create loads without confirmation
 Change operational records without confirmation
 Change financial records without confirmation
 Replace deterministic parsing for stable customer formats
+Merge, deploy, change production databases, or integrate with production systems without explicit user authorization
 #Code Review and Dead-Code Rules
 
 Do not remove code merely because it appears unused.
@@ -143,20 +127,14 @@ Delete only confirmed dead or safely consolidated duplicate code.
 
 Pay special attention to:
 
-pages_app/operations_inbox.py
-services/operations_inbox_service.py
-Email-sync services
-Parser services
-Attachment services
-Pending draft code
-Conversation-history code
-Load-matching code
 Root db_client.py
 database/db_client.py
 Compatibility aliases
 Old backup modules
 Debug panels
 Unused migrations
+
+Operations Inbox-specific dead-code sensitivity (pages_app/operations_inbox.py, services/operations_inbox_service.py, email-sync/parser/attachment/pending-draft/conversation-history/load-matching code) lives in `.claude/rules/operations-inbox.md`.
 #Database Safety
 
 Never run destructive database changes without first providing:
@@ -169,16 +147,11 @@ Rollback SQL
 Files affected
 Test plan
 
-Database migrations should be:
-
-Versioned
-Idempotent when practical
-Documented
-Committed to the repository
-
 Do not place migration fragments inside page files.
 
 Do not automatically treat ocean rate-sheet charges as CaliTrans customer trucking rates.
+
+Migration versioning/idempotency requirements and worker/script/integration-test specifics live in `.claude/rules/database-safety.md` and load automatically when working in those paths.
 
 #Secrets and Files
 
