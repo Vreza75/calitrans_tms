@@ -323,3 +323,16 @@ docs/CODE_REVIEW_PLAYBOOK.md
 docs/TEST_MATRIX.md
 
 Do not edit Operations Inbox code until the current implementation and relevant documentation have been reviewed.
+
+#Dead-Code Sensitivity
+
+Pay special attention before deleting code in this area:
+
+pages_app/operations_inbox.py
+services/operations_inbox_service.py
+Email-sync services
+Parser services
+Attachment services
+Pending draft code
+Conversation-history code
+Load-matching code
