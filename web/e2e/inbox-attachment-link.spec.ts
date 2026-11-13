@@ -75,7 +75,10 @@ test("hostile HTML attachment does not execute script in this page's origin", as
   const contentFetch = page.waitForResponse(
     (r) => r.url().includes("/attachments/") && r.url().includes("/content"),
   );
-  await page.getByRole("button", { name: "hostile.html" }).click();
+  const [popup] = await Promise.all([
+    page.waitForEvent("popup"),
+    page.getByRole("button", { name: "hostile.html" }).click(),
+  ]);
   const contentRes = await contentFetch;
   expect(contentRes.status()).toBe(200);
   // Server reports text/html; the client-side mitigation must not pass
@@ -88,6 +91,12 @@ test("hostile HTML attachment does not execute script in this page's origin", as
   // never runs. (Confirmed empirically: navigating the popup to this
   // blob aborts the navigation entirely, rather than loading a page -
   // the opposite of what happened with the plain-text attachment.)
+  //
+  // Checking only the opener's title (page.title()) is not sufficient: a
+  // hostile payload that targets its own document - rather than reaching
+  // back through window.opener - would execute undetected by that check
+  // alone. The popup itself, not just the opener, is asserted here.
   await page.waitForTimeout(1000);
+  expect(await popup.title()).not.toBe("XSS-EXECUTED");
   expect(await page.title()).not.toBe("XSS-EXECUTED");
 });
