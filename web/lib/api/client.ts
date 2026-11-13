@@ -104,3 +104,52 @@ export const apiClient = {
   put: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
     apiRequest<T>(path, { method: "PUT", body, signal }),
 };
+
+// Opens an attachment in a new tab. A plain `<a href>` cannot work here for
+// two independent reasons: (1) a relative href resolves against Next.js's
+// own origin, not FastAPI's - broken whenever the two run on different
+// origins (the default dev/prod topology, per CORS_ALLOWED_ORIGINS existing
+// specifically to support that split); (2) even with the right origin, this
+// endpoint requires a Bearer token (api/auth.py's require_auth reads only
+// the Authorization header, never a cookie) - a browser-native navigation
+// can't attach one. So: fetch with the same auth header every other call
+// uses, then open the resulting bytes as a blob URL.
+export async function openAttachment(attachmentRef: string, workItemId: number): Promise<void> {
+  // Must open the tab synchronously, before the `await` below - calling
+  // window.open() after an async gap loses the user-gesture context and
+  // every major browser silently blocks it as a popup (no error, no
+  // event - just nothing happens). Open a blank tab first, point it at
+  // the blob once the fetch resolves. Deliberately no "noopener": this
+  // function needs the window handle back to navigate it later, and the
+  // target is always our own blob: URL, never an external/untrusted one,
+  // so the opener-leak risk noopener guards against doesn't apply here.
+  const tab = window.open("", "_blank");
+
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/attachments/${attachmentRef}/content?work_item_id=${workItemId}`,
+    { headers },
+  );
+
+  if (response.status === 401) {
+    onUnauthorized?.();
+  }
+  if (!response.ok) {
+    tab?.close();
+    throw await parseErrorBody(response);
+  }
+
+  const blob = await response.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  if (tab) {
+    tab.location.href = blobUrl;
+  }
+  // Revoke once the tab has had time to load the blob - revoking
+  // immediately can race the tab's own fetch of the object URL.
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+}
