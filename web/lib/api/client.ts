@@ -104,3 +104,108 @@ export const apiClient = {
   put: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
     apiRequest<T>(path, { method: "PUT", body, signal }),
 };
+
+// Thrown when window.open() returns null (the browser's popup blocker
+// rejected the new tab, or the call happened outside a user gesture).
+// A distinct type so callers/tests can tell this apart from an ApiError -
+// there was never a request to fail, so there is nothing to fetch.
+export class PopupBlockedError extends Error {
+  constructor() {
+    super("Unable to open the attachment: the browser blocked the new tab. Allow popups for this site and try again.");
+    this.name = "PopupBlockedError";
+  }
+}
+
+// Opens an attachment in a new tab. A plain `<a href>` cannot work here for
+// two independent reasons: (1) a relative href resolves against Next.js's
+// own origin, not FastAPI's - broken whenever the two run on different
+// origins (the default dev/prod topology, per CORS_ALLOWED_ORIGINS existing
+// specifically to support that split); (2) even with the right origin, this
+// endpoint requires a Bearer token (api/auth.py's require_auth reads only
+// the Authorization header, never a cookie) - a browser-native navigation
+// can't attach one. So: fetch with the same auth header every other call
+// uses, then open the resulting bytes as a blob URL.
+export async function openAttachment(attachmentRef: string, workItemId: number): Promise<void> {
+  // Must open the tab synchronously, before the `await` below - calling
+  // window.open() after an async gap loses the user-gesture context and
+  // every major browser silently blocks it as a popup (no error, no
+  // event - just nothing happens). Open a blank tab first, point it at
+  // the blob once the fetch resolves. Deliberately no "noopener": this
+  // function needs the window handle back to navigate it later, and the
+  // target is always our own blob: URL, never an external/untrusted one,
+  // so the opener-leak risk noopener guards against doesn't apply here.
+  const tab = window.open("", "_blank");
+
+  // window.open() returns null when the popup is blocked. Fetching the
+  // attachment bytes anyway and quietly dropping them on the floor (the
+  // old behavior: `if (tab) { tab.location.href = ... }`, then a plain
+  // `return`) reports success to the caller with nothing having happened -
+  // the dispatcher sees "Opening..." finish and has no idea the attachment
+  // never opened. Fail loudly instead, before spending a network request
+  // on bytes that can never be shown.
+  if (!tab) {
+    throw new PopupBlockedError();
+  }
+
+  const token = getToken();
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  // Every failure path below (network error, non-2xx response, a body
+  // read that fails mid-stream, or the final navigation itself throwing -
+  // e.g. the user manually closed the blank tab before the fetch
+  // resolved) must close the temporary tab rather than leaving an
+  // orphaned about:blank window behind, and must never leave a created
+  // object URL un-revoked.
+  let blobUrl: string | null = null;
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/api/v1/attachments/${encodeURIComponent(attachmentRef)}/content?work_item_id=${workItemId}`,
+      { headers },
+    );
+
+    if (response.status === 401) {
+      onUnauthorized?.();
+    }
+    if (!response.ok) {
+      throw await parseErrorBody(response);
+    }
+
+    // Security: attachment bytes are customer-supplied (email
+    // attachments), not trusted content. A blob: URL created on this
+    // page's origin renders with that origin's privileges - an HTML or
+    // SVG attachment (even one mislabeled as a PDF) could execute script
+    // with access to this page's sessionStorage, including the Bearer
+    // token. Only a narrow allowlist of genuinely inert-to-render types is
+    // passed through as-is; everything else is forced to a type no
+    // browser will execute, so it downloads instead of rendering. This is
+    // enforced on the blob the browser acts on, independent of whatever
+    // Content-Type the server reports.
+    const RENDERABLE_TYPES = new Set(["application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp", "text/plain"]);
+    const reportedType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    const safeType = RENDERABLE_TYPES.has(reportedType) ? reportedType : "application/octet-stream";
+
+    const rawBlob = await response.blob();
+    const blob = safeType === rawBlob.type ? rawBlob : new Blob([await rawBlob.arrayBuffer()], { type: safeType });
+    blobUrl = URL.createObjectURL(blob);
+    tab.location.href = blobUrl;
+  } catch (error) {
+    tab.close();
+    if (blobUrl) {
+      URL.revokeObjectURL(blobUrl);
+    }
+    throw error;
+  }
+
+  // Reaching here means the try block above completed without throwing,
+  // so blobUrl was always assigned - this guard only satisfies the
+  // compiler's string|null narrowing, it is never expected to trigger.
+  if (!blobUrl) return;
+
+  // Revoke once the tab has had time to load the blob - revoking
+  // immediately can race the tab's own fetch of the object URL.
+  const urlToRevoke = blobUrl;
+  setTimeout(() => URL.revokeObjectURL(urlToRevoke), 30_000);
+}
