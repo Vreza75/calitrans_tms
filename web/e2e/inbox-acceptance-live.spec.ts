@@ -50,8 +50,17 @@ async function findWorkItemId(page: import("@playwright/test").Page, token: stri
 }
 
 test("item 1/3: real login, real queue counts, real work-item list and selection", async ({ page }) => {
-  const datasetA = uniqueDataset("pr22-live1a");
-  const datasetB = uniqueDataset("pr22-live1b");
+  // Both datasets share one run-scoped namespace (rather than two fully
+  // independent uniqueDataset() calls) specifically so this test can
+  // filter the list down to exactly its own two seeded rows. Asserting
+  // against the unfiltered first page of /app/inbox was unsafe: any
+  // unrelated open work item (another parallel test, leftover QA data, or
+  // simply more total open items than fit on one page) could push either
+  // seeded row off page 1 under the default sort and fail this test for a
+  // reason that has nothing to do with the behavior under test.
+  const namespace = uniqueDataset("pr22-live1").slice(0, 36);
+  const datasetA = `${namespace}-a`;
+  const datasetB = `${namespace}-b`;
   seedDataset(datasetA);
   seedDataset(datasetB);
   try {
@@ -60,8 +69,22 @@ test("item 1/3: real login, real queue counts, real work-item list and selection
 
     await login(page, DISPATCHER);
     await page.goto("/app/inbox");
-
     await expect(page.getByRole("heading", { name: "Operations Inbox" })).toBeVisible();
+
+    // Filter by this run's own unique namespace - a substring of both
+    // seeded subjects' markers and nothing else's - instead of relying on
+    // an unfiltered page/default sort. No unrelated record can ever match
+    // this filter, and pagination is irrelevant since the server-side
+    // filter, not page position, is what the assertions below depend on.
+    await page.getByPlaceholder("Search subject, sender, booking, container, reference...").fill(namespace);
+    const listResponse = page.waitForResponse(
+      (r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="),
+    );
+    await page.getByRole("button", { name: "Search" }).click();
+    const res = await listResponse;
+    const body = await res.json();
+    expect(body.items.length).toBe(2); // exactly this run's two seeded rows, scoped by namespace - nothing else can match
+
     await expect(page.getByText(`${marker(datasetA)} New inbound order`)).toBeVisible();
     await expect(page.getByText(`${marker(datasetB)} New inbound order`)).toBeVisible();
 
