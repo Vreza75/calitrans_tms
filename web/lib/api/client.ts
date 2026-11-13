@@ -132,7 +132,7 @@ export async function openAttachment(attachmentRef: string, workItemId: number):
   }
 
   const response = await fetch(
-    `${API_BASE_URL}/api/v1/attachments/${attachmentRef}/content?work_item_id=${workItemId}`,
+    `${API_BASE_URL}/api/v1/attachments/${encodeURIComponent(attachmentRef)}/content?work_item_id=${workItemId}`,
     { headers },
   );
 
@@ -144,7 +144,21 @@ export async function openAttachment(attachmentRef: string, workItemId: number):
     throw await parseErrorBody(response);
   }
 
-  const blob = await response.blob();
+  // Security: attachment bytes are customer-supplied (email attachments),
+  // not trusted content. A blob: URL created on this page's origin renders
+  // with that origin's privileges - an HTML or SVG attachment (even one
+  // mislabeled as a PDF) could execute script with access to this page's
+  // sessionStorage, including the Bearer token. Only a narrow allowlist of
+  // genuinely inert-to-render types is passed through as-is; everything
+  // else is forced to a type no browser will execute, so it downloads
+  // instead of rendering. This is enforced on the blob the browser acts
+  // on, independent of whatever Content-Type the server reports.
+  const RENDERABLE_TYPES = new Set(["application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp", "text/plain"]);
+  const reportedType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  const safeType = RENDERABLE_TYPES.has(reportedType) ? reportedType : "application/octet-stream";
+
+  const rawBlob = await response.blob();
+  const blob = safeType === rawBlob.type ? rawBlob : new Blob([await rawBlob.arrayBuffer()], { type: safeType });
   const blobUrl = URL.createObjectURL(blob);
   if (tab) {
     tab.location.href = blobUrl;

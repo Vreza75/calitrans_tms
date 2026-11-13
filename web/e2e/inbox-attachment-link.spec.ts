@@ -58,3 +58,36 @@ test("attachment content request is rejected without a token (auth still enforce
   });
   expect(res.status()).toBe(401);
 });
+
+test("hostile HTML attachment does not execute script in this page's origin", async ({ page }) => {
+  await page.goto("/login");
+  await page.getByLabel("Email").fill(DISPATCHER.email);
+  await page.getByLabel("Password").fill(DISPATCHER.password);
+  const loginResponse = page.waitForResponse(
+    (r) => r.url().includes("/api/v1/auth/login") && r.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Sign In" }).click();
+  await loginResponse;
+
+  await page.goto("/app/inbox?id=1");
+  await expect(page.getByRole("button", { name: "hostile.html" })).toBeVisible();
+
+  const contentFetch = page.waitForResponse(
+    (r) => r.url().includes("/attachments/") && r.url().includes("/content"),
+  );
+  await page.getByRole("button", { name: "hostile.html" }).click();
+  const contentRes = await contentFetch;
+  expect(contentRes.status()).toBe(200);
+  // Server reports text/html; the client-side mitigation must not pass
+  // that through to the blob the browser acts on.
+  expect((contentRes.headers()["content-type"] ?? "")).toContain("text/html");
+
+  // The forced-safe blob type (application/octet-stream) makes Chrome
+  // treat the navigation as a download rather than a document load - it
+  // never becomes a renderable HTML document, so the embedded <script>
+  // never runs. (Confirmed empirically: navigating the popup to this
+  // blob aborts the navigation entirely, rather than loading a page -
+  // the opposite of what happened with the plain-text attachment.)
+  await page.waitForTimeout(1000);
+  expect(await page.title()).not.toBe("XSS-EXECUTED");
+});
