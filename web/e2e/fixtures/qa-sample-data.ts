@@ -92,6 +92,75 @@ export function setRequestType(dataset: string, requestType: string): void {
   });
 }
 
+// Read-only lookups against domain_events for tests that need to correlate
+// a realtime publication with the specific event a command produced -
+// never a fixed/guessed id. aggregate_type/aggregate_id/event_type here
+// must match what the real emitter wrote (e.g.
+// application/work_items/commands.py's close_work_item(): aggregate_type
+// "order_intake_item", aggregate_id str(work_item_id), event_type
+// "inbox.review_status_changed") - scoped tightly enough by the caller's
+// own dynamically-discovered work_item_id that another concurrent test's
+// unrelated event can never match.
+export function latestDomainEventId(aggregateType: string, aggregateId: string, eventType: string): number {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute(",
+    "    'select id from domain_events where aggregate_type = %s and aggregate_id = %s and event_type = %s "
+      + "order by created_at desc, id desc limit 1',",
+    "    (sys.argv[2], sys.argv[3], sys.argv[4]),",
+    ")",
+    "row = cur.fetchone()",
+    "assert row is not None, f'no domain_events row for {sys.argv[2:]}'",
+    "print(row[0])",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, aggregateType, aggregateId, eventType], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  return parseInt(output, 10);
+}
+
+// Authoritative persisted outcome for one specific domain_events id - not
+// a particular publisher-process invocation's own stdout. Under
+// Playwright's fullyParallel execution, a single `process` run claims
+// whatever is pending across every concurrently-running test, so another
+// worker's invocation (not this test's own) can be the one that actually
+// claims and publishes this row; processing is synchronous, so by the
+// time any `process` invocation this test ran has returned, this event's
+// row has already reached its terminal state (published/failed) if it
+// was going to be claimed at all. Checking the row directly is therefore
+// both more authoritative and correct under parallel contention than
+// grepping one particular subprocess call's own output for this id.
+export function domainEventStatus(id: number): { status: string; publishedAt: string | null } {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('select status, published_at from domain_events where id = %s', (sys.argv[2],))",
+    "row = cur.fetchone()",
+    "assert row is not None, f'no domain_events row with id={sys.argv[2]}'",
+    "print(f'{row[0]}|{row[1]}')",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  const [status, publishedAt] = output.split("|");
+  return { status, publishedAt: publishedAt === "None" ? null : publishedAt };
+}
+
 export function cleanupDatasets(datasets: string[]): void {
   for (const dataset of datasets) {
     try {

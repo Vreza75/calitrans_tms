@@ -1,7 +1,14 @@
 import { expect, test } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 
-import { cleanupDataset, marker, seedDataset, uniqueDataset } from "./fixtures/qa-sample-data";
+import {
+  cleanupDataset,
+  domainEventStatus,
+  latestDomainEventId,
+  marker,
+  seedDataset,
+  uniqueDataset,
+} from "./fixtures/qa-sample-data";
 
 // REAL local Supabase Realtime stack (remapped ports 64320-64329, avoiding
 // the pre-existing unrelated victor-ai-os project's default-port instance -
@@ -26,6 +33,16 @@ import { cleanupDataset, marker, seedDataset, uniqueDataset } from "./fixtures/q
 // out of band. The work-item id is still never assumed: it's located by
 // searching for this run's own unique SYNTHETIC-CALITRANS-QA::<dataset>
 // marker through the real search endpoint, exactly as before.
+//
+// Correlation fix: both windows now apply that same marker filter before
+// the close happens (not just window A), and before anything else both
+// must show exactly this run's one work item under the same id. After
+// the close, the test captures the specific domain_events row id
+// close_work_item() just persisted and checks that exact row's final
+// persisted status, instead of accepting any "outcome=published" line
+// anywhere in a worker invocation's output - a check an unrelated pending
+// event (another parallel test's, or leftover) could otherwise satisfy
+// without this test's own event having published at all.
 
 const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
 
@@ -70,7 +87,17 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     await expect(pageA.getByText("Live updates connected")).toBeVisible({ timeout: 15_000 });
     await expect(pageB.getByText("Live updates connected")).toBeVisible({ timeout: 15_000 });
 
+    // Both windows filter by this run's own unique marker before anything
+    // else happens, and both must see exactly one - the same - work item.
+    // Checking pageB only via an unfiltered page.getByText(...).first()
+    // (as before) proves the marker is somewhere on the page, not that
+    // this window's own list is scoped to this run's single item the same
+    // way pageA's is.
     const workItemId = await findMarkerWorkItemId(pageA, datasetMarker);
+    await expect(pageA.getByText(datasetMarker).first()).toBeVisible();
+
+    const workItemIdFromB = await findMarkerWorkItemId(pageB, datasetMarker);
+    expect(workItemIdFromB).toBe(workItemId);
     await expect(pageB.getByText(datasetMarker).first()).toBeVisible();
 
     // Neither window ever navigates away from the list (/app/inbox) from
@@ -85,6 +112,18 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
       data: { reason: "" },
     });
     expect(closeRes.status()).toBeLessThan(300);
+
+    // close_work_item() persists this exact domain_events row - event_type
+    // "inbox.review_status_changed", aggregate_type "order_intake_item",
+    // aggregate_id = this run's own dynamically-discovered workItemId (see
+    // application/work_items/commands.py) - in the same transaction as the
+    // close write above, so it already exists here. Capturing its id is
+    // what lets the assertion below confirm the publisher processed *this*
+    // event specifically, rather than merely that some outcome=published
+    // line appeared anywhere in a worker invocation's output - which an
+    // unrelated pending event (another parallel test's, or leftover) could
+    // satisfy without this test's own event having been published at all.
+    const domainEventId = latestDomainEventId("order_intake_item", String(workItemId), "inbox.review_status_changed");
 
     // "The worker": run the exact script the scheduled GitHub Actions job
     // runs, once, synchronously - the only external action in this test.
@@ -104,8 +143,14 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
         },
       },
     ).toString();
-    expect(output).toContain("outcome=published");
     console.log("process_realtime_events.py output:", output);
+
+    // Authoritative check against the persisted row itself (see
+    // domainEventStatus's doc comment for why this - not this particular
+    // invocation's stdout - is the correct check under parallel execution):
+    // this exact event, and nothing else, must have reached 'published'.
+    const { status: domainEventFinalStatus } = domainEventStatus(domainEventId);
+    expect(domainEventFinalStatus).toBe("published");
 
     // Neither window is refreshed. This run's own dataset has exactly one
     // matching item, so a successful close empties it from both windows'
