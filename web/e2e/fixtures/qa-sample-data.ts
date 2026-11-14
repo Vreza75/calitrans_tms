@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
+import { expect } from "@playwright/test";
+
 // Shared helper for live acceptance specs (REAL backend, REAL disposable QA
 // Postgres - see docs/SAMPLE_DATA_GUIDE.md). Every dataset created through
 // this module is run-scoped: a fresh, globally-unique dataset id per call,
@@ -127,17 +129,18 @@ export function latestDomainEventId(aggregateType: string, aggregateId: string, 
   return parseInt(output, 10);
 }
 
-// Authoritative persisted outcome for one specific domain_events id - not
-// a particular publisher-process invocation's own stdout. Under
-// Playwright's fullyParallel execution, a single `process` run claims
-// whatever is pending across every concurrently-running test, so another
-// worker's invocation (not this test's own) can be the one that actually
-// claims and publishes this row; processing is synchronous, so by the
-// time any `process` invocation this test ran has returned, this event's
-// row has already reached its terminal state (published/failed) if it
-// was going to be claimed at all. Checking the row directly is therefore
-// both more authoritative and correct under parallel contention than
-// grepping one particular subprocess call's own output for this id.
+// A single raw snapshot of one specific domain_events id's persisted
+// state - authoritative for whatever instant it's read at, but NOT by
+// itself proof the row has reached its final state. Under Playwright's
+// fullyParallel execution, a single `process` run claims whatever is
+// pending across every concurrently-running test, so another worker's
+// invocation (not this test's own) can be the one that actually claims
+// this row - and that other invocation may still be mid-flight
+// (status='processing') at the exact instant this function is called,
+// since nothing guarantees it finished before this test's own `process`
+// call returned. Callers that need to know the row's *eventual* outcome
+// must poll this (see waitForDomainEventPublished below), not call it
+// once and trust the result.
 export function domainEventStatus(id: number): { status: string; publishedAt: string | null } {
   const snippet = [
     "import sys",
@@ -159,6 +162,124 @@ export function domainEventStatus(id: number): { status: string; publishedAt: st
     .trim();
   const [status, publishedAt] = output.split("|");
   return { status, publishedAt: publishedAt === "None" ? null : publishedAt };
+}
+
+// Bounded polling of exactly one domain_events id's persisted status -
+// the fix for the race domainEventStatus's own doc comment describes.
+// expect.poll()'s callback, unlike expect(...).toPass(), does NOT retry
+// on a thrown error (see node_modules/playwright/lib/matchers/expect.js's
+// invokePollMatcher: `const value = await actual()` sits outside the
+// try/catch that wraps only the matcher call) - so throwing here on the
+// terminal 'failed' status aborts the poll immediately with a clear,
+// specific error instead of silently retrying it until the timeout.
+// Returning the status for every other value and matching on
+// .toBe("published") is what makes 'pending'/'processing' keep polling
+// (not a match yet, correctly retried) while 'published' succeeds and
+// 'failed' fails fast - exactly the three required outcomes, checking
+// nothing but this one id.
+export async function waitForDomainEventPublished(
+  id: number,
+  options: { timeoutMs?: number; intervals?: number[] } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const intervals = options.intervals ?? [250, 500, 1_000, 2_000];
+  await expect
+    .poll(
+      () => {
+        const { status } = domainEventStatus(id);
+        if (status === "failed") {
+          throw new Error(
+            `domain_events id=${id} reached the terminal status 'failed' - it will never become ` +
+              "'published', so this is not a timing issue worth continuing to poll for.",
+          );
+        }
+        return status;
+      },
+      { timeout: timeoutMs, intervals },
+    )
+    .toBe("published");
+}
+
+// Test-setup helpers for exercising waitForDomainEventPublished's own
+// polling/fail-fast/timeout behavior directly, without needing a live
+// browser, login, or the realtime publisher script - these manipulate
+// domain_events rows the same direct-SQL way domainEventStatus reads
+// them, scoped to a synthetic aggregate_id unique per call (uniqueDataset
+// reused purely as a globally-unique string generator here, not as a
+// seeded dataset), so a regression run can never collide with another
+// test's real row.
+export function insertDomainEvent(
+  eventType: string,
+  aggregateType: string,
+  aggregateId: string,
+  status: "pending" | "processing" = "pending",
+): number {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute(",
+    "    'insert into domain_events (event_type, aggregate_type, aggregate_id, payload, idempotency_key, status) "
+      + "values (%s, %s, %s, %s::jsonb, %s, %s) returning id',",
+    "    (sys.argv[2], sys.argv[3], sys.argv[4], '{}', sys.argv[4], sys.argv[5]),",
+    ")",
+    "row = cur.fetchone()",
+    "conn.commit()",
+    "print(row[0])",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(
+    PYTHON_EXE,
+    ["-c", snippet, QA_PSYCOPG2_DSN, eventType, aggregateType, aggregateId, status],
+    { cwd: REPO_ROOT, env: QA_ENV },
+  )
+    .toString()
+    .trim();
+  return parseInt(output, 10);
+}
+
+export function updateDomainEventStatus(
+  id: number,
+  status: "pending" | "processing" | "published" | "failed",
+): void {
+  const sql =
+    status === "published"
+      ? "update domain_events set status = %s, published_at = now() where id = %s"
+      : "update domain_events set status = %s where id = %s";
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    `cur.execute('${sql}', (sys.argv[2], sys.argv[3]))`,
+    "assert cur.rowcount == 1, f'expected exactly 1 row, updated {cur.rowcount}'",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, status, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+}
+
+export function deleteDomainEvent(id: number): void {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('delete from domain_events where id = %s', (sys.argv[2],))",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
 }
 
 export function cleanupDatasets(datasets: string[]): void {

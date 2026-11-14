@@ -3,11 +3,14 @@ import { execFileSync } from "node:child_process";
 
 import {
   cleanupDataset,
-  domainEventStatus,
+  deleteDomainEvent,
+  insertDomainEvent,
   latestDomainEventId,
   marker,
   seedDataset,
   uniqueDataset,
+  updateDomainEventStatus,
+  waitForDomainEventPublished,
 } from "./fixtures/qa-sample-data";
 
 // REAL local Supabase Realtime stack (remapped ports 64320-64329, avoiding
@@ -145,12 +148,18 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     ).toString();
     console.log("process_realtime_events.py output:", output);
 
-    // Authoritative check against the persisted row itself (see
-    // domainEventStatus's doc comment for why this - not this particular
-    // invocation's stdout - is the correct check under parallel execution):
-    // this exact event, and nothing else, must have reached 'published'.
-    const { status: domainEventFinalStatus } = domainEventStatus(domainEventId);
-    expect(domainEventFinalStatus).toBe("published");
+    // Authoritative check against the persisted row itself, not this
+    // particular invocation's stdout (see qa-sample-data.ts's
+    // domainEventStatus doc comment for why) - but a single immediate
+    // check still races another concurrently-running worker that may
+    // still be claiming/publishing this exact row at the instant it's
+    // checked. Polling the same id until it settles (see
+    // waitForDomainEventPublished's doc comment) is what makes this
+    // correct under genuine parallel contention, not merely "usually
+    // fast enough": success only when this exact event reaches
+    // 'published', fast failure if it reaches the terminal 'failed'
+    // status, a clear timeout if it's still pending/processing.
+    await waitForDomainEventPublished(domainEventId, { timeoutMs: 20_000 });
 
     // Neither window is refreshed. This run's own dataset has exactly one
     // matching item, so a successful close empties it from both windows'
@@ -162,5 +171,63 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     await contextB.close();
   } finally {
     cleanupDataset(dataset);
+  }
+});
+
+// Regression coverage for waitForDomainEventPublished itself - the fix
+// for the race the test above used to have. These exercise the real
+// disposable QA Postgres directly (no mocking, same as the rest of this
+// file) but need no browser, login, or the realtime publisher script:
+// the thing under test is the polling behavior against domain_events
+// state transitions, which is cheaper and more precise to drive directly
+// than through the full UI/worker flow. Each uses its own
+// uniqueDataset()-generated aggregate_id, so none can collide with the
+// main test above or with each other under parallel execution.
+
+test("domain event polling: succeeds even when another worker still owns the event", async () => {
+  // status: "processing" (claimed_at set, not yet published) is exactly
+  // what "another worker owns the event" means in this queue's lifecycle
+  // (see database/domain_events_migration.sql's status comment) - this
+  // simulates a concurrently-running test's own `process` invocation
+  // having claimed the row first, finishing shortly after this test
+  // starts polling. A single immediate check would see "processing" and
+  // (with the old code) either misreport failure or race; the poll must
+  // wait through it and only succeed once it actually reaches published.
+  const aggregateId = uniqueDataset("pr22-poll-processing");
+  const eventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", aggregateId, "processing");
+  try {
+    setTimeout(() => updateDomainEventStatus(eventId, "published"), 1_500);
+    await waitForDomainEventPublished(eventId, { timeoutMs: 10_000 });
+  } finally {
+    deleteDomainEvent(eventId);
+  }
+});
+
+test("domain event polling: times out clearly if the event stays pending forever", async () => {
+  // Nobody ever claims this row (no worker invocation runs against it in
+  // this test) - simulates a lost/never-processed event. Must fail with
+  // a clear timeout, not hang, not silently pass, and not be confused
+  // with the terminal-failure case below.
+  const aggregateId = uniqueDataset("pr22-poll-pending");
+  const eventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", aggregateId, "pending");
+  try {
+    await expect(waitForDomainEventPublished(eventId, { timeoutMs: 2_000 })).rejects.toThrow();
+  } finally {
+    deleteDomainEvent(eventId);
+  }
+});
+
+test("domain event polling: fails fast if the event reaches the terminal failed status", async () => {
+  // Simulates a worker claiming the row and exhausting its retries
+  // (status -> 'failed', the queue's terminal non-success state). Must
+  // fail with a specific "terminal status 'failed'" error - not pass,
+  // and not be indistinguishable from the pending-forever timeout above.
+  const aggregateId = uniqueDataset("pr22-poll-failed");
+  const eventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", aggregateId, "pending");
+  try {
+    setTimeout(() => updateDomainEventStatus(eventId, "failed"), 500);
+    await expect(waitForDomainEventPublished(eventId, { timeoutMs: 10_000 })).rejects.toThrow(/terminal status 'failed'/);
+  } finally {
+    deleteDomainEvent(eventId);
   }
 });
