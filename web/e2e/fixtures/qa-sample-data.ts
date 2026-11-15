@@ -141,16 +141,16 @@ export function latestDomainEventId(aggregateType: string, aggregateId: string, 
 // call returned. Callers that need to know the row's *eventual* outcome
 // must poll this (see waitForDomainEventPublished below), not call it
 // once and trust the result.
-export function domainEventStatus(id: number): { status: string; publishedAt: string | null } {
+export function domainEventStatus(id: number): { status: string; publishedAt: string | null; claimedAt: string | null } {
   const snippet = [
     "import sys",
     "import psycopg2",
     "conn = psycopg2.connect(sys.argv[1])",
     "cur = conn.cursor()",
-    "cur.execute('select status, published_at from domain_events where id = %s', (sys.argv[2],))",
+    "cur.execute('select status, published_at, claimed_at from domain_events where id = %s', (sys.argv[2],))",
     "row = cur.fetchone()",
     "assert row is not None, f'no domain_events row with id={sys.argv[2]}'",
-    "print(f'{row[0]}|{row[1]}')",
+    "print(f'{row[0]}|{row[1]}|{row[2]}')",
     "cur.close()",
     "conn.close()",
   ].join("\n");
@@ -160,8 +160,12 @@ export function domainEventStatus(id: number): { status: string; publishedAt: st
   })
     .toString()
     .trim();
-  const [status, publishedAt] = output.split("|");
-  return { status, publishedAt: publishedAt === "None" ? null : publishedAt };
+  const [status, publishedAt, claimedAt] = output.split("|");
+  return {
+    status,
+    publishedAt: publishedAt === "None" ? null : publishedAt,
+    claimedAt: claimedAt === "None" ? null : claimedAt,
+  };
 }
 
 // Bounded polling of exactly one domain_events id's persisted status -
@@ -208,6 +212,27 @@ export async function waitForDomainEventPublished(
 // reused purely as a globally-unique string generator here, not as a
 // seeded dataset), so a regression run can never collide with another
 // test's real row.
+//
+// Isolation from the real publisher's claim query: repositories/
+// domain_event_repo.py's claim_next_pending() only ever claims rows
+// matching `status = 'pending' and available_at <= now()` (a real,
+// unmodified application predicate - see that file). A fixture row
+// inserted with status 'pending' and the column's own now()-default
+// available_at is therefore real, fully eligible production-shaped
+// queue input, indistinguishable to that query from a real event - any
+// concurrently-running test's own publisher invocation (this file's
+// real `process_realtime_events.py process` calls claim whatever is
+// pending across the whole table, not just their own test's rows) could
+// claim and actually process it, mutating status/claimed_at out from
+// under a test that assumed it would stay untouched. Setting
+// available_at to a day in the future - the existing schema's own
+// column, no new column, no change to the claim predicate itself -
+// makes `available_at <= now()` false, so claim_next_pending's own
+// unmodified query can never select these rows, while every column this
+// module's read/write helpers touch (status, claimed_at, published_at)
+// remains the real, live table - still exercising real persisted state
+// transitions, just never claimable by anything other than this file's
+// own direct updateDomainEventStatus() calls.
 export function insertDomainEvent(
   eventType: string,
   aggregateType: string,
@@ -220,8 +245,8 @@ export function insertDomainEvent(
     "conn = psycopg2.connect(sys.argv[1])",
     "cur = conn.cursor()",
     "cur.execute(",
-    "    'insert into domain_events (event_type, aggregate_type, aggregate_id, payload, idempotency_key, status) "
-      + "values (%s, %s, %s, %s::jsonb, %s, %s) returning id',",
+    "    'insert into domain_events (event_type, aggregate_type, aggregate_id, payload, idempotency_key, status, available_at) "
+      + "values (%s, %s, %s, %s::jsonb, %s, %s, now() + interval \\'1 day\\') returning id',",
     "    (sys.argv[2], sys.argv[3], sys.argv[4], '{}', sys.argv[4], sys.argv[5]),",
     ")",
     "row = cur.fetchone()",

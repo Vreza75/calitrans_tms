@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import {
   cleanupDataset,
   deleteDomainEvent,
+  domainEventStatus,
   insertDomainEvent,
   latestDomainEventId,
   marker,
@@ -71,6 +72,32 @@ async function findMarkerWorkItemId(page: import("@playwright/test").Page, datas
   return body.items[0].id as number;
 }
 
+// "The worker": run the exact script the scheduled GitHub Actions job
+// runs, once, synchronously - the only external action in this file.
+// Shared by the main test (the real worker-to-UI path) and by the
+// polling regression tests below that need to run a genuine concurrent
+// claim attempt against their own controlled fixture rows to confirm
+// those rows are actually immune to it (see insertDomainEvent's
+// available_at doc comment in qa-sample-data.ts).
+function runRealtimePublisher(): string {
+  const repoRoot = process.cwd().replace(/web$/, "");
+  return execFileSync(
+    "C:/GitHub/calitrans_tms_postgres_upgrade_clean/.venv/Scripts/python.exe",
+    ["scripts/process_realtime_events.py", "process"],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        DATABASE_URL: "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa",
+        REALTIME_ENABLED: "true",
+        SUPABASE_URL: "http://127.0.0.1:64321",
+        SUPABASE_SERVICE_ROLE_KEY:
+          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU",
+      },
+    },
+  ).toString();
+}
+
 test("worker-to-UI and cross-window realtime: both windows update without a manual refresh", async ({ browser }) => {
   const dataset = uniqueDataset("pr22-realtime");
   seedDataset(dataset);
@@ -128,24 +155,7 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     // satisfy without this test's own event having been published at all.
     const domainEventId = latestDomainEventId("order_intake_item", String(workItemId), "inbox.review_status_changed");
 
-    // "The worker": run the exact script the scheduled GitHub Actions job
-    // runs, once, synchronously - the only external action in this test.
-    const repoRoot = process.cwd().replace(/web$/, "");
-    const output = execFileSync(
-      "C:/GitHub/calitrans_tms_postgres_upgrade_clean/.venv/Scripts/python.exe",
-      ["scripts/process_realtime_events.py", "process"],
-      {
-        cwd: repoRoot,
-        env: {
-          ...process.env,
-          DATABASE_URL: "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa",
-          REALTIME_ENABLED: "true",
-          SUPABASE_URL: "http://127.0.0.1:64321",
-          SUPABASE_SERVICE_ROLE_KEY:
-            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU",
-        },
-      },
-    ).toString();
+    const output = runRealtimePublisher();
     console.log("process_realtime_events.py output:", output);
 
     // Authoritative check against the persisted row itself, not this
@@ -204,14 +214,48 @@ test("domain event polling: succeeds even when another worker still owns the eve
 });
 
 test("domain event polling: times out clearly if the event stays pending forever", async () => {
-  // Nobody ever claims this row (no worker invocation runs against it in
-  // this test) - simulates a lost/never-processed event. Must fail with
-  // a clear timeout, not hang, not silently pass, and not be confused
-  // with the terminal-failure case below.
+  // Nobody ever claims this row on purpose (no worker invocation runs
+  // against it with intent to process it) - simulates a lost/never-
+  // processed event. Must fail with a clear timeout, not hang, not
+  // silently pass, and not be confused with the terminal-failure case
+  // below.
   const aggregateId = uniqueDataset("pr22-poll-pending");
   const eventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", aggregateId, "pending");
   try {
-    await expect(waitForDomainEventPublished(eventId, { timeoutMs: 2_000 })).rejects.toThrow();
+    // Confirm isolation (not just assume it): actually run the real
+    // publisher once against the live queue while this fixture is
+    // 'pending', the same way a concurrently-running test's own
+    // invocation would. If available_at isolation (see
+    // insertDomainEvent's doc comment) ever regressed, this row would
+    // get claimed here and the assertions below would catch it directly
+    // (claimed_at no longer null, status no longer 'pending') rather
+    // than failing confusingly later or - worse - passing by accident.
+    runRealtimePublisher();
+    const afterPublisherRun = domainEventStatus(eventId);
+    expect(afterPublisherRun.status).toBe("pending");
+    expect(afterPublisherRun.claimedAt).toBeNull();
+
+    let caught: unknown;
+    try {
+      await waitForDomainEventPublished(eventId, { timeoutMs: 2_000 });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught, "waitForDomainEventPublished must reject a row that never leaves pending, not resolve").toBeInstanceOf(Error);
+    // expect.poll()'s own timeout message embeds Jest's character-level
+    // diff highlighting as ANSI codes around just the differing part of
+    // each quoted value (e.g. "p\x1b[7mending\x1b[27m"), splitting
+    // "pending" across escape sequences - strip them before matching so
+    // the check is against the real text, not an accident of whether
+    // this run happened to colorize it the same way.
+    const message = (caught as Error).message.replace(/\x1b\[[0-9;]*m/g, "");
+    // The specific expect.poll() timeout diagnostic (see
+    // waitForDomainEventPublished's doc comment on invokePollMatcher) -
+    // not just "it rejected for some reason" - with the mismatch it
+    // timed out on showing this row's own status, still "pending" the
+    // whole time.
+    expect(message).toMatch(/Timeout \d+ms exceeded while waiting on the predicate/);
+    expect(message).toMatch(/Received:\s*"pending"/);
   } finally {
     deleteDomainEvent(eventId);
   }
@@ -225,6 +269,17 @@ test("domain event polling: fails fast if the event reaches the terminal failed 
   const aggregateId = uniqueDataset("pr22-poll-failed");
   const eventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", aggregateId, "pending");
   try {
+    // Same isolation confirmation as the pending-forever test above:
+    // this fixture is genuinely 'pending' for the moment between insert
+    // and the scheduled transition to 'failed' below - exactly the
+    // window a real concurrent claim could otherwise race into - so
+    // prove a real publisher run during that window still can't touch
+    // it before scheduling the transition.
+    runRealtimePublisher();
+    const afterPublisherRun = domainEventStatus(eventId);
+    expect(afterPublisherRun.status).toBe("pending");
+    expect(afterPublisherRun.claimedAt).toBeNull();
+
     setTimeout(() => updateDomainEventStatus(eventId, "failed"), 500);
     await expect(waitForDomainEventPublished(eventId, { timeoutMs: 10_000 })).rejects.toThrow(/terminal status 'failed'/);
   } finally {
