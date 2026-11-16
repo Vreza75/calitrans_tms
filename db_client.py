@@ -172,6 +172,26 @@ _QA_IDENTITY_ENV_VAR = "CALITRANS_QA_DATABASE_IDENTITY"
 _QA_SAFE_NAME_TOKENS = {"dev", "development", "test", "testing", "qa", "sandbox", "scratch", "disposable"}
 _QA_REJECTED_DATABASE_NAMES = {"postgres", "production", "prod"}
 
+# P1-2: a database-name/identity match alone does not prove the target is
+# actually local - an operator (or a misconfigured env) could acknowledge
+# a *remote* identity that happens to carry a qa-shaped name. Loopback
+# literals only, no name resolution (no "localhost" - that requires a
+# resolution step this guard has no way to verify is unpoisoned, and no
+# suffix/substring match on any of these - exact string equality only).
+_QA_ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
+
+# P1-1: libpq/psycopg2 accept several query parameters that change the
+# actual connection target independently of the URL's own host/port/
+# dbname - confirmed directly (see tests/test_database_url_safety.py):
+# PGDialect_psycopg2.create_connect_args() merges url.query over the
+# parsed authority, so `?host=`/`?hostaddr=`/`?port=`/`?dbname=` silently
+# win even when the authority section shows a safe loopback address.
+# `service=` is worse - it routes through a local pg_service.conf lookup
+# that cannot be validated from the URL at all. Default-deny: only
+# parameters with no ability to change the network/database target are
+# ever allowed through in QA mode.
+_QA_ALLOWED_QUERY_PARAMS = {"sslmode", "connect_timeout", "application_name", "client_encoding"}
+
 
 def database_identity(database_url: str) -> str:
     """Sanitized host[:port]/database identity - never a username,
@@ -205,6 +225,72 @@ def _enforce_qa_database_safety(database_url: str) -> None:
         raise RuntimeError(
             f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL is missing a host or "
             "database name. Refusing to connect."
+        )
+
+    # P1-1: reject any query parameter capable of changing the effective
+    # host, port, database, socket, or service target before it ever
+    # reaches engine creation. Default-deny, not a blacklist of known-bad
+    # names - this also closes multi-host-via-query-string (host/hostaddr
+    # are never on the allowlist regardless of value) without needing to
+    # parse or special-case comma-separated host lists.
+    rejected_params = sorted(set(url.query.keys()) - _QA_ALLOWED_QUERY_PARAMS)
+    if rejected_params:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL carries connection "
+            f"parameter(s) that can override the connection target ({', '.join(rejected_params)}). "
+            "Refusing to connect."
+        )
+
+    # P1-2: exact loopback match only - no "localhost" (requires name
+    # resolution this guard cannot verify is unpoisoned), no suffix or
+    # substring match, remote hosts rejected unconditionally regardless
+    # of how plausible the database name/identity looks.
+    if host not in _QA_ALLOWED_LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved host is not an approved loopback "
+            "address. Refusing to connect."
+        )
+
+    # Defense in depth for P1-1: verify what SQLAlchemy's dialect would
+    # *actually* hand to the DBAPI driver, not just the parsed URL
+    # fields above - catches any override vector this function's own
+    # parameter allowlist did not anticipate (confirmed necessary: with
+    # the allowlist alone removed, create_connect_args() was observed to
+    # return a 'host' key disagreeing with url.host for a crafted query
+    # string - see tests/test_database_url_safety.py).
+    try:
+        _, effective_kwargs = url.get_dialect()().create_connect_args(url)
+    except Exception:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection arguments could not be "
+            "determined. Refusing to connect."
+        ) from None
+
+    if "service" in effective_kwargs:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection routes through a "
+            "pg_service.conf service name. Refusing to connect."
+        )
+
+    effective_host = str(effective_kwargs.get("host") or "").lower()
+    if effective_host not in _QA_ALLOWED_LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection host does not match an "
+            "approved loopback address. Refusing to connect."
+        )
+
+    effective_port = effective_kwargs.get("port")
+    if effective_port is not None and str(effective_port) != str(url.port or ""):
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection port disagrees with the "
+            "validated URL. Refusing to connect."
+        )
+
+    effective_database = str(effective_kwargs.get("dbname") or "").lower()
+    if effective_database != database:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection database disagrees with "
+            "the validated URL. Refusing to connect."
         )
 
     identity = database_identity(database_url)

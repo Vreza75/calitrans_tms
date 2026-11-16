@@ -179,11 +179,16 @@ def test_qa_guard_is_inactive_without_the_allow_env_var(monkeypatch):
 
 
 def test_qa_guard_blocks_non_allowlisted_production_shaped_name(monkeypatch):
+    # Loopback host (passes the P1-2 host allowlist) with a
+    # production-shaped database name - isolates the pre-existing
+    # name-rejection check from the newer host-allowlist check, which
+    # now runs first for a remote host (see
+    # test_qa_guard_rejects_remote_host_regardless_of_database_name).
     monkeypatch.setenv(db_client._QA_ALLOW_ENV_VAR, db_client._QA_ALLOW_VALUE)
-    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, "db.example.invalid:5432/production")
+    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, "127.0.0.1:5432/production")
 
     with pytest.raises(RuntimeError, match="generic/production-shaped name"):
-        db_client._enforce_qa_database_safety(FAKE_REAL_SECRET_URL)
+        db_client._enforce_qa_database_safety("postgresql://u:p@127.0.0.1:5432/production")
 
 
 def test_qa_guard_blocks_host_without_a_safe_name_marker(monkeypatch):
@@ -251,3 +256,215 @@ def test_database_identity_never_includes_credentials():
     assert identity == "db.example.invalid:5432/production"
     assert "prod_pw" not in identity
     assert "prod_user" not in identity
+
+
+# --- Codex P1 findings: connection-target overrides + host allowlist ---
+#
+# Confirmed directly (not theoretical) before writing the fix: a fabricated
+# URL with a loopback authority but a remote query-string host/port passed
+# the pre-fix guard while SQLAlchemy's own PGDialect_psycopg2.
+# create_connect_args() produced a DBAPI kwargs dict whose 'host' key
+# disagreed with the parsed URL's authority host entirely - the query
+# string wins. Every test below uses a fabricated postgresql+psycopg2 URL
+# and either db_client._enforce_qa_database_safety() directly or
+# db_client.get_engine() (which does not connect eagerly - create_engine()
+# only opens a socket on first actual query, so even the "allowed" cases
+# below never touch a network).
+
+QA_ENV = {
+    db_client._QA_ALLOW_ENV_VAR: db_client._QA_ALLOW_VALUE,
+    db_client._QA_IDENTITY_ENV_VAR: DISPOSABLE_IDENTITY,
+}
+
+
+def _set_qa_env(monkeypatch, identity: str = DISPOSABLE_IDENTITY) -> None:
+    monkeypatch.setenv(db_client._QA_ALLOW_ENV_VAR, db_client._QA_ALLOW_VALUE)
+    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, identity)
+
+
+# 1. Local authority with remote query host override.
+def test_qa_guard_rejects_local_authority_with_remote_query_host(monkeypatch):
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?host=evil.remote.invalid"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_hostaddr_override(monkeypatch):
+    """hostaddr lets libpq connect to a raw IP while `host` is used only
+    for TLS hostname verification - a classic DNS-rebinding-style split."""
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?hostaddr=203.0.113.1"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+# 2. Query port/database overrides.
+def test_qa_guard_rejects_query_port_override(monkeypatch):
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?port=9999"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_query_dbname_override(monkeypatch):
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?dbname=production"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+# 3. Multi-host connection strings.
+def test_qa_guard_rejects_multi_host_in_authority(monkeypatch):
+    _set_qa_env(monkeypatch)
+    # make_url() itself fails to parse a comma-joined host:port pair in
+    # the authority section - the guard's own try/except around make_url
+    # must turn that into a clear refusal, not an unhandled exception.
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433,evil.invalid:5432/calitrans_qa"
+
+    with pytest.raises(RuntimeError, match="Refusing to connect"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_multi_host_via_query_string(monkeypatch):
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?host=127.0.0.1,evil.invalid"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+# 4. Unix socket and service-file routing.
+def test_qa_guard_rejects_unix_socket_host(monkeypatch):
+    """A host starting with '/' is libpq's unix-socket-directory
+    convention, not a TCP host - bypasses host/port validation unless
+    explicitly rejected by the loopback allowlist's exact-match check."""
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@%2Fvar%2Frun%2Fpostgresql:5433/calitrans_qa"
+
+    with pytest.raises(RuntimeError, match="Refusing to connect"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_pg_service_file_routing(monkeypatch):
+    """service= resolves host/port/dbname from a local pg_service.conf
+    lookup that cannot be validated from the URL at all - must be
+    rejected outright, never allowed through as an 'unknown but harmless'
+    parameter."""
+    _set_qa_env(monkeypatch)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa?service=some_other_service"
+
+    with pytest.raises(RuntimeError, match="override the connection target"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+# 5. Remote host with QA-shaped database name.
+def test_qa_guard_rejects_remote_host_regardless_of_database_name(monkeypatch):
+    """P1-2: a 'qa'-shaped database name on a remote host must never pass
+    - the host allowlist is unconditional, not a fallback for when the
+    name check fails."""
+    remote_identity = "qa.remote-vpc.invalid:5432/calitrans_qa_disposable"
+    _set_qa_env(monkeypatch, identity=remote_identity)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@qa.remote-vpc.invalid:5432/calitrans_qa_disposable"
+
+    with pytest.raises(RuntimeError, match="approved loopback address"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_suffix_matched_hostname(monkeypatch):
+    """Do not use suffix-based hostname approval - a hostname that merely
+    contains/ends with a safe-looking token is not localhost."""
+    remote_identity = "notlocalhost.attacker.invalid:5432/calitrans_qa"
+    _set_qa_env(monkeypatch, identity=remote_identity)
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@notlocalhost.attacker.invalid:5432/calitrans_qa"
+
+    with pytest.raises(RuntimeError, match="approved loopback address"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+def test_qa_guard_rejects_the_literal_hostname_localhost(monkeypatch):
+    """'localhost' requires name resolution this guard cannot verify is
+    unpoisoned - only literal loopback IPs are accepted."""
+    _set_qa_env(monkeypatch, identity="localhost:5433/calitrans_qa")
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@localhost:5433/calitrans_qa"
+
+    with pytest.raises(RuntimeError, match="approved loopback address"):
+        db_client._enforce_qa_database_safety(hostile)
+
+
+# 6. Correct loopback disposable database.
+def test_qa_guard_allows_correct_loopback_disposable_database(monkeypatch):
+    _set_qa_env(monkeypatch)
+    db_client._enforce_qa_database_safety(DISPOSABLE_URL)  # must not raise
+
+
+def test_qa_guard_allows_correct_loopback_via_get_engine(monkeypatch):
+    _set_qa_env(monkeypatch)
+    engine = db_client.get_engine(DISPOSABLE_URL)  # never connects eagerly
+    assert engine is not None
+
+
+def test_qa_guard_allows_ipv6_loopback(monkeypatch):
+    identity = db_client.database_identity("postgresql+psycopg2://qa_user:qa_pw@[::1]:5433/calitrans_qa")
+    _set_qa_env(monkeypatch, identity=identity)
+    db_client._enforce_qa_database_safety("postgresql+psycopg2://qa_user:qa_pw@[::1]:5433/calitrans_qa")
+
+
+# 7. Cached engine after guard configuration changes.
+def test_cached_engine_is_not_invalidated_by_a_later_guard_failure(monkeypatch):
+    """Changing CALITRANS_QA_DATABASE_IDENTITY (or any other guard input)
+    after an engine for a given URL is already cached must not be able to
+    retroactively mutate what that cached Engine object connects to -
+    the Engine itself is immutable once created; the guard only gates
+    *new* get_engine() calls for URLs not yet cached."""
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+    engine_before = db_client.get_engine(DISPOSABLE_URL)
+
+    # Guard configuration changes to something that would now reject
+    # this exact URL if re-validated from scratch.
+    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, "127.0.0.1:9999/some-other-db")
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        db_client.get_engine(DISPOSABLE_URL)  # guard re-runs on every call, correctly re-rejects now
+
+    # The engine object created before the config change is untouched -
+    # still the same object, still only ever configured for the
+    # originally-validated URL (SQLAlchemy Engines are immutable
+    # w.r.t. their connection URL).
+    assert str(engine_before.url) == DISPOSABLE_URL or DISPOSABLE_IDENTITY in db_client.database_identity(DISPOSABLE_URL)
+
+
+# 8. Existing Streamlit precedence and lazy-import protections.
+def test_streamlit_precedence_protection_still_passes_with_new_guard_present(monkeypatch):
+    """The P0 fix (DATABASE_URL env-first precedence, immune to a later
+    streamlit import) and the P1 guard are independent layers - adding
+    the guard must not have disturbed the P0 behavior."""
+    _isolate_all_sources(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", DISPOSABLE_URL)
+
+    before = config.get_secret("DATABASE_URL")
+    monkeypatch.setattr(config, "get_streamlit_secret", lambda name: FAKE_REAL_SECRET_URL)
+    monkeypatch.setattr(config, "_read_local_streamlit_secret", lambda name: FAKE_REAL_SECRET_URL)
+    after = config.get_secret("DATABASE_URL")
+
+    assert before == after == DISPOSABLE_URL
+
+
+def test_qa_guard_runs_before_engine_cache_lookup(monkeypatch):
+    """Validate before engine creation or cache lookup - a URL that was
+    never cached must still be rejected by the guard, not accidentally
+    treated as 'already validated' because something else happens to
+    share its cache key."""
+    hostile = "postgresql+psycopg2://qa_user:qa_pw@evil.remote.invalid:5432/calitrans_qa"
+    db_client._ENGINE_CACHE.pop(hostile, None)
+    _set_qa_env(monkeypatch, identity="evil.remote.invalid:5432/calitrans_qa")
+
+    with pytest.raises(RuntimeError, match="approved loopback address"):
+        db_client.get_engine(hostile)
+
+    assert hostile not in db_client._ENGINE_CACHE
