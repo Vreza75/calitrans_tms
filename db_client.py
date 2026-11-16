@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Iterator
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from application.exceptions import ConflictError
@@ -148,6 +150,89 @@ def _clean_value(column: str, value: Any) -> Any:
 
 _ENGINE_CACHE: dict[str, Engine] = {}
 
+# Fail-closed guard for disposable QA, opt-in via CALITRANS_ALLOW_QA_DATA -
+# the same convention already used by scripts/sample_data.py and
+# web/e2e/fixtures/qa-sample-data.ts, which every disposable-QA caller
+# already sets. CTMS-010 and the DATABASE_URL resolution-order fix above
+# close the specific silent-switch failure mode, but resolution order
+# alone is a config-correctness property, not a connection-time
+# safeguard - this is the second, independent layer: whatever URL ends up
+# here, by whatever path, is rejected before a connection is attempted
+# unless it is the exact, positively acknowledged disposable target. When
+# CALITRANS_ALLOW_QA_DATA is unset (every normal production/dev run) this
+# function is a no-op - existing behavior for that case is unchanged.
+_QA_ALLOW_ENV_VAR = "CALITRANS_ALLOW_QA_DATA"
+_QA_ALLOW_VALUE = "YES_I_UNDERSTAND_QA_DATA_ONLY"
+_QA_IDENTITY_ENV_VAR = "CALITRANS_QA_DATABASE_IDENTITY"
+# Same tokens/rejections as scripts/sample_data.py's SAFE_NAME_TOKENS /
+# generic-name rejection - kept as a separate literal here (not imported)
+# because db_client.py is lower-level than scripts/ and must not import
+# from it (same reasoning tests/integration/operations_inbox/harness.py
+# already documents for its own copy of this convention).
+_QA_SAFE_NAME_TOKENS = {"dev", "development", "test", "testing", "qa", "sandbox", "scratch", "disposable"}
+_QA_REJECTED_DATABASE_NAMES = {"postgres", "production", "prod"}
+
+
+def database_identity(database_url: str) -> str:
+    """Sanitized host[:port]/database identity - never a username,
+    password, or the raw URL. Same shape as scripts/sample_data.py's
+    target_identity(). Safe to put in log lines or exception messages;
+    the raw database_url never is (requirement: never expose credentials
+    or print full database URLs)."""
+    url = make_url(database_url)
+    host = (url.host or "local").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{url.port}" if url.port else ""
+    database = (url.database or "").strip("/")
+    return f"{host}{port}/{database}"
+
+
+def _enforce_qa_database_safety(database_url: str) -> None:
+    if os.environ.get(_QA_ALLOW_ENV_VAR) != _QA_ALLOW_VALUE:
+        return
+
+    try:
+        url = make_url(database_url)
+    except Exception:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL could not be parsed. Refusing to connect."
+        ) from None
+
+    database = (url.database or "").lower()
+    host = (url.host or "").lower()
+    if not database or not host:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL is missing a host or "
+            "database name. Refusing to connect."
+        )
+
+    identity = database_identity(database_url)
+    if database in _QA_REJECTED_DATABASE_NAMES:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database ({identity}) has a "
+            "generic/production-shaped name. Refusing to connect."
+        )
+
+    name_tokens = {token for token in re.split(r"[^a-z0-9]+", database) if token}
+    if not (name_tokens & _QA_SAFE_NAME_TOKENS):
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database ({identity}) has no "
+            "dev/test/qa/sandbox/scratch/disposable marker. Refusing to connect."
+        )
+
+    expected_identity = os.environ.get(_QA_IDENTITY_ENV_VAR, "").strip().lower()
+    if not expected_identity:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but {_QA_IDENTITY_ENV_VAR} is not set to the exact "
+            f"target ({identity}). Refusing to connect."
+        )
+    if expected_identity != identity.lower():
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but {_QA_IDENTITY_ENV_VAR} does not match the "
+            "resolved target. Refusing to connect."
+        )
+
 
 def get_engine(database_url: str | None = None) -> Engine:
     database_url = str(database_url or get_secret("DATABASE_URL") or "").strip()
@@ -155,6 +240,7 @@ def get_engine(database_url: str | None = None) -> Engine:
         raise RuntimeError(
             f"DATABASE_URL is missing. Config source checked: {get_config_source('DATABASE_URL')}."
         )
+    _enforce_qa_database_safety(database_url)
     engine = _ENGINE_CACHE.get(database_url)
     if engine is None:
         engine = create_engine(database_url, pool_pre_ping=True, future=True)

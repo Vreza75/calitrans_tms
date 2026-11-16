@@ -110,7 +110,13 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     tests/test_config_precedence.py). get_streamlit_secret() only ever
     consults an already-imported streamlit module (see its docstring), so
     this precedence-first check does not by itself cause `import config`
-    to pull in streamlit for processes that never imported it themselves."""
+    to pull in streamlit for processes that never imported it themselves.
+
+    DATABASE_URL is a deliberate exception to this ordering - see
+    get_database_url() below."""
+    if name == "DATABASE_URL":
+        return get_database_url(default)
+
     value = get_streamlit_secret(name)
     if value not in [None, ""]:
         return str(value).strip()
@@ -124,6 +130,56 @@ def get_secret(name: str, default: str | None = None) -> str | None:
         return local_env_value
 
     local_streamlit_value = _read_local_streamlit_secret(name)
+    if local_streamlit_value not in [None, ""]:
+        return local_streamlit_value
+
+    return default
+
+
+def get_database_url(default: str | None = None) -> str | None:
+    """DATABASE_URL resolution, deliberately reordered from get_secret()'s
+    general precedence: an explicitly-set environment variable (or local
+    .env file) always wins over Streamlit secrets here, not the reverse.
+
+    Root cause this closes (confirmed directly, not theoretical - see
+    tests/test_database_url_safety.py): get_secret()'s general order
+    checks Streamlit secrets FIRST, and get_streamlit_secret() starts
+    returning real values the instant anything imports streamlit, however
+    transitively (e.g. services.operations_inbox_service - itself imported
+    lazily, deliberately, from inside application/ command functions like
+    create_load_from_work_item(), specifically so importing it doesn't
+    happen at module load time - see db_client.py's own docstring notes on
+    this). That means a long-lived FastAPI or worker process that started
+    with DATABASE_URL correctly pointed at a disposable QA/dev database
+    could silently start resolving to whatever .streamlit/secrets.toml
+    holds (this repository's holds a real, production-adjacent URL) the
+    moment any request path first touches Operations Inbox legacy
+    services - mid-process, with no code change, no warning, and no log
+    line calling out the switch. CTMS-010 (see conftest.py) already fixed
+    the equivalent failure mode for pytest sessions specifically; this is
+    the general fix, for every entrypoint (FastAPI, workers, scripts,
+    Streamlit itself).
+
+    Streamlit secrets remain the correct *fallback* source when no
+    environment variable is set at all - Streamlit Cloud deployments have
+    no other mechanism to configure DATABASE_URL, and that legacy behavior
+    is preserved here, just demoted from first priority to last resort.
+    db_client.get_engine() additionally enforces a fail-closed QA host
+    allowlist (see its _enforce_qa_database_safety()) as defense in depth
+    beyond resolution order alone."""
+    env_value = os.getenv("DATABASE_URL")
+    if env_value not in [None, ""]:
+        return str(env_value).strip()
+
+    local_env_value = _read_local_env_secret("DATABASE_URL")
+    if local_env_value not in [None, ""]:
+        return local_env_value
+
+    streamlit_value = get_streamlit_secret("DATABASE_URL")
+    if streamlit_value not in [None, ""]:
+        return str(streamlit_value).strip()
+
+    local_streamlit_value = _read_local_streamlit_secret("DATABASE_URL")
     if local_streamlit_value not in [None, ""]:
         return local_streamlit_value
 
@@ -156,6 +212,17 @@ def get_streamlit_secret(name: str) -> str | None:
 
 
 def get_config_source(name: str) -> str:
+    if name == "DATABASE_URL":
+        if os.getenv(name) not in [None, ""]:
+            return "environment/.env"
+        if _read_local_env_secret(name) not in [None, ""]:
+            return "local .env file"
+        if get_streamlit_secret(name) not in [None, ""]:
+            return "streamlit secrets"
+        if _read_local_streamlit_secret(name) not in [None, ""]:
+            return "local .streamlit/secrets.toml"
+        return "missing"
+
     value = get_streamlit_secret(name)
     if value not in [None, ""]:
         return "streamlit secrets"
