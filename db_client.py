@@ -148,7 +148,7 @@ def _clean_value(column: str, value: Any) -> Any:
     return text_value if text_value else None
 
 
-_ENGINE_CACHE: dict[str, Engine] = {}
+_ENGINE_CACHE: dict[tuple[str, str], Engine] = {}
 
 # Fail-closed guard for disposable QA, opt-in via CALITRANS_ALLOW_QA_DATA -
 # the same convention already used by scripts/sample_data.py and
@@ -376,6 +376,23 @@ def _enforce_qa_database_safety(database_url: str) -> str | None:
     return effective_host
 
 
+def _engine_cache_key(database_url: str, validated_qa_host: str | None) -> tuple[str, str]:
+    """The cache key must encode which connection *policy* an engine was
+    built under, not just the URL string - a bare-URL key let an engine
+    created before QA mode was ever enabled (connect_args={}, no pinned
+    hostaddr) be silently handed back after QA mode activated for that
+    same URL, defeating the PGHOSTADDR pin entirely despite every
+    validation check having correctly passed. Different policy
+    (QA-inactive vs QA-active-with-this-host) is a different key, so
+    activating/deactivating QA mode, or any later change that makes
+    _enforce_qa_database_safety() resolve a different host for this URL,
+    can only ever miss the cache and build a fresh, correctly-pinned
+    engine under the new key - the old entry, if any, is simply never
+    looked up again (not mutated - see get_engine()'s own note on why
+    engines are never edited in place)."""
+    return (database_url, validated_qa_host or "")
+
+
 def get_engine(database_url: str | None = None) -> Engine:
     database_url = str(database_url or get_secret("DATABASE_URL") or "").strip()
     if not database_url:
@@ -383,7 +400,8 @@ def get_engine(database_url: str | None = None) -> Engine:
             f"DATABASE_URL is missing. Config source checked: {get_config_source('DATABASE_URL')}."
         )
     validated_qa_host = _enforce_qa_database_safety(database_url)
-    engine = _ENGINE_CACHE.get(database_url)
+    cache_key = _engine_cache_key(database_url, validated_qa_host)
+    engine = _ENGINE_CACHE.get(cache_key)
     if engine is None:
         # Pin hostaddr explicitly to the already-validated loopback host
         # whenever the QA guard ran - libpq treats an explicitly-supplied
@@ -392,9 +410,15 @@ def get_engine(database_url: str | None = None) -> Engine:
         # (create_connect_args() never supplies hostaddr on its own)
         # permanently for this engine, regardless of any environment
         # change after this point - not just at the moment of this check.
+        # An Engine's connect_args are fixed at construction and never
+        # edited afterward (SQLAlchemy does not support mutating them in
+        # place, and this function does not attempt to) - the
+        # policy-aware cache key above, not a later patch to an existing
+        # Engine, is what guarantees a QA-inactive engine is never handed
+        # back once QA mode is active for the same URL.
         connect_args = {"hostaddr": validated_qa_host} if validated_qa_host else {}
         engine = create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
-        _ENGINE_CACHE[database_url] = engine
+        _ENGINE_CACHE[cache_key] = engine
     return engine
 
 

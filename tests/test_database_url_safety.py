@@ -154,8 +154,7 @@ def test_get_engine_default_path_is_immune_to_late_streamlit_import(monkeypatch)
     monkeypatch.setenv("DATABASE_URL", DISPOSABLE_URL)
     monkeypatch.setenv(db_client._QA_ALLOW_ENV_VAR, db_client._QA_ALLOW_VALUE)
     monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, DISPOSABLE_IDENTITY)
-    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
-    db_client._ENGINE_CACHE.pop(FAKE_REAL_SECRET_URL, None)
+    db_client._ENGINE_CACHE.clear()
 
     engine_before = db_client.get_engine()  # no explicit url - exercises the real auto-resolve path
     assert DISPOSABLE_IDENTITY in db_client.database_identity(DISPOSABLE_URL)
@@ -165,7 +164,7 @@ def test_get_engine_default_path_is_immune_to_late_streamlit_import(monkeypatch)
 
     engine_after = db_client.get_engine()
     assert engine_after is engine_before
-    assert FAKE_REAL_SECRET_URL not in db_client._ENGINE_CACHE
+    assert not any(key[0] == FAKE_REAL_SECRET_URL for key in db_client._ENGINE_CACHE)
 
 
 # --- Requirement 5/9: fail-closed QA host allowlist guard --------------
@@ -422,7 +421,7 @@ def test_cached_engine_is_not_invalidated_by_a_later_guard_failure(monkeypatch):
     the Engine itself is immutable once created; the guard only gates
     *new* get_engine() calls for URLs not yet cached."""
     _set_qa_env(monkeypatch)
-    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+    db_client._ENGINE_CACHE.clear()
     engine_before = db_client.get_engine(DISPOSABLE_URL)
 
     # Guard configuration changes to something that would now reject
@@ -461,13 +460,13 @@ def test_qa_guard_runs_before_engine_cache_lookup(monkeypatch):
     treated as 'already validated' because something else happens to
     share its cache key."""
     hostile = "postgresql+psycopg2://qa_user:qa_pw@evil.remote.invalid:5432/calitrans_qa"
-    db_client._ENGINE_CACHE.pop(hostile, None)
+    db_client._ENGINE_CACHE.clear()
     _set_qa_env(monkeypatch, identity="evil.remote.invalid:5432/calitrans_qa")
 
     with pytest.raises(RuntimeError, match="approved loopback address"):
         db_client.get_engine(hostile)
 
-    assert hostile not in db_client._ENGINE_CACHE
+    assert not any(key[0] == hostile for key in db_client._ENGINE_CACHE)
 
 
 # --- Codex P1 finding: libpq environment variables bypass the guard ---
@@ -518,14 +517,15 @@ def test_get_engine_pins_hostaddr_so_a_later_pghostaddr_cannot_redirect(monkeypa
     engine regardless of when the env var appears."""
     _clear_libpq_env(monkeypatch)
     _set_qa_env(monkeypatch)
-    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+    db_client._ENGINE_CACHE.clear()
 
     engine = db_client.get_engine(DISPOSABLE_URL)
     assert engine.dialect.create_connect_args is not None  # sanity: real dialect object
     # The pin lives on the Engine's own connect_args, not something a
     # later env var can retroactively edit.
     monkeypatch.setenv("PGHOSTADDR", "203.0.113.1")
-    assert engine is db_client._ENGINE_CACHE[DISPOSABLE_URL]
+    cache_key = db_client._engine_cache_key(DISPOSABLE_URL, "127.0.0.1")
+    assert engine is db_client._ENGINE_CACHE[cache_key]
 
 
 # PGPORT cannot supply an unvalidated port.
@@ -635,7 +635,7 @@ def test_qa_guard_still_allows_correct_loopback_with_clean_libpq_env(monkeypatch
 def test_get_engine_still_works_for_loopback_with_clean_libpq_env(monkeypatch):
     _clear_libpq_env(monkeypatch)
     _set_qa_env(monkeypatch)
-    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+    db_client._ENGINE_CACHE.clear()
 
     engine = db_client.get_engine(DISPOSABLE_URL)
     assert engine is not None
@@ -645,3 +645,132 @@ def test_get_engine_still_works_for_loopback_with_clean_libpq_env(monkeypatch):
 # the whole file (pytest tests/test_database_url_safety.py), not a
 # single test here; see the session's test-run evidence in the commit
 # message / report rather than duplicating that run inside this file.
+
+
+# --- Codex P1 finding: policy-unaware engine cache ---
+#
+# Confirmed before writing the fix: _ENGINE_CACHE was keyed by the bare
+# database_url string. An engine created for that URL *before*
+# CALITRANS_ALLOW_QA_DATA was ever set (connect_args={}, no pinned
+# hostaddr) would be handed straight back by a later get_engine() call
+# for the same URL once QA mode activated - every guard check passed,
+# but the *returned* Engine was never built with the hostaddr pin at
+# all. _engine_cache_key() now folds the validated QA policy (the
+# pinned host, or "" when inactive) into the cache key itself, so a
+# policy change can only ever miss the cache and build a fresh,
+# correctly-pinned engine - never retroactively mutating an existing
+# Engine (requirement: Engine connect args are fixed at construction).
+
+
+def _effective_connect_kwargs(engine) -> dict:
+    """What would actually be passed to psycopg2.connect() for this
+    Engine - introspected from the pool's connect closure, never by
+    opening a connection. Verifies requirement 10 (actual DBAPI
+    arguments, not merely engine object identity)."""
+    import inspect
+
+    closure = inspect.getclosurevars(engine.pool._creator)
+    return dict(closure.nonlocals["cparams"])
+
+
+# 1. Engine created before QA activation, then QA enabled.
+def test_engine_created_before_qa_activation_is_not_reused_after_qa_enabled(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    monkeypatch.delenv(db_client._QA_ALLOW_ENV_VAR, raising=False)
+    db_client._ENGINE_CACHE.clear()
+
+    pre_qa_engine = db_client.get_engine(DISPOSABLE_URL)
+    assert "hostaddr" not in _effective_connect_kwargs(pre_qa_engine)
+
+    _set_qa_env(monkeypatch)
+    post_qa_engine = db_client.get_engine(DISPOSABLE_URL)
+
+    assert post_qa_engine is not pre_qa_engine
+    assert _effective_connect_kwargs(post_qa_engine)["hostaddr"] == "127.0.0.1"
+    # The pre-QA engine object itself is untouched, not retroactively
+    # pinned - a new one was built instead.
+    assert "hostaddr" not in _effective_connect_kwargs(pre_qa_engine)
+
+
+# 2. Engine created with QA enabled from the beginning.
+def test_engine_created_with_qa_enabled_from_the_start_is_pinned_immediately(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.clear()
+
+    engine = db_client.get_engine(DISPOSABLE_URL)
+    assert _effective_connect_kwargs(engine)["hostaddr"] == "127.0.0.1"
+
+
+# 3. PGHOSTADDR introduced after initial engine creation.
+def test_pghostaddr_introduced_after_engine_creation_cannot_redirect_it(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.clear()
+
+    engine = db_client.get_engine(DISPOSABLE_URL)
+    monkeypatch.setenv("PGHOSTADDR", "203.0.113.1")
+
+    # Re-requesting the same URL under the same policy must fail closed
+    # at the *guard* (PGHOSTADDR's mere presence is rejected) rather
+    # than silently handing back - or rebuilding toward - anything else.
+    with pytest.raises(RuntimeError, match="PGHOSTADDR"):
+        db_client.get_engine(DISPOSABLE_URL)
+
+    # The engine built before PGHOSTADDR appeared is still pinned to the
+    # real loopback address - its own effective args were fixed at
+    # construction and were never going to consult the env var anyway.
+    assert _effective_connect_kwargs(engine)["hostaddr"] == "127.0.0.1"
+
+
+# 4. Cached engine reuse under the same validated policy.
+def test_cached_engine_is_reused_under_an_unchanged_qa_policy(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.clear()
+
+    engine_a = db_client.get_engine(DISPOSABLE_URL)
+    engine_b = db_client.get_engine(DISPOSABLE_URL)
+
+    assert engine_a is engine_b
+    assert _effective_connect_kwargs(engine_a)["hostaddr"] == "127.0.0.1"
+
+
+# 5. QA identity changes.
+def test_qa_identity_change_cannot_reuse_the_previously_validated_engine(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.clear()
+
+    engine_before = db_client.get_engine(DISPOSABLE_URL)
+
+    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, "127.0.0.1:9999/some-other-db")
+    with pytest.raises(RuntimeError, match="does not match"):
+        db_client.get_engine(DISPOSABLE_URL)  # must raise, not return engine_before
+
+    # Restoring the correct identity must still reuse the original,
+    # correctly-pinned engine - a transient identity mismatch did not
+    # evict or corrupt the valid cache entry.
+    monkeypatch.setenv(db_client._QA_IDENTITY_ENV_VAR, DISPOSABLE_IDENTITY)
+    engine_after = db_client.get_engine(DISPOSABLE_URL)
+    assert engine_after is engine_before
+
+
+# 6. QA mode disabled after previously being enabled.
+def test_qa_mode_disabled_after_being_enabled_builds_an_unpinned_engine(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.clear()
+
+    qa_engine = db_client.get_engine(DISPOSABLE_URL)
+    assert _effective_connect_kwargs(qa_engine)["hostaddr"] == "127.0.0.1"
+
+    monkeypatch.delenv(db_client._QA_ALLOW_ENV_VAR, raising=False)
+    non_qa_engine = db_client.get_engine(DISPOSABLE_URL)
+
+    assert non_qa_engine is not qa_engine
+    assert "hostaddr" not in _effective_connect_kwargs(non_qa_engine)
+    # The QA-pinned engine built earlier is unaffected - requirement 7
+    # (normal non-QA behavior) does not come at the cost of requirement
+    # 6 (never mutate an existing Engine's connect args).
+    assert _effective_connect_kwargs(qa_engine)["hostaddr"] == "127.0.0.1"
