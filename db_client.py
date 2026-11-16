@@ -192,6 +192,32 @@ _QA_ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
 # ever allowed through in QA mode.
 _QA_ALLOWED_QUERY_PARAMS = {"sslmode", "connect_timeout", "application_name", "client_encoding"}
 
+# P1-3: none of the checks above touch libpq itself - psycopg2/libpq fill
+# in ANY connection parameter not explicitly supplied from the matching
+# PG* environment variable, with explicit > env var > compiled default
+# precedence. host/port/dbname are always explicitly supplied by
+# create_connect_args() below, so PGHOST/PGPORT/PGDATABASE cannot override
+# them per libpq's own documented precedence - but hostaddr is never
+# explicitly supplied today, so PGHOSTADDR (libpq's "connect to this raw
+# IP, use `host` only for TLS name checking" override) would silently
+# fill that gap. PGSERVICE/PGSERVICEFILE/PGSYSCONFDIR route through a
+# pg_service.conf lookup this guard has no way to inspect from the URL at
+# all - confirmed the right posture is reject, not attempt to validate.
+# Checked at every get_engine() call (not cached), so a later change to
+# any of these is caught the next time an engine is requested; hostaddr
+# is additionally pinned explicitly (see get_engine()) so even the gap
+# between engine creation and SQLAlchemy's lazy first connect cannot be
+# used to reintroduce PGHOSTADDR's effect after this check has passed.
+_QA_UNSAFE_LIBPQ_ENV_VARS = (
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGDATABASE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+)
+
 
 def database_identity(database_url: str) -> str:
     """Sanitized host[:port]/database identity - never a username,
@@ -208,9 +234,27 @@ def database_identity(database_url: str) -> str:
     return f"{host}{port}/{database}"
 
 
-def _enforce_qa_database_safety(database_url: str) -> None:
+def _enforce_qa_database_safety(database_url: str) -> str | None:
+    """Returns the validated loopback host when the guard is active (so
+    get_engine() can pin it as `hostaddr` - see there), or None when
+    CALITRANS_ALLOW_QA_DATA is unset and this function is a no-op."""
     if os.environ.get(_QA_ALLOW_ENV_VAR) != _QA_ALLOW_VALUE:
-        return
+        return None
+
+    # P1-3: reject outright rather than attempt to validate - PGSERVICE/
+    # PGSERVICEFILE/PGSYSCONFDIR cannot be inspected from the URL at all,
+    # and PGHOST/PGHOSTADDR/PGPORT/PGDATABASE being present at all means
+    # this process's environment is not the minimal, fully-explicit one
+    # disposable QA requires. Names only in the message - never values,
+    # which could themselves be or resemble credentials/hostnames worth
+    # not echoing back.
+    present_unsafe_vars = sorted(name for name in _QA_UNSAFE_LIBPQ_ENV_VARS if os.environ.get(name))
+    if present_unsafe_vars:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but libpq connection-routing environment variable(s) "
+            f"are also set ({', '.join(present_unsafe_vars)}) - these can override the "
+            "connection endpoint independently of the validated URL. Refusing to connect."
+        )
 
     try:
         url = make_url(database_url)
@@ -225,6 +269,16 @@ def _enforce_qa_database_safety(database_url: str) -> None:
         raise RuntimeError(
             f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL is missing a host or "
             "database name. Refusing to connect."
+        )
+
+    # Requirement: explicit host, port, AND database - a URL that omits
+    # the port and relies on PostgreSQL's compiled-in default (5432) is
+    # not fully explicit, and this guard's effective-port cross-check
+    # below needs a real value to compare against, not an implicit one.
+    if url.port is None:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL does not specify an "
+            "explicit port. Refusing to connect."
         )
 
     # P1-1: reject any query parameter capable of changing the effective
@@ -319,6 +373,8 @@ def _enforce_qa_database_safety(database_url: str) -> None:
             "resolved target. Refusing to connect."
         )
 
+    return effective_host
+
 
 def get_engine(database_url: str | None = None) -> Engine:
     database_url = str(database_url or get_secret("DATABASE_URL") or "").strip()
@@ -326,10 +382,18 @@ def get_engine(database_url: str | None = None) -> Engine:
         raise RuntimeError(
             f"DATABASE_URL is missing. Config source checked: {get_config_source('DATABASE_URL')}."
         )
-    _enforce_qa_database_safety(database_url)
+    validated_qa_host = _enforce_qa_database_safety(database_url)
     engine = _ENGINE_CACHE.get(database_url)
     if engine is None:
-        engine = create_engine(database_url, pool_pre_ping=True, future=True)
+        # Pin hostaddr explicitly to the already-validated loopback host
+        # whenever the QA guard ran - libpq treats an explicitly-supplied
+        # connection parameter as higher priority than its matching PG*
+        # environment variable, so this closes the PGHOSTADDR gap
+        # (create_connect_args() never supplies hostaddr on its own)
+        # permanently for this engine, regardless of any environment
+        # change after this point - not just at the moment of this check.
+        connect_args = {"hostaddr": validated_qa_host} if validated_qa_host else {}
+        engine = create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
         _ENGINE_CACHE[database_url] = engine
     return engine
 

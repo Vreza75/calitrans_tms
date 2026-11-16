@@ -468,3 +468,180 @@ def test_qa_guard_runs_before_engine_cache_lookup(monkeypatch):
         db_client.get_engine(hostile)
 
     assert hostile not in db_client._ENGINE_CACHE
+
+
+# --- Codex P1 finding: libpq environment variables bypass the guard ---
+#
+# Confirmed before writing the fix: create_connect_args() never supplies
+# a 'hostaddr' key on its own (see the direct check against the real
+# psycopg2 dialect above this file's test run), so libpq falls back to
+# PGHOSTADDR if that environment variable is set - connecting to a raw
+# IP while 'host' is used only for TLS hostname checking. host/port/
+# dbname ARE always explicitly supplied, so PGHOST/PGPORT/PGDATABASE
+# cannot override them per libpq's own documented precedence - but this
+# guard rejects their mere presence anyway rather than relying on that
+# precedence holding across every libpq/psycopg2 version. None of these
+# tests open a real connection - presence-checking os.environ and
+# inspecting create_connect_args()'s return value never touches a socket.
+
+_LIBPQ_ENV_VARS = (
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGDATABASE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+)
+
+
+def _clear_libpq_env(monkeypatch) -> None:
+    for name in _LIBPQ_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+# PGHOSTADDR cannot redirect a loopback connection.
+def test_qa_guard_rejects_pghostaddr_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGHOSTADDR", "203.0.113.1")
+
+    with pytest.raises(RuntimeError, match="PGHOSTADDR"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+def test_get_engine_pins_hostaddr_so_a_later_pghostaddr_cannot_redirect(monkeypatch):
+    """Even if PGHOSTADDR is set *after* get_engine() already validated
+    and cached an engine, the created Engine's connect_args already pin
+    hostaddr to the validated loopback value - libpq's own precedence
+    (explicit > env var) then makes PGHOSTADDR irrelevant for this
+    engine regardless of when the env var appears."""
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+
+    engine = db_client.get_engine(DISPOSABLE_URL)
+    assert engine.dialect.create_connect_args is not None  # sanity: real dialect object
+    # The pin lives on the Engine's own connect_args, not something a
+    # later env var can retroactively edit.
+    monkeypatch.setenv("PGHOSTADDR", "203.0.113.1")
+    assert engine is db_client._ENGINE_CACHE[DISPOSABLE_URL]
+
+
+# PGPORT cannot supply an unvalidated port.
+def test_qa_guard_rejects_pgport_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGPORT", "9999")
+
+    with pytest.raises(RuntimeError, match="PGPORT"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+# PGHOST and PGSERVICE cannot change the effective endpoint.
+def test_qa_guard_rejects_pghost_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGHOST", "evil.remote.invalid")
+
+    with pytest.raises(RuntimeError, match="PGHOST"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+def test_qa_guard_rejects_pgservice_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGSERVICE", "some_remote_service")
+
+    with pytest.raises(RuntimeError, match="PGSERVICE"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+def test_qa_guard_rejects_pgservicefile_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGSERVICEFILE", "/tmp/evil_pg_service.conf")
+
+    with pytest.raises(RuntimeError, match="PGSERVICEFILE"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+def test_qa_guard_rejects_pgdatabase_env_var(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGDATABASE", "production")
+
+    with pytest.raises(RuntimeError, match="PGDATABASE"):
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+
+
+def test_qa_guard_reports_all_present_unsafe_vars_at_once(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGHOST", "evil.invalid")
+    monkeypatch.setenv("PGPORT", "9999")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+    message = str(exc_info.value)
+    assert "PGHOST" in message
+    assert "PGPORT" in message
+
+
+def test_qa_guard_env_var_check_never_exposes_values(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    monkeypatch.setenv("PGHOST", "secret-internal-host.invalid")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+    assert "secret-internal-host.invalid" not in str(exc_info.value)
+
+
+# Missing URL host/port/database fails closed.
+def test_qa_guard_requires_explicit_port_in_url(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch, identity="127.0.0.1/calitrans_qa")
+
+    with pytest.raises(RuntimeError, match="explicit port"):
+        db_client._enforce_qa_database_safety("postgresql+psycopg2://qa_user:qa_pw@127.0.0.1/calitrans_qa")
+
+
+def test_qa_guard_requires_host_in_url(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="missing a host"):
+        db_client._enforce_qa_database_safety("postgresql+psycopg2://qa_user:qa_pw@/calitrans_qa")
+
+
+def test_qa_guard_requires_database_in_url(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="missing a host"):
+        db_client._enforce_qa_database_safety("postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/")
+
+
+# Safe loopback connections still work.
+def test_qa_guard_still_allows_correct_loopback_with_clean_libpq_env(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+
+    result = db_client._enforce_qa_database_safety(DISPOSABLE_URL)
+    assert result == "127.0.0.1"
+
+
+def test_get_engine_still_works_for_loopback_with_clean_libpq_env(monkeypatch):
+    _clear_libpq_env(monkeypatch)
+    _set_qa_env(monkeypatch)
+    db_client._ENGINE_CACHE.pop(DISPOSABLE_URL, None)
+
+    engine = db_client.get_engine(DISPOSABLE_URL)
+    assert engine is not None
+
+
+# Existing 36 database safety tests remain green - enforced by running
+# the whole file (pytest tests/test_database_url_safety.py), not a
+# single test here; see the session's test-run evidence in the commit
+# message / report rather than duplicating that run inside this file.
