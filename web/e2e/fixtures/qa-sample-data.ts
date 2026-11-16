@@ -1,0 +1,321 @@
+import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
+
+import { expect } from "@playwright/test";
+
+// Shared helper for live acceptance specs (REAL backend, REAL disposable QA
+// Postgres - see docs/SAMPLE_DATA_GUIDE.md). Every dataset created through
+// this module is run-scoped: a fresh, globally-unique dataset id per call,
+// seeded via scripts/sample_data.py (never raw application code), so
+// concurrent/parallel/repeated test runs each get their own independent,
+// mutable rows and never collide with or mutate another run's data.
+//
+// This file only shells out to the already-existing, already-safety-gated
+// scripts/sample_data.py CLI (dataset name allow-list, QA-only database
+// identity check, `SYNTHETIC-CALITRANS-QA::` marker). It does not add any
+// new write path and never touches application/, api/, services/, or
+// repositories/.
+
+const PYTHON_EXE = "C:/GitHub/calitrans_tms_postgres_upgrade_clean/.venv/Scripts/python.exe";
+const REPO_ROOT = "C:/GitHub/calitrans_tms_postgres_upgrade_clean";
+
+// Same disposable QA Postgres used by web/e2e/inbox-realtime.spec.ts.
+const QA_SQLALCHEMY_URL = "postgresql+psycopg2://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa";
+const QA_PSYCOPG2_DSN = "postgresql://qa_user:qa_pw@127.0.0.1:5433/calitrans_qa";
+
+const QA_ENV = {
+  ...process.env,
+  CALITRANS_ALLOW_QA_DATA: "YES_I_UNDERSTAND_QA_DATA_ONLY",
+  CALITRANS_QA_DATABASE_IDENTITY: "127.0.0.1:5433/calitrans_qa",
+};
+
+/** Matches scripts/sample_data.py's DATASET_RE: ^[a-z0-9][a-z0-9-]{2,39}$. */
+export function uniqueDataset(label: string): string {
+  const suffix = `${Date.now().toString(36)}${randomBytes(3).toString("hex")}`;
+  return `${label}-${suffix}`.toLowerCase().slice(0, 40);
+}
+
+export function marker(dataset: string): string {
+  return `SYNTHETIC-CALITRANS-QA::${dataset}`;
+}
+
+function runSampleData(command: "seed" | "cleanup", dataset: string): void {
+  execFileSync(
+    PYTHON_EXE,
+    [
+      "scripts/sample_data.py",
+      command,
+      "--database-url",
+      QA_SQLALCHEMY_URL,
+      "--environment",
+      "test",
+      "--dataset",
+      dataset,
+    ],
+    { cwd: REPO_ROOT, env: QA_ENV },
+  );
+}
+
+export function seedDataset(dataset: string): void {
+  runSampleData("seed", dataset);
+}
+
+export function cleanupDataset(dataset: string): void {
+  runSampleData("cleanup", dataset);
+}
+
+// seed() always leaves the one synthetic order_intake row at the default
+// request_type ('Needs Classification' - see
+// database/operations_email_workflow_migration.sql), which is enough for
+// every allowed-action scenario except "New Booking"/"New Order" (needed to
+// exercise create_load - see application/work_items/queries.py's
+// _allowed_actions). No application code or sample_data.py write path
+// supports that yet, so this issues one exact-match UPDATE against the
+// single row seed() just created for this run-scoped dataset, identified by
+// the same deterministic subject seed() always writes. Scoped to a single
+// row by exact equality (never LIKE/broad match) on a value that is itself
+// unique per run, so it can never touch another dataset's row.
+export function setRequestType(dataset: string, requestType: string): void {
+  const subject = `${marker(dataset)} New inbound order`;
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('update order_intake set request_type = %s where source_subject = %s', (sys.argv[2], sys.argv[3]))",
+    "assert cur.rowcount == 1, f'expected exactly 1 row, updated {cur.rowcount}'",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, requestType, subject], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+}
+
+// Read-only lookups against domain_events for tests that need to correlate
+// a realtime publication with the specific event a command produced -
+// never a fixed/guessed id. aggregate_type/aggregate_id/event_type here
+// must match what the real emitter wrote (e.g.
+// application/work_items/commands.py's close_work_item(): aggregate_type
+// "order_intake_item", aggregate_id str(work_item_id), event_type
+// "inbox.review_status_changed") - scoped tightly enough by the caller's
+// own dynamically-discovered work_item_id that another concurrent test's
+// unrelated event can never match.
+export function latestDomainEventId(aggregateType: string, aggregateId: string, eventType: string): number {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute(",
+    "    'select id from domain_events where aggregate_type = %s and aggregate_id = %s and event_type = %s "
+      + "order by created_at desc, id desc limit 1',",
+    "    (sys.argv[2], sys.argv[3], sys.argv[4]),",
+    ")",
+    "row = cur.fetchone()",
+    "assert row is not None, f'no domain_events row for {sys.argv[2:]}'",
+    "print(row[0])",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, aggregateType, aggregateId, eventType], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  return parseInt(output, 10);
+}
+
+// A single raw snapshot of one specific domain_events id's persisted
+// state - authoritative for whatever instant it's read at, but NOT by
+// itself proof the row has reached its final state. Under Playwright's
+// fullyParallel execution, a single `process` run claims whatever is
+// pending across every concurrently-running test, so another worker's
+// invocation (not this test's own) can be the one that actually claims
+// this row - and that other invocation may still be mid-flight
+// (status='processing') at the exact instant this function is called,
+// since nothing guarantees it finished before this test's own `process`
+// call returned. Callers that need to know the row's *eventual* outcome
+// must poll this (see waitForDomainEventPublished below), not call it
+// once and trust the result.
+export function domainEventStatus(id: number): { status: string; publishedAt: string | null; claimedAt: string | null } {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('select status, published_at, claimed_at from domain_events where id = %s', (sys.argv[2],))",
+    "row = cur.fetchone()",
+    "assert row is not None, f'no domain_events row with id={sys.argv[2]}'",
+    "print(f'{row[0]}|{row[1]}|{row[2]}')",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  const [status, publishedAt, claimedAt] = output.split("|");
+  return {
+    status,
+    publishedAt: publishedAt === "None" ? null : publishedAt,
+    claimedAt: claimedAt === "None" ? null : claimedAt,
+  };
+}
+
+// Bounded polling of exactly one domain_events id's persisted status -
+// the fix for the race domainEventStatus's own doc comment describes.
+// expect.poll()'s callback, unlike expect(...).toPass(), does NOT retry
+// on a thrown error (see node_modules/playwright/lib/matchers/expect.js's
+// invokePollMatcher: `const value = await actual()` sits outside the
+// try/catch that wraps only the matcher call) - so throwing here on the
+// terminal 'failed' status aborts the poll immediately with a clear,
+// specific error instead of silently retrying it until the timeout.
+// Returning the status for every other value and matching on
+// .toBe("published") is what makes 'pending'/'processing' keep polling
+// (not a match yet, correctly retried) while 'published' succeeds and
+// 'failed' fails fast - exactly the three required outcomes, checking
+// nothing but this one id.
+export async function waitForDomainEventPublished(
+  id: number,
+  options: { timeoutMs?: number; intervals?: number[] } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const intervals = options.intervals ?? [250, 500, 1_000, 2_000];
+  await expect
+    .poll(
+      () => {
+        const { status } = domainEventStatus(id);
+        if (status === "failed") {
+          throw new Error(
+            `domain_events id=${id} reached the terminal status 'failed' - it will never become ` +
+              "'published', so this is not a timing issue worth continuing to poll for.",
+          );
+        }
+        return status;
+      },
+      { timeout: timeoutMs, intervals },
+    )
+    .toBe("published");
+}
+
+// Test-setup helpers for exercising waitForDomainEventPublished's own
+// polling/fail-fast/timeout behavior directly, without needing a live
+// browser, login, or the realtime publisher script - these manipulate
+// domain_events rows the same direct-SQL way domainEventStatus reads
+// them, scoped to a synthetic aggregate_id unique per call (uniqueDataset
+// reused purely as a globally-unique string generator here, not as a
+// seeded dataset), so a regression run can never collide with another
+// test's real row.
+//
+// Isolation from the real publisher's claim query: repositories/
+// domain_event_repo.py's claim_next_pending() only ever claims rows
+// matching `status = 'pending' and available_at <= now()` (a real,
+// unmodified application predicate - see that file). A fixture row
+// inserted with status 'pending' and the column's own now()-default
+// available_at is therefore real, fully eligible production-shaped
+// queue input, indistinguishable to that query from a real event - any
+// concurrently-running test's own publisher invocation (this file's
+// real `process_realtime_events.py process` calls claim whatever is
+// pending across the whole table, not just their own test's rows) could
+// claim and actually process it, mutating status/claimed_at out from
+// under a test that assumed it would stay untouched. Setting
+// available_at to a day in the future - the existing schema's own
+// column, no new column, no change to the claim predicate itself -
+// makes `available_at <= now()` false, so claim_next_pending's own
+// unmodified query can never select these rows, while every column this
+// module's read/write helpers touch (status, claimed_at, published_at)
+// remains the real, live table - still exercising real persisted state
+// transitions, just never claimable by anything other than this file's
+// own direct updateDomainEventStatus() calls.
+export function insertDomainEvent(
+  eventType: string,
+  aggregateType: string,
+  aggregateId: string,
+  status: "pending" | "processing" = "pending",
+): number {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute(",
+    "    'insert into domain_events (event_type, aggregate_type, aggregate_id, payload, idempotency_key, status, available_at) "
+      + "values (%s, %s, %s, %s::jsonb, %s, %s, now() + interval \\'1 day\\') returning id',",
+    "    (sys.argv[2], sys.argv[3], sys.argv[4], '{}', sys.argv[4], sys.argv[5]),",
+    ")",
+    "row = cur.fetchone()",
+    "conn.commit()",
+    "print(row[0])",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(
+    PYTHON_EXE,
+    ["-c", snippet, QA_PSYCOPG2_DSN, eventType, aggregateType, aggregateId, status],
+    { cwd: REPO_ROOT, env: QA_ENV },
+  )
+    .toString()
+    .trim();
+  return parseInt(output, 10);
+}
+
+export function updateDomainEventStatus(
+  id: number,
+  status: "pending" | "processing" | "published" | "failed",
+): void {
+  const sql =
+    status === "published"
+      ? "update domain_events set status = %s, published_at = now() where id = %s"
+      : "update domain_events set status = %s where id = %s";
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    `cur.execute('${sql}', (sys.argv[2], sys.argv[3]))`,
+    "assert cur.rowcount == 1, f'expected exactly 1 row, updated {cur.rowcount}'",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, status, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+}
+
+export function deleteDomainEvent(id: number): void {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('delete from domain_events where id = %s', (sys.argv[2],))",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(id)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+}
+
+export function cleanupDatasets(datasets: string[]): void {
+  for (const dataset of datasets) {
+    try {
+      cleanupDataset(dataset);
+    } catch (error) {
+      // Best-effort: a cleanup failure must never mask the test's own
+      // pass/fail result, and disposable QA data left behind is harmless
+      // (never shared, always re-cleanable by dataset id).
+      console.error(`qa-sample-data: cleanup failed for dataset ${dataset}:`, error);
+    }
+  }
+}
