@@ -12,7 +12,7 @@ import {
   useUpdateLoadFromWorkItem,
 } from "@/lib/api/useInbox";
 import { useAuth } from "@/lib/auth/AuthContext";
-import { ApiError } from "@/lib/api/client";
+import { ApiError, openAttachment } from "@/lib/api/client";
 
 const WORK_ITEM_MANAGE = "work_item:manage";
 
@@ -45,12 +45,26 @@ export function WorkItemDetail({ workItemId }: { workItemId: number }) {
   const [linkLoadId, setLinkLoadId] = useState("");
   const [updateLoadId, setUpdateLoadId] = useState("");
   const [fillBlankOnly, setFillBlankOnly] = useState(true);
+  const [openingAttachmentRef, setOpeningAttachmentRef] = useState<string | null>(null);
+  const [attachmentError, setAttachmentError] = useState<unknown>(null);
 
   if (isLoading) return <p role="status">Loading work item...</p>;
   if (isError || !detail) return <p role="alert" className="field-error">This work item is no longer available.</p>;
 
   const pending = createLoad.isPending || updateLoad.isPending || linkLoad.isPending || closeItem.isPending;
-  const anyActionError = createLoad.error ?? updateLoad.error ?? linkLoad.error ?? closeItem.error;
+  const anyActionError = createLoad.error ?? updateLoad.error ?? linkLoad.error ?? closeItem.error ?? attachmentError;
+
+  async function handleOpenAttachment(attachmentRef: string) {
+    setAttachmentError(null);
+    setOpeningAttachmentRef(attachmentRef);
+    try {
+      await openAttachment(attachmentRef, workItemId);
+    } catch (error) {
+      setAttachmentError(error);
+    } finally {
+      setOpeningAttachmentRef(null);
+    }
+  }
 
   return (
     <div className="inbox-work-item-detail">
@@ -120,9 +134,14 @@ export function WorkItemDetail({ workItemId }: { workItemId: number }) {
           <ul className="inbox-attachments">
             {attachments.current.map((file) => (
               <li key={file.attachment_ref}>
-                <a href={`/api/v1/attachments/${file.attachment_ref}/content`} target="_blank" rel="noreferrer">
-                  {file.filename}
-                </a>
+                <button
+                  type="button"
+                  className="inbox-attachment-link"
+                  disabled={openingAttachmentRef === file.attachment_ref}
+                  onClick={() => handleOpenAttachment(file.attachment_ref)}
+                >
+                  {openingAttachmentRef === file.attachment_ref ? "Opening..." : file.filename}
+                </button>
               </li>
             ))}
           </ul>
@@ -132,7 +151,7 @@ export function WorkItemDetail({ workItemId }: { workItemId: number }) {
       <section aria-label="Actions" className="inbox-actions">
         <h3>Actions</h3>
         {!canManage && <p className="inline-status">Your role does not have permission to act on work items.</p>}
-        {anyActionError && <p role="alert" className="field-error">{actionErrorMessage(anyActionError)}</p>}
+        {Boolean(anyActionError) && <p role="alert" className="field-error">{actionErrorMessage(anyActionError)}</p>}
 
         <div className="inbox-actions__row">
           {detail.allowed_actions.includes("create_load") && (
