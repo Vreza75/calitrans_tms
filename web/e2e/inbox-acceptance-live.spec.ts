@@ -17,7 +17,21 @@ const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", passwor
 const ACCOUNTING = { email: "accounting.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
 const API_BASE = "http://localhost:8000";
 
-async function login(page: import("@playwright/test").Page, creds: typeof DISPATCHER) {
+// Returns the real session token issued by this login, so callers that
+// also need a bearer token for direct page.request calls (e.g.
+// findWorkItemId) can reuse this one call instead of making a second,
+// independent /api/v1/auth/login request. api/rate_limit.py enforces a
+// real per-client+email sliding-window limit (5 attempts/60s) - exactly
+// the kind of production protection this session must never weaken (see
+// CLAUDE.md). Every test in this file previously made two real login
+// calls for the same DISPATCHER account (one via dispatcherToken(), one
+// here), and Playwright's fullyParallel execution runs every test in
+// this file at once - confirmed live: a real run of this file hit real
+// 429s from the real limiter once there were enough tests to push the
+// combined attempt count past 5 within the window. Halving the call
+// count by reusing this response's token is the fix; loosening
+// _MAX_ATTEMPTS/_WINDOW_SECONDS was not an option.
+async function login(page: import("@playwright/test").Page, creds: typeof DISPATCHER): Promise<string> {
   await page.goto("/login");
   await page.getByLabel("Email").fill(creds.email);
   await page.getByLabel("Password").fill(creds.password);
@@ -30,6 +44,8 @@ async function login(page: import("@playwright/test").Page, creds: typeof DISPAT
   if (response.status() >= 300) {
     throw new Error(`Real login failed for ${creds.email}: HTTP ${response.status()}`);
   }
+  const body = await response.json();
+  return body.token as string;
 }
 
 async function dispatcherToken(page: import("@playwright/test").Page): Promise<string> {
@@ -64,10 +80,9 @@ test("item 1/3: real login, real queue counts, real work-item list and selection
   seedDataset(datasetA);
   seedDataset(datasetB);
   try {
-    const token = await dispatcherToken(page);
+    const token = await login(page, DISPATCHER);
     const idA = await findWorkItemId(page, token, datasetA);
 
-    await login(page, DISPATCHER);
     await page.goto("/app/inbox");
     await expect(page.getByRole("heading", { name: "Operations Inbox" })).toBeVisible();
 
@@ -101,11 +116,9 @@ test("item 4: conversation isolation - two synthetic conversations never cross-c
   seedDataset(datasetA);
   seedDataset(datasetB);
   try {
-    const token = await dispatcherToken(page);
+    const token = await login(page, DISPATCHER);
     const idA = await findWorkItemId(page, token, datasetA);
     const idB = await findWorkItemId(page, token, datasetB);
-
-    await login(page, DISPATCHER);
 
     // Scoped to the detail header specifically - the queue-nav list sidebar
     // legitimately shows both seeded conversations at all times (expected
@@ -127,10 +140,9 @@ test("item 5: extracted fields match the real seeded source record", async ({ pa
   const dataset = uniqueDataset("pr22-live5");
   seedDataset(dataset);
   try {
-    const token = await dispatcherToken(page);
+    const token = await login(page, DISPATCHER);
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await login(page, DISPATCHER);
     await page.goto(`/app/inbox?id=${workItemId}`);
 
     const fields = page.getByRole("region", { name: "Extracted fields" });
@@ -145,10 +157,9 @@ test("item 7: Close against the real application command boundary", async ({ pag
   const dataset = uniqueDataset("pr22-live7");
   seedDataset(dataset);
   try {
-    const token = await dispatcherToken(page);
+    const token = await login(page, DISPATCHER);
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await login(page, DISPATCHER);
     await page.goto(`/app/inbox?id=${workItemId}`);
     await expect(page.getByRole("heading", { name: `${marker(dataset)} New inbound order` })).toBeVisible();
 
@@ -161,9 +172,29 @@ test("item 7: Close against the real application command boundary", async ({ pag
 
     // Real refetch through the real list endpoint - the closed item must
     // actually leave the active queue server-side, not just optimistically
-    // in the client.
+    // in the client. Scoped by this dataset's own unique marker (same
+    // pattern as item 1) rather than asserting on the unfiltered
+    // `.inbox-work-item-row__subject` DOM list: that locator's match count
+    // depends on every other work item currently open across the whole
+    // database, including rows seeded by other tests running concurrently
+    // under Playwright's fullyParallel execution. When no other open item
+    // happens to exist at that instant (e.g. this test running in
+    // isolation, or simply unlucky timing), the locator resolves to zero
+    // elements and `.not.toContainText()` times out as a failure instead
+    // of passing - a false negative that depends on unrelated parallel
+    // test state, not on whether close() actually worked. The server-side
+    // search (only_open=True by default - see
+    // application/work_items/queries.py) deterministically excludes the
+    // now-closed row regardless of what else is open concurrently.
     await page.goto("/app/inbox");
-    await expect(page.locator(".inbox-work-item-row__subject")).not.toContainText(marker(dataset));
+    await page.getByPlaceholder("Search subject, sender, booking, container, reference...").fill(marker(dataset));
+    const searchResponse = page.waitForResponse(
+      (r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="),
+    );
+    await page.getByRole("button", { name: "Search" }).click();
+    const searchRes = await searchResponse;
+    const searchBody = await searchRes.json();
+    expect(searchBody.items.length).toBe(0);
   } finally {
     cleanupDatasets([dataset]);
   }

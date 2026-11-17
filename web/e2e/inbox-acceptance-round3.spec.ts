@@ -19,7 +19,19 @@ import { cleanupDataset, marker, seedDataset, setRequestType, uniqueDataset } fr
 const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
 const API_BASE = "http://localhost:8000";
 
-async function login(page: import("@playwright/test").Page) {
+// Returns the real session token this login issued, so a test that also
+// needs a bearer token for direct page.request calls (findWorkItemId,
+// findLoadIdByBooking, scopedOpenCount) can reuse this one call instead of
+// making a second, independent /api/v1/auth/login request. api/rate_limit.py
+// enforces a real per-client+email sliding-window limit (5 attempts/60s) -
+// a production protection this session must never weaken (see CLAUDE.md).
+// Every test here that used both login() and loginToken() made two real
+// login calls for the same DISPATCHER account; under Playwright's
+// fullyParallel execution that pushed this file's combined attempt count
+// past 5 within the window and tripped real 429s (confirmed live). Reusing
+// this response's token - instead of loosening _MAX_ATTEMPTS/_WINDOW_SECONDS -
+// is the fix.
+async function login(page: import("@playwright/test").Page): Promise<string> {
   await page.goto("/login");
   await page.getByLabel("Email").fill(DISPATCHER.email);
   await page.getByLabel("Password").fill(DISPATCHER.password);
@@ -29,6 +41,8 @@ async function login(page: import("@playwright/test").Page) {
   await page.getByRole("button", { name: "Sign In" }).click();
   const response = await loginResponse;
   if (response.status() >= 300) throw new Error(`Real login failed: HTTP ${response.status()}`);
+  const body = await response.json();
+  return body.token as string;
 }
 
 async function loginToken(page: import("@playwright/test").Page): Promise<string> {
@@ -83,7 +97,9 @@ test("search/filter: server-side search isolates this run's own item from everyt
     await page.getByPlaceholder("Search subject, sender, booking, container, reference...").fill(marker(dataset));
 
     const listResponse = page.waitForResponse((r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="));
-    await page.getByRole("button", { name: "Search" }).click();
+    // exact: true - same substring-collision risk as the Link/Close buttons
+    // above: this test's own dataset is named "pr22-search-*".
+    await page.getByRole("button", { name: "Search", exact: true }).click();
     const res = await listResponse;
     const body = await res.json();
     expect(body.items.length).toBe(1);
@@ -123,10 +139,9 @@ test("create_load: real create-load command against a 'New Booking' classified i
   seedDataset(dataset);
   setRequestType(dataset, "New Booking");
   try {
-    const token = await loginToken(page);
+    const token = await login(page);
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await login(page);
     await page.goto(`/app/inbox?id=${workItemId}`);
     await expect(page.getByRole("button", { name: "Create Load" })).toBeEnabled();
 
@@ -150,19 +165,23 @@ test("link_to_load then update_existing_load: real two-step command sequence, ve
   const dataset = uniqueDataset("pr22-link");
   seedDataset(dataset);
   try {
-    const token = await loginToken(page);
+    const token = await login(page);
     const workItemId = await findWorkItemId(page, token, dataset);
     const newLoadBooking = `QA-${dataset.toUpperCase()}-NEW`;
     const loadId = await findLoadIdByBooking(page, token, newLoadBooking);
 
-    await login(page);
     await page.goto(`/app/inbox?id=${workItemId}`);
 
     await page.getByPlaceholder(/load id/i).first().fill(String(loadId));
     const linkResponse = page.waitForResponse(
       (r) => r.url().includes(`/api/v1/work-items/${workItemId}/link-load`) && r.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "Link" }).click();
+    // exact: true - this test's own dataset is literally named "pr22-link-*"
+    // and the sidebar's work-item-row button's accessible name includes the
+    // full seeded subject (containing that dataset id), so a substring
+    // match against "Link" resolves to two elements (the real Link button
+    // and this row) and throws a strict-mode violation - confirmed live.
+    await page.getByRole("button", { name: "Link", exact: true }).click();
     const linkRes = await linkResponse;
     expect(linkRes.status()).toBeLessThan(300);
 
@@ -205,17 +224,18 @@ test("close command: succeeds against the real command boundary, then and only t
   const dataset = uniqueDataset("pr22-close");
   seedDataset(dataset);
   try {
-    const token = await loginToken(page);
+    const token = await login(page);
     const workItemId = await findWorkItemId(page, token, dataset);
     const before = await scopedOpenCount(page, token, dataset);
 
-    await login(page);
     await page.goto(`/app/inbox?id=${workItemId}`);
 
     const closeResponse = page.waitForResponse(
       (r) => r.url().includes(`/api/v1/work-items/${workItemId}/close`) && r.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "Close" }).click();
+    // exact: true - same substring-collision risk as the Link button above:
+    // this test's own dataset is named "pr22-close-*".
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     const response = await closeResponse;
 
     // The command must be verified successful before its side effect
