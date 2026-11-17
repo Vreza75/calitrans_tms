@@ -100,9 +100,12 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
   seedDataset(dataset);
   const datasetMarker = marker(dataset);
 
+  let workItemId: number | undefined;
+  let contextA: import("@playwright/test").BrowserContext | undefined;
+  let contextB: import("@playwright/test").BrowserContext | undefined;
   try {
-    const contextA = await browser.newContext();
-    const contextB = await browser.newContext();
+    contextA = await browser.newContext();
+    contextB = await browser.newContext();
     const pageA = await contextA.newPage();
     const pageB = await contextB.newPage();
 
@@ -120,7 +123,7 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     // (as before) proves the marker is somewhere on the page, not that
     // this window's own list is scoped to this run's single item the same
     // way pageA's is.
-    const workItemId = await findMarkerWorkItemId(pageA, datasetMarker);
+    workItemId = await findMarkerWorkItemId(pageA, datasetMarker);
     await expect(pageA.getByText(datasetMarker).first()).toBeVisible();
 
     const workItemIdFromB = await findMarkerWorkItemId(pageB, datasetMarker);
@@ -173,10 +176,30 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     // lists - purely via the realtime invalidation path.
     await expect(pageA.getByText(datasetMarker)).toHaveCount(0, { timeout: 15_000 });
     await expect(pageB.getByText(datasetMarker)).toHaveCount(0, { timeout: 15_000 });
-
-    await contextA.close();
-    await contextB.close();
   } finally {
+    // Both context.close() calls moved here (from the end of the try
+    // block) so a failed assertion above still closes the browser
+    // contexts instead of leaking them.
+    await contextA?.close();
+    await contextB?.close();
+
+    // close_work_item() publishes a domain_events row that
+    // scripts/sample_data.py's cleanup() cannot find - see
+    // cleanupCommandDomainEvents's doc comment in qa-sample-data.ts.
+    // Previously this finally block only called cleanupDataset(), which
+    // never touched this test's own command-generated event, leaving it
+    // behind on every run (confirmed by the same pattern already fixed
+    // in inbox-acceptance-live.spec.ts/-round3.spec.ts - this was the
+    // one remaining call site). Scoped by this exact workItemId, which
+    // this run already proved it owns via the marker search above -
+    // never a broad event_type/status/timestamp predicate. Runs
+    // unconditionally in `finally`, so a failed browser assertion above
+    // still cleans up the event before the synthetic dataset is removed.
+    if (workItemId !== undefined) {
+      cleanupCommandDomainEvents("order_intake_item", String(workItemId));
+      expect(findCommandDomainEventIds("order_intake_item", String(workItemId))).toEqual([]);
+    }
+
     cleanupDataset(dataset);
   }
 });
