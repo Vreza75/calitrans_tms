@@ -1,6 +1,6 @@
-import { expect, test } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 
+import { expect, gotoAuthenticated, test } from "./fixtures/auth";
 import {
   cleanupDataset,
   deleteDomainEvent,
@@ -48,18 +48,13 @@ import {
 // event (another parallel test's, or leftover) could otherwise satisfy
 // without this test's own event having published at all.
 
-const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
-
-async function loginAndOpenInbox(page: import("@playwright/test").Page) {
-  await page.goto("/login");
-  await page.getByLabel("Email").fill(DISPATCHER.email);
-  await page.getByLabel("Password").fill(DISPATCHER.password);
-  const loginResponse = page.waitForResponse(
-    (r) => r.url().includes("/api/v1/auth/login") && r.request().method() === "POST",
-  );
-  await page.getByRole("button", { name: "Sign In" }).click();
-  await loginResponse;
-  await page.goto("/app/inbox");
+// Both browser windows below authenticate as the same dispatcher, reusing
+// the one worker-scoped token (see web/e2e/fixtures/auth.ts) instead of
+// two independent real UI logins - BrowserContexts never share
+// sessionStorage with each other, but both can be seeded with the same
+// already-issued token.
+async function loginAndOpenInbox(page: import("@playwright/test").Page, token: string) {
+  await gotoAuthenticated(page, token, "/app/inbox");
 }
 
 async function findMarkerWorkItemId(page: import("@playwright/test").Page, datasetMarker: string): Promise<number> {
@@ -98,7 +93,7 @@ function runRealtimePublisher(): string {
   ).toString();
 }
 
-test("worker-to-UI and cross-window realtime: both windows update without a manual refresh", async ({ browser }) => {
+test("worker-to-UI and cross-window realtime: both windows update without a manual refresh", async ({ browser, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-realtime");
   seedDataset(dataset);
   const datasetMarker = marker(dataset);
@@ -109,8 +104,8 @@ test("worker-to-UI and cross-window realtime: both windows update without a manu
     const pageA = await contextA.newPage();
     const pageB = await contextB.newPage();
 
-    await loginAndOpenInbox(pageA);
-    await loginAndOpenInbox(pageB);
+    await loginAndOpenInbox(pageA, dispatcherSession.token);
+    await loginAndOpenInbox(pageB, dispatcherSession.token);
 
     // Real websocket to the real local Supabase stack, not the default/
     // disconnected indicator state.

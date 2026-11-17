@@ -1,5 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { expect } from "@playwright/test";
 
@@ -92,6 +95,141 @@ export function setRequestType(dataset: string, requestType: string): void {
     cwd: REPO_ROOT,
     env: QA_ENV,
   });
+}
+
+// Seeds one real, run-scoped attachment onto seedDataset()'s own order_intake
+// row - the physical file is written to a fresh OS temp directory (never
+// storage/ or backups/ - see CLAUDE.md's "never commit" list, though these
+// are never committed either way, just local runtime files) and its path is
+// merged into that row's own parsed_data._operations_attachments (the exact
+// key services/operations_attachment_core.py's extract_operations_attachments
+// reads - see that module; there is no separate attachments table). Scoped
+// by the same exact-subject-equality UPDATE pattern as setRequestType()
+// above - one row, never a broad match - so it can never touch another
+// dataset's data. Returns the real file_path written, so the caller can
+// clean it up (cleanupAttachmentFixture) independently of the DB row
+// (cleanupDataset/cleanupDatasets only ever deletes rows, never files).
+export function seedAttachmentFixture(
+  dataset: string,
+  attachment: { filename: string; contentType: string; body: string },
+): string {
+  const dir = mkdtempSync(join(tmpdir(), "calitrans-qa-attach-"));
+  const filePath = join(dir, attachment.filename).replace(/\\/g, "/");
+  writeFileSync(filePath, attachment.body, "utf-8");
+
+  const subject = `${marker(dataset)} New inbound order`;
+  const attachmentJson = JSON.stringify([
+    { filename: attachment.filename, file_path: filePath, content_type: attachment.contentType, is_pdf: false },
+  ]);
+  const snippet = [
+    "import json, sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('select parsed_data from order_intake where source_subject = %s', (sys.argv[2],))",
+    "row = cur.fetchone()",
+    "assert row is not None, f'no order_intake row for subject {sys.argv[2]!r}'",
+    "parsed = row[0] if isinstance(row[0], dict) else (json.loads(row[0]) if row[0] else {})",
+    "parsed['_operations_attachments'] = json.loads(sys.argv[3])",
+    "cur.execute('update order_intake set parsed_data = %s::jsonb where source_subject = %s', (json.dumps(parsed), sys.argv[2]))",
+    "assert cur.rowcount == 1, f'expected exactly 1 row, updated {cur.rowcount}'",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, subject, attachmentJson], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+
+  return filePath;
+}
+
+export function cleanupAttachmentFixture(filePath: string): void {
+  try {
+    rmSync(filePath.replace(/\/[^/]+$/, ""), { recursive: true, force: true });
+  } catch (error) {
+    // Best-effort, same contract as cleanupDatasets(): a cleanup failure
+    // must never mask the test's own pass/fail result.
+    console.error(`qa-sample-data: attachment fixture cleanup failed for ${filePath}:`, error);
+  }
+}
+
+// Confirmed gap: scripts/sample_data.py's cleanup() only deletes rows it
+// itself seeded (matched by the SYNTHETIC-CALITRANS-QA::<dataset> prefix
+// on freetext columns it wrote - see that script's cleanup()). A load
+// created through the REAL application command (create_load_from_work_item
+// -> services/order_intake.py's create_load_from_intake_with_status ->
+// db_client.py's add_row()) never gets a load_id/booking_number containing
+// that prefix: add_row()'s SM_TO_DB_COLUMNS mapping has no "load_id"
+// entry at all (that text column is left null), and booking_number comes
+// from the work item's own pre-seeded booking field ("QA-<dataset>-...",
+// a different, unprefixed naming scheme) - so cleanup()'s LIKE match on
+// loads.load_id can never find it. Confirmed live: creating a load via
+// round3's create_load test and then calling cleanupDataset() left that
+// load row behind. These two functions track and remove exactly that
+// category of row - one the application itself created mid-test, that
+// scripts/sample_data.py's dataset-scoped cleanup was never going to see.
+export function loadBookingNumber(loadId: number): string | null {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('select booking_number from loads where id = %s', (sys.argv[2],))",
+    "row = cur.fetchone()",
+    "print(row[0] if row and row[0] is not None else '')",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(loadId)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  return output === "" ? null : output;
+}
+
+// Deletes exactly one application-created loads row by its numeric id -
+// but only after confirming, by direct read, that its own booking_number
+// contains this run's unique dataset text. That check is what makes this
+// safe to call with an id the test itself just received back from a real
+// create-load response: it can never delete an unrelated real row, even
+// given a wrong/stale id, because the content check would simply fail to
+// match first. Every FK referencing loads.id is "on delete cascade" or
+// "on delete set null" (see database/*.sql) - a single delete here is
+// enough, no separate child-row cleanup needed.
+export function cleanupCreatedLoad(loadId: number, dataset: string): void {
+  const booking = loadBookingNumber(loadId);
+  if (booking === null) {
+    return; // already gone - nothing to do, matches cleanupDatasets()'s best-effort contract
+  }
+  if (!booking.toUpperCase().includes(dataset.toUpperCase())) {
+    throw new Error(
+      `cleanupCreatedLoad refused to delete load id=${loadId}: its booking_number ` +
+        `(${JSON.stringify(booking)}) does not contain this run's own dataset id ` +
+        `(${JSON.stringify(dataset)}) - deleting it would risk an unrelated record.`,
+    );
+  }
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('delete from loads where id = %s', (sys.argv[2],))",
+    "conn.commit()",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, String(loadId)], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  });
+}
+
+export function loadExists(loadId: number): boolean {
+  return loadBookingNumber(loadId) !== null;
 }
 
 // Read-only lookups against domain_events for tests that need to correlate

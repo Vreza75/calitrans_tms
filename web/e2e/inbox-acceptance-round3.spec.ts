@@ -1,5 +1,3 @@
-import { expect, test } from "@playwright/test";
-
 // REAL backend, REAL disposable QA Postgres. Each test seeds its OWN
 // run-scoped dataset through web/e2e/fixtures/qa-sample-data.ts - a fresh,
 // globally-unique dataset id every run, every worker, every retry - and
@@ -13,45 +11,24 @@ import { expect, test } from "@playwright/test";
 // another test's rows, and a count aggregation is always scoped to this
 // test's own marker via the `search` filter so concurrent tests never shift
 // each other's before/after numbers.
+//
+// Authentication: see web/e2e/fixtures/auth.ts's own comment - the
+// worker-scoped `dispatcherSession` fixture replaces this file's old
+// per-test login()/loginToken() pair (every dual-need test used to make
+// two real /api/v1/auth/login calls against one shared account, which
+// tripped api/rate_limit.py's real limiter once the live suite ran
+// concurrently).
 
-import { cleanupDataset, marker, seedDataset, setRequestType, uniqueDataset } from "./fixtures/qa-sample-data";
-
-const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
-const API_BASE = "http://localhost:8000";
-
-// Returns the real session token this login issued, so a test that also
-// needs a bearer token for direct page.request calls (findWorkItemId,
-// findLoadIdByBooking, scopedOpenCount) can reuse this one call instead of
-// making a second, independent /api/v1/auth/login request. api/rate_limit.py
-// enforces a real per-client+email sliding-window limit (5 attempts/60s) -
-// a production protection this session must never weaken (see CLAUDE.md).
-// Every test here that used both login() and loginToken() made two real
-// login calls for the same DISPATCHER account; under Playwright's
-// fullyParallel execution that pushed this file's combined attempt count
-// past 5 within the window and tripped real 429s (confirmed live). Reusing
-// this response's token - instead of loosening _MAX_ATTEMPTS/_WINDOW_SECONDS -
-// is the fix.
-async function login(page: import("@playwright/test").Page): Promise<string> {
-  await page.goto("/login");
-  await page.getByLabel("Email").fill(DISPATCHER.email);
-  await page.getByLabel("Password").fill(DISPATCHER.password);
-  const loginResponse = page.waitForResponse(
-    (r) => r.url().includes("/api/v1/auth/login") && r.request().method() === "POST",
-  );
-  await page.getByRole("button", { name: "Sign In" }).click();
-  const response = await loginResponse;
-  if (response.status() >= 300) throw new Error(`Real login failed: HTTP ${response.status()}`);
-  const body = await response.json();
-  return body.token as string;
-}
-
-async function loginToken(page: import("@playwright/test").Page): Promise<string> {
-  const res = await page.request.post(`${API_BASE}/api/v1/auth/login`, {
-    data: { email: DISPATCHER.email, password: DISPATCHER.password },
-  });
-  const json = await res.json();
-  return json.token as string;
-}
+import { API_BASE, expect, gotoAuthenticated, test } from "./fixtures/auth";
+import {
+  cleanupCreatedLoad,
+  cleanupDataset,
+  loadExists,
+  marker,
+  seedDataset,
+  setRequestType,
+  uniqueDataset,
+} from "./fixtures/qa-sample-data";
 
 async function findWorkItemId(page: import("@playwright/test").Page, token: string, dataset: string): Promise<number> {
   const res = await page.request.get(`${API_BASE}/api/v1/work-items?search=${encodeURIComponent(marker(dataset))}`, {
@@ -88,17 +65,17 @@ async function scopedOpenCount(
   return (body.counts as { queue: string; count: number }[]).reduce((sum, c) => sum + c.count, 0);
 }
 
-test("search/filter: server-side search isolates this run's own item from everything else", async ({ page }) => {
+test("search/filter: server-side search isolates this run's own item from everything else", async ({ page, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-search");
   seedDataset(dataset);
   try {
-    await login(page);
-    await page.goto("/app/inbox");
+    await gotoAuthenticated(page, dispatcherSession.token, "/app/inbox");
     await page.getByPlaceholder("Search subject, sender, booking, container, reference...").fill(marker(dataset));
 
     const listResponse = page.waitForResponse((r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="));
-    // exact: true - same substring-collision risk as the Link/Close buttons
-    // above: this test's own dataset is named "pr22-search-*".
+    // exact: true - this test's own dataset is named "pr22-search-*", which
+    // substring-matches the "Search" button's own accessible name via the
+    // sidebar work-item-row button (confirmed live: strict-mode violation).
     await page.getByRole("button", { name: "Search", exact: true }).click();
     const res = await listResponse;
     const body = await res.json();
@@ -111,11 +88,12 @@ test("search/filter: server-side search isolates this run's own item from everyt
 
 test("queue counts: a real status transition changes the real aggregate, scoped to this run's own item", async ({
   page,
+  dispatcherSession,
 }) => {
   const dataset = uniqueDataset("pr22-counts");
   seedDataset(dataset);
   try {
-    const token = await loginToken(page);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
 
     const before = await scopedOpenCount(page, token, dataset);
@@ -134,15 +112,16 @@ test("queue counts: a real status transition changes the real aggregate, scoped 
   }
 });
 
-test("create_load: real create-load command against a 'New Booking' classified item", async ({ page }) => {
+test("create_load: real create-load command against a 'New Booking' classified item", async ({ page, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-create");
   seedDataset(dataset);
   setRequestType(dataset, "New Booking");
+  let loadId: number | undefined;
   try {
-    const token = await login(page);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await page.goto(`/app/inbox?id=${workItemId}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
     await expect(page.getByRole("button", { name: "Create Load" })).toBeEnabled();
 
     const createResponse = page.waitForResponse(
@@ -154,23 +133,58 @@ test("create_load: real create-load command against a 'New Booking' classified i
     const body = await response.json();
     expect(body.ok).toBe(true);
     expect(body.load_id).toBeTruthy();
+    loadId = body.load_id as number;
+
+    // Independent persistence verification - the response body alone
+    // (status + echoed load_id) does not prove anything landed in the
+    // database. Two separate real reads, neither trusting the create
+    // response's own claims:
+    //   1. The load itself exists, fetched fresh by id.
+    //   2. The SOURCE work item's own matched_load_id (persisted by
+    //      services/operations_inbox_service.py's review_status_sql in
+    //      the same transaction as the load insert) points back at
+    //      exactly this load - proving the link, not just the load row,
+    //      was actually committed.
+    const loadRes = await page.request.get(`${API_BASE}/api/v1/loads/${loadId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(loadRes.status()).toBe(200);
+    const loadBody = await loadRes.json();
+    expect(loadBody.id).toBe(loadId);
+
+    const workItemRes = await page.request.get(`${API_BASE}/api/v1/work-items/${workItemId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const workItemBody = await workItemRes.json();
+    expect(workItemBody.matched_load_id).toBe(loadId);
   } finally {
+    // Cleanup verification, before and after: scripts/sample_data.py's
+    // dataset-scoped cleanup() never finds this row (see
+    // cleanupCreatedLoad's own comment in qa-sample-data.ts for why) - it
+    // is a real row the application itself created mid-test, tracked and
+    // removed explicitly here instead of being silently left behind.
+    if (loadId !== undefined) {
+      expect(loadExists(loadId), "sanity: the created load must still exist right before its own cleanup").toBe(true);
+      cleanupCreatedLoad(loadId, dataset);
+      expect(loadExists(loadId), "the application-created load must be gone after cleanup, not merely the seeded dataset rows").toBe(false);
+    }
     cleanupDataset(dataset);
   }
 });
 
 test("link_to_load then update_existing_load: real two-step command sequence, verified by the persisted load row", async ({
   page,
+  dispatcherSession,
 }) => {
   const dataset = uniqueDataset("pr22-link");
   seedDataset(dataset);
   try {
-    const token = await login(page);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
     const newLoadBooking = `QA-${dataset.toUpperCase()}-NEW`;
     const loadId = await findLoadIdByBooking(page, token, newLoadBooking);
 
-    await page.goto(`/app/inbox?id=${workItemId}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
 
     await page.getByPlaceholder(/load id/i).first().fill(String(loadId));
     const linkResponse = page.waitForResponse(
@@ -214,21 +228,26 @@ test("link_to_load then update_existing_load: real two-step command sequence, ve
     const loadBody = await loadRes.json();
     expect(loadBody.booking_number).toBe(`QA-${dataset.toUpperCase()}-INBOX`);
   } finally {
+    // loadId here is one of seed()'s own 4 pre-seeded loads (load_id text
+    // column already prefixed with this dataset's marker - see
+    // scripts/sample_data.py's seed()), so cleanupDataset() alone already
+    // covers it; no cleanupCreatedLoad() needed in this test.
     cleanupDataset(dataset);
   }
 });
 
 test("close command: succeeds against the real command boundary, then and only then does the queue count reflect it", async ({
   page,
+  dispatcherSession,
 }) => {
   const dataset = uniqueDataset("pr22-close");
   seedDataset(dataset);
   try {
-    const token = await login(page);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
     const before = await scopedOpenCount(page, token, dataset);
 
-    await page.goto(`/app/inbox?id=${workItemId}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
 
     const closeResponse = page.waitForResponse(
       (r) => r.url().includes(`/api/v1/work-items/${workItemId}/close`) && r.request().method() === "POST",

@@ -1,5 +1,3 @@
-import { expect, test } from "@playwright/test";
-
 // REAL backend, REAL disposable QA Postgres. Each test seeds its OWN
 // run-scoped dataset(s) through web/e2e/fixtures/qa-sample-data.ts (a
 // fresh, globally-unique dataset id every run/worker/retry) and discovers
@@ -10,51 +8,18 @@ import { expect, test } from "@playwright/test";
 // under Playwright's fullyParallel execution (web/playwright.config.ts)
 // and under repeated runs, since no test shares or mutates another test's
 // rows.
+//
+// Authentication: see web/e2e/fixtures/auth.ts's own comment for the full
+// rationale - every test here used to make its own independent real
+// /api/v1/auth/login call(s) against one shared account, which tripped
+// api/rate_limit.py's real limiter once the whole live suite ran
+// concurrently. `dispatcherSession` is a worker-scoped fixture (one real
+// login per worker process, from a pool of independent accounts);
+// `gotoAuthenticated` reuses its token for every test in that worker
+// instead of logging in again.
 
+import { ACCOUNTING, API_BASE, expect, gotoAuthenticated, test } from "./fixtures/auth";
 import { cleanupDatasets, marker, seedDataset, uniqueDataset } from "./fixtures/qa-sample-data";
-
-const DISPATCHER = { email: "dispatcher.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
-const ACCOUNTING = { email: "accounting.synthetic-qa@calitrans.invalid", password: "Qa-Test-Pass-123!" };
-const API_BASE = "http://localhost:8000";
-
-// Returns the real session token issued by this login, so callers that
-// also need a bearer token for direct page.request calls (e.g.
-// findWorkItemId) can reuse this one call instead of making a second,
-// independent /api/v1/auth/login request. api/rate_limit.py enforces a
-// real per-client+email sliding-window limit (5 attempts/60s) - exactly
-// the kind of production protection this session must never weaken (see
-// CLAUDE.md). Every test in this file previously made two real login
-// calls for the same DISPATCHER account (one via dispatcherToken(), one
-// here), and Playwright's fullyParallel execution runs every test in
-// this file at once - confirmed live: a real run of this file hit real
-// 429s from the real limiter once there were enough tests to push the
-// combined attempt count past 5 within the window. Halving the call
-// count by reusing this response's token is the fix; loosening
-// _MAX_ATTEMPTS/_WINDOW_SECONDS was not an option.
-async function login(page: import("@playwright/test").Page, creds: typeof DISPATCHER): Promise<string> {
-  await page.goto("/login");
-  await page.getByLabel("Email").fill(creds.email);
-  await page.getByLabel("Password").fill(creds.password);
-
-  const loginResponse = page.waitForResponse(
-    (r) => r.url().includes("/api/v1/auth/login") && r.request().method() === "POST",
-  );
-  await page.getByRole("button", { name: "Sign In" }).click();
-  const response = await loginResponse;
-  if (response.status() >= 300) {
-    throw new Error(`Real login failed for ${creds.email}: HTTP ${response.status()}`);
-  }
-  const body = await response.json();
-  return body.token as string;
-}
-
-async function dispatcherToken(page: import("@playwright/test").Page): Promise<string> {
-  const res = await page.request.post(`${API_BASE}/api/v1/auth/login`, {
-    data: { email: DISPATCHER.email, password: DISPATCHER.password },
-  });
-  const json = await res.json();
-  return json.token as string;
-}
 
 async function findWorkItemId(page: import("@playwright/test").Page, token: string, dataset: string): Promise<number> {
   const res = await page.request.get(`${API_BASE}/api/v1/work-items?search=${encodeURIComponent(marker(dataset))}`, {
@@ -65,7 +30,7 @@ async function findWorkItemId(page: import("@playwright/test").Page, token: stri
   return body.items[0].id as number;
 }
 
-test("item 1/3: real login, real queue counts, real work-item list and selection", async ({ page }) => {
+test("item 1/3: real login, real queue counts, real work-item list and selection", async ({ page, dispatcherSession }) => {
   // Both datasets share one run-scoped namespace (rather than two fully
   // independent uniqueDataset() calls) specifically so this test can
   // filter the list down to exactly its own two seeded rows. Asserting
@@ -80,10 +45,10 @@ test("item 1/3: real login, real queue counts, real work-item list and selection
   seedDataset(datasetA);
   seedDataset(datasetB);
   try {
-    const token = await login(page, DISPATCHER);
+    const token = dispatcherSession.token;
     const idA = await findWorkItemId(page, token, datasetA);
 
-    await page.goto("/app/inbox");
+    await gotoAuthenticated(page, token, "/app/inbox");
     await expect(page.getByRole("heading", { name: "Operations Inbox" })).toBeVisible();
 
     // Filter by this run's own unique namespace - a substring of both
@@ -95,7 +60,7 @@ test("item 1/3: real login, real queue counts, real work-item list and selection
     const listResponse = page.waitForResponse(
       (r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="),
     );
-    await page.getByRole("button", { name: "Search" }).click();
+    await page.getByRole("button", { name: "Search", exact: true }).click();
     const res = await listResponse;
     const body = await res.json();
     expect(body.items.length).toBe(2); // exactly this run's two seeded rows, scoped by namespace - nothing else can match
@@ -110,13 +75,13 @@ test("item 1/3: real login, real queue counts, real work-item list and selection
   }
 });
 
-test("item 4: conversation isolation - two synthetic conversations never cross-contaminate", async ({ page }) => {
+test("item 4: conversation isolation - two synthetic conversations never cross-contaminate", async ({ page, dispatcherSession }) => {
   const datasetA = uniqueDataset("pr22-live4a");
   const datasetB = uniqueDataset("pr22-live4b");
   seedDataset(datasetA);
   seedDataset(datasetB);
   try {
-    const token = await login(page, DISPATCHER);
+    const token = dispatcherSession.token;
     const idA = await findWorkItemId(page, token, datasetA);
     const idB = await findWorkItemId(page, token, datasetB);
 
@@ -124,7 +89,7 @@ test("item 4: conversation isolation - two synthetic conversations never cross-c
     // legitimately shows both seeded conversations at all times (expected
     // master-detail UI, not cross-contamination); isolation means the
     // DETAIL pane for one conversation never shows the other's sender/body.
-    await page.goto(`/app/inbox?id=${idA}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${idA}`);
     await expect(page.getByRole("heading", { name: `${marker(datasetA)} New inbound order` })).toBeVisible();
     await expect(page.locator(".inbox-detail-header__sender")).not.toContainText(`${datasetB}-sender`);
 
@@ -136,14 +101,14 @@ test("item 4: conversation isolation - two synthetic conversations never cross-c
   }
 });
 
-test("item 5: extracted fields match the real seeded source record", async ({ page }) => {
+test("item 5: extracted fields match the real seeded source record", async ({ page, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-live5");
   seedDataset(dataset);
   try {
-    const token = await login(page, DISPATCHER);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await page.goto(`/app/inbox?id=${workItemId}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
 
     const fields = page.getByRole("region", { name: "Extracted fields" });
     await expect(fields.getByText(`${marker(dataset)} Fictional Shipper`)).toBeVisible();
@@ -153,20 +118,20 @@ test("item 5: extracted fields match the real seeded source record", async ({ pa
   }
 });
 
-test("item 7: Close against the real application command boundary", async ({ page }) => {
+test("item 7: Close against the real application command boundary", async ({ page, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-live7");
   seedDataset(dataset);
   try {
-    const token = await login(page, DISPATCHER);
+    const token = dispatcherSession.token;
     const workItemId = await findWorkItemId(page, token, dataset);
 
-    await page.goto(`/app/inbox?id=${workItemId}`);
+    await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
     await expect(page.getByRole("heading", { name: `${marker(dataset)} New inbound order` })).toBeVisible();
 
     const closeResponse = page.waitForResponse(
       (r) => r.url().includes(`/api/v1/work-items/${workItemId}/close`) && r.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
     const response = await closeResponse;
     expect(response.status()).toBeLessThan(300);
 
@@ -191,7 +156,7 @@ test("item 7: Close against the real application command boundary", async ({ pag
     const searchResponse = page.waitForResponse(
       (r) => r.url().includes("/api/v1/work-items?") && r.url().includes("search="),
     );
-    await page.getByRole("button", { name: "Search" }).click();
+    await page.getByRole("button", { name: "Search", exact: true }).click();
     const searchRes = await searchResponse;
     const searchBody = await searchRes.json();
     expect(searchBody.items.length).toBe(0);
@@ -202,6 +167,7 @@ test("item 7: Close against the real application command boundary", async ({ pag
 
 test("item 10: accounting role is blocked at the real backend (list/detail 403, not merely a disabled button)", async ({
   page,
+  dispatcherSession,
 }) => {
   // CORRECTION made after running this against the real backend: the
   // existing mocked e2e test (web/e2e/inbox.spec.ts) assumes accounting
@@ -216,15 +182,17 @@ test("item 10: accounting role is blocked at the real backend (list/detail 403, 
   const dataset = uniqueDataset("pr22-live10");
   seedDataset(dataset);
   try {
-    const dispatcherTokenValue = await dispatcherToken(page);
-    const workItemId = await findWorkItemId(page, dispatcherTokenValue, dataset);
+    const workItemId = await findWorkItemId(page, dispatcherSession.token, dataset);
 
-    const token = await page.request
-      .post(`${API_BASE}/api/v1/auth/login`, {
-        data: { email: ACCOUNTING.email, password: ACCOUNTING.password },
-      })
-      .then((r) => r.json())
-      .then((j) => j.token as string);
+    // ACCOUNTING is a single dedicated account, not pooled: this is the
+    // only test in the whole live suite that uses it, so it never
+    // contends with anything, and this is the only real login call this
+    // test makes for it (the UI check below reuses this same token via
+    // gotoAuthenticated instead of logging in a second time).
+    const accountingLoginRes = await page.request.post(`${API_BASE}/api/v1/auth/login`, {
+      data: { email: ACCOUNTING.email, password: ACCOUNTING.password },
+    });
+    const token = (await accountingLoginRes.json()).token as string;
 
     const listRes = await page.request.get(`${API_BASE}/api/v1/work-items`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -239,8 +207,7 @@ test("item 10: accounting role is blocked at the real backend (list/detail 403, 
     expect(detailRes.status()).toBe(403);
 
     // UI reflects the same real 403, not a silently empty/successful state.
-    await login(page, ACCOUNTING);
-    await page.goto("/app/inbox");
+    await gotoAuthenticated(page, token, "/app/inbox");
     await expect(page.getByText(/Unable to load the inbox/)).toBeVisible();
   } finally {
     cleanupDatasets([dataset]);
