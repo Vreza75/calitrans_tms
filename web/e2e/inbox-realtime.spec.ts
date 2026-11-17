@@ -2,9 +2,11 @@ import { execFileSync } from "node:child_process";
 
 import { expect, gotoAuthenticated, test } from "./fixtures/auth";
 import {
+  cleanupCommandDomainEvents,
   cleanupDataset,
   deleteDomainEvent,
   domainEventStatus,
+  findCommandDomainEventIds,
   insertDomainEvent,
   latestDomainEventId,
   marker,
@@ -279,5 +281,116 @@ test("domain event polling: fails fast if the event reaches the terminal failed 
     await expect(waitForDomainEventPublished(eventId, { timeoutMs: 10_000 })).rejects.toThrow(/terminal status 'failed'/);
   } finally {
     deleteDomainEvent(eventId);
+  }
+});
+
+// Regression coverage for cleanupCommandDomainEvents() itself (Codex P2:
+// command-generated domain_events were never found by
+// scripts/sample_data.py's dataset-scoped cleanup(), since a real
+// command's idempotency_key is a content/time-bucketed hash, never the
+// fixed "qa-sample:<dataset>:domain_events" key cleanup() matches on -
+// see that function's own doc comment in qa-sample-data.ts). Each test
+// below inserts two synthetic rows with DIFFERENT aggregate_ids - one
+// this run "owns" (the id cleanupCommandDomainEvents() is scoped to),
+// one deliberately unrelated - and proves cleanup deletes only the owned
+// row, regardless of which of the three real lifecycle states
+// (pending/processing, published, failed) it's currently in. No browser,
+// login, or real command needed: the thing under test is the cleanup
+// predicate itself, exercised directly against the real disposable QA
+// Postgres the same way the polling tests above do.
+
+test("command-event cleanup: deletes only the owned pending event, leaves an unrelated pending event untouched", async () => {
+  const ownedAggregateId = uniqueDataset("pr23-cleanup-owned-pending");
+  const unrelatedAggregateId = uniqueDataset("pr23-cleanup-unrelated-pending");
+  const ownedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", ownedAggregateId, "pending");
+  const unrelatedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", unrelatedAggregateId, "pending");
+  try {
+    expect(findCommandDomainEventIds("order_intake_item", ownedAggregateId)).toEqual([ownedEventId]);
+
+    cleanupCommandDomainEvents("order_intake_item", ownedAggregateId);
+
+    expect(findCommandDomainEventIds("order_intake_item", ownedAggregateId)).toEqual([]);
+    // The unrelated row must survive untouched - same status, same id,
+    // still readable.
+    expect(domainEventStatus(unrelatedEventId).status).toBe("pending");
+  } finally {
+    deleteDomainEvent(unrelatedEventId);
+    // Best-effort: already deleted by the cleanup call above if it
+    // worked correctly, but this must not throw (or mask a real
+    // assertion failure above) if that call somehow left it behind.
+    try {
+      deleteDomainEvent(ownedEventId);
+    } catch {
+      // already gone - expected on the success path
+    }
+  }
+});
+
+test("command-event cleanup: deletes only the owned published event, leaves an unrelated published event untouched", async () => {
+  const ownedAggregateId = uniqueDataset("pr23-cleanup-owned-published");
+  const unrelatedAggregateId = uniqueDataset("pr23-cleanup-unrelated-published");
+  const ownedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", ownedAggregateId, "pending");
+  const unrelatedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", unrelatedAggregateId, "pending");
+  updateDomainEventStatus(ownedEventId, "published");
+  updateDomainEventStatus(unrelatedEventId, "published");
+  try {
+    cleanupCommandDomainEvents("order_intake_item", ownedAggregateId);
+
+    expect(findCommandDomainEventIds("order_intake_item", ownedAggregateId)).toEqual([]);
+    expect(domainEventStatus(unrelatedEventId).status).toBe("published");
+  } finally {
+    deleteDomainEvent(unrelatedEventId);
+    try {
+      deleteDomainEvent(ownedEventId);
+    } catch {
+      // already gone - expected on the success path
+    }
+  }
+});
+
+test("command-event cleanup: deletes only the owned failed event, leaves an unrelated failed event untouched", async () => {
+  const ownedAggregateId = uniqueDataset("pr23-cleanup-owned-failed");
+  const unrelatedAggregateId = uniqueDataset("pr23-cleanup-unrelated-failed");
+  const ownedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", ownedAggregateId, "pending");
+  const unrelatedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", unrelatedAggregateId, "pending");
+  updateDomainEventStatus(ownedEventId, "failed");
+  updateDomainEventStatus(unrelatedEventId, "failed");
+  try {
+    cleanupCommandDomainEvents("order_intake_item", ownedAggregateId);
+
+    expect(findCommandDomainEventIds("order_intake_item", ownedAggregateId)).toEqual([]);
+    expect(domainEventStatus(unrelatedEventId).status).toBe("failed");
+  } finally {
+    deleteDomainEvent(unrelatedEventId);
+    try {
+      deleteDomainEvent(ownedEventId);
+    } catch {
+      // already gone - expected on the success path
+    }
+  }
+});
+
+test("command-event cleanup: never touches an unrelated event even when both share the same event_type and status", async () => {
+  // The strongest version of "not a broad event_type/status predicate":
+  // both rows below are identical in every column except aggregate_id -
+  // same event_type, same status - so if cleanupCommandDomainEvents() ever
+  // regressed to matching on event_type/status instead of aggregate_id,
+  // this is the test that would catch it.
+  const ownedAggregateId = uniqueDataset("pr23-cleanup-owned-samekind");
+  const unrelatedAggregateId = uniqueDataset("pr23-cleanup-unrelated-samekind");
+  const ownedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", ownedAggregateId, "pending");
+  const unrelatedEventId = insertDomainEvent("inbox.review_status_changed", "order_intake_item", unrelatedAggregateId, "pending");
+  try {
+    cleanupCommandDomainEvents("order_intake_item", ownedAggregateId);
+
+    expect(findCommandDomainEventIds("order_intake_item", ownedAggregateId)).toEqual([]);
+    expect(findCommandDomainEventIds("order_intake_item", unrelatedAggregateId)).toEqual([unrelatedEventId]);
+  } finally {
+    deleteDomainEvent(unrelatedEventId);
+    try {
+      deleteDomainEvent(ownedEventId);
+    } catch {
+      // already gone - expected on the success path
+    }
   }
 });

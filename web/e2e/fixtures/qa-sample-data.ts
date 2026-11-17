@@ -267,6 +267,61 @@ export function latestDomainEventId(aggregateType: string, aggregateId: string, 
   return parseInt(output, 10);
 }
 
+// Confirmed gap (Codex P2): a command-generated domain_events row (e.g.
+// close_work_item()'s "inbox.review_status_changed" - see
+// application/work_items/commands.py) is never found by
+// scripts/sample_data.py's cleanup(), which only matches
+// idempotency_key = 'qa-sample:<dataset>:domain_events' - the exact,
+// fixed key seed() itself writes for its own one inert placeholder row.
+// A real command's idempotency_key is a content-and-time-bucketed sha256
+// hash (see realtime/events.py's time_bucketed_key()), which can never
+// equal that fixed string. These command-generated rows were being left
+// behind by every test that calls a command which publishes one.
+//
+// findCommandDomainEventIds()/cleanupCommandDomainEvents() scope by
+// aggregate_type + aggregate_id ONLY - deliberately never by event_type,
+// status, or any timestamp predicate (the exact things Codex's finding
+// says must not be used, since any of those could also match an
+// unrelated row). A work_item_id (the aggregate_id for every command
+// exercised by this live suite) is a real, never-reused Postgres primary
+// key that this run's own test already discovered by searching for its
+// own unique SYNTHETIC-CALITRANS-QA::<dataset> marker - so scoping by
+// that exact id can only ever match events this run's own commands
+// produced against this run's own row, regardless of which status
+// (pending/processing/published/failed) any of them are currently in.
+export function findCommandDomainEventIds(aggregateType: string, aggregateId: string): number[] {
+  const snippet = [
+    "import sys",
+    "import psycopg2",
+    "conn = psycopg2.connect(sys.argv[1])",
+    "cur = conn.cursor()",
+    "cur.execute('select id from domain_events where aggregate_type = %s and aggregate_id = %s', (sys.argv[2], sys.argv[3]))",
+    "print(','.join(str(row[0]) for row in cur.fetchall()))",
+    "cur.close()",
+    "conn.close()",
+  ].join("\n");
+  const output = execFileSync(PYTHON_EXE, ["-c", snippet, QA_PSYCOPG2_DSN, aggregateType, aggregateId], {
+    cwd: REPO_ROOT,
+    env: QA_ENV,
+  })
+    .toString()
+    .trim();
+  return output === "" ? [] : output.split(",").map((value) => parseInt(value, 10));
+}
+
+// Deletes every domain_events row owned by this exact aggregate (any
+// event_type, any status - see this section's doc comment above for why
+// that's still safe, not broad). Returns the ids actually deleted, so
+// callers can assert on the count/ids instead of just trusting this
+// function silently did the right thing.
+export function cleanupCommandDomainEvents(aggregateType: string, aggregateId: string): number[] {
+  const ids = findCommandDomainEventIds(aggregateType, aggregateId);
+  for (const id of ids) {
+    deleteDomainEvent(id);
+  }
+  return ids;
+}
+
 // A single raw snapshot of one specific domain_events id's persisted
 // state - authoritative for whatever instant it's read at, but NOT by
 // itself proof the row has reached its final state. Under Playwright's

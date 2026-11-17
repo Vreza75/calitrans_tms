@@ -19,7 +19,14 @@
 // instead of logging in again.
 
 import { ACCOUNTING, API_BASE, expect, gotoAuthenticated, test } from "./fixtures/auth";
-import { cleanupDatasets, marker, seedDataset, uniqueDataset } from "./fixtures/qa-sample-data";
+import {
+  cleanupCommandDomainEvents,
+  cleanupDatasets,
+  findCommandDomainEventIds,
+  marker,
+  seedDataset,
+  uniqueDataset,
+} from "./fixtures/qa-sample-data";
 
 async function findWorkItemId(page: import("@playwright/test").Page, token: string, dataset: string): Promise<number> {
   const res = await page.request.get(`${API_BASE}/api/v1/work-items?search=${encodeURIComponent(marker(dataset))}`, {
@@ -121,9 +128,10 @@ test("item 5: extracted fields match the real seeded source record", async ({ pa
 test("item 7: Close against the real application command boundary", async ({ page, dispatcherSession }) => {
   const dataset = uniqueDataset("pr22-live7");
   seedDataset(dataset);
+  let workItemId: number | undefined;
   try {
     const token = dispatcherSession.token;
-    const workItemId = await findWorkItemId(page, token, dataset);
+    workItemId = await findWorkItemId(page, token, dataset);
 
     await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
     await expect(page.getByRole("heading", { name: `${marker(dataset)} New inbound order` })).toBeVisible();
@@ -161,6 +169,23 @@ test("item 7: Close against the real application command boundary", async ({ pag
     const searchBody = await searchRes.json();
     expect(searchBody.items.length).toBe(0);
   } finally {
+    // close_work_item() publishes a domain_events row (event_type
+    // "inbox.review_status_changed" - see application/work_items/
+    // commands.py) that scripts/sample_data.py's cleanup() can never find
+    // (its idempotency_key is a content/time-bucketed hash, not the fixed
+    // "qa-sample:<dataset>:domain_events" key cleanup() matches on -
+    // confirmed live). Scoped by this exact work_item_id, which this run
+    // already proved is its own via the marker search above - never a
+    // broad event_type/status/timestamp predicate. Before/after proof: a
+    // real run-owned event must exist here (the close above just created
+    // it) before cleanup, and none after.
+    if (workItemId !== undefined) {
+      const beforeCleanup = findCommandDomainEventIds("order_intake_item", String(workItemId));
+      expect(beforeCleanup.length).toBeGreaterThan(0);
+      cleanupCommandDomainEvents("order_intake_item", String(workItemId));
+      expect(findCommandDomainEventIds("order_intake_item", String(workItemId))).toEqual([]);
+    }
+
     cleanupDatasets([dataset]);
   }
 });

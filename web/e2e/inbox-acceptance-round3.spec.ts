@@ -21,8 +21,10 @@
 
 import { API_BASE, expect, gotoAuthenticated, test } from "./fixtures/auth";
 import {
+  cleanupCommandDomainEvents,
   cleanupCreatedLoad,
   cleanupDataset,
+  findCommandDomainEventIds,
   loadExists,
   marker,
   seedDataset,
@@ -92,9 +94,10 @@ test("queue counts: a real status transition changes the real aggregate, scoped 
 }) => {
   const dataset = uniqueDataset("pr22-counts");
   seedDataset(dataset);
+  let workItemId: number | undefined;
   try {
     const token = dispatcherSession.token;
-    const workItemId = await findWorkItemId(page, token, dataset);
+    workItemId = await findWorkItemId(page, token, dataset);
 
     const before = await scopedOpenCount(page, token, dataset);
     expect(before).toBe(1); // this run's own item, open, nothing else matches its unique marker
@@ -108,6 +111,12 @@ test("queue counts: a real status transition changes the real aggregate, scoped 
     const after = await scopedOpenCount(page, token, dataset);
     expect(after).toBe(before - 1);
   } finally {
+    // close_work_item() publishes a domain_events row that
+    // scripts/sample_data.py's cleanup() cannot find - see
+    // cleanupCommandDomainEvents's doc comment in qa-sample-data.ts.
+    if (workItemId !== undefined) {
+      cleanupCommandDomainEvents("order_intake_item", String(workItemId));
+    }
     cleanupDataset(dataset);
   }
 });
@@ -242,9 +251,10 @@ test("close command: succeeds against the real command boundary, then and only t
 }) => {
   const dataset = uniqueDataset("pr22-close");
   seedDataset(dataset);
+  let workItemId: number | undefined;
   try {
     const token = dispatcherSession.token;
-    const workItemId = await findWorkItemId(page, token, dataset);
+    workItemId = await findWorkItemId(page, token, dataset);
     const before = await scopedOpenCount(page, token, dataset);
 
     await gotoAuthenticated(page, token, `/app/inbox?id=${workItemId}`);
@@ -264,7 +274,16 @@ test("close command: succeeds against the real command boundary, then and only t
 
     const after = await scopedOpenCount(page, token, dataset);
     expect(after).toBe(before - 1);
+
+    // Before/after proof, in-test rather than only in the finally block:
+    // the close above must have left a real, discoverable command event
+    // behind right now, scoped to exactly this work item.
+    expect(findCommandDomainEventIds("order_intake_item", String(workItemId)).length).toBeGreaterThan(0);
   } finally {
+    if (workItemId !== undefined) {
+      cleanupCommandDomainEvents("order_intake_item", String(workItemId));
+      expect(findCommandDomainEventIds("order_intake_item", String(workItemId))).toEqual([]);
+    }
     cleanupDataset(dataset);
   }
 });
