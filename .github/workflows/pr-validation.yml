@@ -80,6 +80,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate Next.js route types
+        # tsconfig.json's own `include` lists .next/types/**/*.ts (e.g.
+        # LayoutProps - see app/layout.tsx) - those are generated, not
+        # checked in. A clean checkout has no .next/ at all, so tsc fails
+        # on a genuinely missing ambient type without this step first.
+        # `next typegen` generates just the route types, not a full build.
+        run: npx next typegen
+
       - name: TypeScript
         run: npx tsc --noEmit
 
