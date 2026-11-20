@@ -98,6 +98,20 @@ test("a load's card appears in the column matching its current status", async ({
   await expect(page.getByRole("link", { name: "BKG-001" })).toBeVisible();
 });
 
+test("truncated results past the fetch limit show a visible warning instead of silently dropping loads", async ({ page }) => {
+  await mockBackend(page, DISPATCHER_ME, [loadItem()]);
+  await page.route("**/api/v1/loads/search**", (route) =>
+    route.fulfill({
+      json: { items: [loadItem()], page: 1, page_size: 200, total_items: 5, total_pages: 1, sort_by: "", sort_direction: "asc" },
+    }),
+  );
+  await loginAs(page, DISPATCHER_ME);
+
+  await page.goto("/app/dispatch");
+
+  await expect(page.getByText("Showing 1 of 5 matching loads.")).toBeVisible();
+});
+
 test("empty result set shows the no-match message instead of an empty board", async ({ page }) => {
   await mockBackend(page, DISPATCHER_ME, []);
   await loginAs(page, DISPATCHER_ME);

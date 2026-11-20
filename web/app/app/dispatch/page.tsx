@@ -92,6 +92,13 @@ export default function DispatchBoardPage() {
 
       {data && data.items.length === 0 && <p>No loads match this filter.</p>}
 
+      {data && data.total_items > data.items.length && (
+        <p role="alert" className="field-error">
+          Showing {data.items.length} of {data.total_items} matching loads. Narrow the filters above to see the rest -
+          the board never silently drops loads past this page.
+        </p>
+      )}
+
       {groups && data && data.items.length > 0 && (
         <div className="dispatch-board">
           {Array.from(groups.entries()).map(([stage, loads]) => (
