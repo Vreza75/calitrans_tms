@@ -5,9 +5,17 @@
 
 export type LoadSearchFilters = {
   status?: string;
+  service_flow?: string;
   customer?: string;
+  driver_name?: string;
+  port?: string;
+  warehouse?: string;
+  invoice_status?: string;
   search?: string;
+  delivery_after?: string;
+  delivery_before?: string;
   page?: number;
+  limit?: number;
 };
 
 export const loadKeys = {
@@ -47,4 +55,14 @@ export const inboxKeys = {
 
 export const meKeys = {
   current: ["me"] as const,
+};
+
+export const driverKeys = {
+  all: ["drivers"] as const,
+  active: () => [...driverKeys.all, "active"] as const,
+};
+
+export const stageKeys = {
+  all: ["load-stages"] as const,
+  forServiceFlow: (serviceFlow: string) => [...stageKeys.all, serviceFlow] as const,
 };
