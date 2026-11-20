@@ -278,6 +278,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/loads/stages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Operational Stages Endpoint
+         * @description Phase 10B: the Dispatch Board's column set for a given
+         *     service_flow - must be registered before GET /{load_id} so "/stages"
+         *     is never matched as a load_id path parameter.
+         */
+        get: operations["get_operational_stages_endpoint_api_v1_loads_stages_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/loads/{load_id}": {
         parameters: {
             query?: never;
@@ -411,6 +433,29 @@ export interface paths {
          *     services/dispatch_transition_service.py::apply_transition.
          */
         post: operations["assign_driver_endpoint_api_v1_loads__load_id__assign_driver_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/drivers/active": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Active Drivers Endpoint
+         * @description Active roster drivers for the Dispatch Board's assignment dropdown
+         *     (Phase 10B). Same readers as GET /loads/search (READ_LOADS) - seeing
+         *     which drivers are available is part of load visibility, not a
+         *     separate capability.
+         */
+        get: operations["list_active_drivers_endpoint_api_v1_drivers_active_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -679,6 +724,15 @@ export interface components {
              * @default
              */
             review_status: string;
+        };
+        /** DriverOut */
+        DriverOut: {
+            /** Driver Name */
+            driver_name: string;
+            /** Phone */
+            phone: string;
+            /** Truck Number */
+            truck_number: string;
         };
         /** FilterMetaOut */
         FilterMetaOut: {
@@ -1030,6 +1084,15 @@ export interface components {
             role: string;
             /** Permissions */
             permissions: string[];
+        };
+        /**
+         * OperationalStagesOut
+         * @description Phase 10B: the Dispatch Board's column set for a given
+         *     service_flow - see application/loads/queries.py::get_operational_stages.
+         */
+        OperationalStagesOut: {
+            /** Stages */
+            stages: string[];
         };
         /** OrderDraftOut */
         OrderDraftOut: {
@@ -1873,6 +1936,39 @@ export interface operations {
             };
         };
     };
+    get_operational_stages_endpoint_api_v1_loads_stages_get: {
+        parameters: {
+            query?: {
+                service_flow?: string | null;
+            };
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperationalStagesOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_load_endpoint_api_v1_loads__load_id__get: {
         parameters: {
             query?: never;
@@ -2107,6 +2203,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TransitionResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_active_drivers_endpoint_api_v1_drivers_active_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DriverOut"][];
                 };
             };
             /** @description Validation Error */
