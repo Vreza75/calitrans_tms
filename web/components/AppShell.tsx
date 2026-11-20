@@ -11,14 +11,15 @@ type NavItem = {
   enabled: boolean;
 };
 
-// Phase 10A: Operations Inbox is now functional. Dispatch/Overview remain
-// visible, explicitly-labeled placeholders, never a fake empty page that
-// implies completeness.
+// Phase 10A: Operations Inbox is now functional. Phase 10B: Dispatch
+// Board is now functional too. Overview remains a visible,
+// explicitly-labeled placeholder, never a fake empty page that implies
+// completeness.
 const NAV_ITEMS: NavItem[] = [
   { label: "Overview", href: "/app", enabled: false },
   { label: "Loads", href: "/app/loads", enabled: true },
   { label: "Inbox", href: "/app/inbox", enabled: true },
-  { label: "Dispatch", href: "/app/dispatch", enabled: false },
+  { label: "Dispatch", href: "/app/dispatch", enabled: true },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -58,7 +59,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="app-shell__main">
         <header className="app-shell__topbar">
           <span className="app-shell__environment-note">
-            Web client foundation - Streamlit remains the operational system of record
+            Web client - Loads, Inbox, and Dispatch are live here; remaining workflows are migrating off Streamlit
           </span>
           <div className="app-shell__user">
             {currentUser && (
