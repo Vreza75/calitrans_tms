@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Iterator
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from application.exceptions import ConflictError
@@ -146,7 +148,249 @@ def _clean_value(column: str, value: Any) -> Any:
     return text_value if text_value else None
 
 
-_ENGINE_CACHE: dict[str, Engine] = {}
+_ENGINE_CACHE: dict[tuple[str, str], Engine] = {}
+
+# Fail-closed guard for disposable QA, opt-in via CALITRANS_ALLOW_QA_DATA -
+# the same convention already used by scripts/sample_data.py and
+# web/e2e/fixtures/qa-sample-data.ts, which every disposable-QA caller
+# already sets. CTMS-010 and the DATABASE_URL resolution-order fix above
+# close the specific silent-switch failure mode, but resolution order
+# alone is a config-correctness property, not a connection-time
+# safeguard - this is the second, independent layer: whatever URL ends up
+# here, by whatever path, is rejected before a connection is attempted
+# unless it is the exact, positively acknowledged disposable target. When
+# CALITRANS_ALLOW_QA_DATA is unset (every normal production/dev run) this
+# function is a no-op - existing behavior for that case is unchanged.
+_QA_ALLOW_ENV_VAR = "CALITRANS_ALLOW_QA_DATA"
+_QA_ALLOW_VALUE = "YES_I_UNDERSTAND_QA_DATA_ONLY"
+_QA_IDENTITY_ENV_VAR = "CALITRANS_QA_DATABASE_IDENTITY"
+# Same tokens/rejections as scripts/sample_data.py's SAFE_NAME_TOKENS /
+# generic-name rejection - kept as a separate literal here (not imported)
+# because db_client.py is lower-level than scripts/ and must not import
+# from it (same reasoning tests/integration/operations_inbox/harness.py
+# already documents for its own copy of this convention).
+_QA_SAFE_NAME_TOKENS = {"dev", "development", "test", "testing", "qa", "sandbox", "scratch", "disposable"}
+_QA_REJECTED_DATABASE_NAMES = {"postgres", "production", "prod"}
+
+# P1-2: a database-name/identity match alone does not prove the target is
+# actually local - an operator (or a misconfigured env) could acknowledge
+# a *remote* identity that happens to carry a qa-shaped name. Loopback
+# literals only, no name resolution (no "localhost" - that requires a
+# resolution step this guard has no way to verify is unpoisoned, and no
+# suffix/substring match on any of these - exact string equality only).
+_QA_ALLOWED_LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
+
+# P1-1: libpq/psycopg2 accept several query parameters that change the
+# actual connection target independently of the URL's own host/port/
+# dbname - confirmed directly (see tests/test_database_url_safety.py):
+# PGDialect_psycopg2.create_connect_args() merges url.query over the
+# parsed authority, so `?host=`/`?hostaddr=`/`?port=`/`?dbname=` silently
+# win even when the authority section shows a safe loopback address.
+# `service=` is worse - it routes through a local pg_service.conf lookup
+# that cannot be validated from the URL at all. Default-deny: only
+# parameters with no ability to change the network/database target are
+# ever allowed through in QA mode.
+_QA_ALLOWED_QUERY_PARAMS = {"sslmode", "connect_timeout", "application_name", "client_encoding"}
+
+# P1-3: none of the checks above touch libpq itself - psycopg2/libpq fill
+# in ANY connection parameter not explicitly supplied from the matching
+# PG* environment variable, with explicit > env var > compiled default
+# precedence. host/port/dbname are always explicitly supplied by
+# create_connect_args() below, so PGHOST/PGPORT/PGDATABASE cannot override
+# them per libpq's own documented precedence - but hostaddr is never
+# explicitly supplied today, so PGHOSTADDR (libpq's "connect to this raw
+# IP, use `host` only for TLS name checking" override) would silently
+# fill that gap. PGSERVICE/PGSERVICEFILE/PGSYSCONFDIR route through a
+# pg_service.conf lookup this guard has no way to inspect from the URL at
+# all - confirmed the right posture is reject, not attempt to validate.
+# Checked at every get_engine() call (not cached), so a later change to
+# any of these is caught the next time an engine is requested; hostaddr
+# is additionally pinned explicitly (see get_engine()) so even the gap
+# between engine creation and SQLAlchemy's lazy first connect cannot be
+# used to reintroduce PGHOSTADDR's effect after this check has passed.
+_QA_UNSAFE_LIBPQ_ENV_VARS = (
+    "PGHOST",
+    "PGHOSTADDR",
+    "PGPORT",
+    "PGDATABASE",
+    "PGSERVICE",
+    "PGSERVICEFILE",
+    "PGSYSCONFDIR",
+)
+
+
+def database_identity(database_url: str) -> str:
+    """Sanitized host[:port]/database identity - never a username,
+    password, or the raw URL. Same shape as scripts/sample_data.py's
+    target_identity(). Safe to put in log lines or exception messages;
+    the raw database_url never is (requirement: never expose credentials
+    or print full database URLs)."""
+    url = make_url(database_url)
+    host = (url.host or "local").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{url.port}" if url.port else ""
+    database = (url.database or "").strip("/")
+    return f"{host}{port}/{database}"
+
+
+def _enforce_qa_database_safety(database_url: str) -> str | None:
+    """Returns the validated loopback host when the guard is active (so
+    get_engine() can pin it as `hostaddr` - see there), or None when
+    CALITRANS_ALLOW_QA_DATA is unset and this function is a no-op."""
+    if os.environ.get(_QA_ALLOW_ENV_VAR) != _QA_ALLOW_VALUE:
+        return None
+
+    # P1-3: reject outright rather than attempt to validate - PGSERVICE/
+    # PGSERVICEFILE/PGSYSCONFDIR cannot be inspected from the URL at all,
+    # and PGHOST/PGHOSTADDR/PGPORT/PGDATABASE being present at all means
+    # this process's environment is not the minimal, fully-explicit one
+    # disposable QA requires. Names only in the message - never values,
+    # which could themselves be or resemble credentials/hostnames worth
+    # not echoing back.
+    present_unsafe_vars = sorted(name for name in _QA_UNSAFE_LIBPQ_ENV_VARS if os.environ.get(name))
+    if present_unsafe_vars:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but libpq connection-routing environment variable(s) "
+            f"are also set ({', '.join(present_unsafe_vars)}) - these can override the "
+            "connection endpoint independently of the validated URL. Refusing to connect."
+        )
+
+    try:
+        url = make_url(database_url)
+    except Exception:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL could not be parsed. Refusing to connect."
+        ) from None
+
+    database = (url.database or "").lower()
+    host = (url.host or "").lower()
+    if not database or not host:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL is missing a host or "
+            "database name. Refusing to connect."
+        )
+
+    # Requirement: explicit host, port, AND database - a URL that omits
+    # the port and relies on PostgreSQL's compiled-in default (5432) is
+    # not fully explicit, and this guard's effective-port cross-check
+    # below needs a real value to compare against, not an implicit one.
+    if url.port is None:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL does not specify an "
+            "explicit port. Refusing to connect."
+        )
+
+    # P1-1: reject any query parameter capable of changing the effective
+    # host, port, database, socket, or service target before it ever
+    # reaches engine creation. Default-deny, not a blacklist of known-bad
+    # names - this also closes multi-host-via-query-string (host/hostaddr
+    # are never on the allowlist regardless of value) without needing to
+    # parse or special-case comma-separated host lists.
+    rejected_params = sorted(set(url.query.keys()) - _QA_ALLOWED_QUERY_PARAMS)
+    if rejected_params:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database URL carries connection "
+            f"parameter(s) that can override the connection target ({', '.join(rejected_params)}). "
+            "Refusing to connect."
+        )
+
+    # P1-2: exact loopback match only - no "localhost" (requires name
+    # resolution this guard cannot verify is unpoisoned), no suffix or
+    # substring match, remote hosts rejected unconditionally regardless
+    # of how plausible the database name/identity looks.
+    if host not in _QA_ALLOWED_LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved host is not an approved loopback "
+            "address. Refusing to connect."
+        )
+
+    # Defense in depth for P1-1: verify what SQLAlchemy's dialect would
+    # *actually* hand to the DBAPI driver, not just the parsed URL
+    # fields above - catches any override vector this function's own
+    # parameter allowlist did not anticipate (confirmed necessary: with
+    # the allowlist alone removed, create_connect_args() was observed to
+    # return a 'host' key disagreeing with url.host for a crafted query
+    # string - see tests/test_database_url_safety.py).
+    try:
+        _, effective_kwargs = url.get_dialect()().create_connect_args(url)
+    except Exception:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection arguments could not be "
+            "determined. Refusing to connect."
+        ) from None
+
+    if "service" in effective_kwargs:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection routes through a "
+            "pg_service.conf service name. Refusing to connect."
+        )
+
+    effective_host = str(effective_kwargs.get("host") or "").lower()
+    if effective_host not in _QA_ALLOWED_LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection host does not match an "
+            "approved loopback address. Refusing to connect."
+        )
+
+    effective_port = effective_kwargs.get("port")
+    if effective_port is not None and str(effective_port) != str(url.port or ""):
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection port disagrees with the "
+            "validated URL. Refusing to connect."
+        )
+
+    effective_database = str(effective_kwargs.get("dbname") or "").lower()
+    if effective_database != database:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the effective connection database disagrees with "
+            "the validated URL. Refusing to connect."
+        )
+
+    identity = database_identity(database_url)
+    if database in _QA_REJECTED_DATABASE_NAMES:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database ({identity}) has a "
+            "generic/production-shaped name. Refusing to connect."
+        )
+
+    name_tokens = {token for token in re.split(r"[^a-z0-9]+", database) if token}
+    if not (name_tokens & _QA_SAFE_NAME_TOKENS):
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but the resolved database ({identity}) has no "
+            "dev/test/qa/sandbox/scratch/disposable marker. Refusing to connect."
+        )
+
+    expected_identity = os.environ.get(_QA_IDENTITY_ENV_VAR, "").strip().lower()
+    if not expected_identity:
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but {_QA_IDENTITY_ENV_VAR} is not set to the exact "
+            f"target ({identity}). Refusing to connect."
+        )
+    if expected_identity != identity.lower():
+        raise RuntimeError(
+            f"{_QA_ALLOW_ENV_VAR} is set but {_QA_IDENTITY_ENV_VAR} does not match the "
+            "resolved target. Refusing to connect."
+        )
+
+    return effective_host
+
+
+def _engine_cache_key(database_url: str, validated_qa_host: str | None) -> tuple[str, str]:
+    """The cache key must encode which connection *policy* an engine was
+    built under, not just the URL string - a bare-URL key let an engine
+    created before QA mode was ever enabled (connect_args={}, no pinned
+    hostaddr) be silently handed back after QA mode activated for that
+    same URL, defeating the PGHOSTADDR pin entirely despite every
+    validation check having correctly passed. Different policy
+    (QA-inactive vs QA-active-with-this-host) is a different key, so
+    activating/deactivating QA mode, or any later change that makes
+    _enforce_qa_database_safety() resolve a different host for this URL,
+    can only ever miss the cache and build a fresh, correctly-pinned
+    engine under the new key - the old entry, if any, is simply never
+    looked up again (not mutated - see get_engine()'s own note on why
+    engines are never edited in place)."""
+    return (database_url, validated_qa_host or "")
 
 
 def get_engine(database_url: str | None = None) -> Engine:
@@ -155,10 +399,26 @@ def get_engine(database_url: str | None = None) -> Engine:
         raise RuntimeError(
             f"DATABASE_URL is missing. Config source checked: {get_config_source('DATABASE_URL')}."
         )
-    engine = _ENGINE_CACHE.get(database_url)
+    validated_qa_host = _enforce_qa_database_safety(database_url)
+    cache_key = _engine_cache_key(database_url, validated_qa_host)
+    engine = _ENGINE_CACHE.get(cache_key)
     if engine is None:
-        engine = create_engine(database_url, pool_pre_ping=True, future=True)
-        _ENGINE_CACHE[database_url] = engine
+        # Pin hostaddr explicitly to the already-validated loopback host
+        # whenever the QA guard ran - libpq treats an explicitly-supplied
+        # connection parameter as higher priority than its matching PG*
+        # environment variable, so this closes the PGHOSTADDR gap
+        # (create_connect_args() never supplies hostaddr on its own)
+        # permanently for this engine, regardless of any environment
+        # change after this point - not just at the moment of this check.
+        # An Engine's connect_args are fixed at construction and never
+        # edited afterward (SQLAlchemy does not support mutating them in
+        # place, and this function does not attempt to) - the
+        # policy-aware cache key above, not a later patch to an existing
+        # Engine, is what guarantees a QA-inactive engine is never handed
+        # back once QA mode is active for the same URL.
+        connect_args = {"hostaddr": validated_qa_host} if validated_qa_host else {}
+        engine = create_engine(database_url, pool_pre_ping=True, future=True, connect_args=connect_args)
+        _ENGINE_CACHE[cache_key] = engine
     return engine
 
 

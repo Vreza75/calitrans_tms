@@ -1,6 +1,15 @@
 streamlit>=1.35,<2
 pandas>=2.2,<4
-SQLAlchemy>=2.0,<3
+# <2.1, not <3: SQLAlchemy 2.1 changed the default postgres driver for a
+# bare "postgresql://" URL (no "+driver" suffix, used throughout
+# db_client.py and its tests) from psycopg2 to psycopg (v3), which this
+# project never installs. Confirmed by locking against the full open
+# <3 range: every test_database_url_safety.py test that calls
+# get_engine() failed with ModuleNotFoundError: No module named
+# 'psycopg'. Revisit this cap only alongside adding psycopg (v3) as a
+# real dependency or adding an explicit "+psycopg2" driver suffix to
+# every URL this project builds - not by itself.
+SQLAlchemy>=2.0,<2.1
 psycopg2-binary>=2.9,<3
 psycopg[binary]==3.3.8
 python-dotenv>=1.0,<2

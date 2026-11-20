@@ -11,13 +11,13 @@ type NavItem = {
   enabled: boolean;
 };
 
-// STEP 29: only Loads is functional this phase - everything else is a
-// visible, explicitly-labeled placeholder, never a fake empty page that
+// Phase 10A: Operations Inbox is now functional. Dispatch/Overview remain
+// visible, explicitly-labeled placeholders, never a fake empty page that
 // implies completeness.
 const NAV_ITEMS: NavItem[] = [
   { label: "Overview", href: "/app", enabled: false },
   { label: "Loads", href: "/app/loads", enabled: true },
-  { label: "Inbox", href: "/app/inbox", enabled: false },
+  { label: "Inbox", href: "/app/inbox", enabled: true },
   { label: "Dispatch", href: "/app/dispatch", enabled: false },
 ];
 

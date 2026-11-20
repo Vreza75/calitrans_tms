@@ -111,6 +111,36 @@ def test_list_work_items_returns_paginated_shape(client: TestClient, monkeypatch
     assert body["sort"]["sort_by"] == "received_at"
 
 
+def test_queue_counts_returns_one_row_per_queue(client: TestClient, monkeypatch) -> None:
+    from api.routers import work_items as router_module
+
+    monkeypatch.setattr(
+        router_module,
+        "get_work_item_queue_counts",
+        lambda **kwargs: {"New Orders": 18, "Existing Load Updates": 30, "Quotes": 5},
+    )
+
+    r = client.get("/api/v1/work-items/counts")
+
+    assert r.status_code == 200
+    body = r.json()
+    counts_by_queue = {row["queue"]: row["count"] for row in body["counts"]}
+    assert counts_by_queue == {"New Orders": 18, "Existing Load Updates": 30, "Quotes": 5}
+
+
+def test_queue_counts_route_registered_before_work_item_id_route(client: TestClient, monkeypatch) -> None:
+    """Regression guard: /counts must not be swallowed by the untyped
+    /{work_item_id} route (which would 422 trying to int-coerce "counts")."""
+    from api.routers import work_items as router_module
+
+    monkeypatch.setattr(router_module, "get_work_item_queue_counts", lambda **kwargs: {})
+
+    r = client.get("/api/v1/work-items/counts")
+
+    assert r.status_code == 200
+    assert r.json() == {"counts": []}
+
+
 def test_get_work_item_detail_returns_200_for_existing_item(client: TestClient, monkeypatch) -> None:
     from api.routers import work_items as router_module
 

@@ -101,6 +101,15 @@ class WorkItemPageOut(BaseModel):
         )
 
 
+class QueueCountOut(BaseModel):
+    queue: str
+    count: int
+
+
+class WorkItemQueueCountsOut(BaseModel):
+    counts: list[QueueCountOut]
+
+
 class AttachmentMetaOut(BaseModel):
     """Deliberately excludes file_path - see application/work_items/models.py
     AttachmentMeta.attachment_ref for why."""

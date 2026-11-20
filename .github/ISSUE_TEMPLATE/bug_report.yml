@@ -1,0 +1,81 @@
+name: Calitrans defect
+description: Report one independently fixable defect with reproducible evidence.
+title: "[BUG] "
+labels: ["type:bug", "status:needs-triage"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment and sanitized database identity
+      placeholder: "staging — host/database (no credentials)"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Build or commit
+    validations:
+      required: true
+  - type: input
+    id: role
+    attributes:
+      label: User role
+    validations:
+      required: true
+  - type: input
+    id: test_data
+    attributes:
+      label: Test ID and synthetic dataset/record IDs
+  - type: textarea
+    id: preconditions
+    attributes:
+      label: Preconditions
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+    validations:
+      required: true
+  - type: input
+    id: frequency
+    attributes:
+      label: Frequency and approximate time/time zone
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Proposed severity
+      options: [P0, P1, P2, P3, P4]
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted screenshots, logs, request/correlation ID, and database evidence
+      description: Never include credentials, real customer data, phone numbers, attachments, or full database URLs.
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression-test requirement and acceptance criteria

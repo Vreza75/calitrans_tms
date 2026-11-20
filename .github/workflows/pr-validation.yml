@@ -1,0 +1,109 @@
+name: PR Validation
+
+# Minimal PR-gate CI: TypeScript, ESLint, frontend unit tests (vitest),
+# and backend tests (pytest). Runs on every pull request so a real,
+# automated check exists before merging into master - previously there
+# was none (confirmed: no branch protection, no required status checks,
+# no workflow triggered by push or pull_request - see
+# .github/workflows/process-jobs.yml, which is a cron-scheduled
+# production worker runner, not a CI pipeline).
+#
+# Deliberately excludes the Playwright live/realtime acceptance suite
+# (web/e2e/inbox-acceptance-*.spec.ts, inbox-attachment-link.spec.ts,
+# inbox-realtime.spec.ts) - that suite needs a disposable Postgres, a
+# disposable local Supabase Realtime stack, and several synthetic
+# accounts provisioned by hand (see docs/SAMPLE_DATA_GUIDE.md and
+# web/e2e/fixtures/). It stays a manually-run, separately-gated check,
+# not folded into this automatic PR gate.
+#
+# No DATABASE_URL, no CALITRANS_ALLOW_QA_DATA, no production secret of
+# any kind is set anywhere in this workflow - backend tests run exactly
+# the way they do locally with no database configured (see
+# config.py::get_database_url): the ~98 tests gated behind
+# INBOX_CERTIFICATION_DATABASE_URL skip cleanly, and every existing
+# database-isolation guard (db_client.py's QA-only write gate,
+# scripts/sample_data.py's safety checks) is left completely unused and
+# unmodified, never bypassed.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel a stale run for the same PR/branch when new commits land -
+# keeps the Actions tab from queueing redundant runs against an
+# already-superseded head.
+concurrency:
+  group: pr-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (compile + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.lock.txt
+
+      - name: Install dependencies (pinned, hash-verified)
+        # requirements.txt/requirements-dev.txt are the human-authored
+        # range declarations - requirements-dev.lock.txt is the generated,
+        # fully pinned+hashed resolution of them (see
+        # docs/DEPENDENCY_LOCKING.md for the regeneration procedure).
+        # --require-hashes makes pip refuse to install anything that
+        # isn't both pinned AND hash-verified in the lock file - a lock
+        # file missing a transitive dependency, or out of sync with what
+        # requirements*.txt actually declares, fails this step instead of
+        # silently installing something unpinned/unverified.
+        run: pip install --require-hashes -r requirements-dev.lock.txt
+
+      - name: pip check
+        run: pip check
+
+      - name: Compile check
+        run: python -m compileall -q app.py pages_app services ui_components repositories database utils ai_agents ai_core api application scripts tests
+
+      - name: pytest
+        run: pytest -q
+
+  frontend:
+    name: Frontend (tsc + eslint + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Next.js route types
+        # tsconfig.json's own `include` lists .next/types/**/*.ts (e.g.
+        # LayoutProps - see app/layout.tsx) - those are generated, not
+        # checked in. A clean checkout has no .next/ at all, so tsc fails
+        # on a genuinely missing ambient type without this step first.
+        # `next typegen` generates just the route types, not a full build.
+        run: npx next typegen
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Vitest
+        run: npx vitest run

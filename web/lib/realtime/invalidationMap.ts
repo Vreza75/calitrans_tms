@@ -25,6 +25,7 @@ export function invalidateForEvent(queryClient: QueryClient, eventType: string, 
   if (INBOX_EVENT_TYPES.has(eventType)) {
     queryClient.invalidateQueries({ queryKey: inboxKeys.lists() });
     queryClient.invalidateQueries({ queryKey: inboxKeys.detail(event.aggregate_id) });
+    queryClient.invalidateQueries({ queryKey: [...inboxKeys.all, "counts"] });
     return;
   }
 

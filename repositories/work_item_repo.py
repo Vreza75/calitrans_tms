@@ -149,6 +149,26 @@ def count_work_items(where_sql: str, params: dict[str, Any]) -> int:
     return int(df.iloc[0]["total"])
 
 
+def count_work_items_by_queue(where_sql: str, params: dict[str, Any]) -> dict[str, int]:
+    """One bounded aggregation query for queue-nav counts (Phase 10A) -
+    never N+1 (one count-per-queue call). `where_sql`/`params` normally
+    come from build_work_item_filters(queue=None, ...) so counts reflect
+    the currently active search/service_flow/etc filters, same as the
+    per-queue counts Streamlit's Operations Queue radio already shows."""
+    df = read_df(
+        f"""
+        select coalesce(oi.work_queue, '') as queue, count(*) as total
+        from order_intake oi
+        where {where_sql}
+        group by oi.work_queue
+        """,
+        params,
+    )
+    if df.empty:
+        return {}
+    return {str(row["queue"]): int(row["total"]) for _, row in df.iterrows()}
+
+
 def list_work_items_page(
     where_sql: str,
     params: dict[str, Any],
