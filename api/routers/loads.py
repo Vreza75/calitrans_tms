@@ -14,6 +14,7 @@ from api.schemas.loads import (
     LoadSummaryOut,
     LoadTimelineEventOut,
     LoadTimelinePageOut,
+    OperationalStagesOut,
     TransitionLoadIn,
     TransitionResultOut,
 )
@@ -25,6 +26,7 @@ from application.loads.queries import (
     get_load_detail,
     get_load_documents,
     get_load_timeline,
+    get_operational_stages,
     list_loads,
     search_loads,
 )
@@ -90,6 +92,14 @@ def search_loads_endpoint(
         sort_by=result.sort_by,
         sort_direction=result.sort_direction,
     )
+
+
+@router.get("/stages", response_model=OperationalStagesOut, dependencies=[Depends(require_role(*READ_LOADS))])
+def get_operational_stages_endpoint(service_flow: str | None = None) -> OperationalStagesOut:
+    """Phase 10B: the Dispatch Board's column set for a given
+    service_flow - must be registered before GET /{load_id} so "/stages"
+    is never matched as a load_id path parameter."""
+    return OperationalStagesOut(stages=get_operational_stages(service_flow))
 
 
 @router.get("/{load_id}", response_model=LoadSummaryOut, dependencies=[Depends(require_role(*READ_LOADS))])

@@ -15,6 +15,7 @@ from application.loads.models import (
 )
 from db_client import read_df
 from repositories import document_repo, load_query_repo
+from services.dispatch_stages import get_operational_stages as _get_operational_stages_for_service_flow
 
 _SELECT_COLUMNS = """
     id as _row_id,
@@ -293,6 +294,15 @@ def get_load_documents(load_id: int, *, limit: int = 50) -> list[LoadDocumentMet
         )
         for row in rows
     ]
+
+
+def get_operational_stages(service_flow: str | None) -> list[str]:
+    """Phase 10B: the Dispatch Board's column set for a given
+    service_flow - thin wrapper over services.dispatch_stages.
+    get_operational_stages so the Next.js board never reimplements the
+    Import-vs-other-move-types "Returning Empty" column rule itself
+    (CLAUDE.md: don't duplicate business logic in the frontend)."""
+    return _get_operational_stages_for_service_flow(service_flow or "")
 
 
 def int_or_none(value) -> int | None:

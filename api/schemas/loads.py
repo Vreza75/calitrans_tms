@@ -190,6 +190,13 @@ class LoadCommunicationPageOut(PageOut[LoadCommunicationOut]):
     pass
 
 
+class OperationalStagesOut(BaseModel):
+    """Phase 10B: the Dispatch Board's column set for a given
+    service_flow - see application/loads/queries.py::get_operational_stages."""
+
+    stages: list[str]
+
+
 class LoadDocumentMetaOut(BaseModel):
     """Deliberately excludes file_path - never a raw storage path in an
     API response (STEP 12)."""
