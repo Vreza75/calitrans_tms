@@ -579,3 +579,71 @@ input {
   gap: 0.5rem;
   flex-wrap: wrap;
 }
+
+/* Phase 10C: Load Workspace */
+.load-workspace__tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.25rem;
+}
+
+.load-workspace__tabs button {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  padding: 0.5rem 0.75rem;
+}
+
+.load-workspace__tab-button--active {
+  border-bottom-color: var(--accent, currentColor) !important;
+  font-weight: 600;
+}
+
+.load-workspace__edit-form,
+.load-workspace__notes,
+.load-workspace__quick-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+  margin-top: 1.25rem;
+  max-width: 480px;
+}
+
+.load-workspace__tab {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  max-width: 640px;
+}
+
+.load-workspace__document-list,
+.load-workspace__communication-list,
+.load-workspace__timeline-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.load-workspace__document-list li,
+.load-workspace__communication-list li,
+.load-workspace__timeline-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.9rem;
+}
+
+.load-workspace__document-meta {
+  font-size: 0.8rem;
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+}
