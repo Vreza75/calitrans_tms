@@ -196,5 +196,13 @@ def assign_driver_endpoint(
     a (spurious) backward move instead of the assignment-only request it
     actually is. See application/loads/commands.py::transition_load and
     services/dispatch_transition_service.py::apply_transition."""
-    result = transition_load(load_id, None, actor=actor, driver=payload.driver, truck=payload.truck)
+    result = transition_load(
+        load_id,
+        None,
+        actor=actor,
+        driver=payload.driver,
+        truck=payload.truck,
+        expected_driver=payload.expected_driver,
+        expected_truck=payload.expected_truck,
+    )
     return TransitionResultOut(**result.__dict__)

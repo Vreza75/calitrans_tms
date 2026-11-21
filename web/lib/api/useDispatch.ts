@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { apiClient } from "@/lib/api/client";
+import { ApiError, apiClient } from "@/lib/api/client";
 import { driverKeys, loadKeys, stageKeys } from "@/lib/api/queryKeys";
 import type {
   AssignDriverRequest,
@@ -56,6 +56,15 @@ export function useAssignDriver(loadId: number) {
     mutationFn: (payload: AssignDriverRequest) =>
       apiClient.post<TransitionResult>(`/api/v1/loads/${loadId}/assign-driver`, payload),
     onSuccess: invalidate,
+    // P1 fix: a 409 here means someone else's assignment write already
+    // landed on this load (see AssignDriverIn.expected_driver/
+    // expected_truck) - this dispatcher's screen is now showing stale
+    // data too, so refresh the same queries a successful write would,
+    // instead of leaving the stale card/dialog on screen with no hint
+    // anything changed underneath it.
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) invalidate();
+    },
   });
 }
 

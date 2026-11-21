@@ -613,6 +613,10 @@ export interface components {
             driver: string;
             /** Truck */
             truck?: string | null;
+            /** Expected Driver */
+            expected_driver?: string | null;
+            /** Expected Truck */
+            expected_truck?: string | null;
         };
         /**
          * AttachmentMetaOut

@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import text
 
 from db_client import DispatchDatabaseClient, transaction
-from services.dispatch_stages import COMPLETION_STATUS, validate_transition
+from services.dispatch_stages import CANCELLED_STATUS, COMPLETION_STATUS, validate_transition
 from services.workflow_constants import normalize_service_flow
 
 
@@ -82,6 +82,8 @@ def apply_transition(
     override: bool = False,
     override_reason: str = "",
     actor_display_name: str = "dispatcher",
+    expected_driver: str | None = None,
+    expected_truck: str | None = None,
 ) -> dict:
     """Validate and apply an operational status transition for one load.
 
@@ -116,6 +118,36 @@ def apply_transition(
     in the audit trail. This function itself stays framework-neutral -
     it takes a plain string, not an AuthenticatedActor/Streamlit/HTTP
     object.
+
+    `expected_driver`/`expected_truck` (P1 fix) are optional - when
+    provided, each is compared against the matching field on the row as
+    read under this same FOR UPDATE lock (`existing_driver`/
+    `existing_truck` below). A mismatch means another write already
+    changed that field between when the caller loaded the load and when
+    this call acquired the lock, so the write is refused (`ok: False`,
+    surfaced by the caller as a 409) instead of silently overwriting a
+    concurrent dispatcher's assignment - this is the exact "two
+    dispatchers racing on the same load" scenario the row lock already
+    protects status-transition validation against (see
+    _load_row_for_update's own docstring); this check closes the same
+    race for assignment writes specifically. Deliberately compares
+    against the *persisted assignment fields themselves*, not a
+    timestamp/version column - the two values being compared (what the
+    caller displayed vs. what the row now holds) are always plain
+    strings round-tripped losslessly through JSON, with no datetime
+    serialization/timezone ambiguity to get wrong.
+
+    `new_status=None` (assignment-only) skips validate_transition's
+    operational-stage/sequencing rules entirely (P1 fix): those rules
+    exist to govern *transitions*, and an assignment-only call is not
+    one - current_status is never changing. Without this, assigning a
+    driver/truck to a load still sitting at a pre-dispatch status (New,
+    Booking Verified, Hold/Need Info - none of which are members of
+    SHARED_STAGES) was rejected as "not a valid operational status",
+    even though no status change was ever requested. The one rule still
+    enforced for assignment-only is the existing Completed/Cancelled
+    immutability guard (unchanged from validate_transition's own rule)
+    - an actual status transition's validation is completely untouched.
     """
     if override and not override_reason.strip():
         return {"ok": False, "reason": "An override requires a reason.", "status": "", "closeout_stage": ""}
@@ -125,34 +157,57 @@ def apply_transition(
         if row is None:
             return {"ok": False, "reason": f"Load {load_id} not found.", "status": "", "closeout_stage": ""}
 
-        move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
         current_status = str(row.get("Status", "") or "New")
-        effective_new_status = new_status if new_status is not None else current_status
+        closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
         existing_driver = str(row.get("Driver Name", "") or "").strip()
         existing_truck = str(row.get("Truck Assigned", "") or "").strip()
+
+        if expected_driver is not None and existing_driver != expected_driver.strip():
+            return {
+                "ok": False,
+                "reason": "This load's driver assignment was changed by someone else. Refresh and try again.",
+                "status": current_status,
+                "closeout_stage": closeout_stage,
+            }
+        if expected_truck is not None and existing_truck != expected_truck.strip():
+            return {
+                "ok": False,
+                "reason": "This load's truck assignment was changed by someone else. Refresh and try again.",
+                "status": current_status,
+                "closeout_stage": closeout_stage,
+            }
+
+        move_type = normalize_service_flow(str(row.get("TYPE", "")), default="Local Import")
+        effective_new_status = new_status if new_status is not None else current_status
 
         effective_driver = driver.strip() if driver and driver.strip() else existing_driver
         effective_truck = truck.strip() if truck and truck.strip() else existing_truck
         has_origin = bool(str(row.get("Port", "") or row.get("Warehouse", "") or "").strip())
         empty_return_required = bool(str(row.get("empty_return_location", "") or "").strip())
 
-        ok, reason = validate_transition(
-            move_type,
-            current_status,
-            effective_new_status,
-            has_driver=bool(effective_driver),
-            has_truck=bool(effective_truck),
-            has_origin=has_origin,
-            empty_return_required=empty_return_required,
-            override=override,
-        )
+        if new_status is None:
+            if current_status in (COMPLETION_STATUS, CANCELLED_STATUS) and not override:
+                ok, reason = False, f"Load is {current_status}; further operational status changes require an override."
+            else:
+                ok, reason = True, ""
+        else:
+            ok, reason = validate_transition(
+                move_type,
+                current_status,
+                effective_new_status,
+                has_driver=bool(effective_driver),
+                has_truck=bool(effective_truck),
+                has_origin=has_origin,
+                empty_return_required=empty_return_required,
+                override=override,
+            )
 
         if not ok:
             return {
                 "ok": False,
                 "reason": reason,
                 "status": current_status,
-                "closeout_stage": str(row.get("closeout_stage", "Not Started")),
+                "closeout_stage": closeout_stage,
             }
 
         assignment_updates = {}
@@ -168,7 +223,6 @@ def apply_transition(
         if final_note:
             status_updates["Dispatcher Notes"] = final_note
 
-        closeout_stage = str(row.get("closeout_stage", "Not Started") or "Not Started")
         should_set_closeout = effective_new_status == COMPLETION_STATUS and closeout_stage == "Not Started"
 
         if assignment_updates:

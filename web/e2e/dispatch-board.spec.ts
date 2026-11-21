@@ -163,6 +163,91 @@ test("dispatcher can assign a driver and the card reflects it after invalidation
   await expect(page.getByText("Driver: Joe Driver")).toBeVisible();
 });
 
+test("P1 fix: clearing the truck field blocks assignment with a validation message", async ({ page }) => {
+  await mockBackend(page, DISPATCHER_ME, [loadItem({ driver_name: "Old Driver", truck_assigned: "T-OLD" })]);
+  let assignCalled = false;
+  await page.route("**/api/v1/loads/1/assign-driver", (route) => {
+    assignCalled = true;
+    return route.fulfill({ json: { ok: true, reason: "", status: "Ready to Dispatch", closeout_stage: "" } });
+  });
+  await loginAs(page, DISPATCHER_ME);
+
+  await page.goto("/app/dispatch");
+  await page.getByRole("button", { name: "Assign" }).click();
+  await page.getByRole("textbox", { name: "Truck" }).fill("");
+
+  await expect(page.getByText("Truck is required to assign a driver")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Assign", exact: true })).toBeDisabled();
+
+  await page.getByRole("button", { name: "Assign", exact: true }).click({ force: true });
+  expect(assignCalled).toBe(false);
+});
+
+test("P1 fix: a stale assignment conflict surfaces the server's message and refreshes the board", async ({ page }) => {
+  await mockBackend(page, DISPATCHER_ME, [loadItem()]);
+  await page.route("**/api/v1/loads/1/assign-driver", (route) =>
+    route.fulfill({
+      status: 409,
+      json: {
+        error: {
+          code: "conflict",
+          message: "This load's driver assignment was changed by someone else. Refresh and try again.",
+        },
+      },
+    }),
+  );
+  await page.route("**/api/v1/loads/search**", (route) =>
+    route.fulfill({
+      json: {
+        items: [loadItem({ driver_name: "Someone Else", truck_assigned: "T-999" })],
+        page: 1,
+        page_size: 200,
+        total_items: 1,
+        total_pages: 1,
+        sort_by: "",
+        sort_direction: "asc",
+      },
+    }),
+  );
+  await loginAs(page, DISPATCHER_ME);
+
+  await page.goto("/app/dispatch");
+  await page.getByRole("button", { name: "Assign" }).click();
+  await page.getByRole("combobox", { name: "Driver" }).selectOption("Joe Driver");
+  await page.getByRole("button", { name: "Assign", exact: true }).click();
+
+  await expect(page.getByText("This load's driver assignment was changed by someone else.")).toBeVisible();
+  await expect(page.getByText("Driver: Someone Else")).toBeVisible();
+});
+
+test("P1 fix: a driver can be assigned to a load still at a pre-dispatch status (New)", async ({ page }) => {
+  await mockBackend(page, DISPATCHER_ME, [loadItem({ status: "New" })]);
+  await page.route("**/api/v1/loads/1/assign-driver", (route) =>
+    route.fulfill({ json: { ok: true, reason: "", status: "New", closeout_stage: "" } }),
+  );
+  await page.route("**/api/v1/loads/search**", (route) =>
+    route.fulfill({
+      json: {
+        items: [loadItem({ status: "New", driver_name: "Joe Driver", truck_assigned: "T-100" })],
+        page: 1,
+        page_size: 200,
+        total_items: 1,
+        total_pages: 1,
+        sort_by: "",
+        sort_direction: "asc",
+      },
+    }),
+  );
+  await loginAs(page, DISPATCHER_ME);
+
+  await page.goto("/app/dispatch");
+  await page.getByRole("button", { name: "Assign" }).click();
+  await page.getByRole("combobox", { name: "Driver" }).selectOption("Joe Driver");
+  await page.getByRole("button", { name: "Assign", exact: true }).click();
+
+  await expect(page.getByText("Driver: Joe Driver")).toBeVisible();
+});
+
 test("dispatcher can advance a load's status via the transition menu", async ({ page }) => {
   await mockBackend(page, DISPATCHER_ME, [loadItem()]);
   let transitioned = false;

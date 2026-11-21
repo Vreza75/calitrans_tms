@@ -27,11 +27,22 @@ export function AssignDriverDialog({ load, onClose }: Props) {
     if (match) setTruck(match.truck_number);
   }
 
+  const truckIsBlank = !truck.trim();
+
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
-    if (!driverName.trim()) return;
+    if (!driverName.trim() || truckIsBlank) return;
     assignDriver.mutate(
-      { driver: driverName.trim(), truck: truck.trim() || null },
+      {
+        driver: driverName.trim(),
+        truck: truck.trim(),
+        // P1 fix: lets the server detect a concurrent assignment write
+        // that landed on this load after this dialog loaded it (see
+        // api/schemas/loads.py::AssignDriverIn) - what the dialog
+        // believes is currently assigned, not the new value being typed.
+        expected_driver: load.driver_name,
+        expected_truck: load.truck_assigned,
+      },
       { onSuccess: onClose },
     );
   }
@@ -59,6 +70,13 @@ export function AssignDriverDialog({ load, onClose }: Props) {
         <input id={`truck-${load.id}`} value={truck} onChange={(event) => setTruck(event.target.value)} />
       </div>
 
+      {truckIsBlank && (
+        <p role="alert" className="field-error">
+          Truck is required to assign a driver - a blank truck would otherwise silently keep whatever truck was
+          previously on this load.
+        </p>
+      )}
+
       {assignDriver.isError && (
         <p role="alert" className="field-error">
           {assignDriver.error instanceof ApiError ? assignDriver.error.message : "Unable to assign this driver."}
@@ -69,7 +87,7 @@ export function AssignDriverDialog({ load, onClose }: Props) {
         <button type="button" onClick={onClose} disabled={assignDriver.isPending}>
           Cancel
         </button>
-        <button type="submit" disabled={!driverName.trim() || assignDriver.isPending}>
+        <button type="submit" disabled={!driverName.trim() || truckIsBlank || assignDriver.isPending}>
           {assignDriver.isPending ? "Assigning..." : "Assign"}
         </button>
       </div>

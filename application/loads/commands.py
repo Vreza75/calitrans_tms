@@ -70,6 +70,8 @@ def transition_load(
     truck: str | None = None,
     override: bool = False,
     override_reason: str = "",
+    expected_driver: str | None = None,
+    expected_truck: str | None = None,
 ) -> TransitionResult:
     """Status transition + optional driver/truck assignment. The one
     canonical application command wrapping
@@ -99,8 +101,29 @@ def transition_load(
     with a 200-shaped result - a caller like the API needs a distinct
     status code for "load not found" (404) vs. "transition not valid from
     the current state" (409), not a 200 response it has to inspect an
-    `ok` flag on to find out something failed."""
+    `ok` flag on to find out something failed.
+
+    `driver` without a non-blank `truck` is rejected before any read/
+    write (P1 fix): apply_transition's own fallback rule treats a blank/
+    missing `truck` as "no change requested" and silently keeps whatever
+    truck was already on the load. That is correct when a caller is only
+    changing the driver and deliberately leaving the truck alone, but the
+    Dispatch Board's assign-driver dialog always re-sends both fields
+    together, so a dispatcher clearing the truck field there would
+    otherwise see their own clear request silently discarded. Scoped to
+    "driver supplied, truck blank" only - truck-only reassignment (driver
+    omitted) is unaffected.
+
+    `expected_driver`/`expected_truck` are optional - pass the load's
+    driver/truck as the caller last displayed them (see
+    api/schemas/loads.py::AssignDriverIn) to enable optimistic
+    concurrency: apply_transition rejects the write with a conflict
+    result (surfaced here as ConflictError/409) if someone else's
+    assignment write already landed on this load since."""
     require_permission(actor, Permission.DISPATCH_TRANSITION)
+
+    if driver and driver.strip() and not (truck and truck.strip()):
+        raise ValidationError("A truck must be specified when assigning a driver.")
 
     from services.dispatch_transition_service import apply_transition
 
@@ -113,6 +136,8 @@ def transition_load(
         override=override,
         override_reason=override_reason,
         actor_display_name=actor.actor,
+        expected_driver=expected_driver,
+        expected_truck=expected_truck,
     )
 
     if not result.get("ok"):
