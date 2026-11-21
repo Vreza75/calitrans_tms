@@ -14,6 +14,20 @@ export type AssignDriverRequest = Schemas["AssignDriverIn"];
 export type TransitionLoadRequest = Schemas["TransitionLoadIn"];
 export type TransitionResult = Schemas["TransitionResultOut"];
 export type OperationalStages = Schemas["OperationalStagesOut"];
+export type LoadTimelineEvent = Schemas["LoadTimelineEventOut"];
+export type LoadTimelinePage = Schemas["LoadTimelinePageOut"];
+export type LoadCommunication = Schemas["LoadCommunicationOut"];
+export type LoadCommunicationPage = Schemas["LoadCommunicationPageOut"];
+export type LoadDocumentMeta = Schemas["LoadDocumentMetaOut"];
+
+// Phase 10C: Load Workspace.
+export type UpdateLoadFieldsRequest = Schemas["UpdateLoadFieldsIn"];
+export type SaveLoadNoteRequest = Schemas["SaveLoadNoteIn"];
+export type LoadNoteOnlyRequest = Schemas["LoadNoteOnlyIn"];
+export type LoadCommandResult = Schemas["LoadCommandResultOut"];
+export type LogCommunicationRequest = Schemas["LogCommunicationIn"];
+export type LogCommunicationResult = Schemas["LogCommunicationOut"];
+export type DocumentUploadResult = Schemas["DocumentUploadOut"];
 export type LoginRequest = Schemas["LoginIn"];
 export type LoginResponse = Schemas["LoginOut"];
 export type MeResponse = Schemas["MeOut"];

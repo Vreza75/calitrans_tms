@@ -68,7 +68,12 @@ type RequestOptions = {
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (options.body !== undefined) {
+  // FormData (Phase 10C: document upload) is sent as-is - fetch sets its
+  // own Content-Type with the multipart boundary parameter, which a
+  // manually-set "application/json" (or even a manually-set multipart
+  // header without the boundary) would break.
+  const isFormData = options.body instanceof FormData;
+  if (options.body !== undefined && !isFormData) {
     headers["Content-Type"] = "application/json";
   }
   if (token) {
@@ -78,7 +83,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: options.method ?? "GET",
     headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    body: options.body === undefined ? undefined : isFormData ? (options.body as FormData) : JSON.stringify(options.body),
     signal: options.signal,
   });
 
