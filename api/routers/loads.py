@@ -1,24 +1,47 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 
-from api.auth import MUTATE_OPERATIONS, READ_LOADS, AuthenticatedActor, require_auth, require_role
+from api.auth import (
+    DOCUMENT_MUTATE,
+    MUTATE_OPERATIONS,
+    READ_LOADS,
+    AuthenticatedActor,
+    require_auth,
+    require_role,
+)
 from api.schemas.loads import (
     AssignDriverIn,
+    DocumentUploadOut,
+    LoadCommandResultOut,
     LoadCommunicationOut,
     LoadCommunicationPageOut,
     LoadDetailOut,
     LoadDocumentMetaOut,
     LoadListItemOut,
+    LoadNoteOnlyIn,
     LoadPageOut,
     LoadSummaryOut,
     LoadTimelineEventOut,
     LoadTimelinePageOut,
+    LogCommunicationIn,
+    LogCommunicationOut,
     OperationalStagesOut,
+    SaveLoadNoteIn,
     TransitionLoadIn,
     TransitionResultOut,
+    UpdateLoadFieldsIn,
 )
-from application.loads.commands import transition_load
+from application.dispatch.commands import log_dispatch_communication
+from application.documents.commands import attach_load_document
+from application.loads.commands import (
+    cancel_load,
+    mark_load_missing_info,
+    save_load_note,
+    transition_load,
+    update_load_fields,
+    verify_load_booking,
+)
 from application.loads.models import LoadFilters
 from application.loads.queries import (
     get_load,
@@ -206,3 +229,138 @@ def assign_driver_endpoint(
         expected_truck=payload.expected_truck,
     )
     return TransitionResultOut(**result.__dict__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10C: Load Workspace. Every endpoint below is a thin wrapper over an
+# existing, already authorization-gated application command - no business
+# logic, no direct database access, lives here. See docs/architecture/
+# PHASE_10C_LOAD_WORKSPACE_PLAN.md.
+# ---------------------------------------------------------------------------
+
+
+@router.put(
+    "/{load_id}",
+    response_model=LoadCommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def update_load_fields_endpoint(
+    load_id: int, payload: UpdateLoadFieldsIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LoadCommandResultOut:
+    """Free-form multi-field save - the Next.js equivalent of the
+    Streamlit Order Detail Editor's "Save Order Updates" button. Wraps
+    application.loads.commands.update_load_fields unchanged; that
+    function is the existing allowlist/validation boundary for which
+    columns may be written."""
+    result = update_load_fields(actor=actor, load_id=load_id, updates=payload.updates)
+    return LoadCommandResultOut(**result.__dict__)
+
+
+@router.post(
+    "/{load_id}/notes",
+    response_model=LoadCommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def save_load_note_endpoint(
+    load_id: int, payload: SaveLoadNoteIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LoadCommandResultOut:
+    """Notes-only save, distinct from update_load_fields_endpoint above -
+    mirrors Streamlit's separate "Save Notes" button not requiring the
+    rest of the form to be resubmitted."""
+    result = save_load_note(actor=actor, load_id=load_id, note=payload.note)
+    return LoadCommandResultOut(**result.__dict__)
+
+
+@router.post(
+    "/{load_id}/mark-missing-info",
+    response_model=LoadCommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def mark_load_missing_info_endpoint(
+    load_id: int, payload: LoadNoteOnlyIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LoadCommandResultOut:
+    result = mark_load_missing_info(actor=actor, load_id=load_id, note=payload.note)
+    return LoadCommandResultOut(**result.__dict__)
+
+
+@router.post(
+    "/{load_id}/verify-booking",
+    response_model=LoadCommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def verify_load_booking_endpoint(
+    load_id: int, payload: LoadNoteOnlyIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LoadCommandResultOut:
+    result = verify_load_booking(actor=actor, load_id=load_id, note=payload.note)
+    return LoadCommandResultOut(**result.__dict__)
+
+
+@router.post(
+    "/{load_id}/cancel",
+    response_model=LoadCommandResultOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def cancel_load_endpoint(
+    load_id: int, payload: LoadNoteOnlyIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LoadCommandResultOut:
+    result = cancel_load(actor=actor, load_id=load_id, note=payload.note)
+    return LoadCommandResultOut(**result.__dict__)
+
+
+@router.post(
+    "/{load_id}/communications",
+    response_model=LogCommunicationOut,
+    dependencies=[Depends(require_role(*MUTATE_OPERATIONS))],
+)
+def log_load_communication_endpoint(
+    load_id: int, payload: LogCommunicationIn, actor: AuthenticatedActor = Depends(require_auth)
+) -> LogCommunicationOut:
+    """Manual communication-log entry (Streamlit's "Save Message /
+    Driver Communication / Customer Note / Operational Note" buttons) -
+    `provider` is fixed to "internal" here, not accepted from the
+    client: this endpoint logs a note, it does not send anything."""
+    log_dispatch_communication(
+        actor=actor,
+        load_id=load_id,
+        message_type=payload.message_type,
+        direction=payload.direction,
+        recipient=payload.recipient,
+        message_body=payload.message_body,
+        provider="internal",
+    )
+    return LogCommunicationOut(ok=True)
+
+
+class _SyncUploadAdapter:
+    """Adapts FastAPI's UploadFile to the sync .name/.seek()/.read()
+    interface services.document_storage_service.stage_upload() expects
+    (built for Streamlit's UploadedFile) - UploadFile.file is the
+    underlying SpooledTemporaryFile, which already has sync seek()/
+    read(); only .filename -> .name needs renaming. No change to
+    stage_upload or attach_load_document themselves."""
+
+    def __init__(self, upload: UploadFile) -> None:
+        self.name = upload.filename or "upload"
+        self._file = upload.file
+
+    def seek(self, offset: int) -> int:
+        return self._file.seek(offset)
+
+    def read(self) -> bytes:
+        return self._file.read()
+
+
+@router.post(
+    "/{load_id}/documents",
+    response_model=DocumentUploadOut,
+    dependencies=[Depends(require_role(*DOCUMENT_MUTATE))],
+)
+def attach_load_document_endpoint(
+    load_id: int, file: UploadFile = File(...), actor: AuthenticatedActor = Depends(require_auth)
+) -> DocumentUploadOut:
+    """Accounting is included in this route's role gate (DOCUMENT_MUTATE,
+    not MUTATE_OPERATIONS) because Permission.DOCUMENT_ATTACH grants
+    Accounting this specific capability - see api/auth.py's
+    DOCUMENT_MUTATE definition."""
+    document_id = attach_load_document(actor=actor, load_id=load_id, uploaded_file=_SyncUploadAdapter(file), source="web")
+    return DocumentUploadOut(ok=True, document_id=document_id, status="pending")

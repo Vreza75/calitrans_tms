@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from application.exceptions import CommandFailedError, ConflictError, NotFoundError, ValidationError
+from application.exceptions import AuthorizationError, CommandFailedError, ConflictError, NotFoundError, ValidationError
 from utils.error_sanitizer import sanitize_message
 
 logger = logging.getLogger("api.errors")
@@ -41,6 +41,19 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConflictError)
     async def _conflict(request: Request, exc: ConflictError) -> JSONResponse:
         return _envelope(409, "CONFLICT", str(exc))
+
+    @app.exception_handler(AuthorizationError)
+    async def _authorization(request: Request, exc: AuthorizationError) -> JSONResponse:
+        # Phase 10C: no endpoint had actually exercised this path before -
+        # every existing route's require_role() set happened to exactly
+        # match its underlying command's require_permission() grant, so
+        # AuthorizationError never reached this far. Phase 10C's document
+        # upload endpoint is the first route whose role gate (READ_LOADS,
+        # includes Accounting) is deliberately broader than another new
+        # endpoint's gate, making this the first real path to this
+        # exception - per its own docstring, it maps to 403, not FastAPI's
+        # default 500 fallback.
+        return _envelope(403, "FORBIDDEN", str(exc))
 
     @app.exception_handler(CommandFailedError)
     async def _command_failed(request: Request, exc: CommandFailedError) -> JSONResponse:

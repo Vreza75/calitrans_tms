@@ -45,6 +45,7 @@ __all__ = [
     "READ_LOADS",
     "MUTATE_OPERATIONS",
     "ADMIN_ONLY",
+    "DOCUMENT_MUTATE",
 ]
 
 DEV_MODE_ACTOR = AuthenticatedActor(actor="dev-mode", role=Role.ADMIN)
@@ -141,3 +142,10 @@ READ_OPERATIONS = (Role.DISPATCHER, Role.MANAGER, Role.ADMIN)
 READ_LOADS = (Role.DISPATCHER, Role.MANAGER, Role.ADMIN, Role.ACCOUNTING)
 MUTATE_OPERATIONS = (Role.DISPATCHER, Role.MANAGER, Role.ADMIN)
 ADMIN_ONLY = (Role.ADMIN,)
+# Phase 10C: Permission.DOCUMENT_ATTACH (application/auth/permissions.py)
+# is the one Phase 5B mutation permission granted to Accounting as well
+# as Dispatcher/Manager/Admin - matches this role's existing "billing
+# plus enough load context to work invoices" scope. A route gated by the
+# narrower MUTATE_OPERATIONS would reject Accounting at the route before
+# the command's own (correctly broader) permission check ever ran.
+DOCUMENT_MUTATE = (Role.DISPATCHER, Role.MANAGER, Role.ADMIN, Role.ACCOUNTING)
