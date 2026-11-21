@@ -52,6 +52,15 @@ class TransitionResultOut(BaseModel):
 class AssignDriverIn(BaseModel):
     driver: str
     truck: str | None = None
+    # P1 fix: optional optimistic-concurrency guard. Pass the driver/
+    # truck fields exactly as the caller last displayed them (e.g. from
+    # LoadListItemOut.driver_name/truck_assigned) - the write is refused
+    # with a 409 if either no longer matches what's actually persisted,
+    # instead of silently overwriting a concurrent dispatcher's
+    # assignment. Omit either (leave None) to skip that specific check -
+    # existing callers that don't send them keep today's behavior.
+    expected_driver: str | None = None
+    expected_truck: str | None = None
 
 
 class CreateLoadIn(BaseModel):
