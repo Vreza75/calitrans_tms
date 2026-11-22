@@ -436,3 +436,92 @@ def test_attach_document_endpoint_accepts_valid_formats(client: TestClient, monk
 
     assert r.status_code == 200
     assert r.json() == {"ok": True, "document_id": 99, "status": "pending"}
+
+
+# ---------------------------------------------------------------------------
+# Ingress-level request body size limit (FIX 3) - api/body_size_limit.py
+# ---------------------------------------------------------------------------
+
+_INGRESS_BOUNDARY = "ingresslimittest"
+
+
+def _multipart_header(boundary: str) -> bytes:
+    return (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="rate.pdf"\r\n'
+        f"Content-Type: application/pdf\r\n\r\n"
+    ).encode()
+
+
+def _multipart_footer(boundary: str) -> bytes:
+    return f"\r\n--{boundary}--\r\n".encode()
+
+
+def test_attach_document_endpoint_rejects_oversized_body_with_content_length(client: TestClient, monkeypatch):
+    """FIX 3: a request body well beyond the ingress ceiling is rejected
+    with 413 before FastAPI's multipart parser (and therefore
+    attach_load_document/stage_upload) ever runs - even though the
+    client sent an accurate Content-Length, the limit is enforced from
+    actual streamed bytes, not the header."""
+    from api.routers import loads as router_module
+
+    attach_mock = mock.Mock()
+    monkeypatch.setattr(router_module, "attach_load_document", attach_mock)
+
+    oversized_body = (
+        _multipart_header(_INGRESS_BOUNDARY) + b"%PDF-" + b"0" * (30 * 1024 * 1024) + _multipart_footer(_INGRESS_BOUNDARY)
+    )
+
+    r = client.post(
+        "/api/v1/loads/1/documents",
+        content=oversized_body,
+        headers={"Content-Type": f"multipart/form-data; boundary={_INGRESS_BOUNDARY}"},
+    )
+
+    assert r.status_code == 413
+    attach_mock.assert_not_called()
+
+
+def test_attach_document_endpoint_rejects_oversized_chunked_body_without_content_length(
+    client: TestClient, monkeypatch
+):
+    """FIX 3: the same ceiling applies when the client never declares a
+    Content-Length at all (a streamed/chunked request) - the limit is
+    enforced purely from bytes actually received."""
+    from api.routers import loads as router_module
+
+    attach_mock = mock.Mock()
+    monkeypatch.setattr(router_module, "attach_load_document", attach_mock)
+
+    def body_stream():
+        yield _multipart_header(_INGRESS_BOUNDARY)
+        chunk = b"0" * 65536
+        sent = 0
+        target = 30 * 1024 * 1024
+        while sent < target:
+            yield chunk
+            sent += len(chunk)
+        yield _multipart_footer(_INGRESS_BOUNDARY)
+
+    r = client.post(
+        "/api/v1/loads/1/documents",
+        content=body_stream(),
+        headers={"Content-Type": f"multipart/form-data; boundary={_INGRESS_BOUNDARY}"},
+    )
+
+    assert r.status_code == 413
+    attach_mock.assert_not_called()
+
+
+def test_other_routes_are_not_subject_to_the_document_upload_ingress_limit(client: TestClient, monkeypatch):
+    """The ingress limit is scoped to the document-upload route only -
+    an ordinary JSON mutation elsewhere must be unaffected."""
+    from api.routers import loads as router_module
+
+    monkeypatch.setattr(
+        router_module, "update_load_fields", lambda **kwargs: LoadCommandResult(ok=True, load_id=1, status="Active")
+    )
+
+    r = client.put("/api/v1/loads/1", json={"updates": {"customer": "Acme"}})
+
+    assert r.status_code == 200

@@ -133,6 +133,101 @@ describe("EditForm - dirty-field tracking survives a server refresh", () => {
     renderWithClient(<EditForm load={load()} />);
     expect(screen.getByRole("button", { name: "Save Changes" })).toBeDisabled();
   });
+
+  // P1 regression: A starts editing -> B saves -> A receives a realtime
+  // refresh (load.updated_at now reflects B's save) -> A submits. The
+  // version submitted must be the one captured when A started editing,
+  // not the refreshed one - otherwise A's submit would silently match
+  // the server's current row and overwrite B's save with no 409 ever
+  // raised.
+  it("submits the version captured at edit-start, not a version refreshed in afterwards by someone else's save", async () => {
+    putMock.mockResolvedValue({ ok: true, load_id: 1, status: "Ready to Dispatch" });
+    const original = load({ updated_at: "2026-08-15T12:00:00Z" });
+    const { rerender } = renderWithClient(<EditForm load={original} />);
+
+    // A starts editing.
+    fireEvent.change(screen.getByLabelText("Customer"), { target: { value: "A's edit" } });
+
+    // B saves concurrently; A's realtime subscription refreshes the load prop.
+    const afterBsSave = load({ updated_at: "2026-08-15T12:05:00Z", port: "B's new port" });
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <EditForm load={afterBsSave} />
+      </QueryClientProvider>,
+    );
+
+    // A submits.
+    screen.getByRole("button", { name: "Save Changes" }).click();
+
+    await waitFor(() => expect(putMock).toHaveBeenCalled());
+    const [, body] = putMock.mock.calls[0];
+    expect(body.expected_updated_at).toBe("2026-08-15T12:00:00Z");
+    expect(body.expected_updated_at).not.toBe(afterBsSave.updated_at);
+  });
+
+  it("on a 409 from the stale-version submit, preserves A's edit without auto-retrying, and a discard action reloads B's values", async () => {
+    const { ApiError } = await import("@/lib/api/client");
+    putMock.mockRejectedValue(new ApiError(409, "Load was updated by someone else since you loaded it."));
+    const original = load({ updated_at: "2026-08-15T12:00:00Z" });
+    const { rerender } = renderWithClient(<EditForm load={original} />);
+
+    fireEvent.change(screen.getByLabelText("Customer"), { target: { value: "A's edit" } });
+    const afterBsSave = load({ updated_at: "2026-08-15T12:05:00Z", port: "B's new port" });
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <EditForm load={afterBsSave} />
+      </QueryClientProvider>,
+    );
+    screen.getByRole("button", { name: "Save Changes" }).click();
+
+    await waitFor(() =>
+      expect(screen.getByText(/changed by someone else since you opened it/)).toBeInTheDocument(),
+    );
+    // A's unsaved edit survives the 409 - not overwritten, not auto-retried.
+    expect(screen.getByLabelText("Customer")).toHaveValue("A's edit");
+    expect(putMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /discard my edits and reload the latest values/ }));
+
+    await waitFor(() =>
+      expect(screen.queryByText(/changed by someone else since you opened it/)).not.toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("Customer")).toHaveValue(afterBsSave.customer);
+    expect(screen.getByLabelText("Port / Pickup")).toHaveValue("B's new port");
+  });
+
+  it("disables inputs while a save is pending, and ignores a duplicate submit", async () => {
+    let resolvePut!: (value: unknown) => void;
+    putMock.mockReturnValue(new Promise((resolve) => (resolvePut = resolve)));
+    renderWithClient(<EditForm load={load()} />);
+
+    fireEvent.change(screen.getByLabelText("Customer"), { target: { value: "A's edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Customer")).toBeDisabled());
+    expect(screen.getByRole("button", { name: "Saving..." })).toBeDisabled();
+
+    // Duplicate submit attempt while pending must not fire a second request.
+    fireEvent.submit(screen.getByRole("form", { name: "Edit load" }));
+    expect(putMock).toHaveBeenCalledTimes(1);
+
+    resolvePut({ ok: true, load_id: 1, status: "Ready to Dispatch" });
+    await waitFor(() => expect(screen.getByLabelText("Customer")).not.toBeDisabled());
+    expect(screen.getByLabelText("Customer")).toHaveValue(load().customer);
+  });
+
+  it("preserves the unsaved edit and re-enables inputs if the save fails for a non-conflict reason", async () => {
+    const { ApiError } = await import("@/lib/api/client");
+    putMock.mockRejectedValue(new ApiError(500, "boom"));
+    renderWithClient(<EditForm load={load()} />);
+
+    fireEvent.change(screen.getByLabelText("Customer"), { target: { value: "A's edit" } });
+    screen.getByRole("button", { name: "Save Changes" }).click();
+
+    await waitFor(() => expect(screen.getByText("boom")).toBeInTheDocument());
+    expect(screen.getByLabelText("Customer")).toHaveValue("A's edit");
+    expect(screen.getByLabelText("Customer")).not.toBeDisabled();
+  });
 });
 
 describe("NotesEditor - same dirty-tracking/conflict behavior for the single notes field", () => {
@@ -175,5 +270,72 @@ describe("NotesEditor - same dirty-tracking/conflict behavior for the single not
       note: "called customer",
       expected_updated_at: "2026-08-15T12:00:00Z",
     });
+  });
+
+  it("submits the version captured at edit-start, not a version refreshed afterwards by someone else's save", async () => {
+    postMock.mockResolvedValue({ ok: true, load_id: 1 });
+    const original = load({ updated_at: "2026-08-15T12:00:00Z" });
+    const { rerender } = renderWithClient(<NotesEditor load={original} />);
+
+    fireEvent.change(screen.getByLabelText("Dispatcher Notes"), { target: { value: "A's note" } });
+    const afterBsSave = load({ updated_at: "2026-08-15T12:05:00Z", dispatcher_notes: "B's new note" });
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <NotesEditor load={afterBsSave} />
+      </QueryClientProvider>,
+    );
+    screen.getByRole("button", { name: "Save Notes" }).click();
+
+    await waitFor(() => expect(postMock).toHaveBeenCalled());
+    const [, body] = postMock.mock.calls[0];
+    expect(body.expected_updated_at).toBe("2026-08-15T12:00:00Z");
+    expect(body.expected_updated_at).not.toBe(afterBsSave.updated_at);
+  });
+
+  it("on a 409 preserves A's unsaved note without auto-retrying, and a discard action reloads B's note", async () => {
+    const { ApiError } = await import("@/lib/api/client");
+    postMock.mockRejectedValue(new ApiError(409, "Load was updated by someone else since you loaded it."));
+    const original = load({ updated_at: "2026-08-15T12:00:00Z" });
+    const { rerender } = renderWithClient(<NotesEditor load={original} />);
+
+    fireEvent.change(screen.getByLabelText("Dispatcher Notes"), { target: { value: "A's note" } });
+    const afterBsSave = load({ updated_at: "2026-08-15T12:05:00Z", dispatcher_notes: "B's new note" });
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <NotesEditor load={afterBsSave} />
+      </QueryClientProvider>,
+    );
+    screen.getByRole("button", { name: "Save Notes" }).click();
+
+    await waitFor(() =>
+      expect(screen.getByText(/changed by someone else since you opened it/)).toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("Dispatcher Notes")).toHaveValue("A's note");
+    expect(postMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /discard my note and reload the latest value/ }));
+
+    await waitFor(() =>
+      expect(screen.queryByText(/changed by someone else since you opened it/)).not.toBeInTheDocument(),
+    );
+    expect(screen.getByLabelText("Dispatcher Notes")).toHaveValue("B's new note");
+  });
+
+  it("disables the textarea while a save is pending, and ignores a duplicate submit", async () => {
+    let resolvePost!: (value: unknown) => void;
+    postMock.mockReturnValue(new Promise((resolve) => (resolvePost = resolve)));
+    renderWithClient(<NotesEditor load={load()} />);
+
+    fireEvent.change(screen.getByLabelText("Dispatcher Notes"), { target: { value: "A's note" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Notes" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Dispatcher Notes")).toBeDisabled());
+    expect(screen.getByRole("button", { name: "Saving..." })).toBeDisabled();
+
+    fireEvent.submit(screen.getByRole("form", { name: "Dispatcher notes" }));
+    expect(postMock).toHaveBeenCalledTimes(1);
+
+    resolvePost({ ok: true, load_id: 1 });
+    await waitFor(() => expect(screen.getByLabelText("Dispatcher Notes")).not.toBeDisabled());
   });
 });
