@@ -315,7 +315,9 @@ export interface paths {
          *     Streamlit Order Detail Editor's "Save Order Updates" button. Wraps
          *     application.loads.commands.update_load_fields unchanged; that
          *     function is the existing allowlist/validation boundary for which
-         *     columns may be written.
+         *     columns may be written. This endpoint additionally rejects dispatch-
+         *     governed fields before the command ever runs (see
+         *     _reject_dispatch_governed_fields above).
          */
         put: operations["update_load_fields_endpoint_api_v1_loads__load_id__put"];
         post?: never;
@@ -1308,6 +1310,8 @@ export interface components {
         SaveLoadNoteIn: {
             /** Note */
             note: string;
+            /** Expected Updated At */
+            expected_updated_at?: string | null;
         };
         /** SortMetaOut */
         SortMetaOut: {
@@ -1357,6 +1361,8 @@ export interface components {
             updates: {
                 [key: string]: unknown;
             };
+            /** Expected Updated At */
+            expected_updated_at?: string | null;
         };
         /** UpdateLoadIn */
         UpdateLoadIn: {

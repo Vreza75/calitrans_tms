@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { apiClient } from "@/lib/api/client";
+import { ApiError, apiClient } from "@/lib/api/client";
 import { loadKeys } from "@/lib/api/queryKeys";
 import type {
   DocumentUploadResult,
@@ -64,6 +64,14 @@ export function useUpdateLoadFields(loadId: number) {
     mutationFn: (payload: UpdateLoadFieldsRequest) =>
       apiClient.put<LoadCommandResult>(`/api/v1/loads/${loadId}`, payload),
     onSuccess: () => invalidate("fields"),
+    // P1 fix: a 409 means another writer's edit landed on this load
+    // since this form's data was loaded - refresh the same queries a
+    // success would, so the untouched/refreshed fields pick up the
+    // other writer's values (the component keeps the user's own
+    // unsaved dirty fields regardless - see EditForm's own comment).
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) invalidate("fields");
+    },
   });
 }
 
@@ -73,6 +81,9 @@ export function useSaveLoadNote(loadId: number) {
     mutationFn: (payload: SaveLoadNoteRequest) =>
       apiClient.post<LoadCommandResult>(`/api/v1/loads/${loadId}/notes`, payload),
     onSuccess: () => invalidate("fields"),
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) invalidate("fields");
+    },
   });
 }
 
