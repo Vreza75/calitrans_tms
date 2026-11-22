@@ -91,7 +91,7 @@ def test_save_load_note_succeeds_for_authorized_roles(actor, mock_dispatch_clien
     result = commands.save_load_note(actor=actor, load_id=1, note="called customer")
     assert result.ok is True
     mock_dispatch_client.update_row_fields.assert_called_once_with(
-        1, {"Dispatcher Notes": "called customer"}, conn=mock_transaction, created_by=actor.actor
+        1, {"Dispatcher Notes": "called customer"}, conn=mock_transaction, created_by=actor.actor, expected_updated_at=None
     )
 
 

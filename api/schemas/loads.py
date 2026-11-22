@@ -234,10 +234,18 @@ class LoadDocumentMetaOut(BaseModel):
 
 class UpdateLoadFieldsIn(BaseModel):
     updates: dict[str, Any]
+    # P1 fix: optional optimistic-concurrency guard - pass the load's
+    # updated_at exactly as last displayed (LoadDetailOut.updated_at).
+    # update_row_fields() already supports this as a WHERE-clause check
+    # under its own write, atomic with the write itself; a mismatch
+    # raises ConflictError (409), never a silent overwrite. Omit to skip
+    # the check (existing non-Next.js callers keep today's behavior).
+    expected_updated_at: datetime | None = None
 
 
 class SaveLoadNoteIn(BaseModel):
     note: str
+    expected_updated_at: datetime | None = None
 
 
 class LoadNoteOnlyIn(BaseModel):

@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
-from application.exceptions import AuthorizationError, ValidationError
+from application.exceptions import AuthorizationError, ConflictError, ValidationError
 from application.loads.models import LoadCommandResult
 
 
@@ -235,11 +235,11 @@ def test_attach_document_endpoint_passes_filename_through_the_sync_adapter(clien
 
     monkeypatch.setattr(router_module, "attach_load_document", _fake_attach)
 
-    r = client.post("/api/v1/loads/1/documents", files={"file": ("rate.pdf", io.BytesIO(b"hello world"), "application/pdf")})
+    r = client.post("/api/v1/loads/1/documents", files={"file": ("rate.pdf", io.BytesIO(b"%PDF-1.4 hello world"), "application/pdf")})
 
     assert r.status_code == 200
     assert captured["name"] == "rate.pdf"
-    assert captured["bytes"] == b"hello world"
+    assert captured["bytes"] == b"%PDF-1.4 hello world"
     assert captured["source"] == "web"
 
 
@@ -254,7 +254,7 @@ def test_attach_document_endpoint_allows_accounting(monkeypatch):
 
     r = client.post(
         "/api/v1/loads/1/documents",
-        files={"file": ("invoice.pdf", io.BytesIO(b"x"), "application/pdf")},
+        files={"file": ("invoice.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf")},
         headers=ACCOUNTING_AUTH,
     )
 
@@ -268,3 +268,171 @@ def test_attach_document_endpoint_unauthenticated_returns_401(monkeypatch):
     client = TestClient(app)
     r = client.post("/api/v1/loads/1/documents", files={"file": ("x.pdf", io.BytesIO(b"x"), "application/pdf")})
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# P1 regression coverage (Codex review on PR #26)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["status", "Status", "driver_name", "Driver Name", "truck_assigned", "Truck Assigned", "chassis", "Chassis"],
+)
+def test_update_load_fields_endpoint_rejects_dispatch_governed_fields(client: TestClient, monkeypatch, key):
+    """FIX 2: the general update endpoint must never be able to set a
+    field governed by a specialized, safety-checked command - this
+    would bypass apply_transition's row-locking, operational-stage
+    validation, and status/assignment-changed event emission entirely."""
+    from api.routers import loads as router_module
+
+    update_mock = mock.Mock()
+    monkeypatch.setattr(router_module, "update_load_fields", update_mock)
+
+    r = client.put("/api/v1/loads/1", json={"updates": {key: "Cancelled"}})
+
+    assert r.status_code == 422
+    update_mock.assert_not_called()
+
+
+def test_update_load_fields_endpoint_still_allows_non_dispatch_fields(client: TestClient, monkeypatch):
+    """Regression: the denylist must not reject ordinary fields."""
+    from api.routers import loads as router_module
+
+    monkeypatch.setattr(
+        router_module, "update_load_fields", lambda **kwargs: LoadCommandResult(ok=True, load_id=1, status="Active")
+    )
+
+    r = client.put("/api/v1/loads/1", json={"updates": {"customer": "Acme", "port": "Port of LA", "address": "123 Main St"}})
+
+    assert r.status_code == 200
+
+
+def test_update_load_fields_endpoint_passes_expected_updated_at_through(client: TestClient, monkeypatch):
+    """FIX 1: the optimistic-concurrency token reaches the command."""
+    from api.routers import loads as router_module
+
+    captured = {}
+    monkeypatch.setattr(
+        router_module,
+        "update_load_fields",
+        lambda **kwargs: (captured.update(kwargs), LoadCommandResult(ok=True, load_id=1))[1],
+    )
+
+    r = client.put(
+        "/api/v1/loads/1",
+        json={"updates": {"customer": "Acme"}, "expected_updated_at": "2026-08-15T12:00:00Z"},
+    )
+
+    assert r.status_code == 200
+    assert captured["expected_updated_at"] is not None
+
+
+def test_update_load_fields_endpoint_returns_409_on_stale_write(client: TestClient, monkeypatch):
+    """FIX 1: two dispatchers editing the same load - the second writer's
+    stale expected_updated_at must be rejected (409), not silently
+    overwrite the first writer's change."""
+    from api.routers import loads as router_module
+
+    def _raise(**kwargs):
+        raise ConflictError("Load 1 was updated by someone else since you loaded it. Reload and try again.")
+
+    monkeypatch.setattr(router_module, "update_load_fields", _raise)
+
+    r = client.put(
+        "/api/v1/loads/1",
+        json={"updates": {"customer": "Acme"}, "expected_updated_at": "2026-08-15T12:00:00Z"},
+    )
+
+    assert r.status_code == 409
+    assert "someone else" in r.json()["error"]["message"].lower()
+
+
+def test_save_load_note_endpoint_returns_409_on_stale_write(client: TestClient, monkeypatch):
+    """FIX 1: stale notes return 409."""
+    from api.routers import loads as router_module
+
+    def _raise(**kwargs):
+        raise ConflictError("Load 1 was updated by someone else since you loaded it. Reload and try again.")
+
+    monkeypatch.setattr(router_module, "save_load_note", _raise)
+
+    r = client.post(
+        "/api/v1/loads/1/notes",
+        json={"note": "called customer", "expected_updated_at": "2026-08-15T12:00:00Z"},
+    )
+
+    assert r.status_code == 409
+
+
+def test_save_load_note_endpoint_passes_expected_updated_at_through(client: TestClient, monkeypatch):
+    from api.routers import loads as router_module
+
+    captured = {}
+    monkeypatch.setattr(
+        router_module,
+        "save_load_note",
+        lambda **kwargs: (captured.update(kwargs), LoadCommandResult(ok=True, load_id=1))[1],
+    )
+
+    r = client.post("/api/v1/loads/1/notes", json={"note": "x", "expected_updated_at": "2026-08-15T12:00:00Z"})
+
+    assert r.status_code == 200
+    assert captured["expected_updated_at"] is not None
+
+
+def test_attach_document_endpoint_rejects_oversized_file(client: TestClient, monkeypatch):
+    """FIX 3: rejected before attach_load_document (and therefore
+    stage_upload) ever runs - no staged file, no documents row."""
+    from api.routers import loads as router_module
+
+    attach_mock = mock.Mock()
+    monkeypatch.setattr(router_module, "attach_load_document", attach_mock)
+
+    oversized = b"%PDF-" + (b"0" * router_module.MAX_DOCUMENT_UPLOAD_BYTES)
+    r = client.post("/api/v1/loads/1/documents", files={"file": ("rate.pdf", io.BytesIO(oversized), "application/pdf")})
+
+    assert r.status_code == 422
+    assert "limit" in r.json()["error"]["message"].lower()
+    attach_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content,filename,mimetype",
+    [
+        (b"MZ\x90\x00executable-content", "rate.pdf", "application/pdf"),  # spoofed extension/MIME
+        (b"plain text content", "notes.pdf", "application/pdf"),
+        (b"", "empty.pdf", "application/pdf"),
+    ],
+)
+def test_attach_document_endpoint_rejects_invalid_content(client: TestClient, monkeypatch, content, filename, mimetype):
+    """FIX 3: validated by actual content (magic bytes), not filename
+    extension or client-supplied Content-Type - both are attacker-
+    controlled and spoofable."""
+    from api.routers import loads as router_module
+
+    attach_mock = mock.Mock()
+    monkeypatch.setattr(router_module, "attach_load_document", attach_mock)
+
+    r = client.post("/api/v1/loads/1/documents", files={"file": (filename, io.BytesIO(content), mimetype)})
+
+    assert r.status_code == 422
+    assert "unsupported" in r.json()["error"]["message"].lower()
+    attach_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"%PDF-1.4 valid pdf content", b"\xff\xd8\xff\xe0 jpeg content", b"\x89PNG\r\n\x1a\n png content"],
+)
+def test_attach_document_endpoint_accepts_valid_formats(client: TestClient, monkeypatch, content):
+    """FIX 3 regression: valid uploads retain the existing document
+    lifecycle (status starts "pending", document_id returned) unchanged."""
+    from api.routers import loads as router_module
+
+    monkeypatch.setattr(router_module, "attach_load_document", lambda **kwargs: 99)
+
+    r = client.post("/api/v1/loads/1/documents", files={"file": ("rate.pdf", io.BytesIO(content), "application/pdf")})
+
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "document_id": 99, "status": "pending"}
