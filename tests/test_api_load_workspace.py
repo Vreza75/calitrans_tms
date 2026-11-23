@@ -457,12 +457,25 @@ def _multipart_footer(boundary: str) -> bytes:
     return f"\r\n--{boundary}--\r\n".encode()
 
 
-def test_attach_document_endpoint_rejects_oversized_body_with_content_length(client: TestClient, monkeypatch):
+# FIX (bypass): FastAPI's `{load_id}` path segment has no `:int` path
+# convertor, so Starlette's router matches it as any non-slash segment
+# and only FastAPI/pydantic coerce it to int afterward - which accepts
+# representations a `\d+`-only matcher does not (leading "+", leading
+# zeros). Every one of these must still reach the same route, so the
+# ingress guard has to match the structural route, not digit-only IDs.
+_ALTERNATE_LOAD_ID_REPRESENTATIONS = ["1", "+1", "01", "007"]
+
+
+@pytest.mark.parametrize("load_id", _ALTERNATE_LOAD_ID_REPRESENTATIONS)
+def test_attach_document_endpoint_rejects_oversized_body_with_content_length(
+    client: TestClient, monkeypatch, load_id
+):
     """FIX 3: a request body well beyond the ingress ceiling is rejected
     with 413 before FastAPI's multipart parser (and therefore
     attach_load_document/stage_upload) ever runs - even though the
     client sent an accurate Content-Length, the limit is enforced from
-    actual streamed bytes, not the header."""
+    actual streamed bytes, not the header. Covers every integer
+    representation that still routes to this endpoint."""
     from api.routers import loads as router_module
 
     attach_mock = mock.Mock()
@@ -473,7 +486,7 @@ def test_attach_document_endpoint_rejects_oversized_body_with_content_length(cli
     )
 
     r = client.post(
-        "/api/v1/loads/1/documents",
+        f"/api/v1/loads/{load_id}/documents",
         content=oversized_body,
         headers={"Content-Type": f"multipart/form-data; boundary={_INGRESS_BOUNDARY}"},
     )
@@ -482,12 +495,14 @@ def test_attach_document_endpoint_rejects_oversized_body_with_content_length(cli
     attach_mock.assert_not_called()
 
 
+@pytest.mark.parametrize("load_id", _ALTERNATE_LOAD_ID_REPRESENTATIONS)
 def test_attach_document_endpoint_rejects_oversized_chunked_body_without_content_length(
-    client: TestClient, monkeypatch
+    client: TestClient, monkeypatch, load_id
 ):
     """FIX 3: the same ceiling applies when the client never declares a
     Content-Length at all (a streamed/chunked request) - the limit is
-    enforced purely from bytes actually received."""
+    enforced purely from bytes actually received - across every integer
+    representation that still routes to this endpoint."""
     from api.routers import loads as router_module
 
     attach_mock = mock.Mock()
@@ -504,13 +519,34 @@ def test_attach_document_endpoint_rejects_oversized_chunked_body_without_content
         yield _multipart_footer(_INGRESS_BOUNDARY)
 
     r = client.post(
-        "/api/v1/loads/1/documents",
+        f"/api/v1/loads/{load_id}/documents",
         content=body_stream(),
         headers={"Content-Type": f"multipart/form-data; boundary={_INGRESS_BOUNDARY}"},
     )
 
     assert r.status_code == 413
     attach_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("load_id", _ALTERNATE_LOAD_ID_REPRESENTATIONS)
+def test_attach_document_endpoint_accepts_valid_upload_for_every_load_id_representation(
+    client: TestClient, monkeypatch, load_id
+):
+    """Regression: the broadened structural matcher must not reject a
+    normal, well-within-limit upload for any of these representations -
+    document lifecycle (status "pending", document_id returned) is
+    unaffected by the ingress guard."""
+    from api.routers import loads as router_module
+
+    monkeypatch.setattr(router_module, "attach_load_document", lambda **kwargs: 99)
+
+    r = client.post(
+        f"/api/v1/loads/{load_id}/documents",
+        files={"file": ("rate.pdf", io.BytesIO(b"%PDF-1.4 valid pdf content"), "application/pdf")},
+    )
+
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "document_id": 99, "status": "pending"}
 
 
 def test_other_routes_are_not_subject_to_the_document_upload_ingress_limit(client: TestClient, monkeypatch):

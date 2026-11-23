@@ -34,7 +34,14 @@ _DOCUMENT_UPLOAD_INGRESS_CEILING_BYTES = MAX_DOCUMENT_UPLOAD_BYTES + 5 * 1024 * 
 app.add_middleware(
     RequestBodySizeLimitMiddleware,
     max_bytes=_DOCUMENT_UPLOAD_INGRESS_CEILING_BYTES,
-    guarded_routes={("POST", re.compile(r"/api/v1/loads/\d+/documents"))},
+    # P1 fix: match the route structurally (any single non-slash
+    # segment), not `\d+` - the `{load_id}` path parameter has no
+    # `:int` path convertor, so Starlette's router matches any
+    # non-slash segment and FastAPI/pydantic do the int coercion
+    # afterward, accepting representations `\d+` doesn't (e.g. "+1",
+    # "01"). Those reached the real route - and so must reach this
+    # ingress gate - regardless of digit-only appearance.
+    guarded_routes={("POST", re.compile(r"/api/v1/loads/[^/]+/documents"))},
 )
 
 # Phase 10 (Next.js web client) is the first real frontend consumer -
