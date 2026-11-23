@@ -85,4 +85,19 @@ describe("apiClient", () => {
     expect((init?.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     expect(init?.body).toBe(JSON.stringify({ email: "a@b.com", password: "x" }));
   });
+
+  // Phase 10C: document upload sends FormData - JSON-encoding it (the
+  // default for any other body) would both mangle the payload and omit
+  // the multipart boundary the server needs to parse it.
+  it("sends a FormData body as-is, without a Content-Type header, for a multipart upload", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({ ok: true, document_id: 1 }));
+    const formData = new FormData();
+    formData.append("file", new Blob(["pdf bytes"], { type: "application/pdf" }), "rate.pdf");
+
+    await apiClient.post("/api/v1/loads/1/documents", formData);
+
+    const [, init] = fetchSpy.mock.calls[0];
+    expect(init?.body).toBe(formData);
+    expect((init?.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+  });
 });

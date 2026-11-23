@@ -250,7 +250,7 @@ def update_load_from_work_item(
 
 
 def _update_load_fields_with_event(
-    *, load_id: int, updates: dict[str, Any], actor: AuthenticatedActor
+    *, load_id: int, updates: dict[str, Any], actor: AuthenticatedActor, expected_updated_at: Any = None
 ) -> None:
     """Phase 9 STEP 8: shared helper for the direct-field-update commands
     below - wraps DispatchDatabaseClient.update_row_fields in an explicit
@@ -259,12 +259,21 @@ def _update_load_fields_with_event(
     can be recorded in the SAME transaction as the field write (STEP 6).
     A side benefit, not the point of this change: the write and its
     status_events audit row (when status changes) are now also atomic
-    with each other, which they were not before."""
+    with each other, which they were not before.
+
+    `expected_updated_at` (P1 fix) is optional - update_row_fields()
+    already supports this WHERE-clause-based optimistic lock (used by
+    mark_load_ready_to_dispatch/update_dispatch_assignment); it raises
+    ConflictError itself (zero rows matched) rather than silently
+    overwriting a write that landed after the caller loaded this
+    load - propagates up unchanged to whichever caller passed it."""
     from db_client import DispatchDatabaseClient, transaction
     from realtime.events import publish_event, time_bucketed_key
 
     with transaction() as conn:
-        DispatchDatabaseClient().update_row_fields(load_id, updates, conn=conn, created_by=actor.actor)
+        DispatchDatabaseClient().update_row_fields(
+            load_id, updates, conn=conn, created_by=actor.actor, expected_updated_at=expected_updated_at
+        )
         publish_event(
             conn=conn,
             event_type="load.updated",
@@ -288,11 +297,15 @@ def mark_load_missing_info(*, actor: AuthenticatedActor, load_id: int, note: str
     return LoadCommandResult(ok=True, load_id=load_id, status="Hold/Need Info")
 
 
-def save_load_note(*, actor: AuthenticatedActor, load_id: int, note: str) -> LoadCommandResult:
+def save_load_note(
+    *, actor: AuthenticatedActor, load_id: int, note: str, expected_updated_at: Any = None
+) -> LoadCommandResult:
     """Update Dispatcher Notes only - no status change."""
     require_permission(actor, Permission.LOAD_EDIT)
 
-    _update_load_fields_with_event(load_id=load_id, updates={"Dispatcher Notes": note}, actor=actor)
+    _update_load_fields_with_event(
+        load_id=load_id, updates={"Dispatcher Notes": note}, actor=actor, expected_updated_at=expected_updated_at
+    )
     return LoadCommandResult(ok=True, load_id=load_id)
 
 
@@ -320,7 +333,9 @@ def cancel_load(*, actor: AuthenticatedActor, load_id: int, note: str = "") -> L
     return LoadCommandResult(ok=True, load_id=load_id, status="Cancelled")
 
 
-def update_load_fields(*, actor: AuthenticatedActor, load_id: int, updates: dict[str, Any]) -> LoadCommandResult:
+def update_load_fields(
+    *, actor: AuthenticatedActor, load_id: int, updates: dict[str, Any], expected_updated_at: Any = None
+) -> LoadCommandResult:
     """Free-form multi-field save (the Booking Review / Order Detail Editor
     forms). `updates` is passed through to DispatchDatabaseClient.
     update_row_fields() unchanged - that function is the existing
@@ -331,7 +346,7 @@ def update_load_fields(*, actor: AuthenticatedActor, load_id: int, updates: dict
     if not updates:
         raise ValidationError("No fields supplied to update.")
 
-    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor)
+    _update_load_fields_with_event(load_id=load_id, updates=updates, actor=actor, expected_updated_at=expected_updated_at)
     return LoadCommandResult(ok=True, load_id=load_id, status=str(updates.get("status") or updates.get("Status") or ""))
 
 

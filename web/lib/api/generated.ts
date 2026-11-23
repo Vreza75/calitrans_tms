@@ -309,7 +309,17 @@ export interface paths {
         };
         /** Get Load Endpoint */
         get: operations["get_load_endpoint_api_v1_loads__load_id__get"];
-        put?: never;
+        /**
+         * Update Load Fields Endpoint
+         * @description Free-form multi-field save - the Next.js equivalent of the
+         *     Streamlit Order Detail Editor's "Save Order Updates" button. Wraps
+         *     application.loads.commands.update_load_fields unchanged; that
+         *     function is the existing allowlist/validation boundary for which
+         *     columns may be written. This endpoint additionally rejects dispatch-
+         *     governed fields before the command ever runs (see
+         *     _reject_dispatch_governed_fields above).
+         */
+        put: operations["update_load_fields_endpoint_api_v1_loads__load_id__put"];
         post?: never;
         delete?: never;
         options?: never;
@@ -368,7 +378,14 @@ export interface paths {
         /** Get Load Communications Endpoint */
         get: operations["get_load_communications_endpoint_api_v1_loads__load_id__communications_get"];
         put?: never;
-        post?: never;
+        /**
+         * Log Load Communication Endpoint
+         * @description Manual communication-log entry (Streamlit's "Save Message /
+         *     Driver Communication / Customer Note / Operational Note" buttons) -
+         *     `provider` is fixed to "internal" here, not accepted from the
+         *     client: this endpoint logs a note, it does not send anything.
+         */
+        post: operations["log_load_communication_endpoint_api_v1_loads__load_id__communications_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -385,7 +402,14 @@ export interface paths {
         /** Get Load Documents Endpoint */
         get: operations["get_load_documents_endpoint_api_v1_loads__load_id__documents_get"];
         put?: never;
-        post?: never;
+        /**
+         * Attach Load Document Endpoint
+         * @description Accounting is included in this route's role gate (DOCUMENT_MUTATE,
+         *     not MUTATE_OPERATIONS) because Permission.DOCUMENT_ATTACH grants
+         *     Accounting this specific capability - see api/auth.py's
+         *     DOCUMENT_MUTATE definition.
+         */
+        post: operations["attach_load_document_endpoint_api_v1_loads__load_id__documents_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -433,6 +457,79 @@ export interface paths {
          *     services/dispatch_transition_service.py::apply_transition.
          */
         post: operations["assign_driver_endpoint_api_v1_loads__load_id__assign_driver_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/loads/{load_id}/notes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Save Load Note Endpoint
+         * @description Notes-only save, distinct from update_load_fields_endpoint above -
+         *     mirrors Streamlit's separate "Save Notes" button not requiring the
+         *     rest of the form to be resubmitted.
+         */
+        post: operations["save_load_note_endpoint_api_v1_loads__load_id__notes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/loads/{load_id}/mark-missing-info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mark Load Missing Info Endpoint */
+        post: operations["mark_load_missing_info_endpoint_api_v1_loads__load_id__mark_missing_info_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/loads/{load_id}/verify-booking": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify Load Booking Endpoint */
+        post: operations["verify_load_booking_endpoint_api_v1_loads__load_id__verify_booking_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/loads/{load_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel Load Endpoint */
+        post: operations["cancel_load_endpoint_api_v1_loads__load_id__cancel_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -657,6 +754,11 @@ export interface components {
             /** Prior */
             prior: components["schemas"]["AttachmentMetaOut"][];
         };
+        /** Body_attach_load_document_endpoint_api_v1_loads__load_id__documents_post */
+        Body_attach_load_document_endpoint_api_v1_loads__load_id__documents_post: {
+            /** File */
+            file: string;
+        };
         /** CloseWorkItemIn */
         CloseWorkItemIn: {
             /**
@@ -729,6 +831,26 @@ export interface components {
              */
             review_status: string;
         };
+        /**
+         * DocumentUploadOut
+         * @description `status` is always "pending" at response time - the outbox
+         *     processor flips it to "available"/"failed" asynchronously (see
+         *     application/documents/commands.py::attach_load_document's own
+         *     docstring); the client learns the final state via GET
+         *     /loads/{id}/documents after the realtime document.available/
+         *     document.failed invalidation, not from this response.
+         */
+        DocumentUploadOut: {
+            /** Ok */
+            ok: boolean;
+            /** Document Id */
+            document_id: number;
+            /**
+             * Status
+             * @default pending
+             */
+            status: string;
+        };
         /** DriverOut */
         DriverOut: {
             /** Driver Name */
@@ -778,6 +900,23 @@ export interface components {
         LinkLoadIn: {
             /** Load Id */
             load_id: number;
+        };
+        /** LoadCommandResultOut */
+        LoadCommandResultOut: {
+            /** Ok */
+            ok: boolean;
+            /** Load Id */
+            load_id: number;
+            /**
+             * Status
+             * @default
+             */
+            status: string;
+            /**
+             * Reason
+             * @default
+             */
+            reason: string;
         };
         /** LoadCommunicationOut */
         LoadCommunicationOut: {
@@ -980,6 +1119,19 @@ export interface components {
             /** Updated At */
             updated_at: string | null;
         };
+        /**
+         * LoadNoteOnlyIn
+         * @description Shared body shape for the three status quick-actions - each takes
+         *     an optional note, same as application/loads/commands.py's
+         *     mark_load_missing_info/verify_load_booking/cancel_load.
+         */
+        LoadNoteOnlyIn: {
+            /**
+             * Note
+             * @default
+             */
+            note: string;
+        };
         /** LoadPageOut */
         LoadPageOut: {
             /** Items */
@@ -1062,6 +1214,25 @@ export interface components {
              */
             sort_direction: string;
         };
+        /** LogCommunicationIn */
+        LogCommunicationIn: {
+            /** Message Type */
+            message_type: string;
+            /** Direction */
+            direction: string;
+            /**
+             * Recipient
+             * @default
+             */
+            recipient: string;
+            /** Message Body */
+            message_body: string;
+        };
+        /** LogCommunicationOut */
+        LogCommunicationOut: {
+            /** Ok */
+            ok: boolean;
+        };
         /** LoginIn */
         LoginIn: {
             /** Email */
@@ -1135,6 +1306,13 @@ export interface components {
             /** Count */
             count: number;
         };
+        /** SaveLoadNoteIn */
+        SaveLoadNoteIn: {
+            /** Note */
+            note: string;
+            /** Expected Updated At */
+            expected_updated_at?: string | null;
+        };
         /** SortMetaOut */
         SortMetaOut: {
             /** Sort By */
@@ -1176,6 +1354,15 @@ export interface components {
             status: string;
             /** Closeout Stage */
             closeout_stage: string;
+        };
+        /** UpdateLoadFieldsIn */
+        UpdateLoadFieldsIn: {
+            /** Updates */
+            updates: {
+                [key: string]: unknown;
+            };
+            /** Expected Updated At */
+            expected_updated_at?: string | null;
         };
         /** UpdateLoadIn */
         UpdateLoadIn: {
@@ -2006,6 +2193,43 @@ export interface operations {
             };
         };
     };
+    update_load_fields_endpoint_api_v1_loads__load_id__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateLoadFieldsIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadCommandResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_load_detail_endpoint_api_v1_loads__load_id__detail_get: {
         parameters: {
             query?: never;
@@ -2111,6 +2335,43 @@ export interface operations {
             };
         };
     };
+    log_load_communication_endpoint_api_v1_loads__load_id__communications_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LogCommunicationIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogCommunicationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_load_documents_endpoint_api_v1_loads__load_id__documents_get: {
         parameters: {
             query?: {
@@ -2133,6 +2394,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LoadDocumentMetaOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    attach_load_document_endpoint_api_v1_loads__load_id__documents_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["Body_attach_load_document_endpoint_api_v1_loads__load_id__documents_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentUploadOut"];
                 };
             };
             /** @description Validation Error */
@@ -2207,6 +2505,154 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TransitionResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_load_note_endpoint_api_v1_loads__load_id__notes_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveLoadNoteIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadCommandResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mark_load_missing_info_endpoint_api_v1_loads__load_id__mark_missing_info_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoadNoteOnlyIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadCommandResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_load_booking_endpoint_api_v1_loads__load_id__verify_booking_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoadNoteOnlyIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadCommandResultOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_load_endpoint_api_v1_loads__load_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                load_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoadNoteOnlyIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadCommandResultOut"];
                 };
             };
             /** @description Validation Error */

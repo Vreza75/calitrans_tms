@@ -220,3 +220,68 @@ class LoadDocumentMetaOut(BaseModel):
     @classmethod
     def from_domain(cls, doc: LoadDocumentMeta) -> "LoadDocumentMetaOut":
         return cls(**doc.__dict__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 10C: Load Workspace - thin wrappers over the existing, already
+# authorization-gated application/loads/commands.py and application/
+# documents/commands.py and application/dispatch/commands.py::
+# log_dispatch_communication functions. No command logic lives here or
+# in api/routers/loads.py - every endpoint below only translates HTTP
+# <-> the existing command's own parameters/result shape.
+# ---------------------------------------------------------------------------
+
+
+class UpdateLoadFieldsIn(BaseModel):
+    updates: dict[str, Any]
+    # P1 fix: optional optimistic-concurrency guard - pass the load's
+    # updated_at exactly as last displayed (LoadDetailOut.updated_at).
+    # update_row_fields() already supports this as a WHERE-clause check
+    # under its own write, atomic with the write itself; a mismatch
+    # raises ConflictError (409), never a silent overwrite. Omit to skip
+    # the check (existing non-Next.js callers keep today's behavior).
+    expected_updated_at: datetime | None = None
+
+
+class SaveLoadNoteIn(BaseModel):
+    note: str
+    expected_updated_at: datetime | None = None
+
+
+class LoadNoteOnlyIn(BaseModel):
+    """Shared body shape for the three status quick-actions - each takes
+    an optional note, same as application/loads/commands.py's
+    mark_load_missing_info/verify_load_booking/cancel_load."""
+
+    note: str = ""
+
+
+class LoadCommandResultOut(BaseModel):
+    ok: bool
+    load_id: int
+    status: str = ""
+    reason: str = ""
+
+
+class LogCommunicationIn(BaseModel):
+    message_type: str
+    direction: str
+    recipient: str = ""
+    message_body: str
+
+
+class LogCommunicationOut(BaseModel):
+    ok: bool
+
+
+class DocumentUploadOut(BaseModel):
+    """`status` is always "pending" at response time - the outbox
+    processor flips it to "available"/"failed" asynchronously (see
+    application/documents/commands.py::attach_load_document's own
+    docstring); the client learns the final state via GET
+    /loads/{id}/documents after the realtime document.available/
+    document.failed invalidation, not from this response."""
+
+    ok: bool
+    document_id: int
+    status: str = "pending"

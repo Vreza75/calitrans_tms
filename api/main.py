@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -10,12 +11,38 @@ from pydantic import BaseModel
 from db_client import DispatchDatabaseClient, read_df
 
 from api.auth import MUTATE_OPERATIONS, READ_LOADS, require_role
+from api.body_size_limit import RequestBodySizeLimitMiddleware
 from api.errors import register_error_handlers
 from api.routers import attachments, auth, drivers, health, inbox, jobs, loads, work_items
+from api.routers.loads import MAX_DOCUMENT_UPLOAD_BYTES
 
 app = FastAPI(title="Calitrans TMS Integration API")
 
 register_error_handlers(app)
+
+# P1 fix: ingress-level ceiling on the document-upload route, enforced
+# against actual streamed bytes before FastAPI's multipart parser ever
+# runs (see api/body_size_limit.py) - a prior request this large would
+# previously be fully parsed/spooled first and only rejected afterward
+# by the route's own MAX_DOCUMENT_UPLOAD_BYTES check. Set well above
+# MAX_DOCUMENT_UPLOAD_BYTES (the real per-file business limit, still
+# enforced unchanged by api/routers/loads.py's own post-parse check) so
+# this only guards against grossly oversized requests, not against a
+# file that will earn its own precise 422 anyway.
+_DOCUMENT_UPLOAD_INGRESS_CEILING_BYTES = MAX_DOCUMENT_UPLOAD_BYTES + 5 * 1024 * 1024
+
+app.add_middleware(
+    RequestBodySizeLimitMiddleware,
+    max_bytes=_DOCUMENT_UPLOAD_INGRESS_CEILING_BYTES,
+    # P1 fix: match the route structurally (any single non-slash
+    # segment), not `\d+` - the `{load_id}` path parameter has no
+    # `:int` path convertor, so Starlette's router matches any
+    # non-slash segment and FastAPI/pydantic do the int coercion
+    # afterward, accepting representations `\d+` doesn't (e.g. "+1",
+    # "01"). Those reached the real route - and so must reach this
+    # ingress gate - regardless of digit-only appearance.
+    guarded_routes={("POST", re.compile(r"/api/v1/loads/[^/]+/documents"))},
+)
 
 # Phase 10 (Next.js web client) is the first real frontend consumer -
 # restrict CORS to an explicit allowlist read from CORS_ALLOWED_ORIGINS
